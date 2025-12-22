@@ -1,14 +1,12 @@
 use anyhow::Result;
-use api::proto::{self, envelope::Payload, RoomId, UserId, RoomInfo, UserPresence};
+use api::proto::{self, envelope::Payload, RoomId, UserId, RoomInfo, UserPresence, VoiceDatagram};
 use api::{encode_frame, try_decode_frame};
 use bytes::BytesMut;
 use prost::Message;
 use quinn::{Endpoint, ServerConfig};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use server::load_or_create_dev_cert;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
-use tokio::task;
 use tokio::sync::Mutex;
 use tracing::{error, info, debug};
 
@@ -28,7 +26,7 @@ async fn main() -> Result<()> {
             Ok(new_conn) => {
                 info!("new connection from {}", new_conn.remote_address());
                 let st = state.clone();
-                task::spawn(async move {
+                tokio::spawn(async move {
                     if let Err(e) = handle_connection(new_conn, st).await {
                         error!("connection error: {e:?}");
                     }
@@ -53,9 +51,20 @@ fn make_server_endpoint(port: u16) -> Result<Endpoint> {
         .with_single_cert(vec![cert], key)?;
     rustls_config.alpn_protocols = vec![b"rumble".to_vec()];
 
-    let server_config = ServerConfig::with_crypto(Arc::new(quinn::crypto::rustls::QuicServerConfig::try_from(
+    let mut server_config = ServerConfig::with_crypto(Arc::new(quinn::crypto::rustls::QuicServerConfig::try_from(
         Arc::new(rustls_config),
     )?));
+    
+    // Configure transport for faster disconnect detection.
+    let mut transport_config = quinn::TransportConfig::default();
+    // Idle timeout: close connection if no activity for this duration.
+    transport_config.max_idle_timeout(Some(std::time::Duration::from_secs(30).try_into().unwrap()));
+    // Keep-alive: send QUIC-level pings to keep the connection alive and detect dead peers.
+    transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
+    // Enable datagrams for low-latency voice data.
+    // Set a reasonable max size for Opus frames (MTU ~1200 bytes minus overhead).
+    transport_config.datagram_receive_buffer_size(Some(65536));
+    server_config.transport_config(Arc::new(transport_config));
 
     let addr = (Ipv4Addr::UNSPECIFIED, port).into();
     let endpoint = Endpoint::server(server_config, addr)?;
@@ -65,7 +74,12 @@ fn make_server_endpoint(port: u16) -> Result<Endpoint> {
 // cert persistence logic moved to lib.rs (load_or_create_dev_cert)
 
 #[derive(Clone)]
-struct ClientHandle { send: Arc<Mutex<quinn::SendStream>>, username: Arc<Mutex<String>>, user_id: u64 }
+struct ClientHandle { 
+    send: Arc<Mutex<quinn::SendStream>>, 
+    username: Arc<Mutex<String>>, 
+    user_id: u64,
+    conn: quinn::Connection,
+}
 
 struct ServerState {
     clients: Mutex<Vec<Arc<ClientHandle>>>,
@@ -86,62 +100,125 @@ impl ServerState {
 }
 
 async fn handle_connection(conn: quinn::Connection, state: Arc<ServerState>) -> Result<()> {
-    while let Ok((send_stream, mut recv)) = conn.accept_bi().await {
-        info!("new bi stream opened");
-        let user_id = {
-            let mut ctr = state.next_user_id.lock().await; let id = *ctr; *ctr += 1; id
-        };
-        let client_handle = Arc::new(ClientHandle { send: Arc::new(Mutex::new(send_stream)), username: Arc::new(Mutex::new(String::new())), user_id });
-        {
-            let mut clients = state.clients.lock().await;
-            clients.push(client_handle.clone());
-            debug!(total_clients = clients.len(), "server: client registered");
-        }
-        let mut buf = BytesMut::new();
-
-        // Spawn periodic keep-alive sender for this client.
-        let ping_handle = client_handle.clone();
-        let ping_task = task::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
-            loop {
-                interval.tick().await;
-                let ts = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0);
-                let env = proto::Envelope { state_hash: Vec::new(), payload: None };
-                let frame = api::encode_frame(&env);
-                let mut send = ping_handle.send.lock().await;
-                if let Err(e) = send.write_all(&frame).await {
-                    debug!("keep-alive write failed: {e:?}");
-                    break;
+    // Track all client handles for this connection so we can clean up when connection closes.
+    let mut connection_clients: Vec<Arc<ClientHandle>> = Vec::new();
+    
+    // Spawn a task to handle incoming datagrams for voice relay.
+    let conn_for_datagrams = conn.clone();
+    let state_for_datagrams = state.clone();
+    tokio::spawn(async move {
+        handle_datagrams(conn_for_datagrams, state_for_datagrams).await;
+    });
+    
+    loop {
+        match conn.accept_bi().await {
+            Ok((send_stream, mut recv)) => {
+                info!("new bi stream opened");
+                let user_id = {
+                    let mut ctr = state.next_user_id.lock().await; let id = *ctr; *ctr += 1; id
+                };
+                let client_handle = Arc::new(ClientHandle { 
+                    send: Arc::new(Mutex::new(send_stream)), 
+                    username: Arc::new(Mutex::new(String::new())), 
+                    user_id,
+                    conn: conn.clone(),
+                });
+                {
+                    let mut clients = state.clients.lock().await;
+                    clients.push(client_handle.clone());
+                    debug!(total_clients = clients.len(), "server: client registered");
                 }
-            }
-        });
-        loop {
-            let mut chunk = [0u8; 1024];
-            let n_opt = recv.read(&mut chunk).await?;
-            if n_opt.is_none() { info!("stream closed by peer"); break; }
-            let n = n_opt.unwrap();
-            debug!(bytes = n, "server: received bytes on stream");
-            buf.extend_from_slice(&chunk[..n]);
-            while let Some(frame) = try_decode_frame(&mut buf) {
-                match proto::Envelope::decode(&*frame) {
-                    Ok(env) => {
-                        debug!(frame_len = frame.len(), "server: decoded envelope frame");
-                        handle_envelope(env, client_handle.clone(), state.clone()).await?;
+                
+                // Track this client for connection-level cleanup.
+                connection_clients.push(client_handle.clone());
+                
+                let mut buf = BytesMut::new();
+                
+                // Read loop - handle errors gracefully instead of propagating with ?
+                // Use a read timeout to detect dead connections faster.
+                loop {
+                    let mut chunk = [0u8; 1024];
+                    let read_result = tokio::time::timeout(
+                        std::time::Duration::from_secs(30),
+                        recv.read(&mut chunk)
+                    ).await;
+                    
+                    match read_result {
+                        Ok(Ok(Some(n))) => {
+                            debug!(bytes = n, "server: received bytes on stream");
+                            buf.extend_from_slice(&chunk[..n]);
+                            while let Some(frame) = try_decode_frame(&mut buf) {
+                                match proto::Envelope::decode(&*frame) {
+                                    Ok(env) => {
+                                        debug!(frame_len = frame.len(), "server: decoded envelope frame");
+                                        if let Err(e) = handle_envelope(env, client_handle.clone(), state.clone()).await {
+                                            error!("handle_envelope error: {e:?}");
+                                        }
+                                    }
+                                    Err(e) => error!("failed to decode envelope: {e:?}"),
+                                }
+                            }
+                        }
+                        Ok(Ok(None)) => {
+                            info!("stream closed by peer");
+                            break;
+                        }
+                        Ok(Err(e)) => {
+                            info!("stream read error (likely disconnect): {e:?}");
+                            break;
+                        }
+                        Err(_) => {
+                            // Read timeout - check if connection is still alive by trying to write.
+                            info!("read timeout, checking connection health");
+                            let env = proto::Envelope { state_hash: Vec::new(), payload: None };
+                            let frame = api::encode_frame(&env);
+                            let mut send = client_handle.send.lock().await;
+                            if send.write_all(&frame).await.is_err() {
+                                info!("connection dead after read timeout");
+                                break;
+                            }
+                        }
                     }
-                    Err(e) => error!("failed to decode envelope: {e:?}"),
                 }
+                
+                // Stream closed - clean up this client.
+                cleanup_client(&client_handle, &state).await;
+                
+                // Remove from connection tracking.
+                connection_clients.retain(|h| !Arc::ptr_eq(h, &client_handle));
+            }
+            Err(e) => {
+                // Connection closed (timeout, error, or graceful close).
+                info!("connection closed: {e:?}");
+                break;
             }
         }
-        let mut clients = state.clients.lock().await;
-        clients.retain(|h| !Arc::ptr_eq(h, &client_handle));
-        debug!(remaining_clients = clients.len(), "server: client removed");
-        // Stop ping task when stream ends.
-        ping_task.abort();
     }
+    
+    // Connection-level cleanup: clean up any remaining clients from this connection.
+    for client_handle in connection_clients {
+        cleanup_client(&client_handle, &state).await;
+    }
+    
     Ok(())
+}
+
+/// Clean up a client: remove from clients list, remove memberships, broadcast update.
+async fn cleanup_client(client_handle: &Arc<ClientHandle>, state: &Arc<ServerState>) {
+    let user_id = client_handle.user_id;
+    {
+        let mut clients = state.clients.lock().await;
+        clients.retain(|h| !Arc::ptr_eq(h, client_handle));
+        debug!(remaining_clients = clients.len(), "server: client removed");
+    }
+    {
+        let mut memberships = state.memberships.lock().await;
+        memberships.retain(|(uid, _)| *uid != user_id);
+        debug!(user_id, "server: removed user membership");
+    }
+    if let Err(e) = broadcast_room_state(state).await {
+        error!("failed to broadcast room state after disconnect: {e:?}");
+    }
 }
 
 async fn handle_envelope(env: proto::Envelope, sender: Arc<ClientHandle>, state: Arc<ServerState>) -> Result<()> {
@@ -293,4 +370,68 @@ async fn broadcast_room_state(state: &Arc<ServerState>) -> Result<()> {
     let clients = state.clients.lock().await;
     for h in clients.iter() { let mut send = h.send.lock().await; let _ = send.write_all(&frame).await; }
     Ok(())
+}
+
+/// Handle incoming QUIC datagrams for voice relay.
+/// Datagrams are relayed to all other clients in the same room.
+async fn handle_datagrams(conn: quinn::Connection, state: Arc<ServerState>) {
+    loop {
+        match conn.read_datagram().await {
+            Ok(datagram) => {
+                // Decode the VoiceDatagram protobuf.
+                match VoiceDatagram::decode(datagram.as_ref()) {
+                    Ok(voice_dgram) => {
+                        debug!(
+                            sender = voice_dgram.sender_id,
+                            room = voice_dgram.room_id,
+                            seq = voice_dgram.sequence,
+                            data_len = voice_dgram.opus_data.len(),
+                            "server: received voice datagram"
+                        );
+                        
+                        // Find all clients in the same room (excluding sender).
+                        let sender_room = voice_dgram.room_id;
+                        let sender_id = voice_dgram.sender_id;
+                        
+                        // Re-encode for relay (could optimize by just forwarding raw bytes).
+                        let relay_bytes = voice_dgram.encode_to_vec();
+                        
+                        // Get list of clients to relay to.
+                        let clients = state.clients.lock().await;
+                        let memberships = state.memberships.lock().await;
+                        
+                        for client in clients.iter() {
+                            // Skip the sender.
+                            if client.user_id == sender_id {
+                                continue;
+                            }
+                            
+                            // Check if this client is in the same room.
+                            let is_in_room = memberships.iter()
+                                .any(|(uid, rid)| *uid == client.user_id && *rid == sender_room);
+                            
+                            if is_in_room {
+                                // Send datagram to this client.
+                                if let Err(e) = client.conn.send_datagram(relay_bytes.clone().into()) {
+                                    debug!(
+                                        user_id = client.user_id,
+                                        error = ?e,
+                                        "server: failed to relay voice datagram"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        debug!(error = ?e, "server: failed to decode voice datagram");
+                    }
+                }
+            }
+            Err(e) => {
+                // Connection closed or error.
+                debug!(error = ?e, "server: datagram receive ended");
+                break;
+            }
+        }
+    }
 }

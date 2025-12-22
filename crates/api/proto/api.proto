@@ -47,6 +47,16 @@ message VoiceFrame {
   uint32 sequence = 4; // optional sequencing for jitter buffers
 }
 
+// Voice datagram sent via QUIC datagrams (unreliable, low-latency).
+// This is a standalone message not wrapped in Envelope for minimal overhead.
+message VoiceDatagram {
+  uint64 sender_id = 1;    // user id of sender
+  uint64 room_id = 2;      // target room
+  uint32 sequence = 3;     // sequence number for ordering/jitter buffer
+  uint64 timestamp_us = 4; // microseconds since some epoch (for jitter buffer)
+  bytes opus_data = 5;     // Opus-encoded audio frame
+}
+
 // Extend the existing ServerEvent with additional variants for Phase 2.
 
 // Generic envelope that carries a single payload and an optional state hash.

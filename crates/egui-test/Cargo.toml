@@ -13,3 +13,4 @@ uuid = { version = "1.18.1", features = ["v4"] }
 backend = { path = "../backend" }
 api = { path = "../api" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+clap = { version = "4.5.53", features = ["derive"] }
