@@ -1,0 +1,15 @@
+[package]
+name = "egui-test"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+eframe = "0.33.2"
+# egui = "0.33.2"
+egui_extras = { version = "0.33.2", features = ["image"] }
+egui_ltreeview = { version = "0.6.0", features = [] }
+env_logger = { version = "0.11.8", features = ["auto-color", "humantime"] }
+uuid = { version = "1.18.1", features = ["v4"] }
+backend = { path = "../backend" }
+api = { path = "../api" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
