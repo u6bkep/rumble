@@ -159,6 +159,77 @@ async fn test_client_connects_to_server() {
 }
 
 // =============================================================================
+// Test: Server assigns unique user_id via ServerHello (single source of truth)
+// =============================================================================
+
+#[tokio::test]
+async fn test_server_assigns_user_id() {
+    let port = next_test_port();
+    let _server = start_server(port);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Connect a client.
+    let client = backend::Client::connect(
+        &format!("127.0.0.1:{}", port),
+        "user-id-test",
+        None,
+        test_connect_config(),
+    )
+    .await
+    .expect("client should connect");
+
+    // user_id() is now synchronous and always valid after connect()
+    // since connect() waits for ServerHello (single source of truth).
+    let user_id = client.user_id();
+
+    // User ID should be > 0 (0 is never assigned by the server).
+    assert!(user_id > 0, "user_id should be assigned by server, got {}", user_id);
+}
+
+#[tokio::test]
+async fn test_multiple_clients_get_unique_user_ids() {
+    let port = next_test_port();
+    let _server = start_server(port);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Connect first client.
+    let client1 = backend::Client::connect(
+        &format!("127.0.0.1:{}", port),
+        "client1",
+        None,
+        test_connect_config(),
+    )
+    .await
+    .expect("client1 should connect");
+
+    // user_id is immediately available after connect()
+    let user_id1 = client1.user_id();
+
+    // Connect second client.
+    let client2 = backend::Client::connect(
+        &format!("127.0.0.1:{}", port),
+        "client2",
+        None,
+        test_connect_config(),
+    )
+    .await
+    .expect("client2 should connect");
+
+    // user_id is immediately available after connect()
+    let user_id2 = client2.user_id();
+
+    // Both should be > 0.
+    assert!(user_id1 > 0, "user_id1 should be > 0");
+    assert!(user_id2 > 0, "user_id2 should be > 0");
+
+    // They should be unique.
+    assert_ne!(
+        user_id1, user_id2,
+        "each client should get a unique user_id"
+    );
+}
+
+// =============================================================================
 // Test: Create a new room
 // =============================================================================
 
@@ -818,10 +889,8 @@ async fn test_voice_datagram_send_receive() {
         .expect("client2 should connect");
     wait_for_rooms(&client2, 5000).await;
 
-    // Set user IDs for the clients (simulating what server would assign).
-    // In a real scenario, server would send this in ServerHello or similar.
-    client1.set_user_id(1).await;
-    client2.set_user_id(2).await;
+    // user_id is now assigned by server during connect() via ServerHello.
+    // No need to set it manually.
 
     // Both clients should be in the Root room by default.
     // Give time for room state to propagate.
@@ -884,8 +953,7 @@ async fn test_voice_datagram_sequence_numbers() {
         .expect("client2 should connect");
     wait_for_rooms(&client2, 5000).await;
 
-    client1.set_user_id(1).await;
-    client2.set_user_id(2).await;
+    // user_id is assigned by server during connect() - no need to set manually
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     let mut voice_rx = client2.take_voice_receiver();
@@ -946,9 +1014,7 @@ async fn test_voice_datagram_room_scoping() {
         .expect("client3 should connect");
     wait_for_rooms(&client3, 5000).await;
 
-    client1.set_user_id(1).await;
-    client2.set_user_id(2).await;
-    client3.set_user_id(3).await;
+    // user_id is assigned by server during connect() - no need to set manually
 
     // Create a private room.
     client1.create_room("PrivateVoice").await.expect("create_room should succeed");
@@ -1027,8 +1093,7 @@ async fn test_voice_datagram_random_data_integrity() {
         .expect("client2 should connect");
     wait_for_rooms(&client2, 5000).await;
 
-    client1.set_user_id(1).await;
-    client2.set_user_id(2).await;
+    // user_id is assigned by server during connect() - no need to set manually
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     let mut voice_rx = client2.take_voice_receiver();
@@ -1094,8 +1159,7 @@ async fn test_voice_datagram_has_timestamp() {
         .expect("client2 should connect");
     wait_for_rooms(&client2, 5000).await;
 
-    client1.set_user_id(1).await;
-    client2.set_user_id(2).await;
+    // user_id is assigned by server during connect() - no need to set manually
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     let mut voice_rx = client2.take_voice_receiver();

@@ -399,8 +399,9 @@ async fn run_backend_task(
                                 let events_rx = c.take_events_receiver();
                                 let voice_rx = c.take_voice_receiver();
                                 
-                                // Get user_id from the client (may not be available immediately)
-                                let user_id = c.get_user_id().await.unwrap_or(0);
+                                // Get user_id from the client - always valid after connect()
+                                // since connect() waits for ServerHello
+                                let user_id = c.user_id();
                                 
                                 // Get initial snapshot
                                 let snap = c.get_snapshot().await;
@@ -427,8 +428,9 @@ async fn run_backend_task(
                                 let dispatcher_for_events = dispatcher.clone();
                                 let snapshot = c.snapshot.clone();
                                 let name_for_events = name.clone();
+                                let user_id_for_events = user_id;
                                 tokio::spawn(async move {
-                                    handle_server_events(events_rx, dispatcher_for_events, snapshot, name_for_events).await;
+                                    handle_server_events(events_rx, dispatcher_for_events, snapshot, name_for_events, user_id_for_events).await;
                                 });
                                 
                                 // Spawn voice datagram listener
@@ -526,6 +528,7 @@ async fn handle_server_events(
     dispatcher: EventDispatcher,
     snapshot: Arc<tokio::sync::Mutex<crate::RoomSnapshot>>,
     client_name: String,
+    user_id: u64,
 ) {
     while let Some(ev) = events_rx.recv().await {
         match ev.kind {
@@ -540,7 +543,7 @@ async fn handle_server_events(
                 dispatcher.send(BackendEvent::StateUpdated {
                     state: ConnectionState {
                         connected: true,
-                        my_user_id: snap.my_user_id,
+                        my_user_id: Some(user_id),
                         my_client_name: client_name.clone(),
                         current_room_id: snap.current_room_id,
                         rooms: snap.rooms.clone(),

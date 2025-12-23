@@ -87,8 +87,6 @@ pub struct RoomSnapshot {
     pub rooms: Vec<proto::RoomInfo>,
     pub users: Vec<proto::UserPresence>,
     pub current_room_id: Option<u64>,
-    /// Our own user_id (discovered from server's presence list)
-    pub my_user_id: Option<u64>,
 }
 
 /// Handle to a connected client.
@@ -99,8 +97,10 @@ pub struct Client {
     pub snapshot: Arc<tokio::sync::Mutex<RoomSnapshot>>,
     /// Channel to signal the reader task to stop.
     shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
-    /// User ID assigned by the server (discovered from presence list).
-    user_id: Arc<tokio::sync::Mutex<Option<u64>>>,
+    /// User ID assigned by the server via ServerHello.
+    /// This is the single source of truth for the client's identity.
+    /// Always valid after connect() returns successfully.
+    user_id: u64,
     /// Our client name (used to match against presence list)
     client_name: String,
     /// Sequence counter for voice datagrams.
@@ -111,6 +111,9 @@ pub struct Client {
 
 impl Client {
     /// Connect to the QUIC server at `addr`, open a control stream and send `ClientHello`.
+    /// 
+    /// This method waits for the server to respond with `ServerHello` before returning,
+    /// ensuring that `user_id()` is always valid after a successful connection.
     /// 
     /// # Arguments
     /// * `addr` - Server address (e.g., "127.0.0.1:5000")
@@ -137,86 +140,11 @@ impl Client {
 
         info!(remote = %conn.remote_address(), "backend: connected");
 
-        let (send, recv) = conn.open_bi().await?;
+        let (send, mut recv) = conn.open_bi().await?;
         info!("backend: opened bi stream");
-
-        let (events_tx, events_rx) = mpsc::unbounded_channel();
-        let snapshot = Arc::new(tokio::sync::Mutex::new(RoomSnapshot::default()));
-        
-        // User ID will be received from ServerHello
-        let user_id = Arc::new(tokio::sync::Mutex::new(None));
 
         // Shared send stream to allow echoing keep-alives from the reader task.
         let send_arc = Arc::new(tokio::sync::Mutex::new(send));
-
-        // Spawn task to read events and echo keep-alives.
-        let send_for_reader = send_arc.clone();
-        let snapshot_for_reader = snapshot.clone();
-        let user_id_for_reader = user_id.clone();
-        task::spawn(async move {
-            let mut buf = BytesMut::new();
-            let mut local_recv = recv;
-            let _ = async move {
-                loop {
-                    let mut chunk = [0u8; 1024];
-                    let n_opt = local_recv.read(&mut chunk).await?;
-                    if n_opt.is_none() {
-                        info!("backend: server closed stream");
-                        break;
-                    }
-                    let n = n_opt.unwrap();
-                    info!(bytes = n, "backend: received bytes");
-                    buf.extend_from_slice(&chunk[..n]);
-                    while let Some(frame) = try_decode_frame(&mut buf) {
-                        if let Ok(env) = proto::Envelope::decode(&*frame) {
-                            match env.payload {
-                                // Handle ServerHello - extract our user_id assigned by the server
-                                Some(Payload::ServerHello(sh)) => {
-                                    info!(server_name = %sh.server_name, user_id = sh.user_id, "backend: received ServerHello");
-                                    // Store user_id from server - this is authoritative
-                                    *user_id_for_reader.lock().await = Some(sh.user_id);
-                                    // Also update the snapshot for UI access
-                                    let mut snap = snapshot_for_reader.lock().await;
-                                    snap.my_user_id = Some(sh.user_id);
-                                }
-                                Some(Payload::ServerEvent(ev)) => {
-                                    info!(event = ?ev, "backend: received ServerEvent");
-                                    // Echo back keep-alive messages to the server.
-                                    if let Some(proto::server_event::Kind::KeepAlive(k)) = ev.kind.clone() {
-                                        let echo_env = proto::Envelope {
-                                            state_hash: Vec::new(),
-                                            payload: Some(Payload::ServerEvent(proto::ServerEvent {
-                                                kind: Some(proto::server_event::Kind::KeepAlive(proto::KeepAlive { epoch_ms: k.epoch_ms })),
-                                            })),
-                                        };
-                                        let echo_frame = encode_frame(&echo_env);
-                                        let mut s = send_for_reader.lock().await;
-                                        if let Err(e) = s.write_all(&echo_frame).await {
-                                            error!("backend: keep-alive echo write failed: {e:?}");
-                                        }
-                                    }
-                                    // Update local snapshot if room state changes.
-                                    if let Some(proto::server_event::Kind::RoomStateUpdate(rs)) = ev.kind.clone() {
-                                        let mut snap = snapshot_for_reader.lock().await;
-                                        snap.rooms = rs.rooms;
-                                        snap.users = rs.users;
-                                        if snap.current_room_id.is_none() {
-                                            // default to Root if present
-                                            snap.current_room_id = snap.rooms.iter().find_map(|r| r.id.as_ref().map(|i| i.value)).or(Some(1));
-                                        }
-                                        info!(rooms = snap.rooms.len(), users = snap.users.len(), my_user_id = ?snap.my_user_id, "backend: updated snapshot from RoomStateUpdate");
-                                    }
-                                    let _ = events_tx.send(ev);
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                }
-                Ok::<(), anyhow::Error>(())
-            }
-            .await;
-        });
 
         // Send ClientHello.
         let hello = proto::Envelope {
@@ -243,9 +171,98 @@ impl Client {
             let mut send_stream = send_arc.lock().await;
             info!("backend: auto-joining room 1 on connect");
             send_stream.write_all(&join_frame).await?;
-            let mut snap = snapshot.lock().await;
-            snap.current_room_id = Some(1);
         }
+
+        // Wait for ServerHello to get our user_id (single source of truth).
+        // This ensures user_id is always valid after connect() returns.
+        let mut buf = BytesMut::new();
+        let user_id: u64 = 'wait_for_hello: loop {
+            let mut chunk = [0u8; 1024];
+            let n_opt = recv.read(&mut chunk).await?;
+            if n_opt.is_none() {
+                return Err(anyhow::anyhow!("server closed stream before sending ServerHello"));
+            }
+            let n = n_opt.unwrap();
+            info!(bytes = n, "backend: received bytes while waiting for ServerHello");
+            buf.extend_from_slice(&chunk[..n]);
+            
+            while let Some(frame) = try_decode_frame(&mut buf) {
+                if let Ok(env) = proto::Envelope::decode(&*frame) {
+                    if let Some(Payload::ServerHello(sh)) = env.payload {
+                        info!(server_name = %sh.server_name, user_id = sh.user_id, "backend: received ServerHello");
+                        break 'wait_for_hello sh.user_id;
+                    }
+                    // Ignore other messages while waiting for ServerHello
+                    debug!("backend: ignoring non-ServerHello message during handshake");
+                }
+            }
+        };
+
+        let (events_tx, events_rx) = mpsc::unbounded_channel();
+        let snapshot = Arc::new(tokio::sync::Mutex::new(RoomSnapshot {
+            current_room_id: Some(1),
+            ..Default::default()
+        }));
+
+        // Spawn task to read events and echo keep-alives (ServerHello already processed).
+        let send_for_reader = send_arc.clone();
+        let snapshot_for_reader = snapshot.clone();
+        task::spawn(async move {
+            // Continue using the buffer that may have leftover data
+            let mut buf = buf;
+            let mut local_recv = recv;
+            let _ = async move {
+                loop {
+                    // Process any remaining buffered data first
+                    while let Some(frame) = try_decode_frame(&mut buf) {
+                        if let Ok(env) = proto::Envelope::decode(&*frame) {
+                            if let Some(Payload::ServerEvent(ev)) = env.payload {
+                                info!(event = ?ev, "backend: received ServerEvent");
+                                // Echo back keep-alive messages to the server.
+                                if let Some(proto::server_event::Kind::KeepAlive(k)) = ev.kind.clone() {
+                                    let echo_env = proto::Envelope {
+                                        state_hash: Vec::new(),
+                                        payload: Some(Payload::ServerEvent(proto::ServerEvent {
+                                            kind: Some(proto::server_event::Kind::KeepAlive(proto::KeepAlive { epoch_ms: k.epoch_ms })),
+                                        })),
+                                    };
+                                    let echo_frame = encode_frame(&echo_env);
+                                    let mut s = send_for_reader.lock().await;
+                                    if let Err(e) = s.write_all(&echo_frame).await {
+                                        error!("backend: keep-alive echo write failed: {e:?}");
+                                    }
+                                }
+                                // Update local snapshot if room state changes.
+                                if let Some(proto::server_event::Kind::RoomStateUpdate(rs)) = ev.kind.clone() {
+                                    let mut snap = snapshot_for_reader.lock().await;
+                                    snap.rooms = rs.rooms;
+                                    snap.users = rs.users;
+                                    if snap.current_room_id.is_none() {
+                                        // default to Root if present
+                                        snap.current_room_id = snap.rooms.iter().find_map(|r| r.id.as_ref().map(|i| i.value)).or(Some(1));
+                                    }
+                                    info!(rooms = snap.rooms.len(), users = snap.users.len(), "backend: updated snapshot from RoomStateUpdate");
+                                }
+                                let _ = events_tx.send(ev);
+                            }
+                        }
+                    }
+                    
+                    // Read more data
+                    let mut chunk = [0u8; 1024];
+                    let n_opt = local_recv.read(&mut chunk).await?;
+                    if n_opt.is_none() {
+                        info!("backend: server closed stream");
+                        break;
+                    }
+                    let n = n_opt.unwrap();
+                    info!(bytes = n, "backend: received bytes");
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+        });
 
         // Create shutdown channel (not used yet, but available for graceful shutdown).
         let (shutdown_tx, _shutdown_rx) = tokio::sync::oneshot::channel();
@@ -388,14 +405,13 @@ impl Client {
         Ok(())
     }
 
-    /// Set the user ID for this client (useful for tests, normally auto-discovered).
-    pub async fn set_user_id(&self, id: u64) {
-        *self.user_id.lock().await = Some(id);
-    }
-
-    /// Get the user ID for this client.
-    pub async fn get_user_id(&self) -> Option<u64> {
-        *self.user_id.lock().await
+    /// Get the user ID assigned by the server.
+    /// 
+    /// This is the single source of truth for the client's identity,
+    /// assigned by the server via ServerHello during connection.
+    /// Always valid after `connect()` returns successfully.
+    pub fn user_id(&self) -> u64 {
+        self.user_id
     }
 
     /// Get the client name used for this connection.

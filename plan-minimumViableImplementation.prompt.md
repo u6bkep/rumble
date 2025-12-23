@@ -151,8 +151,38 @@ Recommendation: The backend crate should expose a proper event-driven API or cal
    - Client code simplified: no longer needs to look up user_id or room_id when sending
    - All 32 tests pass
 
-5. make the server hello the single source of truth for the client id
+5. ~~make the server hello the single source of truth for the client id~~ **DONE (2025-12-23)**
+   - **Changed `Client::connect()`** to wait for `ServerHello` before returning:
+     - Sends `ClientHello` and `JoinRoom` messages
+     - Waits synchronously for `ServerHello` response
+     - Extracts `user_id` from `ServerHello` - this is now the single source of truth
+     - Only then spawns background tasks for event handling
+   - **Simplified `Client` struct**:
+     - `user_id` is now plain `u64` (was `Arc<Mutex<Option<u64>>>`)
+     - New synchronous `user_id()` getter (was async `get_user_id() -> Option<u64>`)
+     - Removed `set_user_id()` method (no longer needed)
+   - **Removed duplicate `my_user_id` from `RoomSnapshot`**:
+     - `RoomSnapshot` now only contains: `rooms`, `users`, `current_room_id`
+     - User ID is accessed via `Client::user_id()` or `ConnectionState::my_user_id`
+   - **Updated `handle.rs`**:
+     - `run_backend_task` now uses `c.user_id()` directly (no await, no unwrap_or(0))
+     - `handle_server_events` receives `user_id` as parameter (not from snapshot)
+     - `BackendEvent::Connected` always has correct `user_id`
+   - **Updated all tests**:
+     - Removed 11 `set_user_id()` calls that were workarounds for the async issue
+     - Tests now rely on server-assigned user_id via `client.user_id()`
+     - Added 2 new tests: `test_server_assigns_user_id`, `test_multiple_clients_get_unique_user_ids`
+   - All 21 integration tests pass
+   - **Notes:** The flow is now: connect → wait for ServerHello → user_id available immediately.
+     No race conditions, no polling, no Option handling needed.
+
 6. add graceful error recovery and reconnect logic on the client.
+The implementation plan mentions "automatic reconnect/backoff" as TBD, but the current code has:
+
+Spawned tasks that panic or silently fail on errors
+No way to detect and surface connection drops to the UI
+No reconnection logic
+
 7. add state hash verification on the client, trigger a resync if the hash does not match.
 8. clean up room id usage. the server should remember what room a user was in last and place them there when the client re connects. defaulting to the root. channels should use a UUID rather than an incrementing number, except root is always 0.
 9. fix unbounded buffer on audio transmission. gracefully handle slow connections. this will later be improved by varying opus bitrate based on network conditions, but for now just drop old frames if the network is slow.
