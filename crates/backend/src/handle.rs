@@ -301,16 +301,32 @@ impl BackendHandle {
         self.state.current_room_id
     }
     
+    /// Get the current connection status.
+    pub fn connection_status(&self) -> crate::events::ConnectionStatus {
+        self.state.status
+    }
+    
     /// Apply an event to update local state.
     fn apply_event(&mut self, event: &BackendEvent) {
+        use crate::events::ConnectionStatus;
+        
         match event {
             BackendEvent::Connected { user_id, client_name } => {
+                self.state.status = ConnectionStatus::Connected;
                 self.state.connected = true;
                 self.state.my_user_id = Some(*user_id);
                 self.state.my_client_name = client_name.clone();
             }
             BackendEvent::Disconnected { .. } => {
                 self.state = ConnectionState::default();
+            }
+            BackendEvent::ConnectionLost { .. } => {
+                self.state.status = ConnectionStatus::ConnectionLost;
+                self.state.connected = false;
+            }
+            BackendEvent::ConnectionStatusChanged { status } => {
+                self.state.status = *status;
+                self.state.connected = status.is_connected();
             }
             BackendEvent::StateUpdated { state } => {
                 self.state = state.clone();
@@ -384,20 +400,79 @@ async fn run_backend_task(
     repaint_callback: Option<Arc<dyn Fn() + Send + Sync>>,
     event_callback: Option<EventCallback>,
 ) {
+    use crate::ConnectionLostReason;
+    use crate::events::ConnectionStatus;
+    
     let dispatcher = EventDispatcher::new(event_tx, repaint_callback, event_callback);
     let mut client: Option<Client> = None;
     let mut client_name = String::new();
+    let mut connection_lost_rx: Option<tokio_mpsc::UnboundedReceiver<ConnectionLostReason>> = None;
+    
+    // Track last connection parameters for potential reconnection
+    let mut _last_addr = String::new();
+    let mut _last_password: Option<String> = None;
+    let mut _last_config = crate::ConnectConfig::default();
     
     loop {
         tokio::select! {
+            biased;
+            
+            // Check for connection loss first (higher priority)
+            Some(reason) = async {
+                match connection_lost_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                info!("Connection lost detected: {:?}", reason);
+                
+                // Clear the client and connection_lost receiver
+                client = None;
+                connection_lost_rx = None;
+                
+                // Format error message based on reason
+                let error_msg = match reason {
+                    ConnectionLostReason::StreamClosed => "Server closed the connection".to_string(),
+                    ConnectionLostReason::StreamError(e) => format!("Stream error: {}", e),
+                    ConnectionLostReason::DatagramError(e) => format!("Datagram error: {}", e),
+                    ConnectionLostReason::ClientDisconnect => "Client disconnected".to_string(),
+                };
+                
+                // Emit ConnectionLost event
+                dispatcher.send(BackendEvent::ConnectionLost {
+                    error: error_msg,
+                    will_reconnect: false, // For now, no auto-reconnect
+                });
+                
+                // Update status
+                dispatcher.send(BackendEvent::ConnectionStatusChanged {
+                    status: ConnectionStatus::ConnectionLost,
+                });
+            }
+            
             Some(cmd) = command_rx.recv() => {
                 match cmd {
                     BackendCommand::Connect { addr, name, password, config } => {
                         client_name = name.clone();
+                        
+                        // Save connection params for potential reconnection
+                        _last_addr = addr.clone();
+                        _last_password = password.clone();
+                        _last_config = config.clone();
+                        
+                        // Emit connecting status
+                        dispatcher.send(BackendEvent::ConnectionStatusChanged {
+                            status: ConnectionStatus::Connecting,
+                        });
+                        
                         match Client::connect(&addr, &name, password.as_deref(), config).await {
                             Ok(mut c) => {
                                 let events_rx = c.take_events_receiver();
                                 let voice_rx = c.take_voice_receiver();
+                                let lost_rx = c.take_connection_lost_receiver();
+                                
+                                // Store the connection_lost receiver for monitoring
+                                connection_lost_rx = Some(lost_rx);
                                 
                                 // Get user_id from the client - always valid after connect()
                                 // since connect() waits for ServerHello
@@ -412,9 +487,15 @@ async fn run_backend_task(
                                     client_name: name.clone(),
                                 });
                                 
+                                // Emit connected status change
+                                dispatcher.send(BackendEvent::ConnectionStatusChanged {
+                                    status: ConnectionStatus::Connected,
+                                });
+                                
                                 // Send initial state
                                 dispatcher.send(BackendEvent::StateUpdated {
                                     state: ConnectionState {
+                                        status: ConnectionStatus::Connected,
                                         connected: true,
                                         my_user_id: Some(user_id),
                                         my_client_name: name.clone(),
@@ -445,6 +526,9 @@ async fn run_backend_task(
                                 dispatcher.send(BackendEvent::ConnectFailed {
                                     error: e.to_string(),
                                 });
+                                dispatcher.send(BackendEvent::ConnectionStatusChanged {
+                                    status: ConnectionStatus::Disconnected,
+                                });
                             }
                         }
                     }
@@ -454,7 +538,11 @@ async fn run_backend_task(
                             if let Err(e) = c.disconnect().await {
                                 error!("disconnect error: {e}");
                             }
+                            connection_lost_rx = None;
                             dispatcher.send(BackendEvent::Disconnected { reason: None });
+                            dispatcher.send(BackendEvent::ConnectionStatusChanged {
+                                status: ConnectionStatus::Disconnected,
+                            });
                         }
                     }
                     
@@ -511,6 +599,7 @@ async fn run_backend_task(
                     }
                 }
             }
+            
             else => break,
         }
     }
@@ -530,6 +619,8 @@ async fn handle_server_events(
     client_name: String,
     user_id: u64,
 ) {
+    use crate::events::ConnectionStatus;
+    
     while let Some(ev) = events_rx.recv().await {
         match ev.kind {
             Some(proto::server_event::Kind::ChatBroadcast(cb)) => {
@@ -542,6 +633,7 @@ async fn handle_server_events(
                 let snap = snapshot.lock().await;
                 dispatcher.send(BackendEvent::StateUpdated {
                     state: ConnectionState {
+                        status: ConnectionStatus::Connected,
                         connected: true,
                         my_user_id: Some(user_id),
                         my_client_name: client_name.clone(),

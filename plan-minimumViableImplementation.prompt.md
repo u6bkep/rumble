@@ -176,12 +176,36 @@ Recommendation: The backend crate should expose a proper event-driven API or cal
    - **Notes:** The flow is now: connect → wait for ServerHello → user_id available immediately.
      No race conditions, no polling, no Option handling needed.
 
-6. add graceful error recovery and reconnect logic on the client.
-The implementation plan mentions "automatic reconnect/backoff" as TBD, but the current code has:
-
-Spawned tasks that panic or silently fail on errors
-No way to detect and surface connection drops to the UI
-No reconnection logic
+6. ~~add graceful error recovery and reconnect logic on the client~~ **PARTIALLY DONE (2025-12-23)**
+   - **Added `ConnectionStatus` enum** to `events.rs`:
+     - `Disconnected`, `Connecting`, `Connected`, `Reconnecting { attempt, max_attempts }`, `ConnectionLost`
+     - Helper methods: `is_connected()`, `is_connecting()`, `is_failed()`
+   - **Added `ConnectionLostReason` enum** to `lib.rs`:
+     - `StreamClosed`, `StreamError(String)`, `DatagramError(String)`, `ClientDisconnect`
+   - **Added connection loss detection to `Client`**:
+     - Reader task now signals via `connection_lost_tx` when stream read fails
+     - Voice datagram task signals when datagram receive ends
+     - New `take_connection_lost_receiver()` and `try_recv_connection_lost()` methods
+   - **Added new `BackendEvent` variants**:
+     - `ConnectionLost { error, will_reconnect }` - fired when connection unexpectedly lost
+     - `ConnectionStatusChanged { status }` - fired on status transitions
+   - **Updated `ConnectionState`**:
+     - Added `status: ConnectionStatus` field
+     - UI can check `state.status` for detailed connection state
+   - **Updated `BackendHandle`**:
+     - `apply_event()` now handles new events and updates status
+     - New `connection_status()` method to get current status
+     - `run_backend_task` monitors `connection_lost_rx` via `tokio::select!` with biased ordering
+   - **Updated `egui-test`**:
+     - Handles `ConnectionLost` and `ConnectionStatusChanged` events
+     - Shows status messages in chat for connection state changes
+   - **Added 2 new integration tests**:
+     - `test_client_detects_server_disconnect` - verifies disconnect detection (30s QUIC timeout)
+     - `test_connection_status_enum` - verifies status transitions
+   - All tests pass (24 total: 12 server lib + 10 backend + 2 new integration)
+   - **Not yet implemented**: Auto-reconnect with exponential backoff. The infrastructure
+     is in place (last connection params are saved, `Reconnecting` status exists), but the
+     actual reconnect logic is not yet implemented. UI can implement manual reconnect.
 
 7. add state hash verification on the client, trigger a resync if the hash does not match.
 8. clean up room id usage. the server should remember what room a user was in last and place them there when the client re connects. defaulting to the root. channels should use a UUID rather than an incrementing number, except root is always 0.

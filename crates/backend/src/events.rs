@@ -6,6 +6,47 @@
 
 use api::proto::{RoomInfo, UserPresence};
 
+/// Connection lifecycle status.
+/// 
+/// This enum represents the various states the connection can be in,
+/// allowing the UI to provide appropriate feedback to the user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConnectionStatus {
+    /// Not connected to any server.
+    #[default]
+    Disconnected,
+    /// Attempting to establish a connection.
+    Connecting,
+    /// Successfully connected and authenticated.
+    Connected,
+    /// Connection was lost, attempting to reconnect.
+    Reconnecting {
+        /// Current reconnection attempt number (1-indexed).
+        attempt: u32,
+        /// Maximum number of attempts before giving up (0 = unlimited).
+        max_attempts: u32,
+    },
+    /// Connection was lost and reconnection failed or was not attempted.
+    ConnectionLost,
+}
+
+impl ConnectionStatus {
+    /// Check if we are currently connected.
+    pub fn is_connected(&self) -> bool {
+        matches!(self, ConnectionStatus::Connected)
+    }
+    
+    /// Check if we are attempting to connect or reconnect.
+    pub fn is_connecting(&self) -> bool {
+        matches!(self, ConnectionStatus::Connecting | ConnectionStatus::Reconnecting { .. })
+    }
+    
+    /// Check if the connection has failed.
+    pub fn is_failed(&self) -> bool {
+        matches!(self, ConnectionStatus::ConnectionLost)
+    }
+}
+
 /// Commands that can be sent from the UI to the backend.
 #[derive(Debug, Clone)]
 pub enum BackendCommand {
@@ -59,9 +100,26 @@ pub enum BackendEvent {
     ConnectFailed {
         error: String,
     },
-    /// Disconnected from the server.
+    /// Graceful disconnection from the server.
     Disconnected {
         reason: Option<String>,
+    },
+    /// Connection was unexpectedly lost.
+    /// 
+    /// This is different from `Disconnected` which indicates a graceful shutdown.
+    /// The UI may want to show a different message or trigger reconnection.
+    ConnectionLost {
+        /// Error message describing why the connection was lost.
+        error: String,
+        /// Whether the backend will attempt to reconnect.
+        will_reconnect: bool,
+    },
+    /// Connection status has changed.
+    /// 
+    /// Emitted when entering Connecting, Reconnecting, etc. states.
+    /// This allows the UI to show intermediate connection states.
+    ConnectionStatusChanged {
+        status: ConnectionStatus,
     },
     /// Room/user state has been updated.
     StateUpdated {
@@ -86,7 +144,9 @@ pub enum BackendEvent {
 /// Current connection state as seen by the backend.
 #[derive(Debug, Clone, Default)]
 pub struct ConnectionState {
-    /// Whether we are connected to a server.
+    /// Current connection status.
+    pub status: ConnectionStatus,
+    /// Whether we are connected to a server (convenience, same as status.is_connected()).
     pub connected: bool,
     /// Our user ID (if connected and assigned).
     pub my_user_id: Option<u64>,
@@ -131,6 +191,7 @@ mod tests {
     #[test]
     fn test_connection_state_users_in_room() {
         let state = ConnectionState {
+            status: ConnectionStatus::Connected,
             connected: true,
             my_user_id: Some(1),
             my_client_name: "test".to_string(),

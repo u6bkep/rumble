@@ -1200,3 +1200,125 @@ async fn test_voice_datagram_has_timestamp() {
         after_send
     );
 }
+
+// =============================================================================
+// Test: Client detects server shutdown and surfaces disconnection event
+// =============================================================================
+
+#[tokio::test]
+async fn test_client_detects_server_disconnect() {
+    let port = next_test_port();
+    let mut server = start_server(port);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Use BackendHandle to test the full event pipeline
+    let mut handle = backend::BackendHandle::new();
+    
+    handle.send(backend::BackendCommand::Connect {
+        addr: format!("127.0.0.1:{}", port),
+        name: "disconnect-test".to_string(),
+        password: None,
+        config: test_connect_config(),
+    });
+    
+    // Wait for connection
+    let mut connected = false;
+    for _ in 0..100 {
+        while let Some(event) = handle.poll_event() {
+            if matches!(event, backend::BackendEvent::Connected { .. }) {
+                connected = true;
+                break;
+            }
+        }
+        if connected {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(connected, "should connect to server");
+    assert!(handle.is_connected(), "handle should report connected");
+    
+    // Kill the server
+    if let Some(mut child) = server.0.take() {
+        // First try graceful kill
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    
+    // Give QUIC a moment to notice
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    
+    // Try to send a message - this should trigger faster failure detection
+    // as the underlying connection will fail on write
+    handle.send(backend::BackendCommand::SendChat {
+        text: "test message after server kill".to_string(),
+    });
+    
+    // Wait for disconnection event
+    // Note: QUIC connection may take a while to detect dead peer
+    // depending on keep-alive interval (5s) and idle timeout (30s)
+    let mut disconnected = false;
+    for _ in 0..350 { // Wait up to 35 seconds to cover the 30s idle timeout
+        while let Some(event) = handle.poll_event() {
+            eprintln!("Got event: {:?}", event);
+            if matches!(event, backend::BackendEvent::Disconnected { .. } | backend::BackendEvent::ConnectionLost { .. }) {
+                disconnected = true;
+                break;
+            }
+        }
+        if disconnected {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    
+    assert!(disconnected, "should receive disconnection event when server is killed");
+    assert!(!handle.is_connected(), "handle should report not connected");
+}
+
+// =============================================================================
+// Test: Connection status is properly surfaced to the UI
+// =============================================================================
+
+#[tokio::test]
+async fn test_connection_status_enum() {
+    let port = next_test_port();
+    let _server = start_server(port);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let mut handle = backend::BackendHandle::new();
+    
+    // Initially should be disconnected
+    assert_eq!(handle.state().status, backend::ConnectionStatus::Disconnected);
+    
+    handle.send(backend::BackendCommand::Connect {
+        addr: format!("127.0.0.1:{}", port),
+        name: "status-test".to_string(),
+        password: None,
+        config: test_connect_config(),
+    });
+    
+    // Should transition through Connecting to Connected
+    let mut saw_connecting = false;
+    let mut saw_connected = false;
+    for _ in 0..100 {
+        // Check current status
+        match handle.state().status {
+            backend::ConnectionStatus::Connecting => saw_connecting = true,
+            backend::ConnectionStatus::Connected => saw_connected = true,
+            _ => {}
+        }
+        
+        // Drain events
+        while let Some(_event) = handle.poll_event() {}
+        
+        if saw_connected {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    
+    // Note: We may or may not catch Connecting status depending on timing
+    assert!(saw_connected, "should reach Connected status");
+    assert_eq!(handle.state().status, backend::ConnectionStatus::Connected);
+}

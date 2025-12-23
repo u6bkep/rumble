@@ -236,6 +236,38 @@ impl MyApp {
         self.backend.send(cmd);
     }
 
+    /// Attempt to reconnect with the last known connection parameters.
+    fn reconnect(&mut self) {
+        let addr = if self.connect_address.trim().is_empty() {
+            "127.0.0.1:5000".to_string()
+        } else {
+            self.connect_address.trim().to_string()
+        };
+        let name = self.client_name.clone();
+        let password = if self.connect_password.trim().is_empty() {
+            None
+        } else {
+            Some(self.connect_password.trim().to_string())
+        };
+
+        // Build connect config based on saved settings
+        let mut config = backend::ConnectConfig::new();
+        if self.trust_dev_cert {
+            config = config.with_cert("dev-certs/server-cert.der");
+        }
+        if let Ok(cert_path) = std::env::var("RUMBLE_SERVER_CERT_PATH") {
+            config = config.with_cert(cert_path);
+        }
+
+        self.chat_messages.push(format!("Reconnecting to {}...", addr));
+        self.send_command(BackendCommand::Connect {
+            addr,
+            name,
+            password,
+            config,
+        });
+    }
+
     /// Start audio capture with the selected input device.
     fn start_audio_input(&mut self) {
         if self.audio_input.is_some() {
@@ -365,6 +397,42 @@ impl eframe::App for MyApp {
                     self.stop_audio_input();
                     self.stop_audio_output();
                 }
+                BackendEvent::ConnectionLost { error, will_reconnect } => {
+                    let msg = if will_reconnect {
+                        format!("Connection lost: {}. Reconnecting...", error)
+                    } else {
+                        format!("Connection lost: {}", error)
+                    };
+                    self.chat_messages.push(msg);
+                    // Stop audio when connection is lost
+                    self.stop_audio_input();
+                    self.stop_audio_output();
+                }
+                BackendEvent::ConnectionStatusChanged { status } => {
+                    // Log status changes for debugging
+                    use backend::ConnectionStatus;
+                    match status {
+                        ConnectionStatus::Connecting => {
+                            self.chat_messages.push("Connecting...".to_string());
+                        }
+                        ConnectionStatus::Connected => {
+                            // Already handled by BackendEvent::Connected
+                        }
+                        ConnectionStatus::Reconnecting { attempt, max_attempts } => {
+                            self.chat_messages.push(format!(
+                                "Reconnecting (attempt {}/{})...",
+                                attempt,
+                                if max_attempts == 0 { "∞".to_string() } else { max_attempts.to_string() }
+                            ));
+                        }
+                        ConnectionStatus::ConnectionLost => {
+                            // Already handled by BackendEvent::ConnectionLost
+                        }
+                        ConnectionStatus::Disconnected => {
+                            // Already handled by BackendEvent::Disconnected
+                        }
+                    }
+                }
                 BackendEvent::ChatReceived { sender, text } => {
                     self.chat_messages.push(format!("{}: {}", sender, text));
                 }
@@ -415,11 +483,44 @@ impl eframe::App for MyApp {
                             ui.close();
                         }
                     }
+                    // Show reconnect option when not connected and we have an address
+                    if !self.backend.is_connected() && !self.connect_address.is_empty() {
+                        if ui.button("Reconnect").clicked() {
+                            self.reconnect();
+                            ui.close();
+                        }
+                    }
                 });
                 ui.menu_button("Settings", |ui| {
                     if ui.button("Open Settings").clicked() {
                         self.show_settings = true;
                         ui.close();
+                    }
+                });
+                
+                // Show connection status indicator on the right side
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    use backend::ConnectionStatus;
+                    let status = self.backend.connection_status();
+                    match status {
+                        ConnectionStatus::Connected => {
+                            ui.colored_label(egui::Color32::GREEN, "● Connected");
+                        }
+                        ConnectionStatus::Connecting => {
+                            ui.colored_label(egui::Color32::YELLOW, "● Connecting...");
+                        }
+                        ConnectionStatus::Reconnecting { attempt, .. } => {
+                            ui.colored_label(egui::Color32::YELLOW, format!("● Reconnecting ({})...", attempt));
+                        }
+                        ConnectionStatus::ConnectionLost => {
+                            if ui.button("⟳ Reconnect").clicked() {
+                                self.reconnect();
+                            }
+                            ui.colored_label(egui::Color32::RED, "● Connection Lost");
+                        }
+                        ConnectionStatus::Disconnected => {
+                            ui.colored_label(egui::Color32::GRAY, "○ Disconnected");
+                        }
                     }
                 });
             });

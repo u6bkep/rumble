@@ -57,7 +57,7 @@ pub use audio::{samples_to_bytes, bytes_to_samples, SAMPLE_RATE, CHANNELS, FRAME
 pub mod events;
 pub mod handle;
 
-pub use events::{BackendCommand, BackendEvent, ConnectionState};
+pub use events::{BackendCommand, BackendEvent, ConnectionState, ConnectionStatus};
 pub use handle::{BackendHandle, BackendHandleBuilder, CommandSender, EventCallback};
 
 /// Configuration for the backend client.
@@ -89,6 +89,19 @@ pub struct RoomSnapshot {
     pub current_room_id: Option<u64>,
 }
 
+/// Reason for connection loss.
+#[derive(Debug, Clone)]
+pub enum ConnectionLostReason {
+    /// Stream was closed by the server.
+    StreamClosed,
+    /// Stream read error.
+    StreamError(String),
+    /// Datagram receive ended.
+    DatagramError(String),
+    /// Client initiated disconnect.
+    ClientDisconnect,
+}
+
 /// Handle to a connected client.
 pub struct Client {
     send: Arc<tokio::sync::Mutex<quinn::SendStream>>,
@@ -107,6 +120,12 @@ pub struct Client {
     voice_sequence: AtomicU32,
     /// Channel for received voice datagrams.
     voice_rx: mpsc::UnboundedReceiver<VoiceDatagram>,
+    /// Receiver for connection-lost notifications.
+    /// 
+    /// When the reader task or datagram task detects a disconnection,
+    /// they will send a message on this channel. The caller can await
+    /// this to detect when the connection has been lost.
+    connection_lost_rx: mpsc::UnboundedReceiver<ConnectionLostReason>,
 }
 
 impl Client {
@@ -204,14 +223,18 @@ impl Client {
             ..Default::default()
         }));
 
+        // Create connection-lost channel to notify when connection is unexpectedly lost.
+        let (connection_lost_tx, connection_lost_rx) = mpsc::unbounded_channel();
+
         // Spawn task to read events and echo keep-alives (ServerHello already processed).
         let send_for_reader = send_arc.clone();
         let snapshot_for_reader = snapshot.clone();
+        let connection_lost_for_reader = connection_lost_tx.clone();
         task::spawn(async move {
             // Continue using the buffer that may have leftover data
             let mut buf = buf;
             let mut local_recv = recv;
-            let _ = async move {
+            let result = async move {
                 loop {
                     // Process any remaining buffered data first
                     while let Some(frame) = try_decode_frame(&mut buf) {
@@ -230,6 +253,7 @@ impl Client {
                                     let mut s = send_for_reader.lock().await;
                                     if let Err(e) = s.write_all(&echo_frame).await {
                                         error!("backend: keep-alive echo write failed: {e:?}");
+                                        return Err(anyhow::anyhow!("keep-alive write failed: {e}"));
                                     }
                                 }
                                 // Update local snapshot if room state changes.
@@ -250,18 +274,33 @@ impl Client {
                     
                     // Read more data
                     let mut chunk = [0u8; 1024];
-                    let n_opt = local_recv.read(&mut chunk).await?;
-                    if n_opt.is_none() {
-                        info!("backend: server closed stream");
-                        break;
+                    match local_recv.read(&mut chunk).await {
+                        Ok(Some(n)) => {
+                            info!(bytes = n, "backend: received bytes");
+                            buf.extend_from_slice(&chunk[..n]);
+                        }
+                        Ok(None) => {
+                            info!("backend: server closed stream");
+                            return Err(anyhow::anyhow!("stream closed by server"));
+                        }
+                        Err(e) => {
+                            error!("backend: stream read error: {e}");
+                            return Err(anyhow::anyhow!("stream read error: {e}"));
+                        }
                     }
-                    let n = n_opt.unwrap();
-                    info!(bytes = n, "backend: received bytes");
-                    buf.extend_from_slice(&chunk[..n]);
                 }
-                Ok::<(), anyhow::Error>(())
             }
             .await;
+            
+            // Signal connection loss with appropriate reason
+            match result {
+                Ok(()) => {
+                    let _ = connection_lost_for_reader.send(ConnectionLostReason::StreamClosed);
+                }
+                Err(e) => {
+                    let _ = connection_lost_for_reader.send(ConnectionLostReason::StreamError(e.to_string()));
+                }
+            }
         });
 
         // Create shutdown channel (not used yet, but available for graceful shutdown).
@@ -272,6 +311,7 @@ impl Client {
         
         // Spawn task to receive voice datagrams.
         let conn_for_voice = conn.clone();
+        let connection_lost_for_voice = connection_lost_tx;
         task::spawn(async move {
             loop {
                 match conn_for_voice.read_datagram().await {
@@ -292,7 +332,8 @@ impl Client {
                         }
                     }
                     Err(e) => {
-                        debug!(error = ?e, "backend: datagram receive ended");
+                        info!(error = ?e, "backend: datagram receive ended (connection lost)");
+                        let _ = connection_lost_for_voice.send(ConnectionLostReason::DatagramError(e.to_string()));
                         break;
                     }
                 }
@@ -309,6 +350,7 @@ impl Client {
             client_name: client_name.to_string(),
             voice_sequence: AtomicU32::new(0),
             voice_rx,
+            connection_lost_rx,
         })
     }
 
@@ -487,6 +529,20 @@ impl Client {
     /// Try to receive a voice datagram without blocking.
     pub fn try_recv_voice(&mut self) -> Option<VoiceDatagram> {
         self.voice_rx.try_recv().ok()
+    }
+    
+    /// Take ownership of the connection-lost receiver for custom handling.
+    /// 
+    /// This receiver will receive a message when the connection is unexpectedly lost
+    /// (i.e., not via a graceful disconnect). Use this to implement reconnection logic.
+    pub fn take_connection_lost_receiver(&mut self) -> mpsc::UnboundedReceiver<ConnectionLostReason> {
+        let (_dummy_tx, dummy_rx) = mpsc::unbounded_channel();
+        std::mem::replace(&mut self.connection_lost_rx, dummy_rx)
+    }
+    
+    /// Try to receive a connection-lost notification without blocking.
+    pub fn try_recv_connection_lost(&mut self) -> Option<ConnectionLostReason> {
+        self.connection_lost_rx.try_recv().ok()
     }
 }
 
