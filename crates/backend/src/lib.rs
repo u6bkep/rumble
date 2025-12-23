@@ -1,3 +1,37 @@
+//! Backend library for the Rumble voice chat client.
+//!
+//! This crate provides the core client functionality:
+//! - Connection management via QUIC
+//! - Audio capture and playback
+//! - Event-driven API for UI integration
+//!
+//! # Usage
+//!
+//! The recommended way to use this crate is through the [`BackendHandle`] type,
+//! which provides a synchronous interface suitable for immediate-mode UI frameworks:
+//!
+//! ```ignore
+//! use backend::{BackendHandle, BackendCommand, BackendEvent};
+//!
+//! let mut handle = BackendHandle::new();
+//!
+//! // Send commands
+//! handle.send(BackendCommand::Connect {
+//!     addr: "127.0.0.1:5000".to_string(),
+//!     name: "user".to_string(),
+//!     password: None,
+//!     config: Default::default(),
+//! });
+//!
+//! // Poll for events in your update loop
+//! while let Some(event) = handle.poll_event() {
+//!     match event {
+//!         BackendEvent::Connected { user_id, .. } => println!("Connected as {user_id}"),
+//!         _ => {}
+//!     }
+//! }
+//! ```
+
 use anyhow::Result;
 use api::proto::{self, envelope::Payload};
 pub use api::proto::VoiceDatagram;
@@ -18,6 +52,13 @@ use tracing::{error, info, debug};
 pub mod audio;
 pub use audio::{AudioSystem, AudioDeviceInfo, AudioConfig, AudioInput, AudioOutput};
 pub use audio::{samples_to_bytes, bytes_to_samples, SAMPLE_RATE, CHANNELS, FRAME_SIZE};
+
+// Event-driven API for UI integration
+pub mod events;
+pub mod handle;
+
+pub use events::{BackendCommand, BackendEvent, ConnectionState};
+pub use handle::{BackendHandle, BackendHandleBuilder, CommandSender, EventCallback};
 
 /// Configuration for the backend client.
 #[derive(Clone, Debug, Default)]
@@ -221,7 +262,7 @@ impl Client {
                         match VoiceDatagram::decode(datagram.as_ref()) {
                             Ok(voice_dgram) => {
                                 debug!(
-                                    sender = voice_dgram.sender_id,
+                                    sender = ?voice_dgram.sender_id,
                                     seq = voice_dgram.sequence,
                                     data_len = voice_dgram.opus_data.len(),
                                     "backend: received voice datagram"
@@ -372,64 +413,52 @@ impl Client {
     /// The sequence number used for this datagram.
     pub fn send_voice_datagram(&self, opus_data: Vec<u8>) -> Result<u32> {
         let seq = self.voice_sequence.fetch_add(1, Ordering::Relaxed);
-        let snap = self.snapshot.blocking_lock();
-        let room_id = snap.current_room_id.unwrap_or(1);
-        drop(snap);
-        
-        // Get user_id synchronously for the datagram.
-        // We use blocking_lock here since this is intended for audio threads.
-        let user_id = self.user_id.blocking_lock();
-        let sender_id = user_id.unwrap_or(0);
-        drop(user_id);
         
         let timestamp_us = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_micros() as u64)
             .unwrap_or(0);
         
+        // Client only provides audio data, sequence, and timestamp.
+        // sender_id and room_id are set by the server based on the connection.
         let datagram = VoiceDatagram {
-            sender_id,
-            room_id,
+            opus_data,
             sequence: seq,
             timestamp_us,
-            opus_data,
+            sender_id: None,
+            room_id: None,
         };
         
         let bytes = datagram.encode_to_vec();
         self.conn.send_datagram(bytes.into())?;
         
-        debug!(seq, room_id, sender_id, "backend: sent voice datagram");
+        debug!(seq, "backend: sent voice datagram");
         Ok(seq)
     }
 
     /// Send a voice datagram asynchronously.
     pub async fn send_voice_datagram_async(&self, opus_data: Vec<u8>) -> Result<u32> {
         let seq = self.voice_sequence.fetch_add(1, Ordering::Relaxed);
-        let snap = self.snapshot.lock().await;
-        let room_id = snap.current_room_id.unwrap_or(1);
-        drop(snap);
-        
-        let user_id = self.user_id.lock().await;
-        let sender_id = user_id.unwrap_or(0);
-        drop(user_id);
         
         let timestamp_us = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_micros() as u64)
             .unwrap_or(0);
         
+        // Client only provides audio data, sequence, and timestamp.
+        // sender_id and room_id are set by the server based on the connection.
         let datagram = VoiceDatagram {
-            sender_id,
-            room_id,
+            opus_data,
             sequence: seq,
             timestamp_us,
-            opus_data,
+            sender_id: None,
+            room_id: None,
         };
         
         let bytes = datagram.encode_to_vec();
         self.conn.send_datagram(bytes.into())?;
         
-        debug!(seq, room_id, sender_id, "backend: sent voice datagram async");
+        debug!(seq, "backend: sent voice datagram async");
         Ok(seq)
     }
 

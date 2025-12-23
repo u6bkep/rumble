@@ -857,7 +857,7 @@ async fn test_voice_datagram_send_receive() {
     );
 
     let dgram = received_datagram.unwrap();
-    assert_eq!(dgram.sender_id, 1, "sender_id should be 1");
+    assert_eq!(dgram.sender_id, Some(1), "sender_id should be 1 (set by server)");
     assert_eq!(dgram.sequence, 0, "sequence should be 0");
     assert_eq!(dgram.opus_data, test_data_clone, "opus_data should match sent data");
 }

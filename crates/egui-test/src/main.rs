@@ -1,10 +1,9 @@
-use backend::{AudioConfig, AudioDeviceInfo, AudioInput, AudioOutput, AudioSystem, Client};
+use backend::{AudioConfig, AudioDeviceInfo, AudioInput, AudioOutput, AudioSystem};
+use backend::{BackendCommand, BackendEvent, BackendHandle};
 use backend::{bytes_to_samples, samples_to_bytes};
 use clap::Parser;
 use eframe::egui;
 use egui::{CollapsingHeader, Modal};
-use std::sync::Arc;
-use tokio::sync::mpsc as tokio_mpsc;
 use uuid::Uuid;
 
 /// Rumble - A voice chat client
@@ -52,57 +51,6 @@ fn main() -> eframe::Result<()> {
     )
 }
 
-#[derive(Clone, Default)]
-struct RoomUiState {
-    current_room_id: Option<u64>,
-}
-
-/// Commands sent from UI to the async backend task
-enum BackendCommand {
-    Connect {
-        addr: String,
-        name: String,
-        password: Option<String>,
-        config: backend::ConnectConfig,
-    },
-    Disconnect,
-    SendChat {
-        sender: String,
-        text: String,
-    },
-    JoinRoom {
-        room_id: u64,
-    },
-    CreateRoom {
-        name: String,
-    },
-    DeleteRoom {
-        room_id: u64,
-    },
-    RenameRoom {
-        room_id: u64,
-        new_name: String,
-    },
-    /// Send raw audio frame as voice datagram
-    SendVoiceFrame {
-        audio_bytes: Vec<u8>,
-    },
-}
-
-/// Events sent from backend task to UI
-enum UiEvent {
-    Connected,
-    ConnectFailed(String),
-    Disconnected,
-    ChatMessage(String),
-    SnapshotUpdated(backend::RoomSnapshot),
-    /// Received voice audio to play
-    VoiceReceived {
-        sender_id: u64,
-        audio_bytes: Vec<u8>,
-    },
-}
-
 /// State for the rename room modal
 #[derive(Default)]
 struct RenameModalState {
@@ -124,6 +72,8 @@ struct AudioSettings {
     /// Selected output device index (None = default)
     selected_output: Option<usize>,
     /// Whether microphone is enabled (push-to-talk or voice activity)
+    /// Note: Currently push-to-talk is the only mode; this field is reserved for voice activity.
+    #[allow(dead_code)]
     mic_enabled: bool,
     /// Whether audio output is enabled
     output_enabled: bool,
@@ -169,9 +119,7 @@ impl AudioSettings {
 }
 
 struct MyApp {
-    rooms: Vec<api::proto::RoomInfo>,
-    presences: Vec<api::proto::UserPresence>,
-    room_ui: RoomUiState,
+    // UI state
     show_connect: bool,
     show_settings: bool,
     connect_address: String,
@@ -179,12 +127,10 @@ struct MyApp {
     trust_dev_cert: bool,
     chat_messages: Vec<String>,
     chat_input: String,
-    connected: bool,
     client_name: String,
 
-    // Async communication channels (command_tx wrapped in Option for clean shutdown)
-    command_tx: Option<tokio_mpsc::UnboundedSender<BackendCommand>>,
-    ui_event_rx: std::sync::mpsc::Receiver<UiEvent>,
+    // Backend handle (manages connection and state)
+    backend: BackendHandle,
 
     // Rename modal state
     rename_modal: RenameModalState,
@@ -199,13 +145,8 @@ struct MyApp {
     push_to_talk_active: bool,
     /// Track which users are currently talking (user_id -> last voice time)
     talking_users: std::collections::HashMap<u64, std::time::Instant>,
-    /// Our own user_id (from backend snapshot, used for UI indicators)
-    my_user_id: Option<u64>,
 
     egui_ctx: egui::Context,
-
-    // Handle to the background thread for clean shutdown.
-    backend_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Drop for MyApp {
@@ -214,32 +155,21 @@ impl Drop for MyApp {
         self.audio_input = None;
         self.audio_output = None;
 
-        // Drop command_tx first to signal the backend task to exit.
-        // This closes the channel, causing command_rx.recv() to return None.
-        drop(self.command_tx.take());
-
-        // Wait for the backend thread to finish (it will disconnect the client).
-        if let Some(thread) = self.backend_thread.take() {
-            eprintln!("Waiting for backend thread to finish...");
-            let _ = thread.join();
-            eprintln!("Backend thread finished.");
+        // Send disconnect command before dropping the backend handle
+        if self.backend.is_connected() {
+            self.backend.send(BackendCommand::Disconnect);
         }
+        // BackendHandle will clean up the background thread when dropped
     }
 }
 
 impl MyApp {
     fn new(ctx: egui::Context, args: Args) -> Self {
-        let (command_tx, command_rx) = tokio_mpsc::unbounded_channel();
-        let (ui_event_tx, ui_event_rx) = std::sync::mpsc::channel();
-
-        // Spawn the background async runtime and task
-        let ctx_clone = ctx.clone();
-        let backend_thread = std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().expect("create tokio runtime");
-            rt.block_on(async move {
-                run_backend_task(command_rx, ui_event_tx, ctx_clone).await;
-            });
-        });
+        // Create backend handle with repaint callback
+        let ctx_for_repaint = ctx.clone();
+        let backend = BackendHandle::with_repaint_callback(Some(move || {
+            ctx_for_repaint.request_repaint();
+        }));
 
         // Use provided name or generate a random one
         let client_name = args
@@ -253,10 +183,8 @@ impl MyApp {
         // Use provided password or empty
         let connect_password = args.password.clone().unwrap_or_default();
 
-        let command_tx = Some(command_tx);
-
         // If server was specified on command line, connect immediately
-        if let Some(server_addr) = args.server {
+        if let Some(server_addr) = &args.server {
             let addr = if server_addr.trim().is_empty() {
                 "127.0.0.1:5000".to_string()
             } else {
@@ -275,20 +203,15 @@ impl MyApp {
                 config = config.with_cert(cert_path);
             }
 
-            if let Some(tx) = &command_tx {
-                let _ = tx.send(BackendCommand::Connect {
-                    addr,
-                    name: client_name.clone(),
-                    password: args.password,
-                    config,
-                });
-            }
+            backend.send(BackendCommand::Connect {
+                addr,
+                name: client_name.clone(),
+                password: args.password.clone(),
+                config,
+            });
         }
 
         Self {
-            rooms: Vec::new(),
-            presences: Vec::new(),
-            room_ui: RoomUiState::default(),
             show_connect: false,
             show_settings: false,
             connect_address,
@@ -296,27 +219,21 @@ impl MyApp {
             trust_dev_cert: args.trust_dev_cert,
             chat_messages: Vec::new(),
             chat_input: String::new(),
-            connected: false,
             client_name,
-            command_tx,
-            ui_event_rx,
+            backend,
             rename_modal: RenameModalState::default(),
             audio_settings: AudioSettings::default(),
             audio_input: None,
             audio_output: None,
             push_to_talk_active: false,
             talking_users: std::collections::HashMap::new(),
-            my_user_id: None,
             egui_ctx: ctx,
-            backend_thread: Some(backend_thread),
         }
     }
 
-    /// Send a command to the backend task (non-blocking)
+    /// Send a command to the backend (non-blocking)
     fn send_command(&self, cmd: BackendCommand) {
-        if let Some(tx) = &self.command_tx {
-            let _ = tx.send(cmd);
-        }
+        self.backend.send(cmd);
     }
 
     /// Start audio capture with the selected input device.
@@ -337,16 +254,16 @@ impl MyApp {
         };
 
         let config = AudioConfig::default();
-        let command_tx = self.command_tx.clone();
         let input_volume = self.audio_settings.input_volume;
-
+        
+        // Get a command sender that can be used from the audio callback thread
+        let command_sender = self.backend.command_sender();
+        
         match AudioInput::new(&device, &config, move |samples| {
-            // Apply volume and send to backend
+            // Apply volume and send to backend via command sender
             let adjusted: Vec<f32> = samples.iter().map(|s| s * input_volume).collect();
             let bytes = samples_to_bytes(&adjusted);
-            if let Some(tx) = &command_tx {
-                let _ = tx.send(BackendCommand::SendVoiceFrame { audio_bytes: bytes });
-            }
+            command_sender.send_voice(bytes);
         }) {
             Ok(input) => {
                 self.audio_input = Some(input);
@@ -418,201 +335,43 @@ impl MyApp {
     }
 }
 
-/// Background task that owns the Client and processes commands
-async fn run_backend_task(
-    mut command_rx: tokio_mpsc::UnboundedReceiver<BackendCommand>,
-    ui_event_tx: std::sync::mpsc::Sender<UiEvent>,
-    ctx: egui::Context,
-) {
-    let mut client: Option<Client> = None;
-
-    loop {
-        tokio::select! {
-            Some(cmd) = command_rx.recv() => {
-                match cmd {
-                    BackendCommand::Connect { addr, name, password, config } => {
-                        match Client::connect(&addr, &name, password.as_deref(), config).await {
-                            Ok(mut c) => {
-                                let events_rx = c.take_events_receiver();
-                                let voice_rx = c.take_voice_receiver();
-                                let snap = c.get_snapshot().await;
-                                let _ = ui_event_tx.send(UiEvent::Connected);
-                                let _ = ui_event_tx.send(UiEvent::SnapshotUpdated(snap));
-
-                                // Spawn event listener for control messages
-                                let tx = ui_event_tx.clone();
-                                let ctx_ev = ctx.clone();
-                                let snapshot = c.snapshot.clone();
-                                tokio::spawn(async move {
-                                    handle_server_events(events_rx, tx, ctx_ev, snapshot).await;
-                                });
-
-                                // Spawn voice datagram listener
-                                let voice_tx = ui_event_tx.clone();
-                                let ctx_voice = ctx.clone();
-                                tokio::spawn(async move {
-                                    handle_voice_datagrams(voice_rx, voice_tx, ctx_voice).await;
-                                });
-
-                                client = Some(c);
-                            }
-                            Err(e) => {
-                                let _ = ui_event_tx.send(UiEvent::ConnectFailed(e.to_string()));
-                            }
-                        }
-                        ctx.request_repaint();
-                    }
-                    BackendCommand::Disconnect => {
-                        if let Some(c) = client.take() {
-                            if let Err(e) = c.disconnect().await {
-                                eprintln!("disconnect error: {e}");
-                            }
-                            let _ = ui_event_tx.send(UiEvent::Disconnected);
-                            ctx.request_repaint();
-                        }
-                    }
-                    BackendCommand::SendChat { sender, text } => {
-                        if let Some(c) = &client {
-                            if let Err(e) = c.send_chat(&sender, &text).await {
-                                eprintln!("send_chat error: {e}");
-                            }
-                        }
-                    }
-                    BackendCommand::JoinRoom { room_id } => {
-                        if let Some(c) = &client {
-                            if let Err(e) = c.join_room(room_id).await {
-                                eprintln!("join_room error: {e}");
-                            }
-                            let snap = c.get_snapshot().await;
-                            let _ = ui_event_tx.send(UiEvent::SnapshotUpdated(snap));
-                            ctx.request_repaint();
-                        }
-                    }
-                    BackendCommand::CreateRoom { name } => {
-                        if let Some(c) = &client {
-                            if let Err(e) = c.create_room(&name).await {
-                                eprintln!("create_room error: {e}");
-                            }
-                        }
-                    }
-                    BackendCommand::DeleteRoom { room_id } => {
-                        if let Some(c) = &client {
-                            if let Err(e) = c.delete_room(room_id).await {
-                                eprintln!("delete_room error: {e}");
-                            }
-                        }
-                    }
-                    BackendCommand::RenameRoom { room_id, new_name } => {
-                        if let Some(c) = &client {
-                            if let Err(e) = c.rename_room(room_id, &new_name).await {
-                                eprintln!("rename_room error: {e}");
-                            }
-                        }
-                    }
-                    BackendCommand::SendVoiceFrame { audio_bytes } => {
-                        if let Some(c) = &client {
-                            if let Err(e) = c.send_voice_datagram_async(audio_bytes).await {
-                                eprintln!("send_voice_datagram error: {e}");
-                            }
-                        }
-                    }
-                }
-            }
-            else => break,
-        }
-    }
-
-    // Clean up: explicitly disconnect the client before exiting.
-    // This ensures the server is notified even when the UI is closed abruptly.
-    if let Some(c) = client.take() {
-        eprintln!("Backend task exiting, disconnecting client...");
-        let _ = c.disconnect().await;
-    }
-}
-
-/// Handle incoming server events
-async fn handle_server_events(
-    mut events_rx: tokio::sync::mpsc::UnboundedReceiver<api::proto::ServerEvent>,
-    ui_event_tx: std::sync::mpsc::Sender<UiEvent>,
-    ctx: egui::Context,
-    snapshot: Arc<tokio::sync::Mutex<backend::RoomSnapshot>>,
-) {
-    while let Some(ev) = events_rx.recv().await {
-        match ev.kind {
-            Some(api::proto::server_event::Kind::ChatBroadcast(cb)) => {
-                let msg = format!("{}: {}", cb.sender, cb.text);
-                let _ = ui_event_tx.send(UiEvent::ChatMessage(msg));
-                ctx.request_repaint();
-            }
-            Some(api::proto::server_event::Kind::RoomStateUpdate(_)) => {
-                let snap = snapshot.lock().await.clone();
-                let _ = ui_event_tx.send(UiEvent::SnapshotUpdated(snap));
-                ctx.request_repaint();
-            }
-            _ => {}
-        }
-    }
-}
-
-/// Handle incoming voice datagrams and forward to UI for playback
-async fn handle_voice_datagrams(
-    mut voice_rx: tokio::sync::mpsc::UnboundedReceiver<backend::VoiceDatagram>,
-    ui_event_tx: std::sync::mpsc::Sender<UiEvent>,
-    ctx: egui::Context,
-) {
-    while let Some(dgram) = voice_rx.recv().await {
-        // Forward the audio data to the UI for playback
-        let _ = ui_event_tx.send(UiEvent::VoiceReceived {
-            sender_id: dgram.sender_id,
-            audio_bytes: dgram.opus_data,
-        });
-        // Request repaint to update the talking indicator
-        ctx.request_repaint();
-    }
-}
-
 impl eframe::App for MyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.egui_ctx = ctx.clone();
 
-        // Process incoming UI events (non-blocking)
-        while let Ok(event) = self.ui_event_rx.try_recv() {
+        // Process incoming backend events (non-blocking)
+        while let Some(event) = self.backend.poll_event() {
             match event {
-                UiEvent::Connected => {
+                BackendEvent::Connected { user_id, client_name } => {
                     self.chat_messages
-                        .push(format!("Connected to {}", self.connect_address));
-                    self.connected = true;
+                        .push(format!("Connected to {} as {} (id: {})", 
+                            self.connect_address, client_name, user_id));
                     // Start audio output when connected
                     if self.audio_settings.output_enabled {
                         self.start_audio_output();
                     }
                 }
-                UiEvent::ConnectFailed(err) => {
+                BackendEvent::ConnectFailed { error } => {
                     self.chat_messages
-                        .push(format!("Failed to connect: {}", err));
+                        .push(format!("Failed to connect: {}", error));
                 }
-                UiEvent::Disconnected => {
-                    self.chat_messages
-                        .push("Disconnected from server".to_string());
-                    self.connected = false;
-                    self.rooms.clear();
-                    self.presences.clear();
-                    self.room_ui.current_room_id = None;
+                BackendEvent::Disconnected { reason } => {
+                    let msg = match reason {
+                        Some(r) => format!("Disconnected from server: {}", r),
+                        None => "Disconnected from server".to_string(),
+                    };
+                    self.chat_messages.push(msg);
                     // Stop audio when disconnected
                     self.stop_audio_input();
                     self.stop_audio_output();
                 }
-                UiEvent::ChatMessage(msg) => {
-                    self.chat_messages.push(msg);
+                BackendEvent::ChatReceived { sender, text } => {
+                    self.chat_messages.push(format!("{}: {}", sender, text));
                 }
-                UiEvent::SnapshotUpdated(snap) => {
-                    self.rooms = snap.rooms;
-                    self.presences = snap.users;
-                    self.room_ui.current_room_id = snap.current_room_id;
-                    // Get our user_id from the backend snapshot (already discovered there)
-                    self.my_user_id = snap.my_user_id;
+                BackendEvent::StateUpdated { state: _ } => {
+                    // State is automatically updated in the backend handle
                 }
-                UiEvent::VoiceReceived {
+                BackendEvent::VoiceReceived {
                     sender_id,
                     audio_bytes,
                 } => {
@@ -620,6 +379,9 @@ impl eframe::App for MyApp {
                     self.talking_users
                         .insert(sender_id, std::time::Instant::now());
                     self.play_received_audio(&audio_bytes);
+                }
+                BackendEvent::Error { message } => {
+                    self.chat_messages.push(format!("Error: {}", message));
                 }
             }
         }
@@ -631,7 +393,7 @@ impl eframe::App for MyApp {
 
         // Handle push-to-talk (Space key)
         let space_pressed = ctx.input(|i| i.key_down(egui::Key::Space));
-        if space_pressed && !self.push_to_talk_active && self.connected {
+        if space_pressed && !self.push_to_talk_active && self.backend.is_connected() {
             self.push_to_talk_active = true;
             self.start_audio_input();
         } else if !space_pressed && self.push_to_talk_active {
@@ -647,7 +409,7 @@ impl eframe::App for MyApp {
                         self.show_connect = true;
                         ui.close();
                     }
-                    if self.connected {
+                    if self.backend.is_connected() {
                         if ui.button("Disconnect").clicked() {
                             self.send_command(BackendCommand::Disconnect);
                             ui.close();
@@ -697,9 +459,8 @@ impl eframe::App for MyApp {
                                 } || ui.button("Send").clicked();
                                 if send {
                                     let text = self.chat_input.trim();
-                                    if !text.is_empty() && self.connected {
+                                    if !text.is_empty() && self.backend.is_connected() {
                                         self.send_command(BackendCommand::SendChat {
-                                            sender: self.client_name.clone(),
                                             text: text.to_owned(),
                                         });
                                         self.chat_input.clear();
@@ -710,15 +471,18 @@ impl eframe::App for MyApp {
                     });
             });
 
+        // Get current state from backend (clone to avoid borrow issues)
+        let state = self.backend.state().clone();
+
         // Rooms + users
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("Rooms");
             ui.separator();
 
-            if !self.connected {
+            if !state.connected {
                 ui.label("Not connected. Use Server > Connect...");
             }
-            if self.connected && self.rooms.is_empty() {
+            if state.connected && state.rooms.is_empty() {
                 ui.horizontal(|ui| {
                     ui.label("No rooms received yet.");
                     if ui.button("Join Root").clicked() {
@@ -731,9 +495,9 @@ impl eframe::App for MyApp {
                 ui.separator();
             }
             egui::ScrollArea::vertical().show(ui, |ui| {
-                for room in self.rooms.clone() {
+                for room in state.rooms.iter() {
                     let rid = room.id.as_ref().map(|r| r.value).unwrap_or(0);
-                    let is_current = self.room_ui.current_room_id == Some(rid);
+                    let is_current = state.current_room_id == Some(rid);
                     let mut text = room.name.clone();
                     if is_current {
                         text.push_str("  (current)");
@@ -741,12 +505,10 @@ impl eframe::App for MyApp {
                     let resp = ui.selectable_label(is_current, text);
                     if resp.clicked() {
                         self.send_command(BackendCommand::JoinRoom { room_id: rid });
-                        self.room_ui.current_room_id = Some(rid);
                     }
                     resp.context_menu(|ui| {
                         if ui.button("Join").clicked() {
                             self.send_command(BackendCommand::JoinRoom { room_id: rid });
-                            self.room_ui.current_room_id = Some(rid);
                             ui.close();
                         }
                         if ui.button("Rename...").clicked() {
@@ -773,13 +535,9 @@ impl eframe::App for MyApp {
                         .id_salt(rid)
                         .default_open(is_current)
                         .show(ui, |ui| {
-                            for up in self
-                                .presences
-                                .iter()
-                                .filter(|u| u.room_id.as_ref().map(|r| r.value) == Some(rid))
-                            {
+                            for up in state.users_in_room(rid) {
                                 let user_id = up.user_id.as_ref().map(|id| id.value).unwrap_or(0);
-                                let is_self = self.my_user_id == Some(user_id);
+                                let is_self = state.my_user_id == Some(user_id);
 
                                 // Check if user is talking
                                 // For self, use push_to_talk_active; for others, check talking_users
@@ -878,7 +636,7 @@ impl eframe::App for MyApp {
                     });
                     ui.horizontal(|ui| {
                         ui.label("Status:");
-                        ui.label(if self.connected {
+                        ui.label(if self.backend.is_connected() {
                             "Connected"
                         } else {
                             "Disconnected"

@@ -1,8 +1,8 @@
-## Plan: MVP with QUIC, Ed25519, Protobuf-Checksum State Hashing
+# Plan: MVP with QUIC, Ed25519, Protobuf-Checksum State Hashing
 
 Target: Three phases, but always QUIC (no TCP), Ed25519 identities, and state hashes as checksums over canonical protobuf serialization (excluding the hash field).
 
-### Steps
+## Steps
 
 1. **Phase 1 – QUIC Text-Only Vertical Slice**
    1. Convert `crates/api` to a proper library with `prost` and define minimal proto messages: `ClientHello`, `ServerHello`, `ChatMessage`, `ServerEvent::ChatBroadcast`, and a generic `Envelope` that already includes an optional `state_hash` field.
@@ -29,3 +29,130 @@ Target: Three phases, but always QUIC (no TCP), Ed25519 identities, and state ha
 
 
 note: please use cargo add to add dependencies so the latest versions are used.
+
+## mid stage 2 cleanup
+
+### test driven fixes
+these tasks are to be done before moving on with phase 2 completion. before implementing any fixes, write a test that demonstrates the issue and, run it to confirm it fails. after implementing the fix, run the test again to confirm it passes.
+
+each of these will will be handled as a seperate context, so leave notes here about what got done in each, and any relavent notes for later steps.
+
+### opus encoding
+we will leave opus encoding until after the mid stage 2 cleanup is done. 
+
+### fix list
+1. refactor the server to allow for better testing and isolation as you recommended.
+
+   **DONE (2025-12-23)**
+   - Created `crates/server/src/state.rs` with `ServerState` and `ClientHandle` types
+     - `ServerState` now has proper methods: `allocate_user_id()`, `register_client()`, `remove_client()`, 
+       `set_user_room()`, `get_user_room()`, `get_room_members()`, `create_room()`, `delete_room()`, 
+       `rename_room()`, `get_rooms()`, `build_presence_list()`, `remove_user_membership()`
+     - 8 unit tests covering state logic (room creation, deletion, membership, etc.)
+   - Created `crates/server/src/handlers.rs` with protocol message handling
+     - `handle_envelope()` dispatches to specific handlers for each message type
+     - `handle_datagrams()` for voice relay
+     - `broadcast_room_state()` and `cleanup_client()` helpers
+   - Created `crates/server/src/server.rs` with `Server` struct and `Config`
+     - `Server::new(config)` creates a server instance
+     - `Server::run()` runs the accept loop
+     - `Server::state()` provides access for testing
+     - `handle_connection()` manages a single client connection
+   - Updated `crates/server/src/lib.rs` to re-export all types and document the module structure
+   - Slimmed `crates/server/src/main.rs` to ~20 lines - just parses config and calls `Server::new().run()`
+   - All 19 integration tests pass, 8 new unit tests pass
+   - **Notes for later steps:** The state module still uses multiple `Mutex` locks which will be 
+     addressed in step 3. The `VoiceFrame` (stream-based) handler remains but should be removed 
+     when we clean up duplicate message types in step 4.
+
+2. clean up the interface between the gui and the backend.The BackendCommand and UiEvent enums are defined locally in main.rs. This creates:
+
+Duplicate state tracking between UI and backend (e.g., RoomUiState vs RoomSnapshot)
+The command/event pattern is ad-hoc rather than structured
+Audio handling is mixed with UI state in MyApp
+Recommendation: The backend crate should expose a proper event-driven API or callback system, rather than requiring the UI to manage channels and spawn tasks.
+
+   **DONE (2025-12-23)**
+   - Created `crates/backend/src/events.rs` with proper typed API:
+     - `BackendCommand` enum: `Connect`, `Disconnect`, `SendChat`, `JoinRoom`, `CreateRoom`, 
+       `DeleteRoom`, `RenameRoom`, `SendVoice`
+     - `BackendEvent` enum: `Connected`, `ConnectFailed`, `Disconnected`, `StateUpdated`, 
+       `ChatReceived`, `VoiceReceived`, `Error`
+     - `ConnectionState` struct: single source of truth for connection state with helper methods
+       like `users_in_room()`, `get_room()`, `is_user_in_room()`
+   - Created `crates/backend/src/handle.rs` with `BackendHandle`:
+     - Manages tokio runtime internally (no need for UI to spawn threads)
+     - `new()` and `with_repaint_callback()` constructors
+     - `send(command)` for non-blocking command dispatch
+     - `poll_event()` for event polling in UI update loop
+     - `state()` returns current cached `ConnectionState`
+     - `command_sender()` returns clonable `CommandSender` for audio callbacks
+   - Created `CommandSender` type for thread-safe command sending from audio callbacks
+   - Updated `crates/backend/src/lib.rs` to export new types
+   - Refactored `crates/egui-test/src/main.rs`:
+     - Removed local `BackendCommand`, `UiEvent`, `RoomUiState` types
+     - Removed `run_backend_task`, `handle_server_events`, `handle_voice_datagrams` functions
+     - `MyApp` now uses `BackendHandle` instead of managing channels directly
+     - Uses `CommandSender` for audio callback thread communication
+     - UI reads state from `self.backend.state()` instead of duplicate fields
+   - 10 unit tests for events and handle modules, all 37 tests pass
+   - Added callback-based API for reactive/MVVM frameworks:
+     - `BackendHandle::builder()` with `.on_event(callback)` and `.on_repaint(callback)`
+     - `EventCallback` type alias: `Arc<dyn Fn(BackendEvent) + Send + Sync>`
+     - `EventDispatcher` helper dispatches events to both channel and optional callback
+   - **Notes:** The `BackendHandle` internally spawns a single background thread with tokio 
+     runtime. The `CommandSender` is `Clone + Send + Sync` for use in audio callbacks. Both 
+     polling and callback APIs work simultaneously - UI can use either or both. Callback API 
+     enables easier porting to Android (LiveData/StateFlow), iOS (Combine), and WASM.
+
+3. clean up the locks in the server. make whatever can be lock free, and use a single consolidated lock where not. remove blocking code from the audio path.
+
+   **DONE (2025-12-23)**
+   - Refactored `crates/server/src/state.rs` with improved locking strategy:
+     - **`next_user_id`**: Now `AtomicU64` for lock-free ID allocation (was `Mutex<u64>`)
+     - **`clients`**: Now `DashMap<u64, Arc<ClientHandle>>` for lock-free per-client access (was `Mutex<Vec<...>>`)
+     - **`state_data`**: New consolidated `RwLock<StateData>` containing rooms + memberships (was separate `Mutex`es)
+   - Updated `ClientHandle`:
+     - Now has constructor `ClientHandle::new(send, user_id, conn)`
+     - `username` uses `RwLock<String>` with `set_username()` and `get_username()` methods
+     - Added `send_frame(&[u8])` helper method for sending framed messages
+     - No longer `Clone` (was redundant due to `Arc` wrapper)
+   - Updated all handlers in `crates/server/src/handlers.rs`:
+     - `handle_chat_message`: Uses `snapshot_clients()` before iteration, no lock held during I/O
+     - `handle_voice_frame`: Uses `snapshot_clients()` before iteration
+     - `broadcast_room_state`: Uses `snapshot_clients()` before sending
+     - `handle_datagrams`: Uses `snapshot_room_memberships()` for voice relay, lock-free client lookup via DashMap
+     - `cleanup_client`: Uses `remove_client_by_handle()` (lock-free)
+   - Updated `crates/server/src/server.rs`:
+     - `allocate_user_id()` is now sync (no await needed)
+     - `register_client()` is now sync
+     - Uses `client_count()` instead of `clients.lock().await.len()`
+   - New state methods for lock-free operation:
+     - `register_client()`, `remove_client()`, `remove_client_by_handle()` (sync)
+     - `get_client()`, `client_count()`, `for_each_client()`, `snapshot_clients()` (sync)
+     - `snapshot_state()`, `snapshot_room_memberships()` (async, minimal lock time)
+   - Added 4 new unit tests for the new locking infrastructure
+   - All 32 tests pass (12 state tests + 19 integration + 1 doc test)
+   - Added `dashmap` dependency to `crates/server/Cargo.toml`
+   - **Notes:** The voice datagram path now takes a snapshot of room memberships once, then
+     uses lock-free DashMap lookups to find recipients. This eliminates lock contention on
+     the audio path. The `StateData` struct is `Clone` to enable efficient snapshots.
+
+4. ~~clean up the api with regards to duplicate message types~~ **DONE**
+   - **Removed:** `VoiceFrame` message entirely (was legacy stream-based voice)
+   - **Removed:** `VoiceFrame` from `Envelope` payload oneof (field 19 reserved)
+   - **Removed:** `VoiceFrame` from `ServerEvent` kind oneof (field 6 reserved)
+   - **Removed:** `handle_voice_frame()` function from server handlers
+   - **Restructured `VoiceDatagram`** with clear client/server field separation:
+     - Fields 1-3 (client-provided): `opus_data`, `sequence`, `timestamp_us`
+     - Fields 10-11 (server-set, optional): `sender_id`, `room_id`
+   - **Security:** Client no longer sets sender_id or room_id; server determines these
+     from the authenticated connection and current room membership
+   - Client code simplified: no longer needs to look up user_id or room_id when sending
+   - All 32 tests pass
+
+5. make the server hello the single source of truth for the client id
+6. add graceful error recovery and reconnect logic on the client.
+7. add state hash verification on the client, trigger a resync if the hash does not match.
+8. clean up room id usage. the server should remember what room a user was in last and place them there when the client re connects. defaulting to the root. channels should use a UUID rather than an incrementing number, except root is always 0.
+9. fix unbounded buffer on audio transmission. gracefully handle slow connections. this will later be improved by varying opus bitrate based on network conditions, but for now just drop old frames if the network is slow.

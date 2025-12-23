@@ -40,21 +40,33 @@ message UserPresence {
   string username = 3;
 }
 
-message VoiceFrame {
-  RoomId room_id = 1;
-  UserId user_id = 2;
-  bytes opus_bytes = 3; // placeholder: raw/opus frames
-  uint32 sequence = 4; // optional sequencing for jitter buffers
-}
-
 // Voice datagram sent via QUIC datagrams (unreliable, low-latency).
 // This is a standalone message not wrapped in Envelope for minimal overhead.
+//
+// Client -> Server: Only opus_data and sequence are required.
+//   The server determines sender_id and room_id from the connection.
+//
+// Server -> Client: All fields are populated by the server.
+//   sender_id and room_id are set by the server based on the sender's
+//   authenticated identity and current room membership.
 message VoiceDatagram {
-  uint64 sender_id = 1;    // user id of sender
-  uint64 room_id = 2;      // target room
-  uint32 sequence = 3;     // sequence number for ordering/jitter buffer
-  uint64 timestamp_us = 4; // microseconds since some epoch (for jitter buffer)
-  bytes opus_data = 5;     // Opus-encoded audio frame
+  // Opus-encoded audio frame (required)
+  bytes opus_data = 1;
+  
+  // Sequence number for ordering/jitter buffer (client should increment)
+  uint32 sequence = 2;
+  
+  // Timestamp in microseconds (client's capture time, for jitter buffer sync)
+  // Optional: if not set, receiver can use arrival time
+  uint64 timestamp_us = 3;
+  
+  // --- Fields set by server on relay, ignored if sent by client ---
+  
+  // User ID of the sender (set by server based on authenticated connection)
+  optional uint64 sender_id = 10;
+  
+  // Room ID where this audio originated (set by server based on sender's room)
+  optional uint64 room_id = 11;
 }
 
 // Extend the existing ServerEvent with additional variants for Phase 2.
@@ -73,7 +85,7 @@ message Envelope {
     JoinRoom join_room = 16;
     LeaveRoom leave_room = 17;
     RoomState room_state_msg = 18;
-    VoiceFrame voice_frame = 19;
+    // Field 19 reserved: was VoiceFrame, now removed (voice uses datagrams only)
     CreateRoom create_room = 20;
     DeleteRoom delete_room = 21;
     RenameRoom rename_room = 22;
@@ -110,7 +122,7 @@ message ServerEvent {
     RoomState room_state_update = 3;
     UserPresence user_joined = 4;
     UserPresence user_left = 5;
-    VoiceFrame voice_frame = 6;
+    // Field 6 reserved: was VoiceFrame, now removed (voice uses datagrams only)
   }
 }
 
