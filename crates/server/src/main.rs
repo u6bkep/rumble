@@ -100,23 +100,32 @@ impl ServerState {
 }
 
 async fn handle_connection(conn: quinn::Connection, state: Arc<ServerState>) -> Result<()> {
+    // Assign user_id at connection level - this is the authoritative identity.
+    // The server determines identity, not the client.
+    let user_id = {
+        let mut ctr = state.next_user_id.lock().await;
+        let id = *ctr;
+        *ctr += 1;
+        id
+    };
+    info!(user_id, remote = %conn.remote_address(), "assigned user_id for connection");
+    
     // Track all client handles for this connection so we can clean up when connection closes.
     let mut connection_clients: Vec<Arc<ClientHandle>> = Vec::new();
     
     // Spawn a task to handle incoming datagrams for voice relay.
+    // Pass the connection-level user_id so we know who sent each datagram.
     let conn_for_datagrams = conn.clone();
     let state_for_datagrams = state.clone();
     tokio::spawn(async move {
-        handle_datagrams(conn_for_datagrams, state_for_datagrams).await;
+        handle_datagrams(conn_for_datagrams, state_for_datagrams, user_id).await;
     });
     
     loop {
         match conn.accept_bi().await {
             Ok((send_stream, mut recv)) => {
                 info!("new bi stream opened");
-                let user_id = {
-                    let mut ctr = state.next_user_id.lock().await; let id = *ctr; *ctr += 1; id
-                };
+                // Use the connection-level user_id for all streams on this connection
                 let client_handle = Arc::new(ClientHandle { 
                     send: Arc::new(Mutex::new(send_stream)), 
                     username: Arc::new(Mutex::new(String::new())), 
@@ -240,9 +249,15 @@ async fn handle_envelope(env: proto::Envelope, sender: Arc<ClientHandle>, state:
             {
                 let mut m = state.memberships.lock().await; m.push((sender.user_id, 1));
             }
-            let reply = proto::Envelope { state_hash: Vec::new(), payload: Some(Payload::ServerHello(proto::ServerHello { server_name: "Rumble Server".to_string() })) };
+            let reply = proto::Envelope { 
+                state_hash: Vec::new(), 
+                payload: Some(Payload::ServerHello(proto::ServerHello { 
+                    server_name: "Rumble Server".to_string(),
+                    user_id: sender.user_id,
+                })) 
+            };
             let frame = encode_frame(&reply);
-            debug!(bytes = frame.len(), "server: sending ServerHello frame");
+            debug!(bytes = frame.len(), user_id = sender.user_id, "server: sending ServerHello frame with user_id");
             {
                 let mut send = sender.send.lock().await;
                 send.write_all(&frame).await?;
@@ -374,26 +389,44 @@ async fn broadcast_room_state(state: &Arc<ServerState>) -> Result<()> {
 
 /// Handle incoming QUIC datagrams for voice relay.
 /// Datagrams are relayed to all other clients in the same room.
-async fn handle_datagrams(conn: quinn::Connection, state: Arc<ServerState>) {
+/// The sender_user_id is determined by the connection, not by the datagram content.
+async fn handle_datagrams(conn: quinn::Connection, state: Arc<ServerState>, sender_user_id: u64) {
     loop {
         match conn.read_datagram().await {
             Ok(datagram) => {
                 // Decode the VoiceDatagram protobuf.
                 match VoiceDatagram::decode(datagram.as_ref()) {
-                    Ok(voice_dgram) => {
+                    Ok(mut voice_dgram) => {
+                        // SECURITY: Override sender_id with the connection's user_id.
+                        // Never trust the client's claimed identity.
+                        voice_dgram.sender_id = sender_user_id;
+                        
                         debug!(
-                            sender = voice_dgram.sender_id,
+                            sender = sender_user_id,
                             room = voice_dgram.room_id,
                             seq = voice_dgram.sequence,
                             data_len = voice_dgram.opus_data.len(),
                             "server: received voice datagram"
                         );
                         
-                        // Find all clients in the same room (excluding sender).
-                        let sender_room = voice_dgram.room_id;
-                        let sender_id = voice_dgram.sender_id;
+                        // Find sender's room membership to validate room_id
+                        let sender_room = {
+                            let memberships = state.memberships.lock().await;
+                            memberships.iter()
+                                .find(|(uid, _)| *uid == sender_user_id)
+                                .map(|(_, rid)| *rid)
+                        };
                         
-                        // Re-encode for relay (could optimize by just forwarding raw bytes).
+                        // Only relay if sender is actually in the claimed room
+                        let Some(actual_room) = sender_room else {
+                            debug!(sender = sender_user_id, "server: sender not in any room, dropping datagram");
+                            continue;
+                        };
+                        
+                        // Use the sender's actual room, not the claimed room_id
+                        voice_dgram.room_id = actual_room;
+                        
+                        // Re-encode with corrected sender_id and room_id
                         let relay_bytes = voice_dgram.encode_to_vec();
                         
                         // Get list of clients to relay to.
@@ -402,13 +435,13 @@ async fn handle_datagrams(conn: quinn::Connection, state: Arc<ServerState>) {
                         
                         for client in clients.iter() {
                             // Skip the sender.
-                            if client.user_id == sender_id {
+                            if client.user_id == sender_user_id {
                                 continue;
                             }
                             
                             // Check if this client is in the same room.
                             let is_in_room = memberships.iter()
-                                .any(|(uid, rid)| *uid == client.user_id && *rid == sender_room);
+                                .any(|(uid, rid)| *uid == client.user_id && *rid == actual_room);
                             
                             if is_in_room {
                                 // Send datagram to this client.

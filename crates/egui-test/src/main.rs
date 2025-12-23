@@ -1,10 +1,11 @@
+use backend::{AudioConfig, AudioDeviceInfo, AudioInput, AudioOutput, AudioSystem, Client};
+use backend::{bytes_to_samples, samples_to_bytes};
+use clap::Parser;
 use eframe::egui;
 use egui::{CollapsingHeader, Modal};
-use uuid::Uuid;
-use backend::Client;
 use std::sync::Arc;
 use tokio::sync::mpsc as tokio_mpsc;
-use clap::Parser;
+use uuid::Uuid;
 
 /// Rumble - A voice chat client
 #[derive(Parser, Debug, Clone)]
@@ -34,7 +35,7 @@ struct Args {
 fn main() -> eframe::Result<()> {
     env_logger::init();
     let args = Args::parse();
-    
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1000.0, 700.0])
@@ -58,13 +59,34 @@ struct RoomUiState {
 
 /// Commands sent from UI to the async backend task
 enum BackendCommand {
-    Connect { addr: String, name: String, password: Option<String>, config: backend::ConnectConfig },
+    Connect {
+        addr: String,
+        name: String,
+        password: Option<String>,
+        config: backend::ConnectConfig,
+    },
     Disconnect,
-    SendChat { sender: String, text: String },
-    JoinRoom { room_id: u64 },
-    CreateRoom { name: String },
-    DeleteRoom { room_id: u64 },
-    RenameRoom { room_id: u64, new_name: String },
+    SendChat {
+        sender: String,
+        text: String,
+    },
+    JoinRoom {
+        room_id: u64,
+    },
+    CreateRoom {
+        name: String,
+    },
+    DeleteRoom {
+        room_id: u64,
+    },
+    RenameRoom {
+        room_id: u64,
+        new_name: String,
+    },
+    /// Send raw audio frame as voice datagram
+    SendVoiceFrame {
+        audio_bytes: Vec<u8>,
+    },
 }
 
 /// Events sent from backend task to UI
@@ -74,6 +96,11 @@ enum UiEvent {
     Disconnected,
     ChatMessage(String),
     SnapshotUpdated(backend::RoomSnapshot),
+    /// Received voice audio to play
+    VoiceReceived {
+        sender_id: u64,
+        audio_bytes: Vec<u8>,
+    },
 }
 
 /// State for the rename room modal
@@ -82,6 +109,63 @@ struct RenameModalState {
     open: bool,
     room_id: u64,
     room_name: String,
+}
+
+/// Audio settings state
+struct AudioSettings {
+    /// Audio subsystem handle
+    audio_system: AudioSystem,
+    /// Available input devices
+    input_devices: Vec<AudioDeviceInfo>,
+    /// Available output devices  
+    output_devices: Vec<AudioDeviceInfo>,
+    /// Selected input device index (None = default)
+    selected_input: Option<usize>,
+    /// Selected output device index (None = default)
+    selected_output: Option<usize>,
+    /// Whether microphone is enabled (push-to-talk or voice activity)
+    mic_enabled: bool,
+    /// Whether audio output is enabled
+    output_enabled: bool,
+    /// Input volume (0.0 - 2.0, 1.0 = normal)
+    input_volume: f32,
+    /// Output volume (0.0 - 2.0, 1.0 = normal)
+    output_volume: f32,
+}
+
+impl Default for AudioSettings {
+    fn default() -> Self {
+        let audio_system = AudioSystem::new();
+        let input_devices = audio_system.list_input_devices();
+        let output_devices = audio_system.list_output_devices();
+
+        // Find default device indices
+        let selected_input = input_devices.iter().find(|d| d.is_default).map(|d| d.index);
+        let selected_output = output_devices
+            .iter()
+            .find(|d| d.is_default)
+            .map(|d| d.index);
+
+        Self {
+            audio_system,
+            input_devices,
+            output_devices,
+            selected_input,
+            selected_output,
+            mic_enabled: false,
+            output_enabled: true,
+            input_volume: 1.0,
+            output_volume: 1.0,
+        }
+    }
+}
+
+impl AudioSettings {
+    /// Refresh the device lists
+    fn refresh_devices(&mut self) {
+        self.input_devices = self.audio_system.list_input_devices();
+        self.output_devices = self.audio_system.list_output_devices();
+    }
 }
 
 struct MyApp {
@@ -97,26 +181,43 @@ struct MyApp {
     chat_input: String,
     connected: bool,
     client_name: String,
-    
+
     // Async communication channels (command_tx wrapped in Option for clean shutdown)
     command_tx: Option<tokio_mpsc::UnboundedSender<BackendCommand>>,
     ui_event_rx: std::sync::mpsc::Receiver<UiEvent>,
-    
+
     // Rename modal state
     rename_modal: RenameModalState,
-    
+
+    // Audio settings and state
+    audio_settings: AudioSettings,
+    /// Active audio input stream (mic capture)
+    audio_input: Option<AudioInput>,
+    /// Active audio output stream (playback)
+    audio_output: Option<AudioOutput>,
+    /// Push-to-talk key is held
+    push_to_talk_active: bool,
+    /// Track which users are currently talking (user_id -> last voice time)
+    talking_users: std::collections::HashMap<u64, std::time::Instant>,
+    /// Our own user_id (from backend snapshot, used for UI indicators)
+    my_user_id: Option<u64>,
+
     egui_ctx: egui::Context,
-    
+
     // Handle to the background thread for clean shutdown.
     backend_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Drop for MyApp {
     fn drop(&mut self) {
+        // Stop audio streams first.
+        self.audio_input = None;
+        self.audio_output = None;
+
         // Drop command_tx first to signal the backend task to exit.
         // This closes the channel, causing command_rx.recv() to return None.
         drop(self.command_tx.take());
-        
+
         // Wait for the backend thread to finish (it will disconnect the client).
         if let Some(thread) = self.backend_thread.take() {
             eprintln!("Waiting for backend thread to finish...");
@@ -130,7 +231,7 @@ impl MyApp {
     fn new(ctx: egui::Context, args: Args) -> Self {
         let (command_tx, command_rx) = tokio_mpsc::unbounded_channel();
         let (ui_event_tx, ui_event_rx) = std::sync::mpsc::channel();
-        
+
         // Spawn the background async runtime and task
         let ctx_clone = ctx.clone();
         let backend_thread = std::thread::spawn(move || {
@@ -139,18 +240,21 @@ impl MyApp {
                 run_backend_task(command_rx, ui_event_tx, ctx_clone).await;
             });
         });
-        
+
         // Use provided name or generate a random one
-        let client_name = args.name.clone().unwrap_or_else(|| format!("user-{}", Uuid::new_v4().simple()));
-        
+        let client_name = args
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("user-{}", Uuid::new_v4().simple()));
+
         // Use provided server address or default empty
         let connect_address = args.server.clone().unwrap_or_default();
-        
+
         // Use provided password or empty
         let connect_password = args.password.clone().unwrap_or_default();
-        
+
         let command_tx = Some(command_tx);
-        
+
         // If server was specified on command line, connect immediately
         if let Some(server_addr) = args.server {
             let addr = if server_addr.trim().is_empty() {
@@ -158,7 +262,7 @@ impl MyApp {
             } else {
                 server_addr.trim().to_string()
             };
-            
+
             // Build connect config based on CLI args
             let mut config = backend::ConnectConfig::new();
             if args.trust_dev_cert {
@@ -170,7 +274,7 @@ impl MyApp {
             if let Ok(cert_path) = std::env::var("RUMBLE_SERVER_CERT_PATH") {
                 config = config.with_cert(cert_path);
             }
-            
+
             if let Some(tx) = &command_tx {
                 let _ = tx.send(BackendCommand::Connect {
                     addr,
@@ -180,7 +284,7 @@ impl MyApp {
                 });
             }
         }
-        
+
         Self {
             rooms: Vec::new(),
             presences: Vec::new(),
@@ -197,15 +301,119 @@ impl MyApp {
             command_tx,
             ui_event_rx,
             rename_modal: RenameModalState::default(),
+            audio_settings: AudioSettings::default(),
+            audio_input: None,
+            audio_output: None,
+            push_to_talk_active: false,
+            talking_users: std::collections::HashMap::new(),
+            my_user_id: None,
             egui_ctx: ctx,
             backend_thread: Some(backend_thread),
         }
     }
-    
+
     /// Send a command to the backend task (non-blocking)
     fn send_command(&self, cmd: BackendCommand) {
         if let Some(tx) = &self.command_tx {
             let _ = tx.send(cmd);
+        }
+    }
+
+    /// Start audio capture with the selected input device.
+    fn start_audio_input(&mut self) {
+        if self.audio_input.is_some() {
+            return; // Already running
+        }
+
+        let device = if let Some(idx) = self.audio_settings.selected_input {
+            self.audio_settings.audio_system.get_input_device(idx)
+        } else {
+            self.audio_settings.audio_system.default_input_device()
+        };
+
+        let Some(device) = device else {
+            eprintln!("No input device available");
+            return;
+        };
+
+        let config = AudioConfig::default();
+        let command_tx = self.command_tx.clone();
+        let input_volume = self.audio_settings.input_volume;
+
+        match AudioInput::new(&device, &config, move |samples| {
+            // Apply volume and send to backend
+            let adjusted: Vec<f32> = samples.iter().map(|s| s * input_volume).collect();
+            let bytes = samples_to_bytes(&adjusted);
+            if let Some(tx) = &command_tx {
+                let _ = tx.send(BackendCommand::SendVoiceFrame { audio_bytes: bytes });
+            }
+        }) {
+            Ok(input) => {
+                self.audio_input = Some(input);
+                eprintln!("Audio input started");
+            }
+            Err(e) => {
+                eprintln!("Failed to start audio input: {}", e);
+            }
+        }
+    }
+
+    /// Stop audio capture.
+    fn stop_audio_input(&mut self) {
+        if let Some(input) = self.audio_input.take() {
+            input.pause();
+            eprintln!("Audio input stopped");
+        }
+    }
+
+    /// Start audio playback with the selected output device.
+    fn start_audio_output(&mut self) {
+        if self.audio_output.is_some() {
+            return; // Already running
+        }
+
+        let device = if let Some(idx) = self.audio_settings.selected_output {
+            self.audio_settings.audio_system.get_output_device(idx)
+        } else {
+            self.audio_settings.audio_system.default_output_device()
+        };
+
+        let Some(device) = device else {
+            eprintln!("No output device available");
+            return;
+        };
+
+        let config = AudioConfig::default();
+
+        match AudioOutput::new(&device, &config) {
+            Ok(output) => {
+                self.audio_output = Some(output);
+                eprintln!("Audio output started");
+            }
+            Err(e) => {
+                eprintln!("Failed to start audio output: {}", e);
+            }
+        }
+    }
+
+    /// Stop audio playback.
+    fn stop_audio_output(&mut self) {
+        if let Some(output) = self.audio_output.take() {
+            output.pause();
+            eprintln!("Audio output stopped");
+        }
+    }
+
+    /// Queue received audio for playback.
+    fn play_received_audio(&self, audio_bytes: &[u8]) {
+        if let Some(output) = &self.audio_output {
+            let samples = bytes_to_samples(audio_bytes);
+            // Apply output volume
+            let adjusted: Vec<f32> = samples
+                .iter()
+                .map(|s| s * self.audio_settings.output_volume)
+                .collect();
+            output.queue_samples(&adjusted);
         }
     }
 }
@@ -217,7 +425,7 @@ async fn run_backend_task(
     ctx: egui::Context,
 ) {
     let mut client: Option<Client> = None;
-    
+
     loop {
         tokio::select! {
             Some(cmd) = command_rx.recv() => {
@@ -226,18 +434,26 @@ async fn run_backend_task(
                         match Client::connect(&addr, &name, password.as_deref(), config).await {
                             Ok(mut c) => {
                                 let events_rx = c.take_events_receiver();
+                                let voice_rx = c.take_voice_receiver();
                                 let snap = c.get_snapshot().await;
                                 let _ = ui_event_tx.send(UiEvent::Connected);
                                 let _ = ui_event_tx.send(UiEvent::SnapshotUpdated(snap));
-                                
-                                // Spawn event listener
+
+                                // Spawn event listener for control messages
                                 let tx = ui_event_tx.clone();
                                 let ctx_ev = ctx.clone();
                                 let snapshot = c.snapshot.clone();
                                 tokio::spawn(async move {
                                     handle_server_events(events_rx, tx, ctx_ev, snapshot).await;
                                 });
-                                
+
+                                // Spawn voice datagram listener
+                                let voice_tx = ui_event_tx.clone();
+                                let ctx_voice = ctx.clone();
+                                tokio::spawn(async move {
+                                    handle_voice_datagrams(voice_rx, voice_tx, ctx_voice).await;
+                                });
+
                                 client = Some(c);
                             }
                             Err(e) => {
@@ -293,12 +509,19 @@ async fn run_backend_task(
                             }
                         }
                     }
+                    BackendCommand::SendVoiceFrame { audio_bytes } => {
+                        if let Some(c) = &client {
+                            if let Err(e) = c.send_voice_datagram_async(audio_bytes).await {
+                                eprintln!("send_voice_datagram error: {e}");
+                            }
+                        }
+                    }
                 }
             }
             else => break,
         }
     }
-    
+
     // Clean up: explicitly disconnect the client before exiting.
     // This ensures the server is notified even when the UI is closed abruptly.
     if let Some(c) = client.take() {
@@ -331,6 +554,23 @@ async fn handle_server_events(
     }
 }
 
+/// Handle incoming voice datagrams and forward to UI for playback
+async fn handle_voice_datagrams(
+    mut voice_rx: tokio::sync::mpsc::UnboundedReceiver<backend::VoiceDatagram>,
+    ui_event_tx: std::sync::mpsc::Sender<UiEvent>,
+    ctx: egui::Context,
+) {
+    while let Some(dgram) = voice_rx.recv().await {
+        // Forward the audio data to the UI for playback
+        let _ = ui_event_tx.send(UiEvent::VoiceReceived {
+            sender_id: dgram.sender_id,
+            audio_bytes: dgram.opus_data,
+        });
+        // Request repaint to update the talking indicator
+        ctx.request_repaint();
+    }
+}
+
 impl eframe::App for MyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.egui_ctx = ctx.clone();
@@ -339,18 +579,28 @@ impl eframe::App for MyApp {
         while let Ok(event) = self.ui_event_rx.try_recv() {
             match event {
                 UiEvent::Connected => {
-                    self.chat_messages.push(format!("Connected to {}", self.connect_address));
+                    self.chat_messages
+                        .push(format!("Connected to {}", self.connect_address));
                     self.connected = true;
+                    // Start audio output when connected
+                    if self.audio_settings.output_enabled {
+                        self.start_audio_output();
+                    }
                 }
                 UiEvent::ConnectFailed(err) => {
-                    self.chat_messages.push(format!("Failed to connect: {}", err));
+                    self.chat_messages
+                        .push(format!("Failed to connect: {}", err));
                 }
                 UiEvent::Disconnected => {
-                    self.chat_messages.push("Disconnected from server".to_string());
+                    self.chat_messages
+                        .push("Disconnected from server".to_string());
                     self.connected = false;
                     self.rooms.clear();
                     self.presences.clear();
                     self.room_ui.current_room_id = None;
+                    // Stop audio when disconnected
+                    self.stop_audio_input();
+                    self.stop_audio_output();
                 }
                 UiEvent::ChatMessage(msg) => {
                     self.chat_messages.push(msg);
@@ -359,17 +609,43 @@ impl eframe::App for MyApp {
                     self.rooms = snap.rooms;
                     self.presences = snap.users;
                     self.room_ui.current_room_id = snap.current_room_id;
+                    // Get our user_id from the backend snapshot (already discovered there)
+                    self.my_user_id = snap.my_user_id;
+                }
+                UiEvent::VoiceReceived {
+                    sender_id,
+                    audio_bytes,
+                } => {
+                    // Track that this user is talking
+                    self.talking_users
+                        .insert(sender_id, std::time::Instant::now());
+                    self.play_received_audio(&audio_bytes);
                 }
             }
+        }
+
+        // Clean up stale talking indicators (after 200ms of no voice data)
+        let now = std::time::Instant::now();
+        self.talking_users
+            .retain(|_, last_time| now.duration_since(*last_time).as_millis() < 200);
+
+        // Handle push-to-talk (Space key)
+        let space_pressed = ctx.input(|i| i.key_down(egui::Key::Space));
+        if space_pressed && !self.push_to_talk_active && self.connected {
+            self.push_to_talk_active = true;
+            self.start_audio_input();
+        } else if !space_pressed && self.push_to_talk_active {
+            self.push_to_talk_active = false;
+            self.stop_audio_input();
         }
 
         // Top menu
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
-                ui.menu_button("Server", |ui| { 
-                    if ui.button("Connect...").clicked() { 
-                        self.show_connect = true; 
-                        ui.close(); 
+                ui.menu_button("Server", |ui| {
+                    if ui.button("Connect...").clicked() {
+                        self.show_connect = true;
+                        ui.close();
                     }
                     if self.connected {
                         if ui.button("Disconnect").clicked() {
@@ -378,50 +654,67 @@ impl eframe::App for MyApp {
                         }
                     }
                 });
-                ui.menu_button("Settings", |ui| { if ui.button("Open Settings").clicked() { self.show_settings = true; ui.close(); } });
+                ui.menu_button("Settings", |ui| {
+                    if ui.button("Open Settings").clicked() {
+                        self.show_settings = true;
+                        ui.close();
+                    }
+                });
             });
         });
 
         // Chat panel
-        egui::SidePanel::left("left_panel").default_width(320.0).show(ctx, |ui| {
-            egui_extras::StripBuilder::new(ui)
-                .size(egui_extras::Size::remainder())
-                .size(egui_extras::Size::exact(4.0))
-                .size(egui_extras::Size::exact(28.0))
-                .vertical(|mut strip| {
-                    strip.cell(|ui| {
-                        ui.heading("Text Chat"); ui.separator();
-                        egui::ScrollArea::vertical().auto_shrink([false; 2]).stick_to_bottom(true).show(ui, |ui| {
-                            for msg in &self.chat_messages { ui.label(msg); }
+        egui::SidePanel::left("left_panel")
+            .default_width(320.0)
+            .show(ctx, |ui| {
+                egui_extras::StripBuilder::new(ui)
+                    .size(egui_extras::Size::remainder())
+                    .size(egui_extras::Size::exact(4.0))
+                    .size(egui_extras::Size::exact(28.0))
+                    .vertical(|mut strip| {
+                        strip.cell(|ui| {
+                            ui.heading("Text Chat");
+                            ui.separator();
+                            egui::ScrollArea::vertical()
+                                .auto_shrink([false; 2])
+                                .stick_to_bottom(true)
+                                .show(ui, |ui| {
+                                    for msg in &self.chat_messages {
+                                        ui.label(msg);
+                                    }
+                                });
                         });
-                    });
-                    strip.cell(|ui| { ui.add_space(2.0); ui.separator(); });
-                    strip.cell(|ui| {
-                        ui.horizontal(|ui| {
-                            let send = {
-                                let resp = ui.text_edit_singleline(&mut self.chat_input);
-                                resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))
-                            } || ui.button("Send").clicked();
-                            if send {
-                                let text = self.chat_input.trim();
-                                if !text.is_empty() && self.connected {
-                                    self.send_command(BackendCommand::SendChat {
-                                        sender: self.client_name.clone(),
-                                        text: text.to_owned(),
-                                    });
-                                    self.chat_input.clear();
+                        strip.cell(|ui| {
+                            ui.add_space(2.0);
+                            ui.separator();
+                        });
+                        strip.cell(|ui| {
+                            ui.horizontal(|ui| {
+                                let send = {
+                                    let resp = ui.text_edit_singleline(&mut self.chat_input);
+                                    resp.lost_focus()
+                                        && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                                } || ui.button("Send").clicked();
+                                if send {
+                                    let text = self.chat_input.trim();
+                                    if !text.is_empty() && self.connected {
+                                        self.send_command(BackendCommand::SendChat {
+                                            sender: self.client_name.clone(),
+                                            text: text.to_owned(),
+                                        });
+                                        self.chat_input.clear();
+                                    }
                                 }
-                            }
+                            });
                         });
                     });
-                });
-        });
+            });
 
         // Rooms + users
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("Rooms");
             ui.separator();
-            
+
             if !self.connected {
                 ui.label("Not connected. Use Server > Connect...");
             }
@@ -442,7 +735,9 @@ impl eframe::App for MyApp {
                     let rid = room.id.as_ref().map(|r| r.value).unwrap_or(0);
                     let is_current = self.room_ui.current_room_id == Some(rid);
                     let mut text = room.name.clone();
-                    if is_current { text.push_str("  (current)"); }
+                    if is_current {
+                        text.push_str("  (current)");
+                    }
                     let resp = ui.selectable_label(is_current, text);
                     if resp.clicked() {
                         self.send_command(BackendCommand::JoinRoom { room_id: rid });
@@ -463,7 +758,9 @@ impl eframe::App for MyApp {
                             ui.close();
                         }
                         if ui.button("Add Room").clicked() {
-                            self.send_command(BackendCommand::CreateRoom { name: "New Room".to_string() });
+                            self.send_command(BackendCommand::CreateRoom {
+                                name: "New Room".to_string(),
+                            });
                             ui.close();
                         }
                         if rid != 1 && ui.button("Delete Room").clicked() {
@@ -476,8 +773,31 @@ impl eframe::App for MyApp {
                         .id_salt(rid)
                         .default_open(is_current)
                         .show(ui, |ui| {
-                            for up in self.presences.iter().filter(|u| u.room_id.as_ref().map(|r| r.value) == Some(rid)) {
-                                ui.label(&up.username);
+                            for up in self
+                                .presences
+                                .iter()
+                                .filter(|u| u.room_id.as_ref().map(|r| r.value) == Some(rid))
+                            {
+                                let user_id = up.user_id.as_ref().map(|id| id.value).unwrap_or(0);
+                                let is_self = self.my_user_id == Some(user_id);
+
+                                // Check if user is talking
+                                // For self, use push_to_talk_active; for others, check talking_users
+                                let is_talking = if is_self {
+                                    self.push_to_talk_active
+                                } else {
+                                    self.talking_users.contains_key(&user_id)
+                                };
+
+                                ui.horizontal(|ui| {
+                                    if is_talking {
+                                        ui.colored_label(egui::Color32::LIGHT_GREEN, "🎤");
+                                    } else {
+                                        ui.colored_label(egui::Color32::DARK_GRAY, "🔇");
+                                    }
+                                    // let label = format!("{}",up.username);
+                                    ui.label(up.username.to_owned());
+                                });
                             }
                         });
                     ui.separator();
@@ -490,54 +810,272 @@ impl eframe::App for MyApp {
             let modal = Modal::new(egui::Id::new("connect_modal")).show(ctx, |ui| {
                 ui.set_width(280.0);
                 ui.heading("Connect to Server");
-                ui.label("Server address:"); ui.text_edit_singleline(&mut self.connect_address);
-                ui.label("Password (optional):"); ui.text_edit_singleline(&mut self.connect_password);
-                ui.checkbox(&mut self.trust_dev_cert, "Trust dev cert (dev-certs/server-cert.der)");
+                ui.label("Server address:");
+                ui.text_edit_singleline(&mut self.connect_address);
+                ui.label("Password (optional):");
+                ui.text_edit_singleline(&mut self.connect_password);
+                ui.checkbox(
+                    &mut self.trust_dev_cert,
+                    "Trust dev cert (dev-certs/server-cert.der)",
+                );
                 ui.separator();
-                egui::Sides::new().show(ui, |_l| {}, |ui| {
-                    if ui.button("Connect").clicked() {
-                        let addr = if self.connect_address.trim().is_empty() { 
-                            "127.0.0.1:5000".to_string() 
-                        } else { 
-                            self.connect_address.trim().to_string() 
-                        };
-                        let name = self.client_name.clone();
-                        let password = if self.connect_password.trim().is_empty() { 
-                            None 
-                        } else { 
-                            Some(self.connect_password.trim().to_string()) 
-                        };
-                        
-                        // Build connect config based on UI settings
-                        let mut config = backend::ConnectConfig::new();
-                        if self.trust_dev_cert {
-                            config = config.with_cert("dev-certs/server-cert.der");
+                egui::Sides::new().show(
+                    ui,
+                    |_l| {},
+                    |ui| {
+                        if ui.button("Connect").clicked() {
+                            let addr = if self.connect_address.trim().is_empty() {
+                                "127.0.0.1:5000".to_string()
+                            } else {
+                                self.connect_address.trim().to_string()
+                            };
+                            let name = self.client_name.clone();
+                            let password = if self.connect_password.trim().is_empty() {
+                                None
+                            } else {
+                                Some(self.connect_password.trim().to_string())
+                            };
+
+                            // Build connect config based on UI settings
+                            let mut config = backend::ConnectConfig::new();
+                            if self.trust_dev_cert {
+                                config = config.with_cert("dev-certs/server-cert.der");
+                            }
+                            if let Ok(cert_path) = std::env::var("RUMBLE_SERVER_CERT_PATH") {
+                                config = config.with_cert(cert_path);
+                            }
+
+                            self.send_command(BackendCommand::Connect {
+                                addr,
+                                name,
+                                password,
+                                config,
+                            });
+                            ui.close();
                         }
-                        if let Ok(cert_path) = std::env::var("RUMBLE_SERVER_CERT_PATH") {
-                            config = config.with_cert(cert_path);
+                        if ui.button("Cancel").clicked() {
+                            ui.close();
                         }
-                        
-                        self.send_command(BackendCommand::Connect { addr, name, password, config });
-                        ui.close();
-                    }
-                    if ui.button("Cancel").clicked() { ui.close(); }
-                });
+                    },
+                );
             });
-            if modal.should_close() { self.show_connect = false; }
+            if modal.should_close() {
+                self.show_connect = false;
+            }
         }
 
         // Settings modal
         if self.show_settings {
             let modal = Modal::new(egui::Id::new("settings_modal")).show(ctx, |ui| {
-                ui.set_width(320.0);
+                ui.set_width(400.0);
                 ui.heading("Settings");
-                ui.label("server url:"); ui.label(self.connect_address.as_str());
+
+                // Connection info
+                ui.collapsing("Connection", |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Server:");
+                        ui.label(&self.connect_address);
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Status:");
+                        ui.label(if self.connected {
+                            "Connected"
+                        } else {
+                            "Disconnected"
+                        });
+                    });
+                });
+
                 ui.separator();
-                egui::Sides::new().show(ui, |_l| {}, |ui| { if ui.button("Close").clicked() { ui.close(); } });
+
+                // Audio settings
+                ui.collapsing("Audio", |ui| {
+                    // Refresh button
+                    if ui.button("🔄 Refresh Devices").clicked() {
+                        self.audio_settings.refresh_devices();
+                    }
+
+                    ui.separator();
+
+                    // Input device selection
+                    ui.label("Input Device (Microphone):");
+                    let current_input_name = self
+                        .audio_settings
+                        .selected_input
+                        .and_then(|idx| {
+                            self.audio_settings
+                                .input_devices
+                                .iter()
+                                .find(|d| d.index == idx)
+                        })
+                        .map(|d| d.name.clone())
+                        .unwrap_or_else(|| "Default".to_string());
+
+                    // Track selection change outside the borrow
+                    let mut input_device_changed: Option<Option<usize>> = None;
+
+                    egui::ComboBox::from_id_salt("input_device")
+                        .selected_text(&current_input_name)
+                        .show_ui(ui, |ui| {
+                            // Default option
+                            if ui
+                                .selectable_label(
+                                    self.audio_settings.selected_input.is_none(),
+                                    "Default",
+                                )
+                                .clicked()
+                            {
+                                input_device_changed = Some(None);
+                            }
+
+                            for device in &self.audio_settings.input_devices {
+                                let label = if device.is_default {
+                                    format!("{} (default)", device.name)
+                                } else {
+                                    device.name.clone()
+                                };
+                                if ui
+                                    .selectable_label(
+                                        self.audio_settings.selected_input == Some(device.index),
+                                        &label,
+                                    )
+                                    .clicked()
+                                {
+                                    input_device_changed = Some(Some(device.index));
+                                }
+                            }
+                        });
+
+                    // Handle input device change after the borrow ends
+                    if let Some(new_selection) = input_device_changed {
+                        self.audio_settings.selected_input = new_selection;
+                        if self.audio_input.is_some() {
+                            self.stop_audio_input();
+                            self.start_audio_input();
+                        }
+                    }
+
+                    // Input volume slider
+                    ui.horizontal(|ui| {
+                        ui.label("Input Volume:");
+                        ui.add(
+                            egui::Slider::new(&mut self.audio_settings.input_volume, 0.0..=2.0)
+                                .show_value(true)
+                                .suffix("x"),
+                        );
+                    });
+
+                    ui.separator();
+
+                    // Output device selection
+                    ui.label("Output Device (Speakers):");
+                    let current_output_name = self
+                        .audio_settings
+                        .selected_output
+                        .and_then(|idx| {
+                            self.audio_settings
+                                .output_devices
+                                .iter()
+                                .find(|d| d.index == idx)
+                        })
+                        .map(|d| d.name.clone())
+                        .unwrap_or_else(|| "Default".to_string());
+
+                    // Track selection change outside the borrow
+                    let mut output_device_changed: Option<Option<usize>> = None;
+
+                    egui::ComboBox::from_id_salt("output_device")
+                        .selected_text(&current_output_name)
+                        .show_ui(ui, |ui| {
+                            // Default option
+                            if ui
+                                .selectable_label(
+                                    self.audio_settings.selected_output.is_none(),
+                                    "Default",
+                                )
+                                .clicked()
+                            {
+                                output_device_changed = Some(None);
+                            }
+
+                            for device in &self.audio_settings.output_devices {
+                                let label = if device.is_default {
+                                    format!("{} (default)", device.name)
+                                } else {
+                                    device.name.clone()
+                                };
+                                if ui
+                                    .selectable_label(
+                                        self.audio_settings.selected_output == Some(device.index),
+                                        &label,
+                                    )
+                                    .clicked()
+                                {
+                                    output_device_changed = Some(Some(device.index));
+                                }
+                            }
+                        });
+
+                    // Handle output device change after the borrow ends
+                    if let Some(new_selection) = output_device_changed {
+                        self.audio_settings.selected_output = new_selection;
+                        if self.audio_output.is_some() {
+                            self.stop_audio_output();
+                            self.start_audio_output();
+                        }
+                    }
+
+                    // Output volume slider
+                    ui.horizontal(|ui| {
+                        ui.label("Output Volume:");
+                        ui.add(
+                            egui::Slider::new(&mut self.audio_settings.output_volume, 0.0..=2.0)
+                                .show_value(true)
+                                .suffix("x"),
+                        );
+                    });
+
+                    ui.separator();
+
+                    // Output enabled toggle
+                    ui.checkbox(
+                        &mut self.audio_settings.output_enabled,
+                        "Enable audio output",
+                    );
+
+                    // Status info
+                    ui.separator();
+                    ui.label("Push-to-talk: Hold SPACE to transmit");
+
+                    if self.push_to_talk_active {
+                        ui.colored_label(egui::Color32::GREEN, "🎤 Transmitting...");
+                    } else {
+                        ui.label("🔇 Not transmitting");
+                    }
+
+                    // Show buffer status if output is active
+                    if let Some(output) = &self.audio_output {
+                        let buffered = output.buffered_samples();
+                        ui.label(format!("Playback buffer: {} samples", buffered));
+                    }
+                });
+
+                ui.separator();
+                egui::Sides::new().show(
+                    ui,
+                    |_l| {},
+                    |ui| {
+                        if ui.button("Close").clicked() {
+                            ui.close();
+                        }
+                    },
+                );
             });
-            if modal.should_close() { self.show_settings = false; }
+            if modal.should_close() {
+                self.show_settings = false;
+            }
         }
-        
+
         // Rename room modal
         if self.rename_modal.open {
             let modal = Modal::new(egui::Id::new("rename_modal")).show(ctx, |ui| {
@@ -546,21 +1084,29 @@ impl eframe::App for MyApp {
                 ui.label("New name:");
                 ui.text_edit_singleline(&mut self.rename_modal.room_name);
                 ui.separator();
-                egui::Sides::new().show(ui, |_l| {}, |ui| {
-                    if ui.button("Rename").clicked() {
-                        let new_name = self.rename_modal.room_name.trim().to_string();
-                        if !new_name.is_empty() {
-                            self.send_command(BackendCommand::RenameRoom {
-                                room_id: self.rename_modal.room_id,
-                                new_name,
-                            });
+                egui::Sides::new().show(
+                    ui,
+                    |_l| {},
+                    |ui| {
+                        if ui.button("Rename").clicked() {
+                            let new_name = self.rename_modal.room_name.trim().to_string();
+                            if !new_name.is_empty() {
+                                self.send_command(BackendCommand::RenameRoom {
+                                    room_id: self.rename_modal.room_id,
+                                    new_name,
+                                });
+                            }
+                            ui.close();
                         }
-                        ui.close();
-                    }
-                    if ui.button("Cancel").clicked() { ui.close(); }
-                });
+                        if ui.button("Cancel").clicked() {
+                            ui.close();
+                        }
+                    },
+                );
             });
-            if modal.should_close() { self.rename_modal.open = false; }
+            if modal.should_close() {
+                self.rename_modal.open = false;
+            }
         }
     }
 }

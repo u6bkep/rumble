@@ -90,6 +90,9 @@ message ClientHello {
 // Initial response from server.
 message ServerHello {
   string server_name = 1;
+  // The user_id assigned to this client by the server.
+  // This is determined by the server based on the connection, not claimed by the client.
+  uint64 user_id = 2;
 }
 
 // Chat message sent from client to server.
