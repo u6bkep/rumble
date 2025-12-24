@@ -335,6 +335,11 @@ impl BackendHandle {
     ///
     /// Audio commands (StartVoiceCapture, StopVoiceCapture, etc.) are handled
     /// locally by the BackendHandle since audio devices live on the UI thread.
+    /// 
+    /// 
+    /// TODO: this is not actually non blocking. fix.
+    /// 
+    /// 
     pub fn send(&mut self, command: BackendCommand) {
         match command {
             // Audio commands are handled locally
