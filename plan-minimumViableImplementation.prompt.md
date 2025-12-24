@@ -242,5 +242,38 @@ Recommendation: The backend crate should expose a proper event-driven API or cal
      occurs, client requests full state resync. The hash is computed over canonically
      sorted room/user data for determinism across different orderings.
 
-8. clean up room id usage. the server should remember what room a user was in last and place them there when the client re connects. defaulting to the root. channels should use a UUID rather than an incrementing number, except root is always 0.
+8. ~~clean up room id usage~~ **PARTIALLY DONE (2025-12-24)**
+   - **Changed room IDs from incrementing u64 to UUIDs**:
+     - Added `uuid` crate (v1.19.0 with v4 feature) to api, server, backend crates
+     - `RoomId` proto changed from `uint64 value` to `bytes uuid` (16 bytes)
+     - `ROOT_ROOM_UUID` is `Uuid::nil()` (all zeros) - the permanent root room
+   - **API crate UUID helpers**:
+     - `room_id_from_uuid(uuid)` - creates RoomId proto from Uuid
+     - `uuid_from_room_id(&RoomId)` - extracts Uuid from RoomId proto
+     - `root_room_id()` - returns the root room RoomId
+     - `is_root_room(&RoomId)` - checks if a room is the root
+     - `new_room_id()` - generates a new random UUID v4 room ID
+   - **Server updated**:
+     - `StateData.memberships` now uses `Vec<(u64, Uuid)>` instead of `Vec<(u64, u64)>`
+     - `create_room()` generates UUID v4 and returns `Uuid`
+     - `delete_room()`, `rename_room()`, `set_user_room()`, `get_user_room()` use `Uuid`
+     - Root room created with `ROOT_ROOM_UUID` on server start
+   - **Backend updated**:
+     - `RoomSnapshot.current_room_id` changed to `Option<Uuid>`
+     - `BackendCommand::JoinRoom`, `DeleteRoom`, `RenameRoom` use `room_uuid: Uuid`
+     - `ConnectionState.current_room_id` changed to `Option<Uuid>`
+     - `users_in_room(uuid)`, `is_user_in_room(user_id, uuid)`, `get_room(uuid)` use Uuid
+   - **UI updated**:
+     - Room list uses `api::uuid_from_room_id()` to extract UUIDs
+     - All room operations use `room_uuid` instead of `room_id`
+     - Root room check uses `api::ROOT_ROOM_UUID`
+   - **Tests updated**:
+     - All 28 integration tests pass
+     - All 22 unit tests pass
+   - **Not yet implemented** (requires Phase 3 persistence):
+     - Server remembering user's last room by public key
+     - Placing users in their last room on reconnect (defaults to root for now)
+   - **Notes:** The complete "remember last room" feature requires authentication
+     (to identify users by public key) and persistence (to store last room). Currently
+     all users are placed in ROOT_ROOM_UUID on connect.
 9. fix unbounded buffer on audio transmission. gracefully handle slow connections. this will later be improved by varying opus bitrate based on network conditions, but for now just drop old frames if the network is slow.

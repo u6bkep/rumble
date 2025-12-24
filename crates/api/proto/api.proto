@@ -8,8 +8,11 @@ message Login {
   string username = 1; // placeholder, real auth in phase 3
 }
 
+// RoomId is a 16-byte UUID.
+// The Root room always has UUID 0 (all zeros).
+// New rooms are assigned random UUIDs.
 message RoomId {
-  uint64 value = 1;
+  bytes uuid = 1;  // 16 bytes
 }
 
 message UserId {
@@ -66,7 +69,8 @@ message VoiceDatagram {
   optional uint64 sender_id = 10;
   
   // Room ID where this audio originated (set by server based on sender's room)
-  optional uint64 room_id = 11;
+  // This is a UUID (16 bytes)
+  optional bytes room_id = 11;
 }
 
 // Extend the existing ServerEvent with additional variants for Phase 2.
@@ -195,8 +199,8 @@ message UserPresenceChanged {
 
 // Room management requests
 message CreateRoom { string name = 1; }
-message DeleteRoom { uint64 room_id = 1; }
-message RenameRoom { uint64 room_id = 1; string new_name = 2; }
+message DeleteRoom { RoomId room_id = 1; }
+message RenameRoom { RoomId room_id = 1; string new_name = 2; }
 
 // Request a full state resync from the server.
 // Sent by the client when it detects a state hash mismatch.

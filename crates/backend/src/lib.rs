@@ -35,7 +35,7 @@
 use anyhow::Result;
 use api::proto::{self, envelope::Payload};
 pub use api::proto::VoiceDatagram;
-use api::{encode_frame, try_decode_frame};
+use api::{encode_frame, try_decode_frame, room_id_from_uuid, uuid_from_room_id, ROOT_ROOM_UUID};
 use bytes::BytesMut;
 use prost::Message;
 use quinn::Endpoint;
@@ -47,6 +47,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::sync::mpsc;
 use tokio::task;
 use tracing::{error, info, debug};
+use uuid::Uuid;
 
 // Audio subsystem
 pub mod audio;
@@ -86,7 +87,7 @@ impl ConnectConfig {
 pub struct RoomSnapshot {
     pub rooms: Vec<proto::RoomInfo>,
     pub users: Vec<proto::UserPresence>,
-    pub current_room_id: Option<u64>,
+    pub current_room_id: Option<Uuid>,
     /// Last received state hash from the server.
     pub last_state_hash: Vec<u8>,
 }
@@ -102,12 +103,12 @@ fn apply_state_update(snap: &mut RoomSnapshot, update: proto::state_update::Upda
         Update::UserMoved(um) => {
             // Update the user's room in the presence list
             let user_id = um.user_id.as_ref().map(|u| u.value);
-            let new_room_id = um.to_room_id.as_ref().map(|r| r.value);
+            let new_room_uuid = um.to_room_id.as_ref().and_then(uuid_from_room_id);
             
-            if let (Some(uid), Some(new_rid)) = (user_id, new_room_id) {
+            if let (Some(uid), Some(new_uuid)) = (user_id, new_room_uuid) {
                 for user in &mut snap.users {
                     if user.user_id.as_ref().map(|u| u.value) == Some(uid) {
-                        user.room_id = Some(proto::RoomId { value: new_rid });
+                        user.room_id = Some(room_id_from_uuid(new_uuid));
                         break;
                     }
                 }
@@ -121,32 +122,36 @@ fn apply_state_update(snap: &mut RoomSnapshot, update: proto::state_update::Upda
         }
         Update::RoomDeleted(rd) => {
             // Remove the room and move users to fallback room
-            let room_id = rd.room_id.as_ref().map(|r| r.value);
-            let fallback_id = rd.fallback_room_id.as_ref().map(|r| r.value).unwrap_or(1);
+            let room_uuid = rd.room_id.as_ref().and_then(uuid_from_room_id);
+            let fallback_uuid = rd.fallback_room_id.as_ref()
+                .and_then(uuid_from_room_id)
+                .unwrap_or(ROOT_ROOM_UUID);
             
-            if let Some(rid) = room_id {
-                snap.rooms.retain(|r| r.id.as_ref().map(|i| i.value) != Some(rid));
+            if let Some(uuid) = room_uuid {
+                snap.rooms.retain(|r| {
+                    r.id.as_ref().and_then(uuid_from_room_id) != Some(uuid)
+                });
                 
                 // Move users from deleted room to fallback
                 for user in &mut snap.users {
-                    if user.room_id.as_ref().map(|r| r.value) == Some(rid) {
-                        user.room_id = Some(proto::RoomId { value: fallback_id });
+                    if user.room_id.as_ref().and_then(uuid_from_room_id) == Some(uuid) {
+                        user.room_id = Some(room_id_from_uuid(fallback_uuid));
                     }
                 }
                 
                 // Update current_room_id if we were in the deleted room
-                if snap.current_room_id == Some(rid) {
-                    snap.current_room_id = Some(fallback_id);
+                if snap.current_room_id == Some(uuid) {
+                    snap.current_room_id = Some(fallback_uuid);
                 }
             }
         }
         Update::RoomRenamed(rr) => {
             // Update the room name
-            let room_id = rr.room_id.as_ref().map(|r| r.value);
+            let room_uuid = rr.room_id.as_ref().and_then(uuid_from_room_id);
             
-            if let Some(rid) = room_id {
+            if let Some(uuid) = room_uuid {
                 for room in &mut snap.rooms {
-                    if room.id.as_ref().map(|i| i.value) == Some(rid) {
+                    if room.id.as_ref().and_then(uuid_from_room_id) == Some(uuid) {
                         room.name = rr.new_name.clone();
                         break;
                     }
@@ -283,15 +288,15 @@ impl Client {
             send_stream.write_all(&frame).await?;
         }
 
-        // Auto-join Root (room id 1) immediately so server pushes room state.
+        // Auto-join Root room immediately so server pushes room state.
         {
             let join_env = proto::Envelope {
                 state_hash: Vec::new(),
-                payload: Some(Payload::JoinRoom(proto::JoinRoom { room_id: Some(proto::RoomId { value: 1 }) })),
+                payload: Some(Payload::JoinRoom(proto::JoinRoom { room_id: Some(room_id_from_uuid(ROOT_ROOM_UUID)) })),
             };
             let join_frame = encode_frame(&join_env);
             let mut send_stream = send_arc.lock().await;
-            info!("backend: auto-joining room 1 on connect");
+            info!("backend: auto-joining Root room on connect");
             send_stream.write_all(&join_frame).await?;
         }
 
@@ -322,7 +327,7 @@ impl Client {
 
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         let snapshot = Arc::new(tokio::sync::Mutex::new(RoomSnapshot {
-            current_room_id: Some(1),
+            current_room_id: Some(ROOT_ROOM_UUID),
             ..Default::default()
         }));
 
@@ -381,7 +386,9 @@ impl Client {
                                     
                                     if snap.current_room_id.is_none() {
                                         // default to Root if present
-                                        snap.current_room_id = snap.rooms.iter().find_map(|r| r.id.as_ref().map(|i| i.value)).or(Some(1));
+                                        snap.current_room_id = snap.rooms.iter()
+                                            .find_map(|r| r.id.as_ref().and_then(uuid_from_room_id))
+                                            .or(Some(ROOT_ROOM_UUID));
                                     }
                                     
                                     // Compute local hash from the new state
@@ -599,18 +606,18 @@ impl Client {
         std::mem::replace(&mut self.events_rx, dummy_rx)
     }
 
-    /// Request to join a room by id.
-    pub async fn join_room(&self, room_id: u64) -> Result<()> {
+    /// Request to join a room by UUID.
+    pub async fn join_room(&self, room_uuid: Uuid) -> Result<()> {
         let env = proto::Envelope {
             state_hash: Vec::new(),
-            payload: Some(Payload::JoinRoom(proto::JoinRoom { room_id: Some(proto::RoomId { value: room_id }) })),
+            payload: Some(Payload::JoinRoom(proto::JoinRoom { room_id: Some(room_id_from_uuid(room_uuid)) })),
         };
         let frame = encode_frame(&env);
         let mut send = self.send.lock().await;
         send.write_all(&frame).await?;
         {
             let mut snap = self.snapshot.lock().await;
-            snap.current_room_id = Some(room_id);
+            snap.current_room_id = Some(room_uuid);
         }
         Ok(())
     }
@@ -626,14 +633,14 @@ impl Client {
         let mut send = self.send.lock().await; send.write_all(&frame).await?; Ok(())
     }
 
-    pub async fn delete_room(&self, room_id: u64) -> Result<()> {
-        let env = proto::Envelope { state_hash: Vec::new(), payload: Some(Payload::DeleteRoom(proto::DeleteRoom { room_id })) };
+    pub async fn delete_room(&self, room_uuid: Uuid) -> Result<()> {
+        let env = proto::Envelope { state_hash: Vec::new(), payload: Some(Payload::DeleteRoom(proto::DeleteRoom { room_id: Some(room_id_from_uuid(room_uuid)) })) };
         let frame = encode_frame(&env);
         let mut send = self.send.lock().await; send.write_all(&frame).await?; Ok(())
     }
 
-    pub async fn rename_room(&self, room_id: u64, new_name: &str) -> Result<()> {
-        let env = proto::Envelope { state_hash: Vec::new(), payload: Some(Payload::RenameRoom(proto::RenameRoom { room_id, new_name: new_name.to_string() })) };
+    pub async fn rename_room(&self, room_uuid: Uuid, new_name: &str) -> Result<()> {
+        let env = proto::Envelope { state_hash: Vec::new(), payload: Some(Payload::RenameRoom(proto::RenameRoom { room_id: Some(room_id_from_uuid(room_uuid)), new_name: new_name.to_string() })) };
         let frame = encode_frame(&env);
         let mut send = self.send.lock().await; send.write_all(&frame).await?; Ok(())
     }
@@ -792,7 +799,7 @@ impl Client {
         let mut snap = self.snapshot.lock().await;
         // Add a fake room that doesn't exist on the server
         snap.rooms.push(proto::RoomInfo {
-            id: Some(proto::RoomId { value: 99999 }),
+            id: Some(room_id_from_uuid(Uuid::new_v4())),
             name: "FakeRoom".to_string(),
         });
         info!("backend: corrupted local state for testing");

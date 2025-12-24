@@ -55,7 +55,7 @@ fn main() -> eframe::Result<()> {
 #[derive(Default)]
 struct RenameModalState {
     open: bool,
-    room_id: u64,
+    room_uuid: Option<Uuid>,
     room_name: String,
 }
 
@@ -587,35 +587,39 @@ impl eframe::App for MyApp {
                 ui.horizontal(|ui| {
                     ui.label("No rooms received yet.");
                     if ui.button("Join Root").clicked() {
-                        self.send_command(BackendCommand::JoinRoom { room_id: 1 });
+                        self.send_command(BackendCommand::JoinRoom { room_uuid: api::ROOT_ROOM_UUID });
                     }
                     if ui.button("Refresh").clicked() {
-                        self.send_command(BackendCommand::JoinRoom { room_id: 1 });
+                        self.send_command(BackendCommand::JoinRoom { room_uuid: api::ROOT_ROOM_UUID });
                     }
                 });
                 ui.separator();
             }
             egui::ScrollArea::vertical().show(ui, |ui| {
                 for room in state.rooms.iter() {
-                    let rid = room.id.as_ref().map(|r| r.value).unwrap_or(0);
-                    let is_current = state.current_room_id == Some(rid);
+                    let room_uuid = room.id.as_ref().and_then(api::uuid_from_room_id);
+                    let is_current = state.current_room_id == room_uuid;
                     let mut text = room.name.clone();
                     if is_current {
                         text.push_str("  (current)");
                     }
                     let resp = ui.selectable_label(is_current, text);
                     if resp.clicked() {
-                        self.send_command(BackendCommand::JoinRoom { room_id: rid });
+                        if let Some(uuid) = room_uuid {
+                            self.send_command(BackendCommand::JoinRoom { room_uuid: uuid });
+                        }
                     }
                     resp.context_menu(|ui| {
                         if ui.button("Join").clicked() {
-                            self.send_command(BackendCommand::JoinRoom { room_id: rid });
+                            if let Some(uuid) = room_uuid {
+                                self.send_command(BackendCommand::JoinRoom { room_uuid: uuid });
+                            }
                             ui.close();
                         }
                         if ui.button("Rename...").clicked() {
                             self.rename_modal = RenameModalState {
                                 open: true,
-                                room_id: rid,
+                                room_uuid,
                                 room_name: room.name.clone(),
                             };
                             ui.close();
@@ -626,37 +630,42 @@ impl eframe::App for MyApp {
                             });
                             ui.close();
                         }
-                        if rid != 1 && ui.button("Delete Room").clicked() {
-                            self.send_command(BackendCommand::DeleteRoom { room_id: rid });
+                        let is_root = room_uuid == Some(api::ROOT_ROOM_UUID);
+                        if !is_root && ui.button("Delete Room").clicked() {
+                            if let Some(uuid) = room_uuid {
+                                self.send_command(BackendCommand::DeleteRoom { room_uuid: uuid });
+                            }
                             ui.close();
                         }
                     });
                     // Show users in this room
                     CollapsingHeader::new("Users")
-                        .id_salt(rid)
+                        .id_salt(room_uuid)
                         .default_open(is_current)
                         .show(ui, |ui| {
-                            for up in state.users_in_room(rid) {
-                                let user_id = up.user_id.as_ref().map(|id| id.value).unwrap_or(0);
-                                let is_self = state.my_user_id == Some(user_id);
+                            if let Some(uuid) = room_uuid {
+                                for up in state.users_in_room(uuid) {
+                                    let user_id = up.user_id.as_ref().map(|id| id.value).unwrap_or(0);
+                                    let is_self = state.my_user_id == Some(user_id);
 
-                                // Check if user is talking
-                                // For self, use push_to_talk_active; for others, check talking_users
-                                let is_talking = if is_self {
-                                    self.push_to_talk_active
-                                } else {
-                                    self.talking_users.contains_key(&user_id)
-                                };
-
-                                ui.horizontal(|ui| {
-                                    if is_talking {
-                                        ui.colored_label(egui::Color32::LIGHT_GREEN, "🎤");
+                                    // Check if user is talking
+                                    // For self, use push_to_talk_active; for others, check talking_users
+                                    let is_talking = if is_self {
+                                        self.push_to_talk_active
                                     } else {
-                                        ui.colored_label(egui::Color32::DARK_GRAY, "🔇");
-                                    }
-                                    // let label = format!("{}",up.username);
-                                    ui.label(up.username.to_owned());
-                                });
+                                        self.talking_users.contains_key(&user_id)
+                                    };
+
+                                    ui.horizontal(|ui| {
+                                        if is_talking {
+                                            ui.colored_label(egui::Color32::LIGHT_GREEN, "🎤");
+                                        } else {
+                                            ui.colored_label(egui::Color32::DARK_GRAY, "🔇");
+                                        }
+                                        // let label = format!("{}",up.username);
+                                        ui.label(up.username.to_owned());
+                                    });
+                                }
                             }
                         });
                     ui.separator();
@@ -950,10 +959,12 @@ impl eframe::App for MyApp {
                         if ui.button("Rename").clicked() {
                             let new_name = self.rename_modal.room_name.trim().to_string();
                             if !new_name.is_empty() {
-                                self.send_command(BackendCommand::RenameRoom {
-                                    room_id: self.rename_modal.room_id,
-                                    new_name,
-                                });
+                                if let Some(uuid) = self.rename_modal.room_uuid {
+                                    self.send_command(BackendCommand::RenameRoom {
+                                        room_uuid: uuid,
+                                        new_name,
+                                    });
+                                }
                             }
                             ui.close();
                         }

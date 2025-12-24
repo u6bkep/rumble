@@ -16,12 +16,14 @@
 //! The voice/datagram path avoids holding any locks during I/O operations
 //! by taking snapshots of needed data first.
 
-use api::proto::{RoomId, RoomInfo, UserId, UserPresence};
+use api::proto::{RoomInfo, UserId, UserPresence};
+use api::{root_room_id, room_id_from_uuid, uuid_from_room_id, ROOT_ROOM_UUID};
 use dashmap::DashMap;
 use quinn::Connection;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
+use uuid::Uuid;
 
 /// Handle to a connected client's control stream.
 ///
@@ -78,17 +80,17 @@ impl ClientHandle {
 /// This consolidates rooms and memberships to avoid nested lock acquisition.
 #[derive(Debug, Clone)]
 pub struct StateData {
-    /// Room definitions. Room ID 1 is always "Root".
+    /// Room definitions. The Root room always has UUID 0.
     pub rooms: Vec<RoomInfo>,
-    /// Mapping of user_id to room_id for room membership.
-    pub memberships: Vec<(u64 /* user_id */, u64 /* room_id */)>,
+    /// Mapping of user_id to room UUID for room membership.
+    pub memberships: Vec<(u64 /* user_id */, Uuid /* room_uuid */)>,
 }
 
 impl StateData {
     fn new() -> Self {
         Self {
             rooms: vec![RoomInfo {
-                id: Some(RoomId { value: 1 }),
+                id: Some(root_room_id()),
                 name: "Root".to_string(),
             }],
             memberships: Vec::new(),
@@ -183,10 +185,10 @@ impl ServerState {
     }
 
     /// Add a user to a room, replacing any existing membership.
-    pub async fn set_user_room(&self, user_id: u64, room_id: u64) {
+    pub async fn set_user_room(&self, user_id: u64, room_uuid: Uuid) {
         let mut data = self.state_data.write().await;
         data.memberships.retain(|(uid, _)| *uid != user_id);
-        data.memberships.push((user_id, room_id));
+        data.memberships.push((user_id, room_uuid));
     }
 
     /// Remove a user from all rooms.
@@ -196,7 +198,7 @@ impl ServerState {
     }
 
     /// Get the room a user is currently in (read-only, fast).
-    pub async fn get_user_room(&self, user_id: u64) -> Option<u64> {
+    pub async fn get_user_room(&self, user_id: u64) -> Option<Uuid> {
         let data = self.state_data.read().await;
         data.memberships
             .iter()
@@ -205,51 +207,45 @@ impl ServerState {
     }
 
     /// Get all users in a specific room.
-    pub async fn get_room_members(&self, room_id: u64) -> Vec<u64> {
+    pub async fn get_room_members(&self, room_uuid: Uuid) -> Vec<u64> {
         let data = self.state_data.read().await;
         data.memberships
             .iter()
-            .filter(|(_, rid)| *rid == room_id)
+            .filter(|(_, rid)| *rid == room_uuid)
             .map(|(uid, _)| *uid)
             .collect()
     }
 
-    /// Create a new room and return its ID.
-    pub async fn create_room(&self, name: String) -> u64 {
+    /// Create a new room and return its UUID.
+    pub async fn create_room(&self, name: String) -> Uuid {
         let mut data = self.state_data.write().await;
-        let new_id = data
-            .rooms
-            .iter()
-            .filter_map(|r| r.id.as_ref().map(|i| i.value))
-            .max()
-            .unwrap_or(1)
-            + 1;
+        let new_uuid = Uuid::new_v4();
         data.rooms.push(RoomInfo {
-            id: Some(RoomId { value: new_id }),
+            id: Some(room_id_from_uuid(new_uuid)),
             name,
         });
-        new_id
+        new_uuid
     }
 
-    /// Delete a room by ID. Users in the room are moved to Root (room 1).
+    /// Delete a room by UUID. Users in the room are moved to Root.
     /// Returns true if the room was found and deleted.
-    pub async fn delete_room(&self, room_id: u64) -> bool {
+    pub async fn delete_room(&self, room_uuid: Uuid) -> bool {
         // Don't allow deleting the root room
-        if room_id == 1 {
+        if room_uuid == ROOT_ROOM_UUID {
             return false;
         }
 
         let mut data = self.state_data.write().await;
         let before_len = data.rooms.len();
         data.rooms
-            .retain(|r| r.id.as_ref().map(|i| i.value) != Some(room_id));
+            .retain(|r| uuid_from_room_id(r.id.as_ref().unwrap_or(&root_room_id())) != Some(room_uuid));
         let deleted = data.rooms.len() < before_len;
 
         if deleted {
             // Move users from deleted room to Root
             for (_, rid) in data.memberships.iter_mut() {
-                if *rid == room_id {
-                    *rid = 1;
+                if *rid == room_uuid {
+                    *rid = ROOT_ROOM_UUID;
                 }
             }
         }
@@ -258,10 +254,10 @@ impl ServerState {
     }
 
     /// Rename a room. Returns true if the room was found.
-    pub async fn rename_room(&self, room_id: u64, new_name: String) -> bool {
+    pub async fn rename_room(&self, room_uuid: Uuid, new_name: String) -> bool {
         let mut data = self.state_data.write().await;
         for r in data.rooms.iter_mut() {
-            if r.id.as_ref().map(|i| i.value) == Some(room_id) {
+            if uuid_from_room_id(r.id.as_ref().unwrap_or(&root_room_id())) == Some(room_uuid) {
                 r.name = new_name;
                 return true;
             }
@@ -296,7 +292,7 @@ impl ServerState {
                 let username = client.get_username().await;
                 users.push(UserPresence {
                     user_id: Some(UserId { value: uid }),
-                    room_id: Some(RoomId { value: rid }),
+                    room_id: Some(room_id_from_uuid(rid)),
                     username,
                 });
             }
@@ -305,9 +301,9 @@ impl ServerState {
     }
 
     /// Get room membership snapshot for voice relay.
-    /// Returns a map of room_id -> list of user_ids.
+    /// Returns a map of room_uuid -> list of user_ids.
     /// This allows the voice path to determine recipients without holding locks.
-    pub async fn snapshot_room_memberships(&self) -> std::collections::HashMap<u64, Vec<u64>> {
+    pub async fn snapshot_room_memberships(&self) -> std::collections::HashMap<Uuid, Vec<u64>> {
         let data = self.state_data.read().await;
         let mut map = std::collections::HashMap::new();
         for (uid, rid) in &data.memberships {
@@ -326,6 +322,7 @@ impl Default for ServerState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use api::is_root_room;
 
     /// Test that we can create server state and it has the Root room.
     #[tokio::test]
@@ -335,7 +332,7 @@ mod tests {
         let rooms = state.get_rooms().await;
         assert_eq!(rooms.len(), 1);
         assert_eq!(rooms[0].name, "Root");
-        assert_eq!(rooms[0].id.as_ref().unwrap().value, 1);
+        assert!(is_root_room(rooms[0].id.as_ref().unwrap()));
     }
 
     /// Test user ID allocation is sequential and lock-free.
@@ -353,13 +350,14 @@ mod tests {
         assert_eq!(id3, 3);
     }
 
-    /// Test room creation.
+    /// Test room creation generates UUIDs.
     #[tokio::test]
     async fn test_room_creation() {
         let state = ServerState::new();
 
-        let room_id = state.create_room("Test Room".to_string()).await;
-        assert_eq!(room_id, 2); // Root is 1, so new room is 2
+        let room_uuid = state.create_room("Test Room".to_string()).await;
+        // Room should have a valid non-root UUID
+        assert_ne!(room_uuid, ROOT_ROOM_UUID);
 
         let rooms = state.get_rooms().await;
         assert_eq!(rooms.len(), 2);
@@ -372,18 +370,18 @@ mod tests {
         let state = ServerState::new();
 
         // Create a room and put a user in it
-        let room_id = state.create_room("Temp Room".to_string()).await;
-        state.set_user_room(1, room_id).await;
+        let room_uuid = state.create_room("Temp Room".to_string()).await;
+        state.set_user_room(1, room_uuid).await;
 
         // Verify user is in the new room
-        assert_eq!(state.get_user_room(1).await, Some(room_id));
+        assert_eq!(state.get_user_room(1).await, Some(room_uuid));
 
         // Delete the room
-        let deleted = state.delete_room(room_id).await;
+        let deleted = state.delete_room(room_uuid).await;
         assert!(deleted);
 
         // User should be moved to Root
-        assert_eq!(state.get_user_room(1).await, Some(1));
+        assert_eq!(state.get_user_room(1).await, Some(ROOT_ROOM_UUID));
 
         // Room should be gone
         let rooms = state.get_rooms().await;
@@ -395,7 +393,7 @@ mod tests {
     async fn test_cannot_delete_root() {
         let state = ServerState::new();
 
-        let deleted = state.delete_room(1).await;
+        let deleted = state.delete_room(ROOT_ROOM_UUID).await;
         assert!(!deleted);
 
         let rooms = state.get_rooms().await;
@@ -443,14 +441,14 @@ mod tests {
     async fn test_room_rename() {
         let state = ServerState::new();
 
-        let room_id = state.create_room("Old Name".to_string()).await;
-        let renamed = state.rename_room(room_id, "New Name".to_string()).await;
+        let room_uuid = state.create_room("Old Name".to_string()).await;
+        let renamed = state.rename_room(room_uuid, "New Name".to_string()).await;
         assert!(renamed);
 
         let rooms = state.get_rooms().await;
         let room = rooms
             .iter()
-            .find(|r| r.id.as_ref().unwrap().value == room_id);
+            .find(|r| uuid_from_room_id(r.id.as_ref().unwrap()) == Some(room_uuid));
         assert_eq!(room.unwrap().name, "New Name");
     }
 
@@ -459,7 +457,8 @@ mod tests {
     async fn test_rename_nonexistent_room() {
         let state = ServerState::new();
 
-        let renamed = state.rename_room(999, "Whatever".to_string()).await;
+        let fake_uuid = Uuid::new_v4();
+        let renamed = state.rename_room(fake_uuid, "Whatever".to_string()).await;
         assert!(!renamed);
     }
 
@@ -496,12 +495,12 @@ mod tests {
         let state = ServerState::new();
 
         // Create some rooms
-        state.create_room("Room 1".to_string()).await;
-        state.create_room("Room 2".to_string()).await;
+        let room1 = state.create_room("Room 1".to_string()).await;
+        let room2 = state.create_room("Room 2".to_string()).await;
 
         // Add memberships
-        state.set_user_room(1, 2).await;
-        state.set_user_room(2, 3).await;
+        state.set_user_room(1, room1).await;
+        state.set_user_room(2, room2).await;
 
         // Get snapshot
         let snapshot = state.snapshot_state().await;
@@ -519,11 +518,11 @@ mod tests {
         let room_a = state.create_room("Room A".to_string()).await;
         state.set_user_room(1, room_a).await;
         state.set_user_room(2, room_a).await;
-        state.set_user_room(3, 1).await; // Root
+        state.set_user_room(3, ROOT_ROOM_UUID).await; // Root
 
         let map = state.snapshot_room_memberships().await;
 
         assert_eq!(map.get(&room_a).unwrap().len(), 2);
-        assert_eq!(map.get(&1).unwrap().len(), 1);
+        assert_eq!(map.get(&ROOT_ROOM_UUID).unwrap().len(), 1);
     }
 }

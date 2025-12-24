@@ -5,6 +5,11 @@
 //! needing to manage async tasks, channels, or the Client directly.
 
 use api::proto::{RoomInfo, UserPresence};
+use api::uuid_from_room_id;
+use uuid::Uuid;
+
+/// Re-export ROOT_ROOM_UUID for convenience
+pub use api::ROOT_ROOM_UUID;
 
 /// Connection lifecycle status.
 /// 
@@ -63,21 +68,21 @@ pub enum BackendCommand {
     SendChat {
         text: String,
     },
-    /// Join a room by ID.
+    /// Join a room by UUID.
     JoinRoom {
-        room_id: u64,
+        room_uuid: Uuid,
     },
     /// Create a new room.
     CreateRoom {
         name: String,
     },
-    /// Delete a room by ID.
+    /// Delete a room by UUID.
     DeleteRoom {
-        room_id: u64,
+        room_uuid: Uuid,
     },
     /// Rename a room.
     RenameRoom {
-        room_id: u64,
+        room_uuid: Uuid,
         new_name: String,
     },
     /// Send a voice frame (raw audio bytes for now, will be Opus later).
@@ -152,8 +157,8 @@ pub struct ConnectionState {
     pub my_user_id: Option<u64>,
     /// Our client name.
     pub my_client_name: String,
-    /// Current room ID (if in a room).
-    pub current_room_id: Option<u64>,
+    /// Current room UUID (if in a room).
+    pub current_room_id: Option<Uuid>,
     /// List of rooms.
     pub rooms: Vec<RoomInfo>,
     /// List of user presences.
@@ -162,72 +167,78 @@ pub struct ConnectionState {
 
 impl ConnectionState {
     /// Get users in a specific room.
-    pub fn users_in_room(&self, room_id: u64) -> Vec<&UserPresence> {
+    pub fn users_in_room(&self, room_uuid: Uuid) -> Vec<&UserPresence> {
         self.users
             .iter()
-            .filter(|u| u.room_id.as_ref().map(|r| r.value) == Some(room_id))
+            .filter(|u| u.room_id.as_ref().and_then(uuid_from_room_id) == Some(room_uuid))
             .collect()
     }
     
     /// Check if a user is in a room.
-    pub fn is_user_in_room(&self, user_id: u64, room_id: u64) -> bool {
+    pub fn is_user_in_room(&self, user_id: u64, room_uuid: Uuid) -> bool {
         self.users.iter().any(|u| {
             u.user_id.as_ref().map(|id| id.value) == Some(user_id)
-                && u.room_id.as_ref().map(|r| r.value) == Some(room_id)
+                && u.room_id.as_ref().and_then(uuid_from_room_id) == Some(room_uuid)
         })
     }
     
-    /// Get room by ID.
-    pub fn get_room(&self, room_id: u64) -> Option<&RoomInfo> {
-        self.rooms.iter().find(|r| r.id.as_ref().map(|id| id.value) == Some(room_id))
+    /// Get room by UUID.
+    pub fn get_room(&self, room_uuid: Uuid) -> Option<&RoomInfo> {
+        self.rooms.iter().find(|r| r.id.as_ref().and_then(uuid_from_room_id) == Some(room_uuid))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use api::proto::{RoomId, UserId};
+    use api::proto::UserId;
+    use api::room_id_from_uuid;
+    use uuid::Uuid;
 
     #[test]
     fn test_connection_state_users_in_room() {
+        let room1_uuid = ROOT_ROOM_UUID;
+        let room2_uuid = Uuid::new_v4();
+        
         let state = ConnectionState {
             status: ConnectionStatus::Connected,
             connected: true,
             my_user_id: Some(1),
             my_client_name: "test".to_string(),
-            current_room_id: Some(1),
+            current_room_id: Some(room1_uuid),
             rooms: vec![
-                RoomInfo { id: Some(RoomId { value: 1 }), name: "Root".to_string() },
-                RoomInfo { id: Some(RoomId { value: 2 }), name: "Room2".to_string() },
+                RoomInfo { id: Some(room_id_from_uuid(room1_uuid)), name: "Root".to_string() },
+                RoomInfo { id: Some(room_id_from_uuid(room2_uuid)), name: "Room2".to_string() },
             ],
             users: vec![
-                UserPresence { user_id: Some(UserId { value: 1 }), room_id: Some(RoomId { value: 1 }), username: "user1".to_string() },
-                UserPresence { user_id: Some(UserId { value: 2 }), room_id: Some(RoomId { value: 1 }), username: "user2".to_string() },
-                UserPresence { user_id: Some(UserId { value: 3 }), room_id: Some(RoomId { value: 2 }), username: "user3".to_string() },
+                UserPresence { user_id: Some(UserId { value: 1 }), room_id: Some(room_id_from_uuid(room1_uuid)), username: "user1".to_string() },
+                UserPresence { user_id: Some(UserId { value: 2 }), room_id: Some(room_id_from_uuid(room1_uuid)), username: "user2".to_string() },
+                UserPresence { user_id: Some(UserId { value: 3 }), room_id: Some(room_id_from_uuid(room2_uuid)), username: "user3".to_string() },
             ],
         };
         
-        let users_in_room1 = state.users_in_room(1);
+        let users_in_room1 = state.users_in_room(room1_uuid);
         assert_eq!(users_in_room1.len(), 2);
         
-        let users_in_room2 = state.users_in_room(2);
+        let users_in_room2 = state.users_in_room(room2_uuid);
         assert_eq!(users_in_room2.len(), 1);
         assert_eq!(users_in_room2[0].username, "user3");
     }
     
     #[test]
     fn test_connection_state_get_room() {
+        let room_uuid = ROOT_ROOM_UUID;
         let state = ConnectionState {
             rooms: vec![
-                RoomInfo { id: Some(RoomId { value: 1 }), name: "Root".to_string() },
+                RoomInfo { id: Some(room_id_from_uuid(room_uuid)), name: "Root".to_string() },
             ],
             ..Default::default()
         };
         
-        let room = state.get_room(1);
+        let room = state.get_room(room_uuid);
         assert!(room.is_some());
         assert_eq!(room.unwrap().name, "Root");
         
-        assert!(state.get_room(999).is_none());
+        assert!(state.get_room(Uuid::new_v4()).is_none());
     }
 }

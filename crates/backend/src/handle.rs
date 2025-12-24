@@ -296,8 +296,8 @@ impl BackendHandle {
         self.state.my_user_id
     }
     
-    /// Get the current room ID if in a room.
-    pub fn current_room_id(&self) -> Option<u64> {
+    /// Get the current room UUID if in a room.
+    pub fn current_room_id(&self) -> Option<uuid::Uuid> {
         self.state.current_room_id
     }
     
@@ -557,9 +557,9 @@ async fn run_backend_task(
                         }
                     }
                     
-                    BackendCommand::JoinRoom { room_id } => {
+                    BackendCommand::JoinRoom { room_uuid } => {
                         if let Some(c) = &client {
-                            if let Err(e) = c.join_room(room_id).await {
+                            if let Err(e) = c.join_room(room_uuid).await {
                                 error!("join_room error: {e}");
                             }
                         }
@@ -573,17 +573,17 @@ async fn run_backend_task(
                         }
                     }
                     
-                    BackendCommand::DeleteRoom { room_id } => {
+                    BackendCommand::DeleteRoom { room_uuid } => {
                         if let Some(c) = &client {
-                            if let Err(e) = c.delete_room(room_id).await {
+                            if let Err(e) = c.delete_room(room_uuid).await {
                                 error!("delete_room error: {e}");
                             }
                         }
                     }
                     
-                    BackendCommand::RenameRoom { room_id, new_name } => {
+                    BackendCommand::RenameRoom { room_uuid, new_name } => {
                         if let Some(c) = &client {
-                            if let Err(e) = c.rename_room(room_id, &new_name).await {
+                            if let Err(e) = c.rename_room(room_uuid, &new_name).await {
                                 error!("rename_room error: {e}");
                             }
                         }

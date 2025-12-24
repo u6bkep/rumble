@@ -280,18 +280,18 @@ async fn test_delete_room() {
     let snap = wait_for_room_named(&client, "ToDelete", 5000).await;
 
     // Find the room ID.
-    let room_id = snap
+    let room_uuid = snap
         .rooms
         .iter()
         .find(|r| r.name == "ToDelete")
         .and_then(|r| r.id.as_ref())
-        .map(|id| id.value)
+        .and_then(api::uuid_from_room_id)
         .expect("ToDelete room should have an ID");
 
     let initial_count = snap.rooms.len();
 
     // Delete the room.
-    client.delete_room(room_id).await.expect("delete_room should succeed");
+    client.delete_room(room_uuid).await.expect("delete_room should succeed");
 
     // Wait for room count to decrease.
     let snap = wait_for_room_count(&client, initial_count - 1, 5000).await;
@@ -323,16 +323,16 @@ async fn test_rename_room() {
     client.create_room("OldName").await.expect("create_room should succeed");
     let snap = wait_for_room_named(&client, "OldName", 5000).await;
 
-    let room_id = snap
+    let room_uuid = snap
         .rooms
         .iter()
         .find(|r| r.name == "OldName")
         .and_then(|r| r.id.as_ref())
-        .map(|id| id.value)
+        .and_then(api::uuid_from_room_id)
         .expect("OldName room should have an ID");
 
     // Rename the room.
-    client.rename_room(room_id, "NewName").await.expect("rename_room should succeed");
+    client.rename_room(room_uuid, "NewName").await.expect("rename_room should succeed");
 
     // Wait for the new name to appear.
     let snap = wait_for_room_named(&client, "NewName", 5000).await;
@@ -369,22 +369,22 @@ async fn test_join_room() {
     client.create_room("JoinTarget").await.expect("create_room should succeed");
     let snap = wait_for_room_named(&client, "JoinTarget", 5000).await;
 
-    let room_id = snap
+    let room_uuid = snap
         .rooms
         .iter()
         .find(|r| r.name == "JoinTarget")
         .and_then(|r| r.id.as_ref())
-        .map(|id| id.value)
+        .and_then(api::uuid_from_room_id)
         .expect("JoinTarget room should have an ID");
 
     // Join the room.
-    client.join_room(room_id).await.expect("join_room should succeed");
+    client.join_room(room_uuid).await.expect("join_room should succeed");
 
     // Check that our local snapshot reflects the current room.
     let snap = client.get_snapshot().await;
     assert_eq!(
         snap.current_room_id,
-        Some(room_id),
+        Some(room_uuid),
         "current_room_id should be the joined room"
     );
 }
@@ -469,18 +469,18 @@ async fn test_chat_messages_scoped_to_room() {
     client1.create_room("PrivateRoom").await.expect("create_room should succeed");
     let snap = wait_for_room_named(&client1, "PrivateRoom", 5000).await;
 
-    let private_room_id = snap
+    let private_room_uuid = snap
         .rooms
         .iter()
         .find(|r| r.name == "PrivateRoom")
         .and_then(|r| r.id.as_ref())
-        .map(|id| id.value)
+        .and_then(api::uuid_from_room_id)
         .expect("PrivateRoom should have an ID");
 
     // Alice and Bob join the private room.
-    client1.join_room(private_room_id).await.expect("join should succeed");
-    client2.join_room(private_room_id).await.expect("join should succeed");
-    // Charlie stays in Root (room 1).
+    client1.join_room(private_room_uuid).await.expect("join should succeed");
+    client2.join_room(private_room_uuid).await.expect("join should succeed");
+    // Charlie stays in Root.
 
     // Give time for room state to propagate.
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -1020,18 +1020,18 @@ async fn test_voice_datagram_room_scoping() {
     client1.create_room("PrivateVoice").await.expect("create_room should succeed");
     let snap = wait_for_room_named(&client1, "PrivateVoice", 5000).await;
 
-    let private_room_id = snap
+    let private_room_uuid = snap
         .rooms
         .iter()
         .find(|r| r.name == "PrivateVoice")
         .and_then(|r| r.id.as_ref())
-        .map(|id| id.value)
+        .and_then(api::uuid_from_room_id)
         .expect("PrivateVoice should have an ID");
 
     // Alice and Bob join the private room.
-    client1.join_room(private_room_id).await.expect("join should succeed");
-    client2.join_room(private_room_id).await.expect("join should succeed");
-    // Charlie stays in Root (room 1).
+    client1.join_room(private_room_uuid).await.expect("join should succeed");
+    client2.join_room(private_room_uuid).await.expect("join should succeed");
+    // Charlie stays in Root.
 
     tokio::time::sleep(Duration::from_millis(300)).await;
 
@@ -1481,15 +1481,15 @@ async fn test_incremental_updates_applied_correctly() {
     let snap = client.get_snapshot().await;
     assert_eq!(snap.rooms.len(), initial_room_count + 2, "should have two more rooms");
     
-    // Find room ID for TestRoom1
-    let room1_id = snap.rooms.iter()
+    // Find room UUID for TestRoom1
+    let room1_uuid = snap.rooms.iter()
         .find(|r| r.name == "TestRoom1")
         .and_then(|r| r.id.as_ref())
-        .map(|id| id.value)
+        .and_then(api::uuid_from_room_id)
         .expect("TestRoom1 should exist");
     
     // Rename the room - server sends incremental RoomRenamed update
-    client.rename_room(room1_id, "RenamedRoom").await.expect("rename_room should succeed");
+    client.rename_room(room1_uuid, "RenamedRoom").await.expect("rename_room should succeed");
     wait_for_room_named(&client, "RenamedRoom", 5000).await;
     
     let snap = client.get_snapshot().await;
@@ -1497,7 +1497,7 @@ async fn test_incremental_updates_applied_correctly() {
     assert!(snap.rooms.iter().any(|r| r.name == "RenamedRoom"), "RenamedRoom should exist");
     
     // Delete the room - server sends incremental RoomDeleted update
-    client.delete_room(room1_id).await.expect("delete_room should succeed");
+    client.delete_room(room1_uuid).await.expect("delete_room should succeed");
     
     // Wait for the room to be gone
     let mut attempts = 0;

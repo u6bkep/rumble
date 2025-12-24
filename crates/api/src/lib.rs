@@ -4,13 +4,50 @@
 //! provides small helpers for framing protobuf messages over QUIC streams.
 
 use bytes::{Buf, BufMut, BytesMut};
+use prost::Message;
+use blake3::Hasher;
+pub use uuid::Uuid;
 
 pub mod proto {
     include!(concat!(env!("OUT_DIR"), "/rumble.api.v1.rs"));
 }
 
-use prost::Message;
-use blake3::Hasher;
+/// The Root room UUID (all zeros).
+/// This is the default room that all users join when connecting.
+pub const ROOT_ROOM_UUID: Uuid = Uuid::nil();
+
+/// Create a RoomId from a UUID.
+pub fn room_id_from_uuid(uuid: Uuid) -> proto::RoomId {
+    proto::RoomId {
+        uuid: uuid.as_bytes().to_vec(),
+    }
+}
+
+/// Extract a UUID from a RoomId.
+/// Returns None if the RoomId's uuid field is not exactly 16 bytes.
+pub fn uuid_from_room_id(room_id: &proto::RoomId) -> Option<Uuid> {
+    if room_id.uuid.len() == 16 {
+        let bytes: [u8; 16] = room_id.uuid.as_slice().try_into().ok()?;
+        Some(Uuid::from_bytes(bytes))
+    } else {
+        None
+    }
+}
+
+/// Create a new RoomId for the Root room (UUID 0).
+pub fn root_room_id() -> proto::RoomId {
+    room_id_from_uuid(ROOT_ROOM_UUID)
+}
+
+/// Check if a RoomId represents the Root room.
+pub fn is_root_room(room_id: &proto::RoomId) -> bool {
+    uuid_from_room_id(room_id).map(|u| u == ROOT_ROOM_UUID).unwrap_or(false)
+}
+
+/// Generate a new random RoomId.
+pub fn new_room_id() -> proto::RoomId {
+    room_id_from_uuid(Uuid::new_v4())
+}
 
 /// Encode a protobuf message into a length-prefixed frame.
 pub fn encode_frame<M: Message>(msg: &M) -> Vec<u8> {
@@ -67,11 +104,11 @@ pub fn compute_room_state_hash(room_state: &proto::RoomState) -> Vec<u8> {
     // Create a canonicalized copy with sorted rooms and users for determinism
     let mut canonical = room_state.clone();
     
-    // Sort rooms by ID for deterministic ordering
+    // Sort rooms by UUID bytes for deterministic ordering
     canonical.rooms.sort_by(|a, b| {
-        let a_id = a.id.as_ref().map(|r| r.value).unwrap_or(0);
-        let b_id = b.id.as_ref().map(|r| r.value).unwrap_or(0);
-        a_id.cmp(&b_id)
+        let a_id = a.id.as_ref().map(|r| r.uuid.as_slice()).unwrap_or(&[]);
+        let b_id = b.id.as_ref().map(|r| r.uuid.as_slice()).unwrap_or(&[]);
+        a_id.cmp(b_id)
     });
     
     // Sort users by user_id for deterministic ordering

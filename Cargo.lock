@@ -259,6 +259,7 @@ dependencies = [
  "prost",
  "prost-build",
  "prost-types",
+ "uuid",
 ]
 
 [[package]]
@@ -515,6 +516,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
  "webpki-roots",
 ]
 
@@ -3514,6 +3516,7 @@ dependencies = [
  "tokio-stream",
  "tracing",
  "tracing-subscriber",
+ "uuid",
  "webpki-roots",
 ]
 

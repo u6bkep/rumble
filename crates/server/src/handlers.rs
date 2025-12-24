@@ -14,6 +14,7 @@ use crate::state::{compute_room_state_hash, ClientHandle, ServerState};
 use anyhow::Result;
 use api::encode_frame;
 use api::proto::{self, envelope::Payload, RoomState, VoiceDatagram};
+use api::{room_id_from_uuid, uuid_from_room_id, ROOT_ROOM_UUID};
 use prost::Message;
 use std::sync::Arc;
 use tracing::{debug, error, info};
@@ -89,7 +90,7 @@ async fn handle_client_hello(
     sender.set_username(ch.client_name.clone()).await;
 
     // Auto-join Root room
-    state.set_user_room(sender.user_id, 1).await;
+    state.set_user_room(sender.user_id, ROOT_ROOM_UUID).await;
 
     // Send ServerHello with assigned user_id
     let reply = proto::Envelope {
@@ -126,7 +127,7 @@ async fn handle_chat_message(
 ) -> Result<()> {
     info!("chat from {}: {}", msg.sender, msg.text);
 
-    let sender_room = state.get_user_room(sender.user_id).await.unwrap_or(1);
+    let sender_room = state.get_user_room(sender.user_id).await.unwrap_or(ROOT_ROOM_UUID);
 
     let broadcast = proto::Envelope {
         state_hash: Vec::new(),
@@ -162,18 +163,20 @@ async fn handle_join_room(
     sender: Arc<ClientHandle>,
     state: Arc<ServerState>,
 ) -> Result<()> {
-    let new_room_id = jr.room_id.map(|r| r.value).unwrap_or(1);
-    let old_room_id = state.get_user_room(sender.user_id).await.unwrap_or(1);
+    let new_room_uuid = jr.room_id.as_ref()
+        .and_then(uuid_from_room_id)
+        .unwrap_or(ROOT_ROOM_UUID);
+    let old_room_uuid = state.get_user_room(sender.user_id).await.unwrap_or(ROOT_ROOM_UUID);
 
-    state.set_user_room(sender.user_id, new_room_id).await;
+    state.set_user_room(sender.user_id, new_room_uuid).await;
 
     // Send incremental update about user moving rooms
     broadcast_state_update(
         &state,
         proto::state_update::Update::UserMoved(proto::UserMoved {
             user_id: Some(proto::UserId { value: sender.user_id }),
-            from_room_id: Some(proto::RoomId { value: old_room_id }),
-            to_room_id: Some(proto::RoomId { value: new_room_id }),
+            from_room_id: Some(room_id_from_uuid(old_room_uuid)),
+            to_room_id: Some(room_id_from_uuid(new_room_uuid)),
         }),
     ).await?;
 
@@ -191,11 +194,11 @@ async fn handle_disconnect(d: proto::Disconnect, sender: Arc<ClientHandle>) -> R
 /// Handle create room request.
 async fn handle_create_room(cr: proto::CreateRoom, state: Arc<ServerState>) -> Result<()> {
     info!("CreateRoom: {}", cr.name);
-    let room_id = state.create_room(cr.name.clone()).await;
+    let room_uuid = state.create_room(cr.name.clone()).await;
     
     // Send incremental update to all clients
     let room_info = proto::RoomInfo {
-        id: Some(proto::RoomId { value: room_id }),
+        id: Some(room_id_from_uuid(room_uuid)),
         name: cr.name,
     };
     broadcast_state_update(
@@ -209,15 +212,18 @@ async fn handle_create_room(cr: proto::CreateRoom, state: Arc<ServerState>) -> R
 
 /// Handle delete room request.
 async fn handle_delete_room(dr: proto::DeleteRoom, state: Arc<ServerState>) -> Result<()> {
-    info!("DeleteRoom: {}", dr.room_id);
-    state.delete_room(dr.room_id).await;
+    let room_uuid = dr.room_id.as_ref()
+        .and_then(uuid_from_room_id)
+        .unwrap_or(ROOT_ROOM_UUID);
+    info!("DeleteRoom: {}", room_uuid);
+    state.delete_room(room_uuid).await;
     
     // Send incremental update to all clients
     broadcast_state_update(
         &state,
         proto::state_update::Update::RoomDeleted(proto::RoomDeleted {
-            room_id: Some(proto::RoomId { value: dr.room_id }),
-            fallback_room_id: Some(proto::RoomId { value: 1 }), // Root
+            room_id: Some(room_id_from_uuid(room_uuid)),
+            fallback_room_id: Some(room_id_from_uuid(ROOT_ROOM_UUID)),
         }),
     ).await?;
     Ok(())
@@ -225,22 +231,25 @@ async fn handle_delete_room(dr: proto::DeleteRoom, state: Arc<ServerState>) -> R
 
 /// Handle rename room request.
 async fn handle_rename_room(rr: proto::RenameRoom, state: Arc<ServerState>) -> Result<()> {
-    info!("RenameRoom: {} -> {}", rr.room_id, rr.new_name);
+    let room_uuid = rr.room_id.as_ref()
+        .and_then(uuid_from_room_id)
+        .unwrap_or(ROOT_ROOM_UUID);
+    info!("RenameRoom: {} -> {}", room_uuid, rr.new_name);
     
     // Get old name for the update message
     let old_name = state.get_rooms().await
         .iter()
-        .find(|r| r.id.as_ref().map(|i| i.value) == Some(rr.room_id))
+        .find(|r| uuid_from_room_id(r.id.as_ref().unwrap_or(&room_id_from_uuid(ROOT_ROOM_UUID))) == Some(room_uuid))
         .map(|r| r.name.clone())
         .unwrap_or_default();
     
-    state.rename_room(rr.room_id, rr.new_name.clone()).await;
+    state.rename_room(room_uuid, rr.new_name.clone()).await;
     
     // Send incremental update to all clients
     broadcast_state_update(
         &state,
         proto::state_update::Update::RoomRenamed(proto::RoomRenamed {
-            room_id: Some(proto::RoomId { value: rr.room_id }),
+            room_id: Some(room_id_from_uuid(room_uuid)),
             old_name,
             new_name: rr.new_name,
         }),
@@ -392,7 +401,7 @@ pub async fn broadcast_state_update(
 pub async fn cleanup_client(client_handle: &Arc<ClientHandle>, state: &Arc<ServerState>) {
     let user_id = client_handle.user_id;
     let username = client_handle.get_username().await;
-    let room_id = state.get_user_room(user_id).await.unwrap_or(1);
+    let room_uuid = state.get_user_room(user_id).await.unwrap_or(ROOT_ROOM_UUID);
 
     // Remove client from DashMap (lock-free)
     state.remove_client_by_handle(client_handle);
@@ -407,7 +416,7 @@ pub async fn cleanup_client(client_handle: &Arc<ClientHandle>, state: &Arc<Serve
         proto::state_update::Update::UserPresenceChanged(proto::UserPresenceChanged {
             user: Some(proto::UserPresence {
                 user_id: Some(proto::UserId { value: user_id }),
-                room_id: Some(proto::RoomId { value: room_id }),
+                room_id: Some(room_id_from_uuid(room_uuid)),
                 username,
             }),
             change_type: proto::user_presence_changed::ChangeType::LeftServer as i32,
@@ -471,7 +480,7 @@ pub async fn handle_datagrams(
 
                         // Set sender_id and room_id (server-authoritative, client values ignored)
                         voice_dgram.sender_id = Some(sender_user_id);
-                        voice_dgram.room_id = Some(actual_room);
+                        voice_dgram.room_id = Some(actual_room.as_bytes().to_vec());
 
                         // Re-encode with corrected sender_id and room_id
                         let relay_bytes = voice_dgram.encode_to_vec();

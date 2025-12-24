@@ -12,6 +12,7 @@ prost = "0.14"
 prost-types = "0.14"
 bytes = "1"
 blake3 = "1"
+uuid = { version = "1.19.0", features = ["v4"] }
 
 [build-dependencies]
 prost-build = "0.14"

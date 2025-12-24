@@ -19,6 +19,7 @@ prost = "0.14"
 base64 = "0.21"
 dashmap = "6.1.0"
 blake3 = "1.8.2"
+uuid = { version = "1.19.0", features = ["v4"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

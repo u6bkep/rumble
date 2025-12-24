@@ -16,3 +16,4 @@ webpki-roots = "1.0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 cpal = "0.17.0"
+uuid = { version = "1.19.0", features = ["v4"] }
