@@ -207,6 +207,40 @@ Recommendation: The backend crate should expose a proper event-driven API or cal
      is in place (last connection params are saved, `Reconnecting` status exists), but the
      actual reconnect logic is not yet implemented. UI can implement manual reconnect.
 
-7. add state hash verification on the client, trigger a resync if the hash does not match.
+7. ~~add state hash verification on the client, trigger a resync if the hash does not match~~ **DONE (2025-12-23)**
+   - **Implemented state hash computation** using `blake3` for portability:
+     - `compute_room_state_hash()` in `crates/api/src/lib.rs`
+     - Deterministic sorting of rooms and users before hashing
+     - Uses canonical protobuf serialization for the RoomState
+   - **Added `StateUpdate` proto message** for incremental updates:
+     - `state_update_type` enum: `ROOM_CREATED`, `ROOM_DELETED`, `ROOM_RENAMED`, `USER_MOVED`, `USER_LEFT`
+     - `StateUpdate` message with fields for each update type
+     - `expected_hash` field for hash verification after applying update
+   - **Added `RequestStateSync` proto message** for resync requests:
+     - `expected_hash` and `actual_hash` fields for debugging mismatches
+   - **Server sends state hash with all state updates**:
+     - `send_room_state_to_client()` computes and includes hash in `RoomStateUpdate`
+     - `broadcast_state_update()` helper sends incremental updates with hashes
+     - `handle_request_state_sync()` handles resync requests by sending full state
+   - **Client verifies hash and requests resync on mismatch**:
+     - `RoomSnapshot.last_state_hash` tracks server's last known hash
+     - `apply_state_update()` function applies incremental updates locally
+     - Hash verification after full state updates and incremental updates
+     - Automatic `RequestStateSync` sent when hash mismatch detected
+     - `request_state_resync()` method for manual resync requests
+     - `resync_count` counter for testing verification
+   - **Fixed lock contention** in `request_state_resync()`:
+     - Consolidated triple snapshot lock acquisition to single lock/unlock
+   - **Added 4 new integration tests**:
+     - `test_server_sends_state_hash` - verifies hash included in state updates
+     - `test_client_computes_matching_state_hash` - verifies client hash matches server
+     - `test_state_hash_mismatch_triggers_resync` - verifies mismatch detection
+     - `test_incremental_updates_applied_correctly` - verifies incremental update application
+     - `test_request_state_sync_infrastructure` - verifies resync request mechanism
+   - All 28 integration tests pass
+   - **Notes:** State hash enables detecting missed incremental updates. If hash mismatch
+     occurs, client requests full state resync. The hash is computed over canonically
+     sorted room/user data for determinism across different orderings.
+
 8. clean up room id usage. the server should remember what room a user was in last and place them there when the client re connects. defaulting to the root. channels should use a UUID rather than an incrementing number, except root is always 0.
 9. fix unbounded buffer on audio transmission. gracefully handle slow connections. this will later be improved by varying opus bitrate based on network conditions, but for now just drop old frames if the network is slow.

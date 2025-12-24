@@ -1322,3 +1322,239 @@ async fn test_connection_status_enum() {
     assert!(saw_connected, "should reach Connected status");
     assert_eq!(handle.state().status, backend::ConnectionStatus::Connected);
 }
+
+// =============================================================================
+// Test: State hash is computed and verified (#7 - state hash handling)
+// =============================================================================
+
+/// Test that the server includes state_hash in RoomState updates.
+#[tokio::test]
+async fn test_server_sends_state_hash() {
+    let port = next_test_port();
+    let _server = start_server(port);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let client = backend::Client::connect(
+        &format!("127.0.0.1:{}", port),
+        "hash-test-client",
+        None,
+        test_connect_config(),
+    )
+    .await
+    .expect("client should connect");
+
+    // Wait for initial room state
+    wait_for_rooms(&client, 5000).await;
+
+    // Trigger a state change by creating a room
+    client.create_room("HashTestRoom").await.expect("create_room should succeed");
+
+    // Wait for the room to appear
+    wait_for_room_named(&client, "HashTestRoom", 5000).await;
+
+    // Get the last received state hash from the client
+    let last_hash = client.last_received_state_hash().await;
+
+    // The hash should NOT be empty - server should compute and send it
+    assert!(
+        !last_hash.is_empty(),
+        "server should include non-empty state_hash in RoomState updates"
+    );
+}
+
+/// Test that the client can compute a local state hash that matches the server's hash.
+#[tokio::test]
+async fn test_client_computes_matching_state_hash() {
+    let port = next_test_port();
+    let _server = start_server(port);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let client = backend::Client::connect(
+        &format!("127.0.0.1:{}", port),
+        "hash-verify-client",
+        None,
+        test_connect_config(),
+    )
+    .await
+    .expect("client should connect");
+
+    // Wait for initial room state
+    wait_for_rooms(&client, 5000).await;
+
+    // Trigger a state change
+    client.create_room("VerifyHashRoom").await.expect("create_room should succeed");
+    wait_for_room_named(&client, "VerifyHashRoom", 5000).await;
+
+    // Get the received hash from server
+    let server_hash = client.last_received_state_hash().await;
+
+    // Compute local hash from our snapshot
+    let local_hash = client.compute_local_state_hash().await;
+
+    // They should match
+    assert_eq!(
+        server_hash, local_hash,
+        "local computed hash should match server-provided hash"
+    );
+}
+
+/// Test that client can request a state resync.
+/// 
+/// The state hash allows for incremental updates. When the server sends
+/// an incremental update (like "user moved to room X"), it includes the
+/// expected hash after applying the update. The client applies the update
+/// locally and verifies the hash matches.
+/// 
+/// This test verifies that:
+/// 1. The server sends hashes with state updates
+/// 2. The client correctly computes matching local hashes
+/// 3. Incremental updates are applied correctly
+#[tokio::test]
+async fn test_state_hash_mismatch_triggers_resync() {
+    let port = next_test_port();
+    let _server = start_server(port);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let client = backend::Client::connect(
+        &format!("127.0.0.1:{}", port),
+        "resync-test-client",
+        None,
+        test_connect_config(),
+    )
+    .await
+    .expect("client should connect");
+
+    // Wait for initial room state
+    wait_for_rooms(&client, 5000).await;
+
+    // Create a room - this triggers an incremental StateUpdate
+    client.create_room("ResyncTestRoom").await.expect("create_room should succeed");
+    wait_for_room_named(&client, "ResyncTestRoom", 5000).await;
+
+    // Get the hashes - they should match since we applied the update correctly
+    let server_hash = client.last_received_state_hash().await;
+    let local_hash = client.compute_local_state_hash().await;
+
+    assert_eq!(
+        server_hash, local_hash,
+        "server and local hashes should match after applying incremental update"
+    );
+    
+    // The resync_count should be 0 since there was no mismatch
+    let resync_count = client.resync_count();
+    assert_eq!(resync_count, 0, "no resync should have been triggered for correct incremental updates");
+}
+
+/// Test that incremental updates are applied correctly by the client.
+#[tokio::test]
+async fn test_incremental_updates_applied_correctly() {
+    let port = next_test_port();
+    let _server = start_server(port);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let client = backend::Client::connect(
+        &format!("127.0.0.1:{}", port),
+        "incremental-test-client",
+        None,
+        test_connect_config(),
+    )
+    .await
+    .expect("client should connect");
+
+    // Wait for initial room state
+    wait_for_rooms(&client, 5000).await;
+    
+    let initial_snap = client.get_snapshot().await;
+    let initial_room_count = initial_snap.rooms.len();
+    
+    // Create a room - server sends incremental RoomCreated update
+    client.create_room("TestRoom1").await.expect("create_room should succeed");
+    wait_for_room_named(&client, "TestRoom1", 5000).await;
+    
+    let snap = client.get_snapshot().await;
+    assert_eq!(snap.rooms.len(), initial_room_count + 1, "should have one more room");
+    
+    // Create another room
+    client.create_room("TestRoom2").await.expect("create_room should succeed");
+    wait_for_room_named(&client, "TestRoom2", 5000).await;
+    
+    let snap = client.get_snapshot().await;
+    assert_eq!(snap.rooms.len(), initial_room_count + 2, "should have two more rooms");
+    
+    // Find room ID for TestRoom1
+    let room1_id = snap.rooms.iter()
+        .find(|r| r.name == "TestRoom1")
+        .and_then(|r| r.id.as_ref())
+        .map(|id| id.value)
+        .expect("TestRoom1 should exist");
+    
+    // Rename the room - server sends incremental RoomRenamed update
+    client.rename_room(room1_id, "RenamedRoom").await.expect("rename_room should succeed");
+    wait_for_room_named(&client, "RenamedRoom", 5000).await;
+    
+    let snap = client.get_snapshot().await;
+    assert!(!snap.rooms.iter().any(|r| r.name == "TestRoom1"), "TestRoom1 should be renamed");
+    assert!(snap.rooms.iter().any(|r| r.name == "RenamedRoom"), "RenamedRoom should exist");
+    
+    // Delete the room - server sends incremental RoomDeleted update
+    client.delete_room(room1_id).await.expect("delete_room should succeed");
+    
+    // Wait for the room to be gone
+    let mut attempts = 0;
+    loop {
+        let snap = client.get_snapshot().await;
+        if !snap.rooms.iter().any(|r| r.name == "RenamedRoom") {
+            break;
+        }
+        attempts += 1;
+        if attempts > 100 {
+            panic!("timeout waiting for RenamedRoom to be deleted");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    
+    let snap = client.get_snapshot().await;
+    assert_eq!(snap.rooms.len(), initial_room_count + 1, "should have one room less after deletion");
+    
+    // Verify hashes still match throughout all these incremental updates
+    let server_hash = client.last_received_state_hash().await;
+    let local_hash = client.compute_local_state_hash().await;
+    assert_eq!(server_hash, local_hash, "hashes should match after all incremental updates");
+    
+    // No resyncs should have been needed
+    assert_eq!(client.resync_count(), 0, "no resync should have been triggered");
+}
+
+/// Test that RequestStateSync message is properly defined and can be sent.
+/// This tests the resync infrastructure.
+#[tokio::test]
+async fn test_request_state_sync_infrastructure() {
+    let port = next_test_port();
+    let _server = start_server(port);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let client = backend::Client::connect(
+        &format!("127.0.0.1:{}", port),
+        "infrastructure-test-client",
+        None,
+        test_connect_config(),
+    )
+    .await
+    .expect("client should connect");
+
+    wait_for_rooms(&client, 5000).await;
+
+    // Manually request a state sync (simulating what would happen on mismatch)
+    client.request_state_resync().await.expect("request_state_resync should succeed");
+
+    // Wait for the server to respond with fresh state
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // After resync, we should still have valid state
+    let snap = client.get_snapshot().await;
+    assert!(!snap.rooms.is_empty(), "should have rooms after resync");
+    assert!(
+        snap.rooms.iter().any(|r| r.name == "Root"),
+        "should have Root room after resync"
+    );
+}

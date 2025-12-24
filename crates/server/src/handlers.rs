@@ -10,7 +10,7 @@
 //! - The voice path uses snapshots to avoid holding locks during relay
 //! - Client iteration is lock-free via DashMap
 
-use crate::state::{ClientHandle, ServerState};
+use crate::state::{compute_room_state_hash, ClientHandle, ServerState};
 use anyhow::Result;
 use api::encode_frame;
 use api::proto::{self, envelope::Payload, RoomState, VoiceDatagram};
@@ -56,6 +56,9 @@ pub async fn handle_envelope(
         }
         Some(Payload::RenameRoom(rr)) => {
             handle_rename_room(rr, state).await?;
+        }
+        Some(Payload::RequestStateSync(rss)) => {
+            handle_request_state_sync(rss, sender, state).await?;
         }
         // Server-to-client messages or empty - ignore
         Some(Payload::ServerHello(_) | Payload::ServerEvent(_)) | None => {}
@@ -159,12 +162,20 @@ async fn handle_join_room(
     sender: Arc<ClientHandle>,
     state: Arc<ServerState>,
 ) -> Result<()> {
-    let rid = jr.room_id.map(|r| r.value).unwrap_or(1);
+    let new_room_id = jr.room_id.map(|r| r.value).unwrap_or(1);
+    let old_room_id = state.get_user_room(sender.user_id).await.unwrap_or(1);
 
-    state.set_user_room(sender.user_id, rid).await;
+    state.set_user_room(sender.user_id, new_room_id).await;
 
-    // Broadcast updated room state to all clients
-    broadcast_room_state(&state).await?;
+    // Send incremental update about user moving rooms
+    broadcast_state_update(
+        &state,
+        proto::state_update::Update::UserMoved(proto::UserMoved {
+            user_id: Some(proto::UserId { value: sender.user_id }),
+            from_room_id: Some(proto::RoomId { value: old_room_id }),
+            to_room_id: Some(proto::RoomId { value: new_room_id }),
+        }),
+    ).await?;
 
     Ok(())
 }
@@ -180,8 +191,19 @@ async fn handle_disconnect(d: proto::Disconnect, sender: Arc<ClientHandle>) -> R
 /// Handle create room request.
 async fn handle_create_room(cr: proto::CreateRoom, state: Arc<ServerState>) -> Result<()> {
     info!("CreateRoom: {}", cr.name);
-    state.create_room(cr.name).await;
-    broadcast_room_state(&state).await?;
+    let room_id = state.create_room(cr.name.clone()).await;
+    
+    // Send incremental update to all clients
+    let room_info = proto::RoomInfo {
+        id: Some(proto::RoomId { value: room_id }),
+        name: cr.name,
+    };
+    broadcast_state_update(
+        &state,
+        proto::state_update::Update::RoomCreated(proto::RoomCreated {
+            room: Some(room_info),
+        }),
+    ).await?;
     Ok(())
 }
 
@@ -189,15 +211,75 @@ async fn handle_create_room(cr: proto::CreateRoom, state: Arc<ServerState>) -> R
 async fn handle_delete_room(dr: proto::DeleteRoom, state: Arc<ServerState>) -> Result<()> {
     info!("DeleteRoom: {}", dr.room_id);
     state.delete_room(dr.room_id).await;
-    broadcast_room_state(&state).await?;
+    
+    // Send incremental update to all clients
+    broadcast_state_update(
+        &state,
+        proto::state_update::Update::RoomDeleted(proto::RoomDeleted {
+            room_id: Some(proto::RoomId { value: dr.room_id }),
+            fallback_room_id: Some(proto::RoomId { value: 1 }), // Root
+        }),
+    ).await?;
     Ok(())
 }
 
 /// Handle rename room request.
 async fn handle_rename_room(rr: proto::RenameRoom, state: Arc<ServerState>) -> Result<()> {
     info!("RenameRoom: {} -> {}", rr.room_id, rr.new_name);
-    state.rename_room(rr.room_id, rr.new_name).await;
-    broadcast_room_state(&state).await?;
+    
+    // Get old name for the update message
+    let old_name = state.get_rooms().await
+        .iter()
+        .find(|r| r.id.as_ref().map(|i| i.value) == Some(rr.room_id))
+        .map(|r| r.name.clone())
+        .unwrap_or_default();
+    
+    state.rename_room(rr.room_id, rr.new_name.clone()).await;
+    
+    // Send incremental update to all clients
+    broadcast_state_update(
+        &state,
+        proto::state_update::Update::RoomRenamed(proto::RoomRenamed {
+            room_id: Some(proto::RoomId { value: rr.room_id }),
+            old_name,
+            new_name: rr.new_name,
+        }),
+    ).await?;
+    Ok(())
+}
+
+/// Handle a request for full state resync.
+/// 
+/// This is sent by clients when they detect a state hash mismatch.
+/// We simply send them the current full state.
+async fn handle_request_state_sync(
+    rss: proto::RequestStateSync,
+    sender: Arc<ClientHandle>,
+    state: Arc<ServerState>,
+) -> Result<()> {
+    info!(
+        user_id = sender.user_id,
+        expected_hash_len = rss.expected_hash.len(),
+        actual_hash_len = rss.actual_hash.len(),
+        "RequestStateSync: client detected hash mismatch, sending full state"
+    );
+    
+    // Log the hashes for debugging (first 8 bytes as hex)
+    if !rss.expected_hash.is_empty() {
+        debug!(
+            "  expected: {:02x?}...",
+            &rss.expected_hash[..rss.expected_hash.len().min(8)]
+        );
+    }
+    if !rss.actual_hash.is_empty() {
+        debug!(
+            "  actual: {:02x?}...",
+            &rss.actual_hash[..rss.actual_hash.len().min(8)]
+        );
+    }
+    
+    // Send the current state to this client
+    send_room_state_to_client(&sender, &state).await?;
     Ok(())
 }
 
@@ -206,13 +288,19 @@ async fn send_room_state_to_client(client: &ClientHandle, state: &ServerState) -
     let rooms = state.get_rooms().await;
     let users = state.build_presence_list().await;
 
+    // Build the RoomState message
+    let room_state = RoomState {
+        rooms: rooms.clone(),
+        users: users.clone(),
+    };
+
+    // Compute the state hash
+    let state_hash = compute_room_state_hash(&room_state);
+
     let env = proto::Envelope {
-        state_hash: Vec::new(),
+        state_hash,
         payload: Some(Payload::ServerEvent(proto::ServerEvent {
-            kind: Some(proto::server_event::Kind::RoomStateUpdate(RoomState {
-                rooms: rooms.clone(),
-                users: users.clone(),
-            })),
+            kind: Some(proto::server_event::Kind::RoomStateUpdate(room_state)),
         })),
     };
     let frame = encode_frame(&env);
@@ -220,7 +308,7 @@ async fn send_room_state_to_client(client: &ClientHandle, state: &ServerState) -
     info!(
         rooms = rooms.len(),
         users = users.len(),
-        "server: sending initial RoomStateUpdate"
+        "server: sending initial RoomStateUpdate with state_hash"
     );
     client.send_frame(&frame).await?;
 
@@ -232,13 +320,19 @@ pub async fn broadcast_room_state(state: &Arc<ServerState>) -> Result<()> {
     let rooms = state.get_rooms().await;
     let users = state.build_presence_list().await;
 
+    // Build the RoomState message
+    let room_state = RoomState {
+        rooms,
+        users,
+    };
+
+    // Compute the state hash
+    let state_hash = compute_room_state_hash(&room_state);
+
     let env = proto::Envelope {
-        state_hash: Vec::new(),
+        state_hash,
         payload: Some(Payload::ServerEvent(proto::ServerEvent {
-            kind: Some(proto::server_event::Kind::RoomStateUpdate(RoomState {
-                rooms,
-                users,
-            })),
+            kind: Some(proto::server_event::Kind::RoomStateUpdate(room_state)),
         })),
     };
     let frame = encode_frame(&env);
@@ -252,9 +346,53 @@ pub async fn broadcast_room_state(state: &Arc<ServerState>) -> Result<()> {
     Ok(())
 }
 
+/// Broadcast an incremental state update to all connected clients.
+/// 
+/// This sends a StateUpdate message containing:
+/// - The specific change that occurred
+/// - The expected hash AFTER applying this change
+/// 
+/// Clients apply the update locally and verify their computed hash matches.
+/// If there's a mismatch, the client will request a full resync.
+pub async fn broadcast_state_update(
+    state: &Arc<ServerState>,
+    update: proto::state_update::Update,
+) -> Result<()> {
+    // First, compute what the state hash should be after this update
+    let rooms = state.get_rooms().await;
+    let users = state.build_presence_list().await;
+    let room_state = RoomState { rooms, users };
+    let expected_hash = compute_room_state_hash(&room_state);
+
+    let state_update = proto::StateUpdate {
+        expected_hash: expected_hash.clone(),
+        update: Some(update),
+    };
+
+    let env = proto::Envelope {
+        state_hash: expected_hash,
+        payload: Some(Payload::ServerEvent(proto::ServerEvent {
+            kind: Some(proto::server_event::Kind::StateUpdate(state_update)),
+        })),
+    };
+    let frame = encode_frame(&env);
+
+    debug!("server: broadcasting incremental StateUpdate");
+
+    // Snapshot clients, then send without holding state locks
+    let clients = state.snapshot_clients();
+    for h in clients {
+        let _ = h.send_frame(&frame).await;
+    }
+
+    Ok(())
+}
+
 /// Clean up a client: remove from clients list, remove memberships, broadcast update.
 pub async fn cleanup_client(client_handle: &Arc<ClientHandle>, state: &Arc<ServerState>) {
     let user_id = client_handle.user_id;
+    let username = client_handle.get_username().await;
+    let room_id = state.get_user_room(user_id).await.unwrap_or(1);
 
     // Remove client from DashMap (lock-free)
     state.remove_client_by_handle(client_handle);
@@ -263,8 +401,19 @@ pub async fn cleanup_client(client_handle: &Arc<ClientHandle>, state: &Arc<Serve
 
     debug!(user_id, "server: cleaned up client");
 
-    if let Err(e) = broadcast_room_state(state).await {
-        error!("failed to broadcast room state after disconnect: {e:?}");
+    // Send incremental update about user leaving
+    if let Err(e) = broadcast_state_update(
+        state,
+        proto::state_update::Update::UserPresenceChanged(proto::UserPresenceChanged {
+            user: Some(proto::UserPresence {
+                user_id: Some(proto::UserId { value: user_id }),
+                room_id: Some(proto::RoomId { value: room_id }),
+                username,
+            }),
+            change_type: proto::user_presence_changed::ChangeType::LeftServer as i32,
+        }),
+    ).await {
+        error!("failed to broadcast state update after disconnect: {e:?}");
     }
 }
 

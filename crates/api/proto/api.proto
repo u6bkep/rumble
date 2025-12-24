@@ -89,6 +89,7 @@ message Envelope {
     CreateRoom create_room = 20;
     DeleteRoom delete_room = 21;
     RenameRoom rename_room = 22;
+    RequestStateSync request_state_sync = 23;
   }
 }
 
@@ -119,17 +120,92 @@ message ServerEvent {
     ChatBroadcast chat_broadcast = 1;
     // Periodic keep-alive ping from the server.
     KeepAlive keep_alive = 2;
+    // Full state snapshot (used for initial sync and resync)
     RoomState room_state_update = 3;
+    // Incremental user joined notification
     UserPresence user_joined = 4;
+    // Incremental user left notification  
     UserPresence user_left = 5;
     // Field 6 reserved: was VoiceFrame, now removed (voice uses datagrams only)
+    // Incremental state update with hash for verification
+    StateUpdate state_update = 7;
   }
+}
+
+// Incremental state update message.
+// Contains a single state change and the expected hash after applying it.
+// Client applies the update locally and verifies the resulting hash.
+// If mismatch, client requests a full resync.
+message StateUpdate {
+  // The state hash AFTER this update is applied.
+  // Client should compute its local hash after applying and compare.
+  bytes expected_hash = 1;
+  
+  oneof update {
+    // A user moved to a different room
+    UserMoved user_moved = 10;
+    // A new room was created
+    RoomCreated room_created = 11;
+    // A room was deleted
+    RoomDeleted room_deleted = 12;
+    // A room was renamed
+    RoomRenamed room_renamed = 13;
+    // A user's presence changed (joined server, left server, name change)
+    UserPresenceChanged user_presence_changed = 14;
+  }
+}
+
+// Incremental update: user moved to a different room
+message UserMoved {
+  UserId user_id = 1;
+  RoomId from_room_id = 2;
+  RoomId to_room_id = 3;
+}
+
+// Incremental update: new room created
+message RoomCreated {
+  RoomInfo room = 1;
+}
+
+// Incremental update: room deleted
+message RoomDeleted {
+  RoomId room_id = 1;
+  // Users that were in the room are moved to fallback_room_id (usually Root)
+  RoomId fallback_room_id = 2;
+}
+
+// Incremental update: room renamed
+message RoomRenamed {
+  RoomId room_id = 1;
+  string old_name = 2;
+  string new_name = 3;
+}
+
+// Incremental update: user presence changed
+message UserPresenceChanged {
+  UserPresence user = 1;
+  // Type of change
+  enum ChangeType {
+    JOINED_SERVER = 0;
+    LEFT_SERVER = 1;
+    NAME_CHANGED = 2;
+  }
+  ChangeType change_type = 2;
 }
 
 // Room management requests
 message CreateRoom { string name = 1; }
 message DeleteRoom { uint64 room_id = 1; }
 message RenameRoom { uint64 room_id = 1; string new_name = 2; }
+
+// Request a full state resync from the server.
+// Sent by the client when it detects a state hash mismatch.
+message RequestStateSync {
+  // The hash the client expected (for debugging/logging).
+  bytes expected_hash = 1;
+  // The hash the client computed locally (for debugging/logging).
+  bytes actual_hash = 2;
+}
 
 // Broadcast of a chat message to all connected clients.
 message ChatBroadcast {

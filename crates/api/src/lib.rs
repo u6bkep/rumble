@@ -55,6 +55,43 @@ pub fn compute_state_hash<M: Message>(msg: &M) -> Vec<u8> {
     digest.as_bytes().to_vec()
 }
 
+/// Compute a state hash from a RoomState message with canonical sorting.
+/// 
+/// This function canonicalizes the RoomState by sorting rooms by ID and users
+/// by user_id before hashing. This ensures deterministic hashes regardless of
+/// the order items were added.
+/// 
+/// This is the standard hash function used for state synchronization between
+/// client and server.
+pub fn compute_room_state_hash(room_state: &proto::RoomState) -> Vec<u8> {
+    // Create a canonicalized copy with sorted rooms and users for determinism
+    let mut canonical = room_state.clone();
+    
+    // Sort rooms by ID for deterministic ordering
+    canonical.rooms.sort_by(|a, b| {
+        let a_id = a.id.as_ref().map(|r| r.value).unwrap_or(0);
+        let b_id = b.id.as_ref().map(|r| r.value).unwrap_or(0);
+        a_id.cmp(&b_id)
+    });
+    
+    // Sort users by user_id for deterministic ordering
+    canonical.users.sort_by(|a, b| {
+        let a_id = a.user_id.as_ref().map(|u| u.value).unwrap_or(0);
+        let b_id = b.user_id.as_ref().map(|u| u.value).unwrap_or(0);
+        a_id.cmp(&b_id)
+    });
+    
+    // Serialize to bytes
+    let mut buf = Vec::with_capacity(canonical.encoded_len());
+    canonical.encode(&mut buf).expect("prost encode failed");
+    
+    // Hash with blake3
+    let mut hasher = Hasher::new();
+    hasher.update(&buf);
+    let digest = hasher.finalize();
+    digest.as_bytes().to_vec()
+}
+
 /// Helper to attach a just-computed state hash to an `Envelope`.
 pub fn with_state_hash(mut env: proto::Envelope, hash: Vec<u8>) -> proto::Envelope {
     env.state_hash = hash;

@@ -87,6 +87,107 @@ pub struct RoomSnapshot {
     pub rooms: Vec<proto::RoomInfo>,
     pub users: Vec<proto::UserPresence>,
     pub current_room_id: Option<u64>,
+    /// Last received state hash from the server.
+    pub last_state_hash: Vec<u8>,
+}
+
+/// Apply an incremental state update to a snapshot.
+/// 
+/// This modifies the snapshot in place to reflect the change described
+/// in the update message.
+fn apply_state_update(snap: &mut RoomSnapshot, update: proto::state_update::Update) {
+    use proto::state_update::Update;
+    
+    match update {
+        Update::UserMoved(um) => {
+            // Update the user's room in the presence list
+            let user_id = um.user_id.as_ref().map(|u| u.value);
+            let new_room_id = um.to_room_id.as_ref().map(|r| r.value);
+            
+            if let (Some(uid), Some(new_rid)) = (user_id, new_room_id) {
+                for user in &mut snap.users {
+                    if user.user_id.as_ref().map(|u| u.value) == Some(uid) {
+                        user.room_id = Some(proto::RoomId { value: new_rid });
+                        break;
+                    }
+                }
+            }
+        }
+        Update::RoomCreated(rc) => {
+            // Add the new room to the list
+            if let Some(room) = rc.room {
+                snap.rooms.push(room);
+            }
+        }
+        Update::RoomDeleted(rd) => {
+            // Remove the room and move users to fallback room
+            let room_id = rd.room_id.as_ref().map(|r| r.value);
+            let fallback_id = rd.fallback_room_id.as_ref().map(|r| r.value).unwrap_or(1);
+            
+            if let Some(rid) = room_id {
+                snap.rooms.retain(|r| r.id.as_ref().map(|i| i.value) != Some(rid));
+                
+                // Move users from deleted room to fallback
+                for user in &mut snap.users {
+                    if user.room_id.as_ref().map(|r| r.value) == Some(rid) {
+                        user.room_id = Some(proto::RoomId { value: fallback_id });
+                    }
+                }
+                
+                // Update current_room_id if we were in the deleted room
+                if snap.current_room_id == Some(rid) {
+                    snap.current_room_id = Some(fallback_id);
+                }
+            }
+        }
+        Update::RoomRenamed(rr) => {
+            // Update the room name
+            let room_id = rr.room_id.as_ref().map(|r| r.value);
+            
+            if let Some(rid) = room_id {
+                for room in &mut snap.rooms {
+                    if room.id.as_ref().map(|i| i.value) == Some(rid) {
+                        room.name = rr.new_name.clone();
+                        break;
+                    }
+                }
+            }
+        }
+        Update::UserPresenceChanged(upc) => {
+            use proto::user_presence_changed::ChangeType;
+            
+            if let Some(user) = upc.user {
+                let change_type = ChangeType::try_from(upc.change_type)
+                    .unwrap_or(ChangeType::JoinedServer);
+                
+                match change_type {
+                    ChangeType::JoinedServer => {
+                        // Add user to presence list
+                        snap.users.push(user);
+                    }
+                    ChangeType::LeftServer => {
+                        // Remove user from presence list
+                        let user_id = user.user_id.as_ref().map(|u| u.value);
+                        if let Some(uid) = user_id {
+                            snap.users.retain(|u| u.user_id.as_ref().map(|i| i.value) != Some(uid));
+                        }
+                    }
+                    ChangeType::NameChanged => {
+                        // Update username
+                        let user_id = user.user_id.as_ref().map(|u| u.value);
+                        if let Some(uid) = user_id {
+                            for u in &mut snap.users {
+                                if u.user_id.as_ref().map(|i| i.value) == Some(uid) {
+                                    u.username = user.username.clone();
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Reason for connection loss.
@@ -126,6 +227,8 @@ pub struct Client {
     /// they will send a message on this channel. The caller can await
     /// this to detect when the connection has been lost.
     connection_lost_rx: mpsc::UnboundedReceiver<ConnectionLostReason>,
+    /// Counter for state resyncs (for testing/debugging).
+    resync_count: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl Client {
@@ -226,10 +329,14 @@ impl Client {
         // Create connection-lost channel to notify when connection is unexpectedly lost.
         let (connection_lost_tx, connection_lost_rx) = mpsc::unbounded_channel();
 
+        // Create resync counter
+        let resync_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+
         // Spawn task to read events and echo keep-alives (ServerHello already processed).
         let send_for_reader = send_arc.clone();
         let snapshot_for_reader = snapshot.clone();
         let connection_lost_for_reader = connection_lost_tx.clone();
+        let resync_count_for_reader = resync_count.clone();
         task::spawn(async move {
             // Continue using the buffer that may have leftover data
             let mut buf = buf;
@@ -239,6 +346,9 @@ impl Client {
                     // Process any remaining buffered data first
                     while let Some(frame) = try_decode_frame(&mut buf) {
                         if let Ok(env) = proto::Envelope::decode(&*frame) {
+                            // Extract state_hash before we consume payload
+                            let received_state_hash = env.state_hash.clone();
+                            
                             if let Some(Payload::ServerEvent(ev)) = env.payload {
                                 info!(event = ?ev, "backend: received ServerEvent");
                                 // Echo back keep-alive messages to the server.
@@ -259,14 +369,115 @@ impl Client {
                                 // Update local snapshot if room state changes.
                                 if let Some(proto::server_event::Kind::RoomStateUpdate(rs)) = ev.kind.clone() {
                                     let mut snap = snapshot_for_reader.lock().await;
-                                    snap.rooms = rs.rooms;
-                                    snap.users = rs.users;
+                                    
+                                    // Before updating, check if we should verify the hash
+                                    // (only if we have a previous hash and the server sent one)
+                                    let should_verify = !snap.last_state_hash.is_empty() && !received_state_hash.is_empty();
+                                    
+                                    // Update the snapshot with new data
+                                    snap.rooms = rs.rooms.clone();
+                                    snap.users = rs.users.clone();
+                                    snap.last_state_hash = received_state_hash.clone();
+                                    
                                     if snap.current_room_id.is_none() {
                                         // default to Root if present
                                         snap.current_room_id = snap.rooms.iter().find_map(|r| r.id.as_ref().map(|i| i.value)).or(Some(1));
                                     }
+                                    
+                                    // Compute local hash from the new state
+                                    let room_state = proto::RoomState {
+                                        rooms: snap.rooms.clone(),
+                                        users: snap.users.clone(),
+                                    };
+                                    let local_hash = api::compute_room_state_hash(&room_state);
+                                    
+                                    // Verify hash matches what server sent
+                                    if !received_state_hash.is_empty() && local_hash != received_state_hash {
+                                        error!(
+                                            "backend: state hash mismatch! local={:02x?}... server={:02x?}...",
+                                            &local_hash[..local_hash.len().min(8)],
+                                            &received_state_hash[..received_state_hash.len().min(8)]
+                                        );
+                                        
+                                        // Request resync
+                                        resync_count_for_reader.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                        let resync_env = proto::Envelope {
+                                            state_hash: Vec::new(),
+                                            payload: Some(Payload::RequestStateSync(proto::RequestStateSync {
+                                                expected_hash: received_state_hash.clone(),
+                                                actual_hash: local_hash,
+                                            })),
+                                        };
+                                        let resync_frame = encode_frame(&resync_env);
+                                        let mut s = send_for_reader.lock().await;
+                                        if let Err(e) = s.write_all(&resync_frame).await {
+                                            error!("backend: failed to send RequestStateSync: {e:?}");
+                                        } else {
+                                            info!("backend: sent RequestStateSync to server");
+                                        }
+                                    } else if should_verify && !received_state_hash.is_empty() {
+                                        debug!(
+                                            "backend: state hash verified: {:02x?}...",
+                                            &received_state_hash[..received_state_hash.len().min(8)]
+                                        );
+                                    }
+                                    
                                     info!(rooms = snap.rooms.len(), users = snap.users.len(), "backend: updated snapshot from RoomStateUpdate");
                                 }
+                                
+                                // Handle incremental state updates
+                                if let Some(proto::server_event::Kind::StateUpdate(su)) = ev.kind.clone() {
+                                    let mut snap = snapshot_for_reader.lock().await;
+                                    let expected_hash = su.expected_hash.clone();
+                                    
+                                    // Apply the incremental update
+                                    if let Some(update) = su.update {
+                                        apply_state_update(&mut snap, update);
+                                    }
+                                    
+                                    // Compute local hash after applying update
+                                    let room_state = proto::RoomState {
+                                        rooms: snap.rooms.clone(),
+                                        users: snap.users.clone(),
+                                    };
+                                    let local_hash = api::compute_room_state_hash(&room_state);
+                                    
+                                    // Verify hash matches expected
+                                    if !expected_hash.is_empty() && local_hash != expected_hash {
+                                        error!(
+                                            "backend: state hash mismatch after incremental update! local={:02x?}... expected={:02x?}...",
+                                            &local_hash[..local_hash.len().min(8)],
+                                            &expected_hash[..expected_hash.len().min(8)]
+                                        );
+                                        
+                                        // Request resync
+                                        resync_count_for_reader.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                        let resync_env = proto::Envelope {
+                                            state_hash: Vec::new(),
+                                            payload: Some(Payload::RequestStateSync(proto::RequestStateSync {
+                                                expected_hash: expected_hash.clone(),
+                                                actual_hash: local_hash.clone(),
+                                            })),
+                                        };
+                                        let resync_frame = encode_frame(&resync_env);
+                                        let mut s = send_for_reader.lock().await;
+                                        if let Err(e) = s.write_all(&resync_frame).await {
+                                            error!("backend: failed to send RequestStateSync: {e:?}");
+                                        } else {
+                                            info!("backend: sent RequestStateSync to server after hash mismatch");
+                                        }
+                                    } else {
+                                        // Update last known hash on success
+                                        snap.last_state_hash = expected_hash.clone();
+                                        debug!(
+                                            "backend: incremental update applied, hash verified: {:02x?}...",
+                                            &expected_hash[..expected_hash.len().min(8)]
+                                        );
+                                    }
+                                    
+                                    info!(rooms = snap.rooms.len(), users = snap.users.len(), "backend: applied incremental StateUpdate");
+                                }
+                                
                                 let _ = events_tx.send(ev);
                             }
                         }
@@ -351,6 +562,7 @@ impl Client {
             voice_sequence: AtomicU32::new(0),
             voice_rx,
             connection_lost_rx,
+            resync_count,
         })
     }
 
@@ -543,6 +755,83 @@ impl Client {
     /// Try to receive a connection-lost notification without blocking.
     pub fn try_recv_connection_lost(&mut self) -> Option<ConnectionLostReason> {
         self.connection_lost_rx.try_recv().ok()
+    }
+    
+    /// Get the last received state hash from the server.
+    /// 
+    /// This is updated whenever the server sends a RoomStateUpdate with a state_hash.
+    pub async fn last_received_state_hash(&self) -> Vec<u8> {
+        self.snapshot.lock().await.last_state_hash.clone()
+    }
+    
+    /// Compute a local state hash from the current snapshot.
+    /// 
+    /// This computes the hash the same way the server does, using canonical
+    /// sorting of rooms and users before hashing.
+    pub async fn compute_local_state_hash(&self) -> Vec<u8> {
+        let snap = self.snapshot.lock().await;
+        let room_state = proto::RoomState {
+            rooms: snap.rooms.clone(),
+            users: snap.users.clone(),
+        };
+        api::compute_room_state_hash(&room_state)
+    }
+    
+    /// Get the number of times a resync has been requested.
+    /// 
+    /// This is useful for testing to verify that hash mismatches trigger resyncs.
+    pub fn resync_count(&self) -> u32 {
+        self.resync_count.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    
+    /// Corrupt the local state for testing purposes.
+    /// 
+    /// This artificially modifies the local snapshot to cause a hash mismatch
+    /// on the next state update, which should trigger a resync.
+    pub async fn corrupt_local_state_for_testing(&self) {
+        let mut snap = self.snapshot.lock().await;
+        // Add a fake room that doesn't exist on the server
+        snap.rooms.push(proto::RoomInfo {
+            id: Some(proto::RoomId { value: 99999 }),
+            name: "FakeRoom".to_string(),
+        });
+        info!("backend: corrupted local state for testing");
+    }
+    
+    /// Manually request a state resync from the server.
+    /// 
+    /// This sends a RequestStateSync message to the server, which will
+    /// respond with a full RoomState update. This is typically called
+    /// automatically when a hash mismatch is detected, but can also be
+    /// called manually if needed.
+    pub async fn request_state_resync(&self) -> Result<()> {
+        // Gather all snapshot data in a single lock acquisition
+        let (current_hash, local_hash) = {
+            let snap = self.snapshot.lock().await;
+            let current_hash = snap.last_state_hash.clone();
+            let room_state = proto::RoomState {
+                rooms: snap.rooms.clone(),
+                users: snap.users.clone(),
+            };
+            let local_hash = api::compute_room_state_hash(&room_state);
+            (current_hash, local_hash)
+        };
+        
+        let env = proto::Envelope {
+            state_hash: Vec::new(),
+            payload: Some(Payload::RequestStateSync(proto::RequestStateSync {
+                expected_hash: current_hash,
+                actual_hash: local_hash,
+            })),
+        };
+        let frame = encode_frame(&env);
+        
+        let mut send = self.send.lock().await;
+        send.write_all(&frame).await?;
+        info!("backend: sent manual RequestStateSync");
+        
+        self.resync_count.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }
 }
 

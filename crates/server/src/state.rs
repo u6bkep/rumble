@@ -96,6 +96,13 @@ impl StateData {
     }
 }
 
+/// Compute a state hash from a RoomState message.
+/// 
+/// Re-exports the canonical hash function from the API crate.
+pub fn compute_room_state_hash(room_state: &api::proto::RoomState) -> Vec<u8> {
+    api::compute_room_state_hash(room_state)
+}
+
 /// The server's shared state.
 ///
 /// This contains all mutable server state including:
