@@ -33,32 +33,53 @@
 //! ```
 
 use anyhow::Result;
-use api::proto::{self, envelope::Payload};
 pub use api::proto::VoiceDatagram;
-use api::{encode_frame, try_decode_frame, room_id_from_uuid, uuid_from_room_id, ROOT_ROOM_UUID};
+use api::{
+    ROOT_ROOM_UUID, encode_frame,
+    proto::{self, envelope::Payload},
+    room_id_from_uuid, try_decode_frame, uuid_from_room_id,
+};
 use bytes::BytesMut;
 use prost::Message;
-use quinn::Endpoint;
-use quinn::crypto::rustls::QuicClientConfig;
-use std::net::ToSocketAddrs;
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
-use tokio::sync::mpsc;
-use tokio::task;
-use tracing::{error, info, debug};
+use quinn::{Endpoint, crypto::rustls::QuicClientConfig};
+use std::{
+    net::ToSocketAddrs,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
+};
+use tokio::{sync::mpsc, task};
+use tracing::{debug, error, info};
 use uuid::Uuid;
 
 // Audio subsystem
 pub mod audio;
-pub use audio::{AudioSystem, AudioDeviceInfo, AudioConfig, AudioInput, AudioOutput};
-pub use audio::{samples_to_bytes, bytes_to_samples, SAMPLE_RATE, CHANNELS, FRAME_SIZE};
+pub use audio::{
+    AudioConfig, AudioDeviceInfo, AudioInput, AudioOutput, AudioSystem, CHANNELS, FRAME_SIZE,
+    MAX_PLAYBACK_BUFFER_SAMPLES, SAMPLE_RATE, bytes_to_samples, samples_to_bytes,
+};
+
+// Opus codec for voice encoding/decoding
+pub mod codec;
+pub use codec::{
+    CodecError, DecoderStats, EncoderStats, OPUS_FRAME_SIZE, OPUS_MAX_PACKET_SIZE,
+    OPUS_SAMPLE_RATE, VoiceDecoder, VoiceEncoder, opus_version,
+};
+
+// Bounded voice channel for handling slow connections
+pub mod bounded_voice;
+pub use bounded_voice::{
+    BoundedVoiceReceiver, BoundedVoiceSender, VoiceChannelConfig, VoiceChannelStats,
+    bounded_voice_channel,
+};
 
 // Event-driven API for UI integration
 pub mod events;
 pub mod handle;
 
-pub use events::{BackendCommand, BackendEvent, ConnectionState, ConnectionStatus};
+pub use events::{AudioState, BackendCommand, BackendEvent, ConnectionState, ConnectionStatus};
 pub use handle::{BackendHandle, BackendHandleBuilder, CommandSender, EventCallback};
 
 /// Configuration for the backend client.
@@ -93,18 +114,18 @@ pub struct RoomSnapshot {
 }
 
 /// Apply an incremental state update to a snapshot.
-/// 
+///
 /// This modifies the snapshot in place to reflect the change described
 /// in the update message.
 fn apply_state_update(snap: &mut RoomSnapshot, update: proto::state_update::Update) {
     use proto::state_update::Update;
-    
+
     match update {
         Update::UserMoved(um) => {
             // Update the user's room in the presence list
             let user_id = um.user_id.as_ref().map(|u| u.value);
             let new_room_uuid = um.to_room_id.as_ref().and_then(uuid_from_room_id);
-            
+
             if let (Some(uid), Some(new_uuid)) = (user_id, new_room_uuid) {
                 for user in &mut snap.users {
                     if user.user_id.as_ref().map(|u| u.value) == Some(uid) {
@@ -123,22 +144,23 @@ fn apply_state_update(snap: &mut RoomSnapshot, update: proto::state_update::Upda
         Update::RoomDeleted(rd) => {
             // Remove the room and move users to fallback room
             let room_uuid = rd.room_id.as_ref().and_then(uuid_from_room_id);
-            let fallback_uuid = rd.fallback_room_id.as_ref()
+            let fallback_uuid = rd
+                .fallback_room_id
+                .as_ref()
                 .and_then(uuid_from_room_id)
                 .unwrap_or(ROOT_ROOM_UUID);
-            
+
             if let Some(uuid) = room_uuid {
-                snap.rooms.retain(|r| {
-                    r.id.as_ref().and_then(uuid_from_room_id) != Some(uuid)
-                });
-                
+                snap.rooms
+                    .retain(|r| r.id.as_ref().and_then(uuid_from_room_id) != Some(uuid));
+
                 // Move users from deleted room to fallback
                 for user in &mut snap.users {
                     if user.room_id.as_ref().and_then(uuid_from_room_id) == Some(uuid) {
                         user.room_id = Some(room_id_from_uuid(fallback_uuid));
                     }
                 }
-                
+
                 // Update current_room_id if we were in the deleted room
                 if snap.current_room_id == Some(uuid) {
                     snap.current_room_id = Some(fallback_uuid);
@@ -148,7 +170,7 @@ fn apply_state_update(snap: &mut RoomSnapshot, update: proto::state_update::Upda
         Update::RoomRenamed(rr) => {
             // Update the room name
             let room_uuid = rr.room_id.as_ref().and_then(uuid_from_room_id);
-            
+
             if let Some(uuid) = room_uuid {
                 for room in &mut snap.rooms {
                     if room.id.as_ref().and_then(uuid_from_room_id) == Some(uuid) {
@@ -160,11 +182,11 @@ fn apply_state_update(snap: &mut RoomSnapshot, update: proto::state_update::Upda
         }
         Update::UserPresenceChanged(upc) => {
             use proto::user_presence_changed::ChangeType;
-            
+
             if let Some(user) = upc.user {
-                let change_type = ChangeType::try_from(upc.change_type)
-                    .unwrap_or(ChangeType::JoinedServer);
-                
+                let change_type =
+                    ChangeType::try_from(upc.change_type).unwrap_or(ChangeType::JoinedServer);
+
                 match change_type {
                     ChangeType::JoinedServer => {
                         // Add user to presence list
@@ -174,7 +196,8 @@ fn apply_state_update(snap: &mut RoomSnapshot, update: proto::state_update::Upda
                         // Remove user from presence list
                         let user_id = user.user_id.as_ref().map(|u| u.value);
                         if let Some(uid) = user_id {
-                            snap.users.retain(|u| u.user_id.as_ref().map(|i| i.value) != Some(uid));
+                            snap.users
+                                .retain(|u| u.user_id.as_ref().map(|i| i.value) != Some(uid));
                         }
                     }
                     ChangeType::NameChanged => {
@@ -224,10 +247,10 @@ pub struct Client {
     client_name: String,
     /// Sequence counter for voice datagrams.
     voice_sequence: AtomicU32,
-    /// Channel for received voice datagrams.
-    voice_rx: mpsc::UnboundedReceiver<VoiceDatagram>,
+    /// Channel for received voice datagrams (bounded to prevent unbounded growth).
+    voice_rx: mpsc::Receiver<VoiceDatagram>,
     /// Receiver for connection-lost notifications.
-    /// 
+    ///
     /// When the reader task or datagram task detects a disconnection,
     /// they will send a message on this channel. The caller can await
     /// this to detect when the connection has been lost.
@@ -238,16 +261,21 @@ pub struct Client {
 
 impl Client {
     /// Connect to the QUIC server at `addr`, open a control stream and send `ClientHello`.
-    /// 
+    ///
     /// This method waits for the server to respond with `ServerHello` before returning,
     /// ensuring that `user_id()` is always valid after a successful connection.
-    /// 
+    ///
     /// # Arguments
     /// * `addr` - Server address (e.g., "127.0.0.1:5000")
     /// * `client_name` - Name to identify this client
     /// * `password` - Optional password for server authentication
     /// * `config` - Connection configuration (certificates, etc.)
-    pub async fn connect(addr: &str, client_name: &str, password: Option<&str>, config: ConnectConfig) -> Result<Self> {
+    pub async fn connect(
+        addr: &str,
+        client_name: &str,
+        password: Option<&str>,
+        config: ConnectConfig,
+    ) -> Result<Self> {
         // Initialize logging if not already set up by the application.
         let _ = tracing_subscriber::fmt()
             .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -261,9 +289,7 @@ impl Client {
             .next()
             .ok_or_else(|| anyhow::anyhow!("invalid address"))?;
 
-        let conn = endpoint
-            .connect(addr, "localhost")?
-            .await?;
+        let conn = endpoint.connect(addr, "localhost")?.await?;
 
         info!(remote = %conn.remote_address(), "backend: connected");
 
@@ -292,7 +318,9 @@ impl Client {
         {
             let join_env = proto::Envelope {
                 state_hash: Vec::new(),
-                payload: Some(Payload::JoinRoom(proto::JoinRoom { room_id: Some(room_id_from_uuid(ROOT_ROOM_UUID)) })),
+                payload: Some(Payload::JoinRoom(proto::JoinRoom {
+                    room_id: Some(room_id_from_uuid(ROOT_ROOM_UUID)),
+                })),
             };
             let join_frame = encode_frame(&join_env);
             let mut send_stream = send_arc.lock().await;
@@ -307,12 +335,17 @@ impl Client {
             let mut chunk = [0u8; 1024];
             let n_opt = recv.read(&mut chunk).await?;
             if n_opt.is_none() {
-                return Err(anyhow::anyhow!("server closed stream before sending ServerHello"));
+                return Err(anyhow::anyhow!(
+                    "server closed stream before sending ServerHello"
+                ));
             }
             let n = n_opt.unwrap();
-            info!(bytes = n, "backend: received bytes while waiting for ServerHello");
+            info!(
+                bytes = n,
+                "backend: received bytes while waiting for ServerHello"
+            );
             buf.extend_from_slice(&chunk[..n]);
-            
+
             while let Some(frame) = try_decode_frame(&mut buf) {
                 if let Ok(env) = proto::Envelope::decode(&*frame) {
                     if let Some(Payload::ServerHello(sh)) = env.payload {
@@ -353,7 +386,7 @@ impl Client {
                         if let Ok(env) = proto::Envelope::decode(&*frame) {
                             // Extract state_hash before we consume payload
                             let received_state_hash = env.state_hash.clone();
-                            
+
                             if let Some(Payload::ServerEvent(ev)) = env.payload {
                                 info!(event = ?ev, "backend: received ServerEvent");
                                 // Echo back keep-alive messages to the server.
@@ -374,30 +407,30 @@ impl Client {
                                 // Update local snapshot if room state changes.
                                 if let Some(proto::server_event::Kind::RoomStateUpdate(rs)) = ev.kind.clone() {
                                     let mut snap = snapshot_for_reader.lock().await;
-                                    
+
                                     // Before updating, check if we should verify the hash
                                     // (only if we have a previous hash and the server sent one)
                                     let should_verify = !snap.last_state_hash.is_empty() && !received_state_hash.is_empty();
-                                    
+
                                     // Update the snapshot with new data
                                     snap.rooms = rs.rooms.clone();
                                     snap.users = rs.users.clone();
                                     snap.last_state_hash = received_state_hash.clone();
-                                    
+
                                     if snap.current_room_id.is_none() {
                                         // default to Root if present
                                         snap.current_room_id = snap.rooms.iter()
                                             .find_map(|r| r.id.as_ref().and_then(uuid_from_room_id))
                                             .or(Some(ROOT_ROOM_UUID));
                                     }
-                                    
+
                                     // Compute local hash from the new state
                                     let room_state = proto::RoomState {
                                         rooms: snap.rooms.clone(),
                                         users: snap.users.clone(),
                                     };
                                     let local_hash = api::compute_room_state_hash(&room_state);
-                                    
+
                                     // Verify hash matches what server sent
                                     if !received_state_hash.is_empty() && local_hash != received_state_hash {
                                         error!(
@@ -405,7 +438,7 @@ impl Client {
                                             &local_hash[..local_hash.len().min(8)],
                                             &received_state_hash[..received_state_hash.len().min(8)]
                                         );
-                                        
+
                                         // Request resync
                                         resync_count_for_reader.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                                         let resync_env = proto::Envelope {
@@ -428,27 +461,27 @@ impl Client {
                                             &received_state_hash[..received_state_hash.len().min(8)]
                                         );
                                     }
-                                    
+
                                     info!(rooms = snap.rooms.len(), users = snap.users.len(), "backend: updated snapshot from RoomStateUpdate");
                                 }
-                                
+
                                 // Handle incremental state updates
                                 if let Some(proto::server_event::Kind::StateUpdate(su)) = ev.kind.clone() {
                                     let mut snap = snapshot_for_reader.lock().await;
                                     let expected_hash = su.expected_hash.clone();
-                                    
+
                                     // Apply the incremental update
                                     if let Some(update) = su.update {
                                         apply_state_update(&mut snap, update);
                                     }
-                                    
+
                                     // Compute local hash after applying update
                                     let room_state = proto::RoomState {
                                         rooms: snap.rooms.clone(),
                                         users: snap.users.clone(),
                                     };
                                     let local_hash = api::compute_room_state_hash(&room_state);
-                                    
+
                                     // Verify hash matches expected
                                     if !expected_hash.is_empty() && local_hash != expected_hash {
                                         error!(
@@ -456,7 +489,7 @@ impl Client {
                                             &local_hash[..local_hash.len().min(8)],
                                             &expected_hash[..expected_hash.len().min(8)]
                                         );
-                                        
+
                                         // Request resync
                                         resync_count_for_reader.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                                         let resync_env = proto::Envelope {
@@ -481,15 +514,15 @@ impl Client {
                                             &expected_hash[..expected_hash.len().min(8)]
                                         );
                                     }
-                                    
+
                                     info!(rooms = snap.rooms.len(), users = snap.users.len(), "backend: applied incremental StateUpdate");
                                 }
-                                
+
                                 let _ = events_tx.send(ev);
                             }
                         }
                     }
-                    
+
                     // Read more data
                     let mut chunk = [0u8; 1024];
                     match local_recv.read(&mut chunk).await {
@@ -509,14 +542,15 @@ impl Client {
                 }
             }
             .await;
-            
+
             // Signal connection loss with appropriate reason
             match result {
                 Ok(()) => {
                     let _ = connection_lost_for_reader.send(ConnectionLostReason::StreamClosed);
                 }
                 Err(e) => {
-                    let _ = connection_lost_for_reader.send(ConnectionLostReason::StreamError(e.to_string()));
+                    let _ = connection_lost_for_reader
+                        .send(ConnectionLostReason::StreamError(e.to_string()));
                 }
             }
         });
@@ -524,9 +558,11 @@ impl Client {
         // Create shutdown channel (not used yet, but available for graceful shutdown).
         let (shutdown_tx, _shutdown_rx) = tokio::sync::oneshot::channel();
 
-        // Create voice datagram channel.
-        let (voice_tx, voice_rx) = mpsc::unbounded_channel();
-        
+        // Create voice datagram channel (bounded to prevent unbounded memory growth).
+        // 100 frames is about 500ms at 5ms frame size, or 2 seconds at 20ms.
+        const VOICE_RECEIVE_BUFFER_SIZE: usize = 100;
+        let (voice_tx, voice_rx) = mpsc::channel(VOICE_RECEIVE_BUFFER_SIZE);
+
         // Spawn task to receive voice datagrams.
         let conn_for_voice = conn.clone();
         let connection_lost_for_voice = connection_lost_tx;
@@ -542,7 +578,11 @@ impl Client {
                                     data_len = voice_dgram.opus_data.len(),
                                     "backend: received voice datagram"
                                 );
-                                let _ = voice_tx.send(voice_dgram);
+                                // Use try_send to drop old frames when buffer is full
+                                // rather than blocking or growing unbounded
+                                if voice_tx.try_send(voice_dgram).is_err() {
+                                    debug!("backend: voice receive buffer full, dropping datagram");
+                                }
                             }
                             Err(e) => {
                                 debug!(error = ?e, "backend: failed to decode voice datagram");
@@ -551,18 +591,19 @@ impl Client {
                     }
                     Err(e) => {
                         info!(error = ?e, "backend: datagram receive ended (connection lost)");
-                        let _ = connection_lost_for_voice.send(ConnectionLostReason::DatagramError(e.to_string()));
+                        let _ = connection_lost_for_voice
+                            .send(ConnectionLostReason::DatagramError(e.to_string()));
                         break;
                     }
                 }
             }
         });
 
-        Ok(Client { 
-            send: send_arc, 
-            conn, 
-            events_rx, 
-            snapshot, 
+        Ok(Client {
+            send: send_arc,
+            conn,
+            events_rx,
+            snapshot,
             shutdown_tx: Some(shutdown_tx),
             user_id,
             client_name: client_name.to_string(),
@@ -584,7 +625,10 @@ impl Client {
         };
         let frame = encode_frame(&msg);
         let mut send = self.send.lock().await;
-        info!(bytes = frame.len(), sender, "backend: sending ChatMessage frame");
+        info!(
+            bytes = frame.len(),
+            sender, "backend: sending ChatMessage frame"
+        );
         send.write_all(&frame).await?;
         Ok(())
     }
@@ -610,7 +654,9 @@ impl Client {
     pub async fn join_room(&self, room_uuid: Uuid) -> Result<()> {
         let env = proto::Envelope {
             state_hash: Vec::new(),
-            payload: Some(Payload::JoinRoom(proto::JoinRoom { room_id: Some(room_id_from_uuid(room_uuid)) })),
+            payload: Some(Payload::JoinRoom(proto::JoinRoom {
+                room_id: Some(room_id_from_uuid(room_uuid)),
+            })),
         };
         let frame = encode_frame(&env);
         let mut send = self.send.lock().await;
@@ -628,21 +674,43 @@ impl Client {
     }
 
     pub async fn create_room(&self, name: &str) -> Result<()> {
-        let env = proto::Envelope { state_hash: Vec::new(), payload: Some(Payload::CreateRoom(proto::CreateRoom { name: name.to_string() })) };
+        let env = proto::Envelope {
+            state_hash: Vec::new(),
+            payload: Some(Payload::CreateRoom(proto::CreateRoom {
+                name: name.to_string(),
+            })),
+        };
         let frame = encode_frame(&env);
-        let mut send = self.send.lock().await; send.write_all(&frame).await?; Ok(())
+        let mut send = self.send.lock().await;
+        send.write_all(&frame).await?;
+        Ok(())
     }
 
     pub async fn delete_room(&self, room_uuid: Uuid) -> Result<()> {
-        let env = proto::Envelope { state_hash: Vec::new(), payload: Some(Payload::DeleteRoom(proto::DeleteRoom { room_id: Some(room_id_from_uuid(room_uuid)) })) };
+        let env = proto::Envelope {
+            state_hash: Vec::new(),
+            payload: Some(Payload::DeleteRoom(proto::DeleteRoom {
+                room_id: Some(room_id_from_uuid(room_uuid)),
+            })),
+        };
         let frame = encode_frame(&env);
-        let mut send = self.send.lock().await; send.write_all(&frame).await?; Ok(())
+        let mut send = self.send.lock().await;
+        send.write_all(&frame).await?;
+        Ok(())
     }
 
     pub async fn rename_room(&self, room_uuid: Uuid, new_name: &str) -> Result<()> {
-        let env = proto::Envelope { state_hash: Vec::new(), payload: Some(Payload::RenameRoom(proto::RenameRoom { room_id: Some(room_id_from_uuid(room_uuid)), new_name: new_name.to_string() })) };
+        let env = proto::Envelope {
+            state_hash: Vec::new(),
+            payload: Some(Payload::RenameRoom(proto::RenameRoom {
+                room_id: Some(room_id_from_uuid(room_uuid)),
+                new_name: new_name.to_string(),
+            })),
+        };
         let frame = encode_frame(&env);
-        let mut send = self.send.lock().await; send.write_all(&frame).await?; Ok(())
+        let mut send = self.send.lock().await;
+        send.write_all(&frame).await?;
+        Ok(())
     }
 
     /// Gracefully disconnect from the server.
@@ -667,7 +735,7 @@ impl Client {
     }
 
     /// Get the user ID assigned by the server.
-    /// 
+    ///
     /// This is the single source of truth for the client's identity,
     /// assigned by the server via ServerHello during connection.
     /// Always valid after `connect()` returns successfully.
@@ -682,20 +750,20 @@ impl Client {
 
     /// Send a voice datagram with the given opus data.
     /// Uses QUIC datagrams for low-latency unreliable delivery.
-    /// 
+    ///
     /// # Arguments
     /// * `opus_data` - Opus-encoded audio frame bytes
-    /// 
+    ///
     /// # Returns
     /// The sequence number used for this datagram.
     pub fn send_voice_datagram(&self, opus_data: Vec<u8>) -> Result<u32> {
         let seq = self.voice_sequence.fetch_add(1, Ordering::Relaxed);
-        
+
         let timestamp_us = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_micros() as u64)
             .unwrap_or(0);
-        
+
         // Client only provides audio data, sequence, and timestamp.
         // sender_id and room_id are set by the server based on the connection.
         let datagram = VoiceDatagram {
@@ -705,10 +773,10 @@ impl Client {
             sender_id: None,
             room_id: None,
         };
-        
+
         let bytes = datagram.encode_to_vec();
         self.conn.send_datagram(bytes.into())?;
-        
+
         debug!(seq, "backend: sent voice datagram");
         Ok(seq)
     }
@@ -716,12 +784,12 @@ impl Client {
     /// Send a voice datagram asynchronously.
     pub async fn send_voice_datagram_async(&self, opus_data: Vec<u8>) -> Result<u32> {
         let seq = self.voice_sequence.fetch_add(1, Ordering::Relaxed);
-        
+
         let timestamp_us = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_micros() as u64)
             .unwrap_or(0);
-        
+
         // Client only provides audio data, sequence, and timestamp.
         // sender_id and room_id are set by the server based on the connection.
         let datagram = VoiceDatagram {
@@ -731,17 +799,21 @@ impl Client {
             sender_id: None,
             room_id: None,
         };
-        
+
         let bytes = datagram.encode_to_vec();
         self.conn.send_datagram(bytes.into())?;
-        
+
         debug!(seq, "backend: sent voice datagram async");
         Ok(seq)
     }
 
     /// Take ownership of the voice datagram receiver for custom handling.
-    pub fn take_voice_receiver(&mut self) -> mpsc::UnboundedReceiver<VoiceDatagram> {
-        let (_dummy_tx, dummy_rx) = mpsc::unbounded_channel();
+    ///
+    /// The receiver is bounded to prevent unbounded memory growth when
+    /// playback can't keep up with incoming audio.
+    pub fn take_voice_receiver(&mut self) -> mpsc::Receiver<VoiceDatagram> {
+        // Create a dummy bounded channel with capacity 1
+        let (_dummy_tx, dummy_rx) = mpsc::channel(1);
         std::mem::replace(&mut self.voice_rx, dummy_rx)
     }
 
@@ -749,30 +821,32 @@ impl Client {
     pub fn try_recv_voice(&mut self) -> Option<VoiceDatagram> {
         self.voice_rx.try_recv().ok()
     }
-    
+
     /// Take ownership of the connection-lost receiver for custom handling.
-    /// 
+    ///
     /// This receiver will receive a message when the connection is unexpectedly lost
     /// (i.e., not via a graceful disconnect). Use this to implement reconnection logic.
-    pub fn take_connection_lost_receiver(&mut self) -> mpsc::UnboundedReceiver<ConnectionLostReason> {
+    pub fn take_connection_lost_receiver(
+        &mut self,
+    ) -> mpsc::UnboundedReceiver<ConnectionLostReason> {
         let (_dummy_tx, dummy_rx) = mpsc::unbounded_channel();
         std::mem::replace(&mut self.connection_lost_rx, dummy_rx)
     }
-    
+
     /// Try to receive a connection-lost notification without blocking.
     pub fn try_recv_connection_lost(&mut self) -> Option<ConnectionLostReason> {
         self.connection_lost_rx.try_recv().ok()
     }
-    
+
     /// Get the last received state hash from the server.
-    /// 
+    ///
     /// This is updated whenever the server sends a RoomStateUpdate with a state_hash.
     pub async fn last_received_state_hash(&self) -> Vec<u8> {
         self.snapshot.lock().await.last_state_hash.clone()
     }
-    
+
     /// Compute a local state hash from the current snapshot.
-    /// 
+    ///
     /// This computes the hash the same way the server does, using canonical
     /// sorting of rooms and users before hashing.
     pub async fn compute_local_state_hash(&self) -> Vec<u8> {
@@ -783,16 +857,16 @@ impl Client {
         };
         api::compute_room_state_hash(&room_state)
     }
-    
+
     /// Get the number of times a resync has been requested.
-    /// 
+    ///
     /// This is useful for testing to verify that hash mismatches trigger resyncs.
     pub fn resync_count(&self) -> u32 {
         self.resync_count.load(std::sync::atomic::Ordering::SeqCst)
     }
-    
+
     /// Corrupt the local state for testing purposes.
-    /// 
+    ///
     /// This artificially modifies the local snapshot to cause a hash mismatch
     /// on the next state update, which should trigger a resync.
     pub async fn corrupt_local_state_for_testing(&self) {
@@ -804,9 +878,9 @@ impl Client {
         });
         info!("backend: corrupted local state for testing");
     }
-    
+
     /// Manually request a state resync from the server.
-    /// 
+    ///
     /// This sends a RequestStateSync message to the server, which will
     /// respond with a full RoomState update. This is typically called
     /// automatically when a hash mismatch is detected, but can also be
@@ -823,7 +897,7 @@ impl Client {
             let local_hash = api::compute_room_state_hash(&room_state);
             (current_hash, local_hash)
         };
-        
+
         let env = proto::Envelope {
             state_hash: Vec::new(),
             payload: Some(Payload::RequestStateSync(proto::RequestStateSync {
@@ -832,11 +906,11 @@ impl Client {
             })),
         };
         let frame = encode_frame(&env);
-        
+
         let mut send = self.send.lock().await;
         send.write_all(&frame).await?;
         info!("backend: sent manual RequestStateSync");
-        
+
         self.resync_count.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
@@ -850,7 +924,8 @@ impl Drop for Client {
         }
         // Close the QUIC connection immediately.
         // This is synchronous and will signal to the server that we're done.
-        self.conn.close(quinn::VarInt::from_u32(0), b"client dropped");
+        self.conn
+            .close(quinn::VarInt::from_u32(0), b"client dropped");
     }
 }
 
@@ -860,7 +935,7 @@ fn make_client_endpoint(config: &ConnectConfig) -> Result<Endpoint> {
     // Start with webpki system roots.
     let mut root_store = rustls::RootCertStore::empty();
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    
+
     // Load additional configured certificates.
     for cert_path in &config.additional_certs {
         match std::fs::read(cert_path) {
@@ -875,15 +950,17 @@ fn make_client_endpoint(config: &ConnectConfig) -> Result<Endpoint> {
         }
     }
 
-    let mut client_cfg = rustls::ClientConfig::builder_with_provider(rustls::crypto::ring::default_provider().into())
-        .with_protocol_versions(&[&rustls::version::TLS13])?
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
+    let mut client_cfg = rustls::ClientConfig::builder_with_provider(
+        rustls::crypto::ring::default_provider().into(),
+    )
+    .with_protocol_versions(&[&rustls::version::TLS13])?
+    .with_root_certificates(root_store)
+    .with_no_client_auth();
     client_cfg.alpn_protocols = vec![b"rumble".to_vec()];
     let rustls_config = Arc::new(client_cfg);
     let crypto = QuicClientConfig::try_from(rustls_config)?;
     let mut client_config = quinn::ClientConfig::new(Arc::new(crypto));
-    
+
     // Configure transport for faster disconnect detection.
     let mut transport_config = quinn::TransportConfig::default();
     // Idle timeout: close connection if no activity for this duration.
@@ -893,7 +970,7 @@ fn make_client_endpoint(config: &ConnectConfig) -> Result<Endpoint> {
     // Enable datagrams for low-latency voice data.
     transport_config.datagram_receive_buffer_size(Some(65536));
     client_config.transport_config(Arc::new(transport_config));
-    
+
     endpoint.set_default_client_config(client_config);
     Ok(endpoint)
 }

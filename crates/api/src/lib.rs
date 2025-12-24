@@ -3,9 +3,9 @@
 //! Generated protobuf types live in the `proto` module. This crate also
 //! provides small helpers for framing protobuf messages over QUIC streams.
 
+use blake3::Hasher;
 use bytes::{Buf, BufMut, BytesMut};
 use prost::Message;
-use blake3::Hasher;
 pub use uuid::Uuid;
 
 pub mod proto {
@@ -41,7 +41,9 @@ pub fn root_room_id() -> proto::RoomId {
 
 /// Check if a RoomId represents the Root room.
 pub fn is_root_room(room_id: &proto::RoomId) -> bool {
-    uuid_from_room_id(room_id).map(|u| u == ROOT_ROOM_UUID).unwrap_or(false)
+    uuid_from_room_id(room_id)
+        .map(|u| u == ROOT_ROOM_UUID)
+        .unwrap_or(false)
 }
 
 /// Generate a new random RoomId.
@@ -55,7 +57,8 @@ pub fn encode_frame<M: Message>(msg: &M) -> Vec<u8> {
     // Reserve space for length prefix.
     buf.reserve(4 + msg.encoded_len());
     buf.put_u32(msg.encoded_len() as u32);
-    msg.encode(&mut buf).expect("encoding to BytesMut cannot fail");
+    msg.encode(&mut buf)
+        .expect("encoding to BytesMut cannot fail");
     buf.to_vec()
 }
 
@@ -93,35 +96,35 @@ pub fn compute_state_hash<M: Message>(msg: &M) -> Vec<u8> {
 }
 
 /// Compute a state hash from a RoomState message with canonical sorting.
-/// 
+///
 /// This function canonicalizes the RoomState by sorting rooms by ID and users
 /// by user_id before hashing. This ensures deterministic hashes regardless of
 /// the order items were added.
-/// 
+///
 /// This is the standard hash function used for state synchronization between
 /// client and server.
 pub fn compute_room_state_hash(room_state: &proto::RoomState) -> Vec<u8> {
     // Create a canonicalized copy with sorted rooms and users for determinism
     let mut canonical = room_state.clone();
-    
+
     // Sort rooms by UUID bytes for deterministic ordering
     canonical.rooms.sort_by(|a, b| {
         let a_id = a.id.as_ref().map(|r| r.uuid.as_slice()).unwrap_or(&[]);
         let b_id = b.id.as_ref().map(|r| r.uuid.as_slice()).unwrap_or(&[]);
         a_id.cmp(b_id)
     });
-    
+
     // Sort users by user_id for deterministic ordering
     canonical.users.sort_by(|a, b| {
         let a_id = a.user_id.as_ref().map(|u| u.value).unwrap_or(0);
         let b_id = b.user_id.as_ref().map(|u| u.value).unwrap_or(0);
         a_id.cmp(&b_id)
     });
-    
+
     // Serialize to bytes
     let mut buf = Vec::with_capacity(canonical.encoded_len());
     canonical.encode(&mut buf).expect("prost encode failed");
-    
+
     // Hash with blake3
     let mut hasher = Hasher::new();
     hasher.update(&buf);

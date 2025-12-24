@@ -1,6 +1,4 @@
-use backend::{AudioConfig, AudioDeviceInfo, AudioInput, AudioOutput, AudioSystem};
 use backend::{BackendCommand, BackendEvent, BackendHandle};
-use backend::{bytes_to_samples, samples_to_bytes};
 use clap::Parser;
 use eframe::egui;
 use egui::{CollapsingHeader, Modal};
@@ -59,65 +57,6 @@ struct RenameModalState {
     room_name: String,
 }
 
-/// Audio settings state
-struct AudioSettings {
-    /// Audio subsystem handle
-    audio_system: AudioSystem,
-    /// Available input devices
-    input_devices: Vec<AudioDeviceInfo>,
-    /// Available output devices  
-    output_devices: Vec<AudioDeviceInfo>,
-    /// Selected input device index (None = default)
-    selected_input: Option<usize>,
-    /// Selected output device index (None = default)
-    selected_output: Option<usize>,
-    /// Whether microphone is enabled (push-to-talk or voice activity)
-    /// Note: Currently push-to-talk is the only mode; this field is reserved for voice activity.
-    #[allow(dead_code)]
-    mic_enabled: bool,
-    /// Whether audio output is enabled
-    output_enabled: bool,
-    /// Input volume (0.0 - 2.0, 1.0 = normal)
-    input_volume: f32,
-    /// Output volume (0.0 - 2.0, 1.0 = normal)
-    output_volume: f32,
-}
-
-impl Default for AudioSettings {
-    fn default() -> Self {
-        let audio_system = AudioSystem::new();
-        let input_devices = audio_system.list_input_devices();
-        let output_devices = audio_system.list_output_devices();
-
-        // Find default device indices
-        let selected_input = input_devices.iter().find(|d| d.is_default).map(|d| d.index);
-        let selected_output = output_devices
-            .iter()
-            .find(|d| d.is_default)
-            .map(|d| d.index);
-
-        Self {
-            audio_system,
-            input_devices,
-            output_devices,
-            selected_input,
-            selected_output,
-            mic_enabled: false,
-            output_enabled: true,
-            input_volume: 1.0,
-            output_volume: 1.0,
-        }
-    }
-}
-
-impl AudioSettings {
-    /// Refresh the device lists
-    fn refresh_devices(&mut self) {
-        self.input_devices = self.audio_system.list_input_devices();
-        self.output_devices = self.audio_system.list_output_devices();
-    }
-}
-
 struct MyApp {
     // UI state
     show_connect: bool,
@@ -129,37 +68,27 @@ struct MyApp {
     chat_input: String,
     client_name: String,
 
-    // Backend handle (manages connection and state)
+    // Backend handle (manages connection, audio, and state)
     backend: BackendHandle,
 
     // Rename modal state
     rename_modal: RenameModalState,
 
-    // Audio settings and state
-    audio_settings: AudioSettings,
-    /// Active audio input stream (mic capture)
-    audio_input: Option<AudioInput>,
-    /// Active audio output stream (playback)
-    audio_output: Option<AudioOutput>,
     /// Push-to-talk key is held
     push_to_talk_active: bool,
-    /// Track which users are currently talking (user_id -> last voice time)
-    talking_users: std::collections::HashMap<u64, std::time::Instant>,
+    /// Track which users are currently talking (user_id -> is_talking)
+    talking_users: std::collections::HashSet<u64>,
 
     egui_ctx: egui::Context,
 }
 
 impl Drop for MyApp {
     fn drop(&mut self) {
-        // Stop audio streams first.
-        self.audio_input = None;
-        self.audio_output = None;
-
         // Send disconnect command before dropping the backend handle
         if self.backend.is_connected() {
             self.backend.send(BackendCommand::Disconnect);
         }
-        // BackendHandle will clean up the background thread when dropped
+        // BackendHandle will clean up the background thread and audio when dropped
     }
 }
 
@@ -167,9 +96,9 @@ impl MyApp {
     fn new(ctx: egui::Context, args: Args) -> Self {
         // Create backend handle with repaint callback
         let ctx_for_repaint = ctx.clone();
-        let backend = BackendHandle::with_repaint_callback(Some(move || {
+        let mut backend = BackendHandle::with_repaint_callback(move || {
             ctx_for_repaint.request_repaint();
-        }));
+        });
 
         // Use provided name or generate a random one
         let client_name = args
@@ -222,17 +151,14 @@ impl MyApp {
             client_name,
             backend,
             rename_modal: RenameModalState::default(),
-            audio_settings: AudioSettings::default(),
-            audio_input: None,
-            audio_output: None,
             push_to_talk_active: false,
-            talking_users: std::collections::HashMap::new(),
+            talking_users: std::collections::HashSet::new(),
             egui_ctx: ctx,
         }
     }
 
     /// Send a command to the backend (non-blocking)
-    fn send_command(&self, cmd: BackendCommand) {
+    fn send_command(&mut self, cmd: BackendCommand) {
         self.backend.send(cmd);
     }
 
@@ -259,7 +185,8 @@ impl MyApp {
             config = config.with_cert(cert_path);
         }
 
-        self.chat_messages.push(format!("Reconnecting to {}...", addr));
+        self.chat_messages
+            .push(format!("Reconnecting to {}...", addr));
         self.send_command(BackendCommand::Connect {
             addr,
             name,
@@ -268,102 +195,24 @@ impl MyApp {
         });
     }
 
-    /// Start audio capture with the selected input device.
-    fn start_audio_input(&mut self) {
-        if self.audio_input.is_some() {
-            return; // Already running
-        }
-
-        let device = if let Some(idx) = self.audio_settings.selected_input {
-            self.audio_settings.audio_system.get_input_device(idx)
-        } else {
-            self.audio_settings.audio_system.default_input_device()
-        };
-
-        let Some(device) = device else {
-            eprintln!("No input device available");
-            return;
-        };
-
-        let config = AudioConfig::default();
-        let input_volume = self.audio_settings.input_volume;
-        
-        // Get a command sender that can be used from the audio callback thread
-        let command_sender = self.backend.command_sender();
-        
-        match AudioInput::new(&device, &config, move |samples| {
-            // Apply volume and send to backend via command sender
-            let adjusted: Vec<f32> = samples.iter().map(|s| s * input_volume).collect();
-            let bytes = samples_to_bytes(&adjusted);
-            command_sender.send_voice(bytes);
-        }) {
-            Ok(input) => {
-                self.audio_input = Some(input);
-                eprintln!("Audio input started");
-            }
-            Err(e) => {
-                eprintln!("Failed to start audio input: {}", e);
-            }
-        }
+    /// Start audio capture (push-to-talk)
+    fn start_voice_capture(&mut self) {
+        self.backend.send(BackendCommand::StartVoiceCapture);
     }
 
-    /// Stop audio capture.
-    fn stop_audio_input(&mut self) {
-        if let Some(input) = self.audio_input.take() {
-            input.pause();
-            eprintln!("Audio input stopped");
-        }
+    /// Stop audio capture
+    fn stop_voice_capture(&mut self) {
+        self.backend.send(BackendCommand::StopVoiceCapture);
     }
 
-    /// Start audio playback with the selected output device.
-    fn start_audio_output(&mut self) {
-        if self.audio_output.is_some() {
-            return; // Already running
-        }
-
-        let device = if let Some(idx) = self.audio_settings.selected_output {
-            self.audio_settings.audio_system.get_output_device(idx)
-        } else {
-            self.audio_settings.audio_system.default_output_device()
-        };
-
-        let Some(device) = device else {
-            eprintln!("No output device available");
-            return;
-        };
-
-        let config = AudioConfig::default();
-
-        match AudioOutput::new(&device, &config) {
-            Ok(output) => {
-                self.audio_output = Some(output);
-                eprintln!("Audio output started");
-            }
-            Err(e) => {
-                eprintln!("Failed to start audio output: {}", e);
-            }
-        }
+    /// Start audio playback
+    fn start_playback(&mut self) {
+        self.backend.send(BackendCommand::StartPlayback);
     }
 
-    /// Stop audio playback.
-    fn stop_audio_output(&mut self) {
-        if let Some(output) = self.audio_output.take() {
-            output.pause();
-            eprintln!("Audio output stopped");
-        }
-    }
-
-    /// Queue received audio for playback.
-    fn play_received_audio(&self, audio_bytes: &[u8]) {
-        if let Some(output) = &self.audio_output {
-            let samples = bytes_to_samples(audio_bytes);
-            // Apply output volume
-            let adjusted: Vec<f32> = samples
-                .iter()
-                .map(|s| s * self.audio_settings.output_volume)
-                .collect();
-            output.queue_samples(&adjusted);
-        }
+    /// Stop audio playback
+    fn stop_playback(&mut self) {
+        self.backend.send(BackendCommand::StopPlayback);
     }
 }
 
@@ -374,14 +223,16 @@ impl eframe::App for MyApp {
         // Process incoming backend events (non-blocking)
         while let Some(event) = self.backend.poll_event() {
             match event {
-                BackendEvent::Connected { user_id, client_name } => {
-                    self.chat_messages
-                        .push(format!("Connected to {} as {} (id: {})", 
-                            self.connect_address, client_name, user_id));
-                    // Start audio output when connected
-                    if self.audio_settings.output_enabled {
-                        self.start_audio_output();
-                    }
+                BackendEvent::Connected {
+                    user_id,
+                    client_name,
+                } => {
+                    self.chat_messages.push(format!(
+                        "Connected to {} as {} (id: {})",
+                        self.connect_address, client_name, user_id
+                    ));
+                    // Start audio playback when connected
+                    self.start_playback();
                 }
                 BackendEvent::ConnectFailed { error } => {
                     self.chat_messages
@@ -394,10 +245,13 @@ impl eframe::App for MyApp {
                     };
                     self.chat_messages.push(msg);
                     // Stop audio when disconnected
-                    self.stop_audio_input();
-                    self.stop_audio_output();
+                    self.stop_voice_capture();
+                    self.stop_playback();
                 }
-                BackendEvent::ConnectionLost { error, will_reconnect } => {
+                BackendEvent::ConnectionLost {
+                    error,
+                    will_reconnect,
+                } => {
                     let msg = if will_reconnect {
                         format!("Connection lost: {}. Reconnecting...", error)
                     } else {
@@ -405,8 +259,8 @@ impl eframe::App for MyApp {
                     };
                     self.chat_messages.push(msg);
                     // Stop audio when connection is lost
-                    self.stop_audio_input();
-                    self.stop_audio_output();
+                    self.stop_voice_capture();
+                    self.stop_playback();
                 }
                 BackendEvent::ConnectionStatusChanged { status } => {
                     // Log status changes for debugging
@@ -418,11 +272,18 @@ impl eframe::App for MyApp {
                         ConnectionStatus::Connected => {
                             // Already handled by BackendEvent::Connected
                         }
-                        ConnectionStatus::Reconnecting { attempt, max_attempts } => {
+                        ConnectionStatus::Reconnecting {
+                            attempt,
+                            max_attempts,
+                        } => {
                             self.chat_messages.push(format!(
                                 "Reconnecting (attempt {}/{})...",
                                 attempt,
-                                if max_attempts == 0 { "∞".to_string() } else { max_attempts.to_string() }
+                                if max_attempts == 0 {
+                                    "∞".to_string()
+                                } else {
+                                    max_attempts.to_string()
+                                }
                             ));
                         }
                         ConnectionStatus::ConnectionLost => {
@@ -439,14 +300,20 @@ impl eframe::App for MyApp {
                 BackendEvent::StateUpdated { state: _ } => {
                     // State is automatically updated in the backend handle
                 }
-                BackendEvent::VoiceReceived {
-                    sender_id,
-                    audio_bytes,
+                BackendEvent::VoiceActivity {
+                    user_id,
+                    is_talking,
                 } => {
-                    // Track that this user is talking
-                    self.talking_users
-                        .insert(sender_id, std::time::Instant::now());
-                    self.play_received_audio(&audio_bytes);
+                    // Track which users are talking
+                    if is_talking {
+                        self.talking_users.insert(user_id);
+                    } else {
+                        self.talking_users.remove(&user_id);
+                    }
+                }
+                BackendEvent::AudioStateChanged { state: _ } => {
+                    // Audio state is updated in backend.state().audio automatically
+                    // No action needed here - UI reads from backend state directly
                 }
                 BackendEvent::Error { message } => {
                     self.chat_messages.push(format!("Error: {}", message));
@@ -454,19 +321,14 @@ impl eframe::App for MyApp {
             }
         }
 
-        // Clean up stale talking indicators (after 200ms of no voice data)
-        let now = std::time::Instant::now();
-        self.talking_users
-            .retain(|_, last_time| now.duration_since(*last_time).as_millis() < 200);
-
         // Handle push-to-talk (Space key)
         let space_pressed = ctx.input(|i| i.key_down(egui::Key::Space));
         if space_pressed && !self.push_to_talk_active && self.backend.is_connected() {
             self.push_to_talk_active = true;
-            self.start_audio_input();
+            self.start_voice_capture();
         } else if !space_pressed && self.push_to_talk_active {
             self.push_to_talk_active = false;
-            self.stop_audio_input();
+            self.stop_voice_capture();
         }
 
         // Top menu
@@ -497,7 +359,7 @@ impl eframe::App for MyApp {
                         ui.close();
                     }
                 });
-                
+
                 // Show connection status indicator on the right side
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     use backend::ConnectionStatus;
@@ -510,7 +372,10 @@ impl eframe::App for MyApp {
                             ui.colored_label(egui::Color32::YELLOW, "● Connecting...");
                         }
                         ConnectionStatus::Reconnecting { attempt, .. } => {
-                            ui.colored_label(egui::Color32::YELLOW, format!("● Reconnecting ({})...", attempt));
+                            ui.colored_label(
+                                egui::Color32::YELLOW,
+                                format!("● Reconnecting ({})...", attempt),
+                            );
                         }
                         ConnectionStatus::ConnectionLost => {
                             if ui.button("⟳ Reconnect").clicked() {
@@ -587,10 +452,14 @@ impl eframe::App for MyApp {
                 ui.horizontal(|ui| {
                     ui.label("No rooms received yet.");
                     if ui.button("Join Root").clicked() {
-                        self.send_command(BackendCommand::JoinRoom { room_uuid: api::ROOT_ROOM_UUID });
+                        self.send_command(BackendCommand::JoinRoom {
+                            room_uuid: api::ROOT_ROOM_UUID,
+                        });
                     }
                     if ui.button("Refresh").clicked() {
-                        self.send_command(BackendCommand::JoinRoom { room_uuid: api::ROOT_ROOM_UUID });
+                        self.send_command(BackendCommand::JoinRoom {
+                            room_uuid: api::ROOT_ROOM_UUID,
+                        });
                     }
                 });
                 ui.separator();
@@ -645,7 +514,8 @@ impl eframe::App for MyApp {
                         .show(ui, |ui| {
                             if let Some(uuid) = room_uuid {
                                 for up in state.users_in_room(uuid) {
-                                    let user_id = up.user_id.as_ref().map(|id| id.value).unwrap_or(0);
+                                    let user_id =
+                                        up.user_id.as_ref().map(|id| id.value).unwrap_or(0);
                                     let is_self = state.my_user_id == Some(user_id);
 
                                     // Check if user is talking
@@ -653,7 +523,7 @@ impl eframe::App for MyApp {
                                     let is_talking = if is_self {
                                         self.push_to_talk_active
                                     } else {
-                                        self.talking_users.contains_key(&user_id)
+                                        self.talking_users.contains(&user_id)
                                     };
 
                                     ui.horizontal(|ui| {
@@ -758,45 +628,38 @@ impl eframe::App for MyApp {
 
                 // Audio settings
                 ui.collapsing("Audio", |ui| {
+                    // Clone audio state to avoid borrow conflicts with send()
+                    let audio = self.backend.state().audio.clone();
+
                     // Refresh button
                     if ui.button("🔄 Refresh Devices").clicked() {
-                        self.audio_settings.refresh_devices();
+                        self.backend.send(BackendCommand::RefreshAudioDevices);
                     }
 
                     ui.separator();
 
                     // Input device selection
                     ui.label("Input Device (Microphone):");
-                    let current_input_name = self
-                        .audio_settings
-                        .selected_input
-                        .and_then(|idx| {
-                            self.audio_settings
-                                .input_devices
-                                .iter()
-                                .find(|d| d.index == idx)
-                        })
+                    let current_input_name = audio
+                        .selected_input_device()
                         .map(|d| d.name.clone())
                         .unwrap_or_else(|| "Default".to_string());
 
-                    // Track selection change outside the borrow
-                    let mut input_device_changed: Option<Option<usize>> = None;
+                    // Track selection change
+                    let mut input_device_changed: Option<Option<String>> = None;
 
                     egui::ComboBox::from_id_salt("input_device")
                         .selected_text(&current_input_name)
                         .show_ui(ui, |ui| {
                             // Default option
                             if ui
-                                .selectable_label(
-                                    self.audio_settings.selected_input.is_none(),
-                                    "Default",
-                                )
+                                .selectable_label(audio.selected_input_id.is_none(), "Default")
                                 .clicked()
                             {
                                 input_device_changed = Some(None);
                             }
 
-                            for device in &self.audio_settings.input_devices {
+                            for device in &audio.input_devices {
                                 let label = if device.is_default {
                                     format!("{} (default)", device.name)
                                 } else {
@@ -804,69 +667,70 @@ impl eframe::App for MyApp {
                                 };
                                 if ui
                                     .selectable_label(
-                                        self.audio_settings.selected_input == Some(device.index),
+                                        audio.selected_input_id.as_ref() == Some(&device.id),
                                         &label,
                                     )
                                     .clicked()
                                 {
-                                    input_device_changed = Some(Some(device.index));
+                                    input_device_changed = Some(Some(device.id.clone()));
                                 }
                             }
                         });
 
-                    // Handle input device change after the borrow ends
+                    // Handle input device change
                     if let Some(new_selection) = input_device_changed {
-                        self.audio_settings.selected_input = new_selection;
-                        if self.audio_input.is_some() {
-                            self.stop_audio_input();
-                            self.start_audio_input();
-                        }
+                        self.backend.send(BackendCommand::SetInputDevice {
+                            device_id: new_selection,
+                        });
                     }
 
                     // Input volume slider
+                    let mut input_volume = audio.input_volume;
                     ui.horizontal(|ui| {
                         ui.label("Input Volume:");
-                        ui.add(
-                            egui::Slider::new(&mut self.audio_settings.input_volume, 0.0..=2.0)
-                                .show_value(true)
-                                .suffix("x"),
-                        );
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut input_volume, 0.0..=2.0)
+                                    .show_value(true)
+                                    .suffix("x"),
+                            )
+                            .changed()
+                        {
+                            // Note: We can't call send() in the closure due to borrow rules
+                            // The slider change is handled below
+                        }
                     });
+                    // Handle volume change after the ui.horizontal closure
+                    if input_volume != audio.input_volume {
+                        self.backend.send(BackendCommand::SetInputVolume {
+                            volume: input_volume,
+                        });
+                    }
 
                     ui.separator();
 
                     // Output device selection
                     ui.label("Output Device (Speakers):");
-                    let current_output_name = self
-                        .audio_settings
-                        .selected_output
-                        .and_then(|idx| {
-                            self.audio_settings
-                                .output_devices
-                                .iter()
-                                .find(|d| d.index == idx)
-                        })
+                    let current_output_name = audio
+                        .selected_output_device()
                         .map(|d| d.name.clone())
                         .unwrap_or_else(|| "Default".to_string());
 
-                    // Track selection change outside the borrow
-                    let mut output_device_changed: Option<Option<usize>> = None;
+                    // Track selection change
+                    let mut output_device_changed: Option<Option<String>> = None;
 
                     egui::ComboBox::from_id_salt("output_device")
                         .selected_text(&current_output_name)
                         .show_ui(ui, |ui| {
                             // Default option
                             if ui
-                                .selectable_label(
-                                    self.audio_settings.selected_output.is_none(),
-                                    "Default",
-                                )
+                                .selectable_label(audio.selected_output_id.is_none(), "Default")
                                 .clicked()
                             {
                                 output_device_changed = Some(None);
                             }
 
-                            for device in &self.audio_settings.output_devices {
+                            for device in &audio.output_devices {
                                 let label = if device.is_default {
                                     format!("{} (default)", device.name)
                                 } else {
@@ -874,57 +738,53 @@ impl eframe::App for MyApp {
                                 };
                                 if ui
                                     .selectable_label(
-                                        self.audio_settings.selected_output == Some(device.index),
+                                        audio.selected_output_id.as_ref() == Some(&device.id),
                                         &label,
                                     )
                                     .clicked()
                                 {
-                                    output_device_changed = Some(Some(device.index));
+                                    output_device_changed = Some(Some(device.id.clone()));
                                 }
                             }
                         });
 
-                    // Handle output device change after the borrow ends
+                    // Handle output device change
                     if let Some(new_selection) = output_device_changed {
-                        self.audio_settings.selected_output = new_selection;
-                        if self.audio_output.is_some() {
-                            self.stop_audio_output();
-                            self.start_audio_output();
-                        }
+                        self.backend.send(BackendCommand::SetOutputDevice {
+                            device_id: new_selection,
+                        });
                     }
 
                     // Output volume slider
+                    let mut output_volume = audio.output_volume;
                     ui.horizontal(|ui| {
                         ui.label("Output Volume:");
                         ui.add(
-                            egui::Slider::new(&mut self.audio_settings.output_volume, 0.0..=2.0)
+                            egui::Slider::new(&mut output_volume, 0.0..=2.0)
                                 .show_value(true)
                                 .suffix("x"),
                         );
                     });
+                    // Handle volume change after the ui.horizontal closure
+                    if output_volume != audio.output_volume {
+                        self.backend.send(BackendCommand::SetOutputVolume {
+                            volume: output_volume,
+                        });
+                    }
 
                     ui.separator();
-
-                    // Output enabled toggle
-                    ui.checkbox(
-                        &mut self.audio_settings.output_enabled,
-                        "Enable audio output",
-                    );
 
                     // Status info
-                    ui.separator();
                     ui.label("Push-to-talk: Hold SPACE to transmit");
 
-                    if self.push_to_talk_active {
+                    if audio.is_capturing {
                         ui.colored_label(egui::Color32::GREEN, "🎤 Transmitting...");
                     } else {
                         ui.label("🔇 Not transmitting");
                     }
 
-                    // Show buffer status if output is active
-                    if let Some(output) = &self.audio_output {
-                        let buffered = output.buffered_samples();
-                        ui.label(format!("Playback buffer: {} samples", buffered));
+                    if audio.is_playing {
+                        ui.label("🔊 Audio output active");
                     }
                 });
 

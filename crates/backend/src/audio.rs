@@ -1,12 +1,20 @@
 //! Audio capture and playback using cpal.
 //!
 //! This module provides audio device enumeration, input capture, and output playback
-//! for voice communication. Raw audio samples are used (no encoding yet).
+//! for voice communication. Audio samples are captured as f32 PCM and should be
+//! encoded with Opus before transmission (see the `codec` module).
 
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{Device, Host, SampleFormat, Stream, StreamConfig};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use cpal::{
+    Device, Host, SampleFormat, Stream, StreamConfig,
+    traits::{DeviceTrait, HostTrait, StreamTrait},
+};
+use std::{
+    collections::VecDeque,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 use tracing::{debug, error, info, warn};
 
 /// Audio sample rate used for voice communication.
@@ -16,19 +24,28 @@ pub const SAMPLE_RATE: u32 = 48000;
 /// Number of channels (mono for voice).
 pub const CHANNELS: u16 = 1;
 
-/// Frame size in samples.
-/// For raw audio over QUIC datagrams (max ~1200 bytes), we use 240 samples (5ms).
-/// This gives us 240 * 4 = 960 bytes of audio data per frame.
-/// When Opus encoding is added, this can be increased to 960 samples (20ms).
-pub const FRAME_SIZE: usize = 240;
+/// Frame size in samples for Opus encoding.
+///
+/// At 48kHz, common Opus frame sizes are:
+/// - 120 samples (2.5ms)
+/// - 240 samples (5ms)
+/// - 480 samples (10ms)
+/// - 960 samples (20ms) <- **default, good balance**
+/// - 1920 samples (40ms)
+/// - 2880 samples (60ms)
+///
+/// 20ms (960 samples) is recommended for VoIP as it provides a good
+/// balance between latency and compression efficiency.
+pub const FRAME_SIZE: usize = 960;
 
 /// Information about an audio device.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AudioDeviceInfo {
-    /// Device name for display.
+    /// Stable identifier for the device (used for selection).
+    /// This is the device name, which should be stable across sessions.
+    pub id: String,
+    /// Device name for display (same as id for now, but could differ).
     pub name: String,
-    /// Internal index for device selection.
-    pub index: usize,
     /// Whether this is the default device.
     pub is_default: bool,
 }
@@ -38,7 +55,10 @@ fn get_device_name(device: &Device) -> Option<String> {
     // Try the new description() API first, fall back to deprecated name()
     // #[allow(deprecated)]
     // device.name().ok()
-    device.description().map(|desc| desc.name().to_string()).ok()
+    device
+        .description()
+        .map(|desc| desc.name().to_string())
+        .ok()
 }
 
 /// Audio subsystem handle.
@@ -62,7 +82,8 @@ impl AudioSystem {
 
     /// List available input (microphone) devices.
     pub fn list_input_devices(&self) -> Vec<AudioDeviceInfo> {
-        let default_name = self.host
+        let default_name = self
+            .host
             .default_input_device()
             .and_then(|d| get_device_name(&d));
 
@@ -70,11 +91,14 @@ impl AudioSystem {
             .input_devices()
             .map(|devices| {
                 devices
-                    .enumerate()
-                    .filter_map(|(index, device)| {
+                    .filter_map(|device| {
                         let name = get_device_name(&device)?;
                         let is_default = default_name.as_ref() == Some(&name);
-                        Some(AudioDeviceInfo { name, index, is_default })
+                        Some(AudioDeviceInfo {
+                            id: name.clone(),
+                            name,
+                            is_default,
+                        })
                     })
                     .collect()
             })
@@ -83,7 +107,8 @@ impl AudioSystem {
 
     /// List available output (speaker/headphone) devices.
     pub fn list_output_devices(&self) -> Vec<AudioDeviceInfo> {
-        let default_name = self.host
+        let default_name = self
+            .host
             .default_output_device()
             .and_then(|d| get_device_name(&d));
 
@@ -91,11 +116,14 @@ impl AudioSystem {
             .output_devices()
             .map(|devices| {
                 devices
-                    .enumerate()
-                    .filter_map(|(index, device)| {
+                    .filter_map(|device| {
                         let name = get_device_name(&device)?;
                         let is_default = default_name.as_ref() == Some(&name);
-                        Some(AudioDeviceInfo { name, index, is_default })
+                        Some(AudioDeviceInfo {
+                            id: name.clone(),
+                            name,
+                            is_default,
+                        })
                     })
                     .collect()
             })
@@ -112,14 +140,20 @@ impl AudioSystem {
         self.host.default_output_device()
     }
 
-    /// Get an input device by index.
-    pub fn get_input_device(&self, index: usize) -> Option<Device> {
-        self.host.input_devices().ok()?.nth(index)
+    /// Get an input device by its ID (device name).
+    pub fn get_input_device_by_id(&self, id: &str) -> Option<Device> {
+        self.host
+            .input_devices()
+            .ok()?
+            .find(|d| get_device_name(d).as_deref() == Some(id))
     }
 
-    /// Get an output device by index.
-    pub fn get_output_device(&self, index: usize) -> Option<Device> {
-        self.host.output_devices().ok()?.nth(index)
+    /// Get an output device by its ID (device name).
+    pub fn get_output_device_by_id(&self, id: &str) -> Option<Device> {
+        self.host
+            .output_devices()
+            .ok()?
+            .find(|d| get_device_name(d).as_deref() == Some(id))
     }
 }
 
@@ -152,7 +186,7 @@ pub struct AudioInput {
 
 impl AudioInput {
     /// Create and start an audio input stream.
-    /// 
+    ///
     /// # Arguments
     /// * `device` - The input device to use
     /// * `config` - Audio configuration
@@ -169,7 +203,7 @@ impl AudioInput {
 
         let is_capturing = Arc::new(AtomicBool::new(true));
         let samples_buffer = Arc::new(Mutex::new(Vec::with_capacity(config.frame_size * 2)));
-        
+
         let is_capturing_clone = is_capturing.clone();
         let samples_buffer_clone = samples_buffer.clone();
         let frame_size = config.frame_size;
@@ -178,18 +212,22 @@ impl AudioInput {
         let err_fn = |err| error!("audio input error: {}", err);
 
         // Check supported formats and pick the best one
-        let supported = device.supported_input_configs()
+        let supported = device
+            .supported_input_configs()
             .map_err(|e| format!("Failed to get supported input configs: {}", e))?;
-        
+
         let format = supported
             .filter(|c| c.channels() == config.channels)
-            .filter(|c| c.min_sample_rate() <= config.sample_rate && c.max_sample_rate() >= config.sample_rate)
+            .filter(|c| {
+                c.min_sample_rate() <= config.sample_rate
+                    && c.max_sample_rate() >= config.sample_rate
+            })
             .next();
 
         let stream = if let Some(supported_config) = format {
             let sample_format = supported_config.sample_format();
             debug!(sample_format = ?sample_format, "audio: using supported format");
-            
+
             // TODO: make this generic over sample formats. see https://github.com/RustAudio/cpal/blob/5d571761f09474dc85a45639fe06b8ead40104b1/examples/beep.rs#L91
             match sample_format {
                 SampleFormat::F32 => {
@@ -201,7 +239,7 @@ impl AudioInput {
                             }
                             let mut buffer = samples_buffer_clone.lock().unwrap();
                             buffer.extend_from_slice(data);
-                            
+
                             // When we have enough samples, call the callback
                             while buffer.len() >= frame_size {
                                 let frame: Vec<f32> = buffer.drain(..frame_size).collect();
@@ -222,13 +260,12 @@ impl AudioInput {
                                 return;
                             }
                             // Convert i16 to f32
-                            let float_data: Vec<f32> = data.iter()
-                                .map(|&s| s as f32 / i16::MAX as f32)
-                                .collect();
-                            
+                            let float_data: Vec<f32> =
+                                data.iter().map(|&s| s as f32 / i16::MAX as f32).collect();
+
                             let mut buffer = samples_buffer_clone.lock().unwrap();
                             buffer.extend_from_slice(&float_data);
-                            
+
                             while buffer.len() >= frame_size {
                                 let frame: Vec<f32> = buffer.drain(..frame_size).collect();
                                 if let Ok(mut cb) = on_frame.lock() {
@@ -248,13 +285,14 @@ impl AudioInput {
                                 return;
                             }
                             // Convert u16 to f32
-                            let float_data: Vec<f32> = data.iter()
+                            let float_data: Vec<f32> = data
+                                .iter()
                                 .map(|&s| (s as f32 / u16::MAX as f32) * 2.0 - 1.0)
                                 .collect();
-                            
+
                             let mut buffer = samples_buffer_clone.lock().unwrap();
                             buffer.extend_from_slice(&float_data);
-                            
+
                             while buffer.len() >= frame_size {
                                 let frame: Vec<f32> = buffer.drain(..frame_size).collect();
                                 if let Ok(mut cb) = on_frame.lock() {
@@ -274,13 +312,12 @@ impl AudioInput {
                                 return;
                             }
                             // Convert u8 to f32 (128 is silence)
-                            let float_data: Vec<f32> = data.iter()
-                                .map(|&s| (s as f32 - 128.0) / 128.0)
-                                .collect();
-                            
+                            let float_data: Vec<f32> =
+                                data.iter().map(|&s| (s as f32 - 128.0) / 128.0).collect();
+
                             let mut buffer = samples_buffer_clone.lock().unwrap();
                             buffer.extend_from_slice(&float_data);
-                            
+
                             while buffer.len() >= frame_size {
                                 let frame: Vec<f32> = buffer.drain(..frame_size).collect();
                                 if let Ok(mut cb) = on_frame.lock() {
@@ -305,7 +342,7 @@ impl AudioInput {
                     }
                     let mut buffer = samples_buffer_clone.lock().unwrap();
                     buffer.extend_from_slice(data);
-                    
+
                     while buffer.len() >= frame_size {
                         let frame: Vec<f32> = buffer.drain(..frame_size).collect();
                         if let Ok(mut cb) = on_frame.lock() {
@@ -316,9 +353,12 @@ impl AudioInput {
                 err_fn,
                 None,
             )
-        }.map_err(|e| format!("Failed to build input stream: {}", e))?;
+        }
+        .map_err(|e| format!("Failed to build input stream: {}", e))?;
 
-        stream.play().map_err(|e| format!("Failed to start input stream: {}", e))?;
+        stream
+            .play()
+            .map_err(|e| format!("Failed to start input stream: {}", e))?;
         info!("audio: input stream started");
 
         Ok(Self {
@@ -346,17 +386,31 @@ impl AudioInput {
     }
 }
 
+/// Maximum number of samples to buffer for playback before dropping old samples.
+/// At 48kHz mono, this controls the latency/jitter tradeoff:
+/// - 4800 samples = 100ms (good for low-latency local networks)
+/// - 9600 samples = 200ms (reasonable for typical internet)
+/// - 14400 samples = 300ms (handles more jitter but adds delay)
+///
+/// We use 200ms as a balance between low latency and handling network jitter.
+pub const MAX_PLAYBACK_BUFFER_SAMPLES: usize = 9600;
+
 /// Handle for audio output (speaker playback).
 pub struct AudioOutput {
     stream: Stream,
     is_playing: Arc<AtomicBool>,
-    /// Ring buffer for samples to play.
-    playback_buffer: Arc<Mutex<Vec<f32>>>,
+    /// Ring buffer for samples to play (front = oldest, back = newest).
+    /// Samples are pushed to back, popped from front.
+    playback_buffer: Arc<Mutex<VecDeque<f32>>>,
+    /// Maximum buffer size before dropping old samples.
+    max_buffer_size: usize,
+    /// Counter for dropped samples (for statistics/debugging).
+    dropped_samples: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl AudioOutput {
     /// Create and start an audio output stream.
-    /// 
+    ///
     /// # Arguments
     /// * `device` - The output device to use
     /// * `config` - Audio configuration
@@ -368,26 +422,30 @@ impl AudioOutput {
         };
 
         let is_playing = Arc::new(AtomicBool::new(true));
-        let playback_buffer = Arc::new(Mutex::new(Vec::with_capacity(config.frame_size * 10)));
-        
+        let playback_buffer = Arc::new(Mutex::new(VecDeque::with_capacity(config.frame_size * 10)));
+
         let is_playing_clone = is_playing.clone();
         let playback_buffer_clone = playback_buffer.clone();
 
         let err_fn = |err| error!("audio output error: {}", err);
 
         // Check supported formats
-        let supported = device.supported_output_configs()
+        let supported = device
+            .supported_output_configs()
             .map_err(|e| format!("Failed to get supported output configs: {}", e))?;
-        
+
         let format = supported
             .filter(|c| c.channels() == config.channels)
-            .filter(|c| c.min_sample_rate() <= config.sample_rate && c.max_sample_rate() >= config.sample_rate)
+            .filter(|c| {
+                c.min_sample_rate() <= config.sample_rate
+                    && c.max_sample_rate() >= config.sample_rate
+            })
             .next();
 
         let stream = if let Some(supported_config) = format {
             let sample_format = supported_config.sample_format();
             debug!(sample_format = ?sample_format, "audio: using output format");
-            
+
             match sample_format {
                 SampleFormat::F32 => {
                     device.build_output_stream(
@@ -399,49 +457,46 @@ impl AudioOutput {
                             }
                             let mut buffer = playback_buffer_clone.lock().unwrap();
                             for sample in data.iter_mut() {
-                                *sample = buffer.pop().unwrap_or(0.0);
+                                // pop_front = oldest sample first (FIFO)
+                                *sample = buffer.pop_front().unwrap_or(0.0);
                             }
                         },
                         err_fn,
                         None,
                     )
                 }
-                SampleFormat::I16 => {
-                    device.build_output_stream(
-                        &stream_config,
-                        move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
-                            if !is_playing_clone.load(Ordering::Relaxed) {
-                                data.fill(0);
-                                return;
-                            }
-                            let mut buffer = playback_buffer_clone.lock().unwrap();
-                            for sample in data.iter_mut() {
-                                let f = buffer.pop().unwrap_or(0.0);
-                                *sample = (f * i16::MAX as f32) as i16;
-                            }
-                        },
-                        err_fn,
-                        None,
-                    )
-                }
-                SampleFormat::U16 => {
-                    device.build_output_stream(
-                        &stream_config,
-                        move |data: &mut [u16], _: &cpal::OutputCallbackInfo| {
-                            if !is_playing_clone.load(Ordering::Relaxed) {
-                                data.fill(u16::MAX / 2);
-                                return;
-                            }
-                            let mut buffer = playback_buffer_clone.lock().unwrap();
-                            for sample in data.iter_mut() {
-                                let f = buffer.pop().unwrap_or(0.0);
-                                *sample = ((f + 1.0) / 2.0 * u16::MAX as f32) as u16;
-                            }
-                        },
-                        err_fn,
-                        None,
-                    )
-                }
+                SampleFormat::I16 => device.build_output_stream(
+                    &stream_config,
+                    move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
+                        if !is_playing_clone.load(Ordering::Relaxed) {
+                            data.fill(0);
+                            return;
+                        }
+                        let mut buffer = playback_buffer_clone.lock().unwrap();
+                        for sample in data.iter_mut() {
+                            let f = buffer.pop_front().unwrap_or(0.0);
+                            *sample = (f * i16::MAX as f32) as i16;
+                        }
+                    },
+                    err_fn,
+                    None,
+                ),
+                SampleFormat::U16 => device.build_output_stream(
+                    &stream_config,
+                    move |data: &mut [u16], _: &cpal::OutputCallbackInfo| {
+                        if !is_playing_clone.load(Ordering::Relaxed) {
+                            data.fill(u16::MAX / 2);
+                            return;
+                        }
+                        let mut buffer = playback_buffer_clone.lock().unwrap();
+                        for sample in data.iter_mut() {
+                            let f = buffer.pop_front().unwrap_or(0.0);
+                            *sample = ((f + 1.0) / 2.0 * u16::MAX as f32) as u16;
+                        }
+                    },
+                    err_fn,
+                    None,
+                ),
                 SampleFormat::U8 => {
                     device.build_output_stream(
                         &stream_config,
@@ -452,7 +507,7 @@ impl AudioOutput {
                             }
                             let mut buffer = playback_buffer_clone.lock().unwrap();
                             for sample in data.iter_mut() {
-                                let f = buffer.pop().unwrap_or(0.0);
+                                let f = buffer.pop_front().unwrap_or(0.0);
                                 // Convert f32 [-1, 1] to u8 [0, 255] with 128 as center
                                 *sample = ((f * 128.0) + 128.0).clamp(0.0, 255.0) as u8;
                             }
@@ -475,32 +530,73 @@ impl AudioOutput {
                     }
                     let mut buffer = playback_buffer_clone.lock().unwrap();
                     for sample in data.iter_mut() {
-                        *sample = buffer.pop().unwrap_or(0.0);
+                        *sample = buffer.pop_front().unwrap_or(0.0);
                     }
                 },
                 err_fn,
                 None,
             )
-        }.map_err(|e| format!("Failed to build output stream: {}", e))?;
+        }
+        .map_err(|e| format!("Failed to build output stream: {}", e))?;
 
-        stream.play().map_err(|e| format!("Failed to start output stream: {}", e))?;
+        stream
+            .play()
+            .map_err(|e| format!("Failed to start output stream: {}", e))?;
         info!("audio: output stream started");
 
         Ok(Self {
             stream,
             is_playing,
             playback_buffer,
+            max_buffer_size: MAX_PLAYBACK_BUFFER_SAMPLES,
+            dropped_samples: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
     }
 
+    /// Create an audio output stream with a custom max buffer size.
+    ///
+    /// Use this if you need to tune the latency/drop tradeoff.
+    /// A larger buffer allows more network jitter but increases latency.
+    /// A smaller buffer reduces latency but drops more samples on jitter.
+    pub fn with_max_buffer(
+        device: &Device,
+        config: &AudioConfig,
+        max_buffer_size: usize,
+    ) -> Result<Self, String> {
+        let mut output = Self::new(device, config)?;
+        output.max_buffer_size = max_buffer_size;
+        Ok(output)
+    }
+
     /// Queue audio samples for playback.
+    ///
+    /// Samples are added to the back of the buffer (newest).
+    /// Playback reads from the front (oldest) - FIFO order.
+    /// If the buffer would exceed `max_buffer_size`, oldest samples are dropped.
     pub fn queue_samples(&self, samples: &[f32]) {
         let mut buffer = self.playback_buffer.lock().unwrap();
-        // Prepend samples (buffer is read from back)
-        let mut new_buffer = samples.to_vec();
-        new_buffer.reverse();
-        new_buffer.extend(buffer.drain(..));
-        *buffer = new_buffer;
+
+        // Add new samples to the back
+        buffer.extend(samples.iter().copied());
+
+        // If we exceeded the max size, drop oldest samples from the front
+        if buffer.len() > self.max_buffer_size {
+            let samples_to_drop = buffer.len() - self.max_buffer_size;
+            buffer.drain(..samples_to_drop);
+            self.dropped_samples
+                .fetch_add(samples_to_drop, Ordering::Relaxed);
+
+            debug!(
+                dropped = samples_to_drop,
+                buffer_size = buffer.len(),
+                "audio: dropped old samples to maintain buffer limit"
+            );
+        }
+    }
+
+    /// Get the number of samples that have been dropped.
+    pub fn dropped_samples(&self) -> usize {
+        self.dropped_samples.load(Ordering::Relaxed)
     }
 
     /// Get the number of samples currently buffered.
@@ -533,14 +629,13 @@ impl AudioOutput {
 
 /// Convert f32 samples to bytes for transmission.
 pub fn samples_to_bytes(samples: &[f32]) -> Vec<u8> {
-    samples.iter()
-        .flat_map(|&s| s.to_le_bytes())
-        .collect()
+    samples.iter().flat_map(|&s| s.to_le_bytes()).collect()
 }
 
 /// Convert bytes back to f32 samples.
 pub fn bytes_to_samples(bytes: &[u8]) -> Vec<f32> {
-    bytes.chunks_exact(4)
+    bytes
+        .chunks_exact(4)
         .map(|chunk| {
             let arr: [u8; 4] = chunk.try_into().unwrap();
             f32::from_le_bytes(arr)

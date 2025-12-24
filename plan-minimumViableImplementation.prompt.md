@@ -277,3 +277,35 @@ Recommendation: The backend crate should expose a proper event-driven API or cal
      (to identify users by public key) and persistence (to store last room). Currently
      all users are placed in ROOT_ROOM_UUID on connect.
 9. fix unbounded buffer on audio transmission. gracefully handle slow connections. this will later be improved by varying opus bitrate based on network conditions, but for now just drop old frames if the network is slow.
+
+   **DONE (2025-12-24)**
+   - **Created `crates/backend/src/bounded_voice.rs`** with bounded voice channel implementation:
+     - `BoundedVoiceSender<T>` and `BoundedVoiceReceiver<T>` types
+     - `VoiceChannelConfig { max_frames }` configuration (default: 50 frames)
+     - `VoiceChannelStats` for monitoring dropped frames
+     - `try_send()` drops frames when channel is full (non-blocking)
+     - Shared counters for `total_sent`, `dropped`, `received` statistics
+   - **Updated `BackendHandle` and `CommandSender`** in `handle.rs`:
+     - Added separate bounded channel for outbound voice frames
+     - `CommandSender::send_voice()` uses bounded channel with drop-on-full semantics
+     - `BackendHandle::voice_stats()` returns channel statistics
+     - `BackendHandleBuilder::voice_buffer_capacity()` for custom buffer sizing
+     - Voice commands still work through command channel for backwards compatibility
+   - **Updated `Client` in `lib.rs`** for bounded voice receive:
+     - Changed `voice_rx` from `UnboundedReceiver` to `Receiver` (bounded)
+     - `VOICE_RECEIVE_BUFFER_SIZE = 100` frames (~500ms at 5ms, ~2s at 20ms)
+     - Voice task uses `try_send()` to drop frames when receiver is slow
+   - **Updated `AudioOutput` in `audio.rs`** for bounded playback buffer:
+     - Added `MAX_PLAYBACK_BUFFER_SAMPLES = 48000` (1 second at 48kHz)
+     - Added `max_buffer_size` and `dropped_samples` fields
+     - `queue_samples()` now drops old samples when buffer exceeds limit
+     - `with_max_buffer()` constructor for custom buffer sizing
+     - `dropped_samples()` method to monitor dropped sample count
+   - **All 3 unbounded audio paths are now bounded**:
+     1. Outbound voice (audio capture → network): BoundedVoiceSender, 50 frames
+     2. Inbound voice (network → playback event): tokio::mpsc::channel, 100 frames
+     3. Playback buffer (samples → audio output): Vec with max 48000 samples
+   - All 13 backend unit tests pass, all 28 server integration tests pass
+   - **Notes:** When network is slow, frames are dropped at the earliest possible point
+     to minimize memory growth. Statistics are available for debugging/monitoring.
+     Future enhancement: adaptive Opus bitrate based on drop rate.

@@ -2,16 +2,19 @@
 //!
 //! This module provides the main `Server` struct and connection handling logic.
 
-use crate::handlers::{cleanup_client, handle_datagrams, handle_envelope};
-use crate::state::{ClientHandle, ServerState};
+use crate::{
+    handlers::{cleanup_client, handle_datagrams, handle_envelope},
+    state::{ClientHandle, ServerState},
+};
 use anyhow::Result;
-use api::proto::{self, Envelope};
-use api::try_decode_frame;
+use api::{
+    proto::{self, Envelope},
+    try_decode_frame,
+};
 use bytes::BytesMut;
 use prost::Message;
 use quinn::{Endpoint, ServerConfig};
-use std::net::Ipv4Addr;
-use std::sync::Arc;
+use std::{net::Ipv4Addr, sync::Arc};
 use tracing::{debug, error, info};
 
 /// Configuration for the server.
@@ -178,9 +181,12 @@ pub async fn handle_connection(conn: quinn::Connection, state: Arc<ServerState>)
                                             frame_len = frame.len(),
                                             "server: decoded envelope frame"
                                         );
-                                        if let Err(e) =
-                                            handle_envelope(env, client_handle.clone(), state.clone())
-                                                .await
+                                        if let Err(e) = handle_envelope(
+                                            env,
+                                            client_handle.clone(),
+                                            state.clone(),
+                                        )
+                                        .await
                                         {
                                             error!("handle_envelope error: {e:?}");
                                         }

@@ -47,16 +47,15 @@ pub use server::{Config, Server};
 pub use state::{ClientHandle, ServerState, StateData};
 
 use anyhow::Result;
-use base64::engine::general_purpose::STANDARD as B64;
-use base64::Engine;
+use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tracing::info;
 
 /// Generate or load a persistent development self-signed certificate/key pair.
-/// 
-/// Certificates are stored as DER in `dev-certs/server-cert.der` and 
+///
+/// Certificates are stored as DER in `dev-certs/server-cert.der` and
 /// key in `dev-certs/server-key.der`.
-/// 
+///
 /// # Returns
 /// A tuple of (certificate, private key) suitable for use with rustls/quinn.
 pub fn load_or_create_dev_cert() -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>)> {

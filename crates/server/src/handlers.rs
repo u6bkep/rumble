@@ -10,11 +10,13 @@
 //! - The voice path uses snapshots to avoid holding locks during relay
 //! - Client iteration is lock-free via DashMap
 
-use crate::state::{compute_room_state_hash, ClientHandle, ServerState};
+use crate::state::{ClientHandle, ServerState, compute_room_state_hash};
 use anyhow::Result;
-use api::encode_frame;
-use api::proto::{self, envelope::Payload, RoomState, VoiceDatagram};
-use api::{room_id_from_uuid, uuid_from_room_id, ROOT_ROOM_UUID};
+use api::{
+    ROOT_ROOM_UUID, encode_frame,
+    proto::{self, RoomState, VoiceDatagram, envelope::Payload},
+    room_id_from_uuid, uuid_from_room_id,
+};
 use prost::Message;
 use std::sync::Arc;
 use tracing::{debug, error, info};
@@ -127,7 +129,10 @@ async fn handle_chat_message(
 ) -> Result<()> {
     info!("chat from {}: {}", msg.sender, msg.text);
 
-    let sender_room = state.get_user_room(sender.user_id).await.unwrap_or(ROOT_ROOM_UUID);
+    let sender_room = state
+        .get_user_room(sender.user_id)
+        .await
+        .unwrap_or(ROOT_ROOM_UUID);
 
     let broadcast = proto::Envelope {
         state_hash: Vec::new(),
@@ -163,10 +168,15 @@ async fn handle_join_room(
     sender: Arc<ClientHandle>,
     state: Arc<ServerState>,
 ) -> Result<()> {
-    let new_room_uuid = jr.room_id.as_ref()
+    let new_room_uuid = jr
+        .room_id
+        .as_ref()
         .and_then(uuid_from_room_id)
         .unwrap_or(ROOT_ROOM_UUID);
-    let old_room_uuid = state.get_user_room(sender.user_id).await.unwrap_or(ROOT_ROOM_UUID);
+    let old_room_uuid = state
+        .get_user_room(sender.user_id)
+        .await
+        .unwrap_or(ROOT_ROOM_UUID);
 
     state.set_user_room(sender.user_id, new_room_uuid).await;
 
@@ -174,11 +184,14 @@ async fn handle_join_room(
     broadcast_state_update(
         &state,
         proto::state_update::Update::UserMoved(proto::UserMoved {
-            user_id: Some(proto::UserId { value: sender.user_id }),
+            user_id: Some(proto::UserId {
+                value: sender.user_id,
+            }),
             from_room_id: Some(room_id_from_uuid(old_room_uuid)),
             to_room_id: Some(room_id_from_uuid(new_room_uuid)),
         }),
-    ).await?;
+    )
+    .await?;
 
     Ok(())
 }
@@ -195,7 +208,7 @@ async fn handle_disconnect(d: proto::Disconnect, sender: Arc<ClientHandle>) -> R
 async fn handle_create_room(cr: proto::CreateRoom, state: Arc<ServerState>) -> Result<()> {
     info!("CreateRoom: {}", cr.name);
     let room_uuid = state.create_room(cr.name.clone()).await;
-    
+
     // Send incremental update to all clients
     let room_info = proto::RoomInfo {
         id: Some(room_id_from_uuid(room_uuid)),
@@ -206,18 +219,21 @@ async fn handle_create_room(cr: proto::CreateRoom, state: Arc<ServerState>) -> R
         proto::state_update::Update::RoomCreated(proto::RoomCreated {
             room: Some(room_info),
         }),
-    ).await?;
+    )
+    .await?;
     Ok(())
 }
 
 /// Handle delete room request.
 async fn handle_delete_room(dr: proto::DeleteRoom, state: Arc<ServerState>) -> Result<()> {
-    let room_uuid = dr.room_id.as_ref()
+    let room_uuid = dr
+        .room_id
+        .as_ref()
         .and_then(uuid_from_room_id)
         .unwrap_or(ROOT_ROOM_UUID);
     info!("DeleteRoom: {}", room_uuid);
     state.delete_room(room_uuid).await;
-    
+
     // Send incremental update to all clients
     broadcast_state_update(
         &state,
@@ -225,26 +241,34 @@ async fn handle_delete_room(dr: proto::DeleteRoom, state: Arc<ServerState>) -> R
             room_id: Some(room_id_from_uuid(room_uuid)),
             fallback_room_id: Some(room_id_from_uuid(ROOT_ROOM_UUID)),
         }),
-    ).await?;
+    )
+    .await?;
     Ok(())
 }
 
 /// Handle rename room request.
 async fn handle_rename_room(rr: proto::RenameRoom, state: Arc<ServerState>) -> Result<()> {
-    let room_uuid = rr.room_id.as_ref()
+    let room_uuid = rr
+        .room_id
+        .as_ref()
         .and_then(uuid_from_room_id)
         .unwrap_or(ROOT_ROOM_UUID);
     info!("RenameRoom: {} -> {}", room_uuid, rr.new_name);
-    
+
     // Get old name for the update message
-    let old_name = state.get_rooms().await
+    let old_name = state
+        .get_rooms()
+        .await
         .iter()
-        .find(|r| uuid_from_room_id(r.id.as_ref().unwrap_or(&room_id_from_uuid(ROOT_ROOM_UUID))) == Some(room_uuid))
+        .find(|r| {
+            uuid_from_room_id(r.id.as_ref().unwrap_or(&room_id_from_uuid(ROOT_ROOM_UUID)))
+                == Some(room_uuid)
+        })
         .map(|r| r.name.clone())
         .unwrap_or_default();
-    
+
     state.rename_room(room_uuid, rr.new_name.clone()).await;
-    
+
     // Send incremental update to all clients
     broadcast_state_update(
         &state,
@@ -253,12 +277,13 @@ async fn handle_rename_room(rr: proto::RenameRoom, state: Arc<ServerState>) -> R
             old_name,
             new_name: rr.new_name,
         }),
-    ).await?;
+    )
+    .await?;
     Ok(())
 }
 
 /// Handle a request for full state resync.
-/// 
+///
 /// This is sent by clients when they detect a state hash mismatch.
 /// We simply send them the current full state.
 async fn handle_request_state_sync(
@@ -272,7 +297,7 @@ async fn handle_request_state_sync(
         actual_hash_len = rss.actual_hash.len(),
         "RequestStateSync: client detected hash mismatch, sending full state"
     );
-    
+
     // Log the hashes for debugging (first 8 bytes as hex)
     if !rss.expected_hash.is_empty() {
         debug!(
@@ -286,7 +311,7 @@ async fn handle_request_state_sync(
             &rss.actual_hash[..rss.actual_hash.len().min(8)]
         );
     }
-    
+
     // Send the current state to this client
     send_room_state_to_client(&sender, &state).await?;
     Ok(())
@@ -330,10 +355,7 @@ pub async fn broadcast_room_state(state: &Arc<ServerState>) -> Result<()> {
     let users = state.build_presence_list().await;
 
     // Build the RoomState message
-    let room_state = RoomState {
-        rooms,
-        users,
-    };
+    let room_state = RoomState { rooms, users };
 
     // Compute the state hash
     let state_hash = compute_room_state_hash(&room_state);
@@ -356,11 +378,11 @@ pub async fn broadcast_room_state(state: &Arc<ServerState>) -> Result<()> {
 }
 
 /// Broadcast an incremental state update to all connected clients.
-/// 
+///
 /// This sends a StateUpdate message containing:
 /// - The specific change that occurred
 /// - The expected hash AFTER applying this change
-/// 
+///
 /// Clients apply the update locally and verify their computed hash matches.
 /// If there's a mismatch, the client will request a full resync.
 pub async fn broadcast_state_update(
@@ -421,7 +443,9 @@ pub async fn cleanup_client(client_handle: &Arc<ClientHandle>, state: &Arc<Serve
             }),
             change_type: proto::user_presence_changed::ChangeType::LeftServer as i32,
         }),
-    ).await {
+    )
+    .await
+    {
         error!("failed to broadcast state update after disconnect: {e:?}");
     }
 }
@@ -459,15 +483,13 @@ pub async fn handle_datagrams(
                         let room_memberships = state.snapshot_room_memberships().await;
 
                         // Find sender's room from the snapshot
-                        let sender_room = room_memberships
-                            .iter()
-                            .find_map(|(rid, users)| {
-                                if users.contains(&sender_user_id) {
-                                    Some(*rid)
-                                } else {
-                                    None
-                                }
-                            });
+                        let sender_room = room_memberships.iter().find_map(|(rid, users)| {
+                            if users.contains(&sender_user_id) {
+                                Some(*rid)
+                            } else {
+                                None
+                            }
+                        });
 
                         // Only relay if sender is actually in a room
                         let Some(actual_room) = sender_room else {

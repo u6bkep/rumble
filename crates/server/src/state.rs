@@ -16,12 +16,17 @@
 //! The voice/datagram path avoids holding any locks during I/O operations
 //! by taking snapshots of needed data first.
 
-use api::proto::{RoomInfo, UserId, UserPresence};
-use api::{root_room_id, room_id_from_uuid, uuid_from_room_id, ROOT_ROOM_UUID};
+use api::{
+    ROOT_ROOM_UUID,
+    proto::{RoomInfo, UserId, UserPresence},
+    room_id_from_uuid, root_room_id, uuid_from_room_id,
+};
 use dashmap::DashMap;
 use quinn::Connection;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
@@ -99,7 +104,7 @@ impl StateData {
 }
 
 /// Compute a state hash from a RoomState message.
-/// 
+///
 /// Re-exports the canonical hash function from the API crate.
 pub fn compute_room_state_hash(room_state: &api::proto::RoomState) -> Vec<u8> {
     api::compute_room_state_hash(room_state)
@@ -237,8 +242,9 @@ impl ServerState {
 
         let mut data = self.state_data.write().await;
         let before_len = data.rooms.len();
-        data.rooms
-            .retain(|r| uuid_from_room_id(r.id.as_ref().unwrap_or(&root_room_id())) != Some(room_uuid));
+        data.rooms.retain(|r| {
+            uuid_from_room_id(r.id.as_ref().unwrap_or(&root_room_id())) != Some(room_uuid)
+        });
         let deleted = data.rooms.len() < before_len;
 
         if deleted {

@@ -4,7 +4,7 @@
 //! and runs the server.
 
 use anyhow::Result;
-use server::{load_or_create_dev_cert, Config, Server};
+use server::{Config, Server, load_or_create_dev_cert};
 
 #[tokio::main]
 async fn main() -> Result<()> {
