@@ -10,11 +10,11 @@
 //! - The voice path uses snapshots to avoid holding locks during relay
 //! - Client iteration is lock-free via DashMap
 
-use crate::state::{ClientHandle, ServerState, compute_room_state_hash};
+use crate::state::{ClientHandle, ServerState, compute_server_state_hash};
 use anyhow::Result;
 use api::{
     ROOT_ROOM_UUID, encode_frame,
-    proto::{self, RoomState, VoiceDatagram, envelope::Payload},
+    proto::{self, ServerState as ProtoServerState, VoiceDatagram, envelope::Payload},
     room_id_from_uuid, uuid_from_room_id,
 };
 use prost::Message;
@@ -65,7 +65,6 @@ pub async fn handle_envelope(
         }
         // Server-to-client messages or empty - ignore
         Some(Payload::ServerHello(_) | Payload::ServerEvent(_)) | None => {}
-        Some(Payload::Login(_) | Payload::LeaveRoom(_) | Payload::RoomStateMsg(_)) => {}
     }
     Ok(())
 }
@@ -115,8 +114,21 @@ async fn handle_client_hello(
         return Err(e.into());
     }
 
-    // Send initial RoomState
-    send_room_state_to_client(&sender, &state).await?;
+    // Send initial ServerState
+    send_server_state_to_client(&sender, &state).await?;
+
+    // Broadcast that this user joined
+    broadcast_state_update(
+        &state,
+        proto::state_update::Update::UserJoined(proto::UserJoined {
+            user: Some(proto::User {
+                user_id: Some(proto::UserId { value: sender.user_id }),
+                username: ch.client_name,
+                current_room: Some(room_id_from_uuid(ROOT_ROOM_UUID)),
+            }),
+        }),
+    )
+    .await?;
 
     Ok(())
 }
@@ -173,21 +185,20 @@ async fn handle_join_room(
         .as_ref()
         .and_then(uuid_from_room_id)
         .unwrap_or(ROOT_ROOM_UUID);
-    let old_room_uuid = state
+    let _old_room_uuid = state
         .get_user_room(sender.user_id)
         .await
         .unwrap_or(ROOT_ROOM_UUID);
 
     state.set_user_room(sender.user_id, new_room_uuid).await;
 
-    // Send incremental update about user moving rooms
+    // Send incremental update about user moving rooms (from_room is implicit)
     broadcast_state_update(
         &state,
         proto::state_update::Update::UserMoved(proto::UserMoved {
             user_id: Some(proto::UserId {
                 value: sender.user_id,
             }),
-            from_room_id: Some(room_id_from_uuid(old_room_uuid)),
             to_room_id: Some(room_id_from_uuid(new_room_uuid)),
         }),
     )
@@ -255,18 +266,6 @@ async fn handle_rename_room(rr: proto::RenameRoom, state: Arc<ServerState>) -> R
         .unwrap_or(ROOT_ROOM_UUID);
     info!("RenameRoom: {} -> {}", room_uuid, rr.new_name);
 
-    // Get old name for the update message
-    let old_name = state
-        .get_rooms()
-        .await
-        .iter()
-        .find(|r| {
-            uuid_from_room_id(r.id.as_ref().unwrap_or(&room_id_from_uuid(ROOT_ROOM_UUID)))
-                == Some(room_uuid)
-        })
-        .map(|r| r.name.clone())
-        .unwrap_or_default();
-
     state.rename_room(room_uuid, rr.new_name.clone()).await;
 
     // Send incremental update to all clients
@@ -274,7 +273,6 @@ async fn handle_rename_room(rr: proto::RenameRoom, state: Arc<ServerState>) -> R
         &state,
         proto::state_update::Update::RoomRenamed(proto::RoomRenamed {
             room_id: Some(room_id_from_uuid(room_uuid)),
-            old_name,
             new_name: rr.new_name,
         }),
     )
@@ -313,28 +311,28 @@ async fn handle_request_state_sync(
     }
 
     // Send the current state to this client
-    send_room_state_to_client(&sender, &state).await?;
+    send_server_state_to_client(&sender, &state).await?;
     Ok(())
 }
 
-/// Send current room state to a single client.
-async fn send_room_state_to_client(client: &ClientHandle, state: &ServerState) -> Result<()> {
+/// Send current server state to a single client.
+async fn send_server_state_to_client(client: &ClientHandle, state: &ServerState) -> Result<()> {
     let rooms = state.get_rooms().await;
-    let users = state.build_presence_list().await;
+    let users = state.build_user_list().await;
 
-    // Build the RoomState message
-    let room_state = RoomState {
+    // Build the ServerState message
+    let server_state = ProtoServerState {
         rooms: rooms.clone(),
         users: users.clone(),
     };
 
     // Compute the state hash
-    let state_hash = compute_room_state_hash(&room_state);
+    let state_hash = compute_server_state_hash(&server_state);
 
     let env = proto::Envelope {
         state_hash,
         payload: Some(Payload::ServerEvent(proto::ServerEvent {
-            kind: Some(proto::server_event::Kind::RoomStateUpdate(room_state)),
+            kind: Some(proto::server_event::Kind::ServerState(server_state)),
         })),
     };
     let frame = encode_frame(&env);
@@ -342,28 +340,28 @@ async fn send_room_state_to_client(client: &ClientHandle, state: &ServerState) -
     info!(
         rooms = rooms.len(),
         users = users.len(),
-        "server: sending initial RoomStateUpdate with state_hash"
+        "server: sending initial ServerState with state_hash"
     );
     client.send_frame(&frame).await?;
 
     Ok(())
 }
 
-/// Broadcast current room state to all connected clients.
-pub async fn broadcast_room_state(state: &Arc<ServerState>) -> Result<()> {
+/// Broadcast current server state to all connected clients.
+pub async fn broadcast_server_state(state: &Arc<ServerState>) -> Result<()> {
     let rooms = state.get_rooms().await;
-    let users = state.build_presence_list().await;
+    let users = state.build_user_list().await;
 
-    // Build the RoomState message
-    let room_state = RoomState { rooms, users };
+    // Build the ServerState message
+    let server_state = ProtoServerState { rooms, users };
 
     // Compute the state hash
-    let state_hash = compute_room_state_hash(&room_state);
+    let state_hash = compute_server_state_hash(&server_state);
 
     let env = proto::Envelope {
         state_hash,
         payload: Some(Payload::ServerEvent(proto::ServerEvent {
-            kind: Some(proto::server_event::Kind::RoomStateUpdate(room_state)),
+            kind: Some(proto::server_event::Kind::ServerState(server_state)),
         })),
     };
     let frame = encode_frame(&env);
@@ -391,9 +389,9 @@ pub async fn broadcast_state_update(
 ) -> Result<()> {
     // First, compute what the state hash should be after this update
     let rooms = state.get_rooms().await;
-    let users = state.build_presence_list().await;
-    let room_state = RoomState { rooms, users };
-    let expected_hash = compute_room_state_hash(&room_state);
+    let users = state.build_user_list().await;
+    let server_state = ProtoServerState { rooms, users };
+    let expected_hash = compute_server_state_hash(&server_state);
 
     let state_update = proto::StateUpdate {
         expected_hash: expected_hash.clone(),
@@ -422,8 +420,6 @@ pub async fn broadcast_state_update(
 /// Clean up a client: remove from clients list, remove memberships, broadcast update.
 pub async fn cleanup_client(client_handle: &Arc<ClientHandle>, state: &Arc<ServerState>) {
     let user_id = client_handle.user_id;
-    let username = client_handle.get_username().await;
-    let room_uuid = state.get_user_room(user_id).await.unwrap_or(ROOT_ROOM_UUID);
 
     // Remove client from DashMap (lock-free)
     state.remove_client_by_handle(client_handle);
@@ -435,13 +431,8 @@ pub async fn cleanup_client(client_handle: &Arc<ClientHandle>, state: &Arc<Serve
     // Send incremental update about user leaving
     if let Err(e) = broadcast_state_update(
         state,
-        proto::state_update::Update::UserPresenceChanged(proto::UserPresenceChanged {
-            user: Some(proto::UserPresence {
-                user_id: Some(proto::UserId { value: user_id }),
-                room_id: Some(room_id_from_uuid(room_uuid)),
-                username,
-            }),
-            change_type: proto::user_presence_changed::ChangeType::LeftServer as i32,
+        proto::state_update::Update::UserLeft(proto::UserLeft {
+            user_id: Some(proto::UserId { value: user_id }),
         }),
     )
     .await

@@ -1,170 +1,82 @@
-//! Backend events and commands for UI integration.
+//! Backend state and commands for UI integration.
 //!
-//! This module provides a structured event-driven API for communication between
-//! the UI layer and the backend. The UI sends commands and receives events without
-//! needing to manage async tasks, channels, or the Client directly.
+//! This module provides a state-driven API for communication between
+//! the UI layer and the backend. The UI reads state and sends commands.
+//! The backend updates state and calls the repaint callback.
 
 use crate::audio::AudioDeviceInfo;
-use api::{
-    proto::{RoomInfo, UserPresence},
-    uuid_from_room_id,
-};
+use api::proto::{RoomInfo, User};
+use std::collections::HashSet;
 use uuid::Uuid;
 
 /// Re-export ROOT_ROOM_UUID for convenience
 pub use api::ROOT_ROOM_UUID;
 
-/// Connection lifecycle status.
-///
-/// This enum represents the various states the connection can be in,
-/// allowing the UI to provide appropriate feedback to the user.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ConnectionStatus {
+// =============================================================================
+// Connection State
+// =============================================================================
+
+/// Connection lifecycle state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectionState {
     /// Not connected to any server.
-    #[default]
     Disconnected,
     /// Attempting to establish a connection.
-    Connecting,
+    Connecting { server_addr: String },
     /// Successfully connected and authenticated.
-    Connected,
-    /// Connection was lost, attempting to reconnect.
-    Reconnecting {
-        /// Current reconnection attempt number (1-indexed).
-        attempt: u32,
-        /// Maximum number of attempts before giving up (0 = unlimited).
-        max_attempts: u32,
-    },
-    /// Connection was lost and reconnection failed or was not attempted.
-    ConnectionLost,
+    Connected { server_name: String, user_id: u64 },
+    /// Connection was unexpectedly lost.
+    ConnectionLost { error: String },
 }
 
-impl ConnectionStatus {
+impl Default for ConnectionState {
+    fn default() -> Self {
+        ConnectionState::Disconnected
+    }
+}
+
+impl ConnectionState {
     /// Check if we are currently connected.
     pub fn is_connected(&self) -> bool {
-        matches!(self, ConnectionStatus::Connected)
+        matches!(self, ConnectionState::Connected { .. })
     }
 
-    /// Check if we are attempting to connect or reconnect.
+    /// Check if we are attempting to connect.
     pub fn is_connecting(&self) -> bool {
-        matches!(
-            self,
-            ConnectionStatus::Connecting | ConnectionStatus::Reconnecting { .. }
-        )
+        matches!(self, ConnectionState::Connecting { .. })
     }
 
-    /// Check if the connection has failed.
-    pub fn is_failed(&self) -> bool {
-        matches!(self, ConnectionStatus::ConnectionLost)
+    /// Get the user ID if connected.
+    pub fn user_id(&self) -> Option<u64> {
+        match self {
+            ConnectionState::Connected { user_id, .. } => Some(*user_id),
+            _ => None,
+        }
     }
 }
 
-/// Commands that can be sent from the UI to the backend.
-#[derive(Debug, Clone)]
-pub enum BackendCommand {
-    /// Connect to a server.
-    Connect {
-        addr: String,
-        name: String,
-        password: Option<String>,
-        config: crate::ConnectConfig,
-    },
-    /// Disconnect from the current server.
-    Disconnect,
-    /// Send a chat message.
-    SendChat { text: String },
-    /// Join a room by UUID.
-    JoinRoom { room_uuid: Uuid },
-    /// Create a new room.
-    CreateRoom { name: String },
-    /// Delete a room by UUID.
-    DeleteRoom { room_uuid: Uuid },
-    /// Rename a room.
-    RenameRoom { room_uuid: Uuid, new_name: String },
+// =============================================================================
+// Transmission Mode
+// =============================================================================
 
-    // Audio control commands - audio is handled entirely by the backend
-    /// Start capturing audio from the microphone and transmitting to the server.
-    /// This is typically triggered by push-to-talk key press.
-    StartVoiceCapture,
-    /// Stop capturing audio.
-    /// This is typically triggered by push-to-talk key release.
-    StopVoiceCapture,
-    /// Start audio playback (receiving and playing voice from other users).
-    StartPlayback,
-    /// Stop audio playback.
-    StopPlayback,
-    /// Set the input (microphone) device by ID.
-    /// Use `None` for the system default device.
-    SetInputDevice { device_id: Option<String> },
-    /// Set the output (speaker) device by ID.
-    /// Use `None` for the system default device.
-    SetOutputDevice { device_id: Option<String> },
-    /// Set the input volume multiplier (0.0 = muted, 1.0 = normal, 2.0 = boosted).
-    SetInputVolume { volume: f32 },
-    /// Set the output volume multiplier (0.0 = muted, 1.0 = normal, 2.0 = boosted).
-    SetOutputVolume { volume: f32 },
-    /// Refresh the list of available audio devices.
-    RefreshAudioDevices,
+/// Voice transmission mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TransmissionMode {
+    /// Only transmit while PTT key is held.
+    #[default]
+    PushToTalk,
+    /// Always transmitting when connected.
+    Continuous,
+    /// Not transmitting (muted).
+    Muted,
+    // Future: VoiceActivated { threshold: f32 }
 }
 
-/// Events that the backend sends to the UI.
-#[derive(Debug, Clone)]
-pub enum BackendEvent {
-    /// Successfully connected to the server.
-    Connected {
-        /// Our user ID assigned by the server.
-        user_id: u64,
-        /// Our client name.
-        client_name: String,
-    },
-    /// Connection attempt failed.
-    ConnectFailed { error: String },
-    /// Graceful disconnection from the server.
-    Disconnected { reason: Option<String> },
-    /// Connection was unexpectedly lost.
-    ///
-    /// This is different from `Disconnected` which indicates a graceful shutdown.
-    /// The UI may want to show a different message or trigger reconnection.
-    ConnectionLost {
-        /// Error message describing why the connection was lost.
-        error: String,
-        /// Whether the backend will attempt to reconnect.
-        will_reconnect: bool,
-    },
-    /// Connection status has changed.
-    ///
-    /// Emitted when entering Connecting, Reconnecting, etc. states.
-    /// This allows the UI to show intermediate connection states.
-    ConnectionStatusChanged { status: ConnectionStatus },
-    /// Room/user state has been updated.
-    StateUpdated { state: ConnectionState },
-    /// Received a chat message.
-    ChatReceived { sender: String, text: String },
-    /// Voice activity detected for a user.
-    ///
-    /// This event notifies the UI when a user starts or stops talking.
-    /// The actual audio playback is handled internally by the backend.
-    VoiceActivity {
-        /// User ID of the speaker.
-        user_id: u64,
-        /// Whether the user is currently talking.
-        is_talking: bool,
-    },
-    /// Audio state has changed.
-    ///
-    /// Sent when audio devices, settings, or capture/playback state changes.
-    /// This contains the complete audio state so the UI can update accordingly.
-    AudioStateChanged {
-        /// Current audio state.
-        state: AudioState,
-    },
-    /// An error occurred.
-    Error { message: String },
-}
+// =============================================================================
+// Audio State
+// =============================================================================
 
 /// Audio subsystem state.
-///
-/// This contains all audio-related state that the UI might need to display.
-/// The backend owns this state and emits `AudioStateChanged` events when it changes.
 #[derive(Debug, Clone, Default)]
 pub struct AudioState {
     /// Available input (microphone) devices.
@@ -172,37 +84,26 @@ pub struct AudioState {
     /// Available output (speaker/headphone) devices.
     pub output_devices: Vec<AudioDeviceInfo>,
     /// Currently selected input device ID (None = system default).
-    pub selected_input_id: Option<String>,
+    pub selected_input: Option<String>,
     /// Currently selected output device ID (None = system default).
-    pub selected_output_id: Option<String>,
-    /// Input volume multiplier (0.0 = muted, 1.0 = normal, 2.0 = boosted).
-    pub input_volume: f32,
-    /// Output volume multiplier (0.0 = muted, 1.0 = normal, 2.0 = boosted).
-    pub output_volume: f32,
-    /// Whether voice capture is currently active.
-    pub is_capturing: bool,
-    /// Whether audio playback is currently active.
-    pub is_playing: bool,
+    pub selected_output: Option<String>,
+    /// Current transmission mode.
+    pub transmission_mode: TransmissionMode,
+    /// Whether we are actually transmitting right now.
+    pub is_transmitting: bool,
+    /// User IDs of users currently transmitting voice.
+    pub talking_users: HashSet<u64>,
 }
 
 impl AudioState {
     /// Create a new AudioState with default values.
     pub fn new() -> Self {
-        Self {
-            input_devices: Vec::new(),
-            output_devices: Vec::new(),
-            selected_input_id: None,
-            selected_output_id: None,
-            input_volume: 1.0,
-            output_volume: 1.0,
-            is_capturing: false,
-            is_playing: false,
-        }
+        Self::default()
     }
 
     /// Get the selected input device info, if any.
     pub fn selected_input_device(&self) -> Option<&AudioDeviceInfo> {
-        match &self.selected_input_id {
+        match &self.selected_input {
             Some(id) => self.input_devices.iter().find(|d| &d.id == id),
             None => self.input_devices.iter().find(|d| d.is_default),
         }
@@ -210,40 +111,69 @@ impl AudioState {
 
     /// Get the selected output device info, if any.
     pub fn selected_output_device(&self) -> Option<&AudioDeviceInfo> {
-        match &self.selected_output_id {
+        match &self.selected_output {
             Some(id) => self.output_devices.iter().find(|d| &d.id == id),
             None => self.output_devices.iter().find(|d| d.is_default),
         }
     }
 }
 
-/// Current connection state as seen by the backend.
-#[derive(Debug, Clone, Default)]
-pub struct ConnectionState {
-    /// Current connection status.
-    pub status: ConnectionStatus,
-    /// Whether we are connected to a server (convenience, same as status.is_connected()).
-    pub connected: bool,
-    /// Our user ID (if connected and assigned).
-    pub my_user_id: Option<u64>,
-    /// Our client name.
-    pub my_client_name: String,
-    /// Current room UUID (if in a room).
-    pub current_room_id: Option<Uuid>,
-    /// List of rooms.
-    pub rooms: Vec<RoomInfo>,
-    /// List of user presences.
-    pub users: Vec<UserPresence>,
-    /// Audio subsystem state.
-    pub audio: AudioState,
+// =============================================================================
+// Chat Message
+// =============================================================================
+
+/// A chat message.
+#[derive(Debug, Clone)]
+pub struct ChatMessage {
+    pub sender: String,
+    pub text: String,
+    pub timestamp: std::time::Instant,
 }
 
-impl ConnectionState {
+// =============================================================================
+// Main State Struct
+// =============================================================================
+
+/// The complete client state exposed to the UI.
+///
+/// The UI renders based on this state. User actions result in Commands
+/// sent to the backend, which updates this state and calls the repaint callback.
+#[derive(Debug, Clone, Default)]
+pub struct State {
+    // Connection
+    /// Current connection state.
+    pub connection: ConnectionState,
+    
+    // Server state (when connected)
+    /// List of rooms on the server.
+    pub rooms: Vec<RoomInfo>,
+    /// List of users on the server.
+    pub users: Vec<User>,
+    /// Our user ID (if connected).
+    pub my_user_id: Option<u64>,
+    /// Our current room ID (if in a room).
+    pub my_room_id: Option<Uuid>,
+    
+    // Audio
+    /// Audio subsystem state.
+    pub audio: AudioState,
+    
+    // Chat (recent messages, not persisted)
+    /// Recent chat messages.
+    pub chat_messages: Vec<ChatMessage>,
+}
+
+impl State {
     /// Get users in a specific room.
-    pub fn users_in_room(&self, room_uuid: Uuid) -> Vec<&UserPresence> {
+    pub fn users_in_room(&self, room_uuid: Uuid) -> Vec<&User> {
         self.users
             .iter()
-            .filter(|u| u.room_id.as_ref().and_then(uuid_from_room_id) == Some(room_uuid))
+            .filter(|u| {
+                u.current_room
+                    .as_ref()
+                    .and_then(api::uuid_from_room_id)
+                    == Some(room_uuid)
+            })
             .collect()
     }
 
@@ -251,7 +181,10 @@ impl ConnectionState {
     pub fn is_user_in_room(&self, user_id: u64, room_uuid: Uuid) -> bool {
         self.users.iter().any(|u| {
             u.user_id.as_ref().map(|id| id.value) == Some(user_id)
-                && u.room_id.as_ref().and_then(uuid_from_room_id) == Some(room_uuid)
+                && u.current_room
+                    .as_ref()
+                    .and_then(api::uuid_from_room_id)
+                    == Some(room_uuid)
         })
     }
 
@@ -259,27 +192,83 @@ impl ConnectionState {
     pub fn get_room(&self, room_uuid: Uuid) -> Option<&RoomInfo> {
         self.rooms
             .iter()
-            .find(|r| r.id.as_ref().and_then(uuid_from_room_id) == Some(room_uuid))
+            .find(|r| r.id.as_ref().and_then(api::uuid_from_room_id) == Some(room_uuid))
     }
+    
+    /// Get a user by ID.
+    pub fn get_user(&self, user_id: u64) -> Option<&User> {
+        self.users
+            .iter()
+            .find(|u| u.user_id.as_ref().map(|id| id.value) == Some(user_id))
+    }
+}
+
+// =============================================================================
+// Commands
+// =============================================================================
+
+/// Commands that can be sent from the UI to the backend.
+///
+/// Commands are fire-and-forget. The UI sends a command, and the backend
+/// updates state asynchronously.
+#[derive(Debug, Clone)]
+pub enum Command {
+    // Connection
+    /// Connect to a server.
+    Connect {
+        addr: String,
+        name: String,
+        password: Option<String>,
+    },
+    /// Disconnect from the current server.
+    Disconnect,
+
+    // Room/Chat
+    /// Join a room by UUID.
+    JoinRoom { room_id: Uuid },
+    /// Create a new room.
+    CreateRoom { name: String },
+    /// Delete a room by UUID.
+    DeleteRoom { room_id: Uuid },
+    /// Rename a room.
+    RenameRoom { room_id: Uuid, new_name: String },
+    /// Send a chat message.
+    SendChat { text: String },
+
+    // Audio configuration (always available)
+    /// Set the input (microphone) device by ID.
+    SetInputDevice { device_id: Option<String> },
+    /// Set the output (speaker) device by ID.
+    SetOutputDevice { device_id: Option<String> },
+    /// Refresh the list of available audio devices.
+    RefreshAudioDevices,
+
+    // Transmission control
+    /// Set the transmission mode.
+    SetTransmissionMode { mode: TransmissionMode },
+    /// Start transmitting (only effective in PushToTalk mode).
+    StartTransmit,
+    /// Stop transmitting.
+    StopTransmit,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use api::{proto::UserId, room_id_from_uuid};
-    use uuid::Uuid;
 
     #[test]
-    fn test_connection_state_users_in_room() {
+    fn test_state_users_in_room() {
         let room1_uuid = ROOT_ROOM_UUID;
         let room2_uuid = Uuid::new_v4();
 
-        let state = ConnectionState {
-            status: ConnectionStatus::Connected,
-            connected: true,
+        let state = State {
+            connection: ConnectionState::Connected {
+                server_name: "Test".to_string(),
+                user_id: 1,
+            },
             my_user_id: Some(1),
-            my_client_name: "test".to_string(),
-            current_room_id: Some(room1_uuid),
+            my_room_id: Some(room1_uuid),
             rooms: vec![
                 RoomInfo {
                     id: Some(room_id_from_uuid(room1_uuid)),
@@ -291,22 +280,24 @@ mod tests {
                 },
             ],
             users: vec![
-                UserPresence {
+                User {
                     user_id: Some(UserId { value: 1 }),
-                    room_id: Some(room_id_from_uuid(room1_uuid)),
+                    current_room: Some(room_id_from_uuid(room1_uuid)),
                     username: "user1".to_string(),
                 },
-                UserPresence {
+                User {
                     user_id: Some(UserId { value: 2 }),
-                    room_id: Some(room_id_from_uuid(room1_uuid)),
+                    current_room: Some(room_id_from_uuid(room1_uuid)),
                     username: "user2".to_string(),
                 },
-                UserPresence {
+                User {
                     user_id: Some(UserId { value: 3 }),
-                    room_id: Some(room_id_from_uuid(room2_uuid)),
+                    current_room: Some(room_id_from_uuid(room2_uuid)),
                     username: "user3".to_string(),
                 },
             ],
+            audio: AudioState::default(),
+            chat_messages: vec![],
         };
 
         let users_in_room1 = state.users_in_room(room1_uuid);
@@ -318,9 +309,9 @@ mod tests {
     }
 
     #[test]
-    fn test_connection_state_get_room() {
+    fn test_state_get_room() {
         let room_uuid = ROOT_ROOM_UUID;
-        let state = ConnectionState {
+        let state = State {
             rooms: vec![RoomInfo {
                 id: Some(room_id_from_uuid(room_uuid)),
                 name: "Root".to_string(),

@@ -1,4 +1,4 @@
-use backend::{BackendCommand, BackendEvent, BackendHandle};
+use backend::{BackendHandle, Command, ConnectionState, ConnectConfig, TransmissionMode};
 use clap::Parser;
 use eframe::egui;
 use egui::{CollapsingHeader, Modal};
@@ -76,8 +76,6 @@ struct MyApp {
 
     /// Push-to-talk key is held
     push_to_talk_active: bool,
-    /// Track which users are currently talking (user_id -> is_talking)
-    talking_users: std::collections::HashSet<u64>,
 
     egui_ctx: egui::Context,
 }
@@ -85,8 +83,9 @@ struct MyApp {
 impl Drop for MyApp {
     fn drop(&mut self) {
         // Send disconnect command before dropping the backend handle
-        if self.backend.is_connected() {
-            self.backend.send(BackendCommand::Disconnect);
+        let state = self.backend.state();
+        if state.connection.is_connected() {
+            self.backend.send(Command::Disconnect);
         }
         // BackendHandle will clean up the background thread and audio when dropped
     }
@@ -94,11 +93,26 @@ impl Drop for MyApp {
 
 impl MyApp {
     fn new(ctx: egui::Context, args: Args) -> Self {
+        // Build connect config based on CLI args
+        let mut config = ConnectConfig::new();
+        if args.trust_dev_cert {
+            config = config.with_cert("dev-certs/server-cert.der");
+        }
+        if let Some(cert_path) = &args.cert {
+            config = config.with_cert(cert_path);
+        }
+        if let Ok(cert_path) = std::env::var("RUMBLE_SERVER_CERT_PATH") {
+            config = config.with_cert(cert_path);
+        }
+
         // Create backend handle with repaint callback
         let ctx_for_repaint = ctx.clone();
-        let mut backend = BackendHandle::with_repaint_callback(move || {
-            ctx_for_repaint.request_repaint();
-        });
+        let backend = BackendHandle::with_config(
+            move || {
+                ctx_for_repaint.request_repaint();
+            },
+            config,
+        );
 
         // Use provided name or generate a random one
         let client_name = args
@@ -106,64 +120,44 @@ impl MyApp {
             .clone()
             .unwrap_or_else(|| format!("user-{}", Uuid::new_v4().simple()));
 
+        let mut chat_messages = Vec::new();
+        chat_messages.push(format!(
+            "Rumble Client v{}",
+            env!("CARGO_PKG_VERSION")
+        ));
+        chat_messages.push(format!("Client name: {}", client_name));
+
         // Use provided server address or default empty
         let connect_address = args.server.clone().unwrap_or_default();
 
         // Use provided password or empty
         let connect_password = args.password.clone().unwrap_or_default();
 
-        // If server was specified on command line, connect immediately
-        if let Some(server_addr) = &args.server {
-            let addr = if server_addr.trim().is_empty() {
-                "127.0.0.1:5000".to_string()
-            } else {
-                server_addr.trim().to_string()
-            };
-
-            // Build connect config based on CLI args
-            let mut config = backend::ConnectConfig::new();
-            if args.trust_dev_cert {
-                config = config.with_cert("dev-certs/server-cert.der");
-            }
-            if let Some(cert_path) = &args.cert {
-                config = config.with_cert(cert_path);
-            }
-            if let Ok(cert_path) = std::env::var("RUMBLE_SERVER_CERT_PATH") {
-                config = config.with_cert(cert_path);
-            }
-
-            backend.send(BackendCommand::Connect {
-                addr,
-                name: client_name.clone(),
-                password: args.password.clone(),
-                config,
-            });
-        }
-
-        Self {
+        let mut app = Self {
             show_connect: false,
             show_settings: false,
-            connect_address,
-            connect_password,
+            connect_address: connect_address.clone(),
+            connect_password: connect_password.clone(),
             trust_dev_cert: args.trust_dev_cert,
-            chat_messages: Vec::new(),
+            chat_messages,
             chat_input: String::new(),
-            client_name,
+            client_name: client_name.clone(),
             backend,
             rename_modal: RenameModalState::default(),
             push_to_talk_active: false,
-            talking_users: std::collections::HashSet::new(),
             egui_ctx: ctx,
+        };
+
+        // If server was specified on command line, connect immediately
+        if args.server.is_some() {
+            app.connect();
         }
+
+        app
     }
 
-    /// Send a command to the backend (non-blocking)
-    fn send_command(&mut self, cmd: BackendCommand) {
-        self.backend.send(cmd);
-    }
-
-    /// Attempt to reconnect with the last known connection parameters.
-    fn reconnect(&mut self) {
+    /// Connect to the server using current settings.
+    fn connect(&mut self) {
         let addr = if self.connect_address.trim().is_empty() {
             "127.0.0.1:5000".to_string()
         } else {
@@ -176,43 +170,35 @@ impl MyApp {
             Some(self.connect_password.trim().to_string())
         };
 
-        // Build connect config based on saved settings
-        let mut config = backend::ConnectConfig::new();
-        if self.trust_dev_cert {
-            config = config.with_cert("dev-certs/server-cert.der");
-        }
-        if let Ok(cert_path) = std::env::var("RUMBLE_SERVER_CERT_PATH") {
-            config = config.with_cert(cert_path);
-        }
-
-        self.chat_messages
-            .push(format!("Reconnecting to {}...", addr));
-        self.send_command(BackendCommand::Connect {
+        self.chat_messages.push(format!("Connecting to {}...", addr));
+        self.backend.send(Command::Connect {
             addr,
             name,
             password,
-            config,
         });
     }
 
-    /// Start audio capture (push-to-talk)
-    fn start_voice_capture(&mut self) {
-        self.backend.send(BackendCommand::StartVoiceCapture);
+    /// Attempt to reconnect with the last known connection parameters.
+    fn reconnect(&mut self) {
+        self.chat_messages
+            .push(format!("Reconnecting to {}...", self.connect_address));
+        self.connect();
     }
 
-    /// Stop audio capture
-    fn stop_voice_capture(&mut self) {
-        self.backend.send(BackendCommand::StopVoiceCapture);
+    /// Start audio transmission (push-to-talk).
+    fn start_transmit(&mut self) {
+        self.backend.send(Command::StartTransmit);
     }
 
-    /// Start audio playback
-    fn start_playback(&mut self) {
-        self.backend.send(BackendCommand::StartPlayback);
+    /// Stop audio transmission.
+    fn stop_transmit(&mut self) {
+        self.backend.send(Command::StopTransmit);
     }
 
-    /// Stop audio playback
-    fn stop_playback(&mut self) {
-        self.backend.send(BackendCommand::StopPlayback);
+    /// Check if connected based on current state.
+    #[allow(dead_code)]
+    fn is_connected(&self) -> bool {
+        self.backend.state().connection.is_connected()
     }
 }
 
@@ -220,115 +206,17 @@ impl eframe::App for MyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.egui_ctx = ctx.clone();
 
-        // Process incoming backend events (non-blocking)
-        while let Some(event) = self.backend.poll_event() {
-            match event {
-                BackendEvent::Connected {
-                    user_id,
-                    client_name,
-                } => {
-                    self.chat_messages.push(format!(
-                        "Connected to {} as {} (id: {})",
-                        self.connect_address, client_name, user_id
-                    ));
-                    // Start audio playback when connected
-                    self.start_playback();
-                }
-                BackendEvent::ConnectFailed { error } => {
-                    self.chat_messages
-                        .push(format!("Failed to connect: {}", error));
-                }
-                BackendEvent::Disconnected { reason } => {
-                    let msg = match reason {
-                        Some(r) => format!("Disconnected from server: {}", r),
-                        None => "Disconnected from server".to_string(),
-                    };
-                    self.chat_messages.push(msg);
-                    // Stop audio when disconnected
-                    self.stop_voice_capture();
-                    self.stop_playback();
-                }
-                BackendEvent::ConnectionLost {
-                    error,
-                    will_reconnect,
-                } => {
-                    let msg = if will_reconnect {
-                        format!("Connection lost: {}. Reconnecting...", error)
-                    } else {
-                        format!("Connection lost: {}", error)
-                    };
-                    self.chat_messages.push(msg);
-                    // Stop audio when connection is lost
-                    self.stop_voice_capture();
-                    self.stop_playback();
-                }
-                BackendEvent::ConnectionStatusChanged { status } => {
-                    // Log status changes for debugging
-                    use backend::ConnectionStatus;
-                    match status {
-                        ConnectionStatus::Connecting => {
-                            self.chat_messages.push("Connecting...".to_string());
-                        }
-                        ConnectionStatus::Connected => {
-                            // Already handled by BackendEvent::Connected
-                        }
-                        ConnectionStatus::Reconnecting {
-                            attempt,
-                            max_attempts,
-                        } => {
-                            self.chat_messages.push(format!(
-                                "Reconnecting (attempt {}/{})...",
-                                attempt,
-                                if max_attempts == 0 {
-                                    "∞".to_string()
-                                } else {
-                                    max_attempts.to_string()
-                                }
-                            ));
-                        }
-                        ConnectionStatus::ConnectionLost => {
-                            // Already handled by BackendEvent::ConnectionLost
-                        }
-                        ConnectionStatus::Disconnected => {
-                            // Already handled by BackendEvent::Disconnected
-                        }
-                    }
-                }
-                BackendEvent::ChatReceived { sender, text } => {
-                    self.chat_messages.push(format!("{}: {}", sender, text));
-                }
-                BackendEvent::StateUpdated { state: _ } => {
-                    // State is automatically updated in the backend handle
-                }
-                BackendEvent::VoiceActivity {
-                    user_id,
-                    is_talking,
-                } => {
-                    // Track which users are talking
-                    if is_talking {
-                        self.talking_users.insert(user_id);
-                    } else {
-                        self.talking_users.remove(&user_id);
-                    }
-                }
-                BackendEvent::AudioStateChanged { state: _ } => {
-                    // Audio state is updated in backend.state().audio automatically
-                    // No action needed here - UI reads from backend state directly
-                }
-                BackendEvent::Error { message } => {
-                    self.chat_messages.push(format!("Error: {}", message));
-                }
-            }
-        }
+        // Get current state from backend (clone to avoid borrow issues)
+        let state = self.backend.state();
 
         // Handle push-to-talk (Space key)
         let space_pressed = ctx.input(|i| i.key_down(egui::Key::Space));
-        if space_pressed && !self.push_to_talk_active && self.backend.is_connected() {
+        if space_pressed && !self.push_to_talk_active && state.connection.is_connected() {
             self.push_to_talk_active = true;
-            self.start_voice_capture();
+            self.start_transmit();
         } else if !space_pressed && self.push_to_talk_active {
             self.push_to_talk_active = false;
-            self.stop_voice_capture();
+            self.stop_transmit();
         }
 
         // Top menu
@@ -339,14 +227,14 @@ impl eframe::App for MyApp {
                         self.show_connect = true;
                         ui.close();
                     }
-                    if self.backend.is_connected() {
+                    if state.connection.is_connected() {
                         if ui.button("Disconnect").clicked() {
-                            self.send_command(BackendCommand::Disconnect);
+                            self.backend.send(Command::Disconnect);
                             ui.close();
                         }
                     }
                     // Show reconnect option when not connected and we have an address
-                    if !self.backend.is_connected() && !self.connect_address.is_empty() {
+                    if !state.connection.is_connected() && !self.connect_address.is_empty() {
                         if ui.button("Reconnect").clicked() {
                             self.reconnect();
                             ui.close();
@@ -362,28 +250,23 @@ impl eframe::App for MyApp {
 
                 // Show connection status indicator on the right side
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    use backend::ConnectionStatus;
-                    let status = self.backend.connection_status();
-                    match status {
-                        ConnectionStatus::Connected => {
+                    match &state.connection {
+                        ConnectionState::Connected { .. } => {
                             ui.colored_label(egui::Color32::GREEN, "● Connected");
                         }
-                        ConnectionStatus::Connecting => {
+                        ConnectionState::Connecting { .. } => {
                             ui.colored_label(egui::Color32::YELLOW, "● Connecting...");
                         }
-                        ConnectionStatus::Reconnecting { attempt, .. } => {
-                            ui.colored_label(
-                                egui::Color32::YELLOW,
-                                format!("● Reconnecting ({})...", attempt),
-                            );
-                        }
-                        ConnectionStatus::ConnectionLost => {
+                        ConnectionState::ConnectionLost { error } => {
                             if ui.button("⟳ Reconnect").clicked() {
                                 self.reconnect();
                             }
-                            ui.colored_label(egui::Color32::RED, "● Connection Lost");
+                            ui.colored_label(
+                                egui::Color32::RED,
+                                format!("● Connection Lost: {}", error),
+                            );
                         }
-                        ConnectionStatus::Disconnected => {
+                        ConnectionState::Disconnected => {
                             ui.colored_label(egui::Color32::GRAY, "○ Disconnected");
                         }
                     }
@@ -425,8 +308,8 @@ impl eframe::App for MyApp {
                                 } || ui.button("Send").clicked();
                                 if send {
                                     let text = self.chat_input.trim();
-                                    if !text.is_empty() && self.backend.is_connected() {
-                                        self.send_command(BackendCommand::SendChat {
+                                    if !text.is_empty() && state.connection.is_connected() {
+                                        self.backend.send(Command::SendChat {
                                             text: text.to_owned(),
                                         });
                                         self.chat_input.clear();
@@ -437,28 +320,25 @@ impl eframe::App for MyApp {
                     });
             });
 
-        // Get current state from backend (clone to avoid borrow issues)
-        let state = self.backend.state().clone();
-
         // Rooms + users
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("Rooms");
             ui.separator();
 
-            if !state.connected {
+            if !state.connection.is_connected() {
                 ui.label("Not connected. Use Server > Connect...");
             }
-            if state.connected && state.rooms.is_empty() {
+            if state.connection.is_connected() && state.rooms.is_empty() {
                 ui.horizontal(|ui| {
                     ui.label("No rooms received yet.");
                     if ui.button("Join Root").clicked() {
-                        self.send_command(BackendCommand::JoinRoom {
-                            room_uuid: api::ROOT_ROOM_UUID,
+                        self.backend.send(Command::JoinRoom {
+                            room_id: api::ROOT_ROOM_UUID,
                         });
                     }
                     if ui.button("Refresh").clicked() {
-                        self.send_command(BackendCommand::JoinRoom {
-                            room_uuid: api::ROOT_ROOM_UUID,
+                        self.backend.send(Command::JoinRoom {
+                            room_id: api::ROOT_ROOM_UUID,
                         });
                     }
                 });
@@ -467,7 +347,7 @@ impl eframe::App for MyApp {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 for room in state.rooms.iter() {
                     let room_uuid = room.id.as_ref().and_then(api::uuid_from_room_id);
-                    let is_current = state.current_room_id == room_uuid;
+                    let is_current = state.my_room_id == room_uuid;
                     let mut text = room.name.clone();
                     if is_current {
                         text.push_str("  (current)");
@@ -475,13 +355,13 @@ impl eframe::App for MyApp {
                     let resp = ui.selectable_label(is_current, text);
                     if resp.clicked() {
                         if let Some(uuid) = room_uuid {
-                            self.send_command(BackendCommand::JoinRoom { room_uuid: uuid });
+                            self.backend.send(Command::JoinRoom { room_id: uuid });
                         }
                     }
                     resp.context_menu(|ui| {
                         if ui.button("Join").clicked() {
                             if let Some(uuid) = room_uuid {
-                                self.send_command(BackendCommand::JoinRoom { room_uuid: uuid });
+                                self.backend.send(Command::JoinRoom { room_id: uuid });
                             }
                             ui.close();
                         }
@@ -494,7 +374,7 @@ impl eframe::App for MyApp {
                             ui.close();
                         }
                         if ui.button("Add Room").clicked() {
-                            self.send_command(BackendCommand::CreateRoom {
+                            self.backend.send(Command::CreateRoom {
                                 name: "New Room".to_string(),
                             });
                             ui.close();
@@ -502,7 +382,7 @@ impl eframe::App for MyApp {
                         let is_root = room_uuid == Some(api::ROOT_ROOM_UUID);
                         if !is_root && ui.button("Delete Room").clicked() {
                             if let Some(uuid) = room_uuid {
-                                self.send_command(BackendCommand::DeleteRoom { room_uuid: uuid });
+                                self.backend.send(Command::DeleteRoom { room_id: uuid });
                             }
                             ui.close();
                         }
@@ -513,9 +393,9 @@ impl eframe::App for MyApp {
                         .default_open(is_current)
                         .show(ui, |ui| {
                             if let Some(uuid) = room_uuid {
-                                for up in state.users_in_room(uuid) {
+                                for user in state.users_in_room(uuid) {
                                     let user_id =
-                                        up.user_id.as_ref().map(|id| id.value).unwrap_or(0);
+                                        user.user_id.as_ref().map(|id| id.value).unwrap_or(0);
                                     let is_self = state.my_user_id == Some(user_id);
 
                                     // Check if user is talking
@@ -523,17 +403,16 @@ impl eframe::App for MyApp {
                                     let is_talking = if is_self {
                                         self.push_to_talk_active
                                     } else {
-                                        self.talking_users.contains(&user_id)
+                                        state.audio.talking_users.contains(&user_id)
                                     };
 
                                     ui.horizontal(|ui| {
                                         if is_talking {
-                                            ui.colored_label(egui::Color32::LIGHT_GREEN, "🎤");
+                                            ui.colored_label(egui::Color32::LIGHT_GREEN, "��");
                                         } else {
                                             ui.colored_label(egui::Color32::DARK_GRAY, "🔇");
                                         }
-                                        // let label = format!("{}",up.username);
-                                        ui.label(up.username.to_owned());
+                                        ui.label(&user.username);
                                     });
                                 }
                             }
@@ -562,33 +441,7 @@ impl eframe::App for MyApp {
                     |_l| {},
                     |ui| {
                         if ui.button("Connect").clicked() {
-                            let addr = if self.connect_address.trim().is_empty() {
-                                "127.0.0.1:5000".to_string()
-                            } else {
-                                self.connect_address.trim().to_string()
-                            };
-                            let name = self.client_name.clone();
-                            let password = if self.connect_password.trim().is_empty() {
-                                None
-                            } else {
-                                Some(self.connect_password.trim().to_string())
-                            };
-
-                            // Build connect config based on UI settings
-                            let mut config = backend::ConnectConfig::new();
-                            if self.trust_dev_cert {
-                                config = config.with_cert("dev-certs/server-cert.der");
-                            }
-                            if let Ok(cert_path) = std::env::var("RUMBLE_SERVER_CERT_PATH") {
-                                config = config.with_cert(cert_path);
-                            }
-
-                            self.send_command(BackendCommand::Connect {
-                                addr,
-                                name,
-                                password,
-                                config,
-                            });
+                            self.connect();
                             ui.close();
                         }
                         if ui.button("Cancel").clicked() {
@@ -616,7 +469,7 @@ impl eframe::App for MyApp {
                     });
                     ui.horizontal(|ui| {
                         ui.label("Status:");
-                        ui.label(if self.backend.is_connected() {
+                        ui.label(if state.connection.is_connected() {
                             "Connected"
                         } else {
                             "Disconnected"
@@ -629,11 +482,11 @@ impl eframe::App for MyApp {
                 // Audio settings
                 ui.collapsing("Audio", |ui| {
                     // Clone audio state to avoid borrow conflicts with send()
-                    let audio = self.backend.state().audio.clone();
+                    let audio = state.audio.clone();
 
                     // Refresh button
                     if ui.button("🔄 Refresh Devices").clicked() {
-                        self.backend.send(BackendCommand::RefreshAudioDevices);
+                        self.backend.send(Command::RefreshAudioDevices);
                     }
 
                     ui.separator();
@@ -653,7 +506,7 @@ impl eframe::App for MyApp {
                         .show_ui(ui, |ui| {
                             // Default option
                             if ui
-                                .selectable_label(audio.selected_input_id.is_none(), "Default")
+                                .selectable_label(audio.selected_input.is_none(), "Default")
                                 .clicked()
                             {
                                 input_device_changed = Some(None);
@@ -667,7 +520,7 @@ impl eframe::App for MyApp {
                                 };
                                 if ui
                                     .selectable_label(
-                                        audio.selected_input_id.as_ref() == Some(&device.id),
+                                        audio.selected_input.as_ref() == Some(&device.id),
                                         &label,
                                     )
                                     .clicked()
@@ -679,31 +532,8 @@ impl eframe::App for MyApp {
 
                     // Handle input device change
                     if let Some(new_selection) = input_device_changed {
-                        self.backend.send(BackendCommand::SetInputDevice {
+                        self.backend.send(Command::SetInputDevice {
                             device_id: new_selection,
-                        });
-                    }
-
-                    // Input volume slider
-                    let mut input_volume = audio.input_volume;
-                    ui.horizontal(|ui| {
-                        ui.label("Input Volume:");
-                        if ui
-                            .add(
-                                egui::Slider::new(&mut input_volume, 0.0..=2.0)
-                                    .show_value(true)
-                                    .suffix("x"),
-                            )
-                            .changed()
-                        {
-                            // Note: We can't call send() in the closure due to borrow rules
-                            // The slider change is handled below
-                        }
-                    });
-                    // Handle volume change after the ui.horizontal closure
-                    if input_volume != audio.input_volume {
-                        self.backend.send(BackendCommand::SetInputVolume {
-                            volume: input_volume,
                         });
                     }
 
@@ -724,7 +554,7 @@ impl eframe::App for MyApp {
                         .show_ui(ui, |ui| {
                             // Default option
                             if ui
-                                .selectable_label(audio.selected_output_id.is_none(), "Default")
+                                .selectable_label(audio.selected_output.is_none(), "Default")
                                 .clicked()
                             {
                                 output_device_changed = Some(None);
@@ -738,7 +568,7 @@ impl eframe::App for MyApp {
                                 };
                                 if ui
                                     .selectable_label(
-                                        audio.selected_output_id.as_ref() == Some(&device.id),
+                                        audio.selected_output.as_ref() == Some(&device.id),
                                         &label,
                                     )
                                     .clicked()
@@ -750,41 +580,51 @@ impl eframe::App for MyApp {
 
                     // Handle output device change
                     if let Some(new_selection) = output_device_changed {
-                        self.backend.send(BackendCommand::SetOutputDevice {
+                        self.backend.send(Command::SetOutputDevice {
                             device_id: new_selection,
                         });
                     }
 
-                    // Output volume slider
-                    let mut output_volume = audio.output_volume;
+                    ui.separator();
+
+                    // Transmission mode
+                    ui.label("Transmission Mode:");
                     ui.horizontal(|ui| {
-                        ui.label("Output Volume:");
-                        ui.add(
-                            egui::Slider::new(&mut output_volume, 0.0..=2.0)
-                                .show_value(true)
-                                .suffix("x"),
-                        );
+                        if ui.selectable_label(
+                            matches!(audio.transmission_mode, TransmissionMode::PushToTalk),
+                            "Push-to-Talk",
+                        ).clicked() {
+                            self.backend.send(Command::SetTransmissionMode {
+                                mode: TransmissionMode::PushToTalk,
+                            });
+                        }
+                        if ui.selectable_label(
+                            matches!(audio.transmission_mode, TransmissionMode::Continuous),
+                            "Continuous",
+                        ).clicked() {
+                            self.backend.send(Command::SetTransmissionMode {
+                                mode: TransmissionMode::Continuous,
+                            });
+                        }
+                        if ui.selectable_label(
+                            matches!(audio.transmission_mode, TransmissionMode::Muted),
+                            "Muted",
+                        ).clicked() {
+                            self.backend.send(Command::SetTransmissionMode {
+                                mode: TransmissionMode::Muted,
+                            });
+                        }
                     });
-                    // Handle volume change after the ui.horizontal closure
-                    if output_volume != audio.output_volume {
-                        self.backend.send(BackendCommand::SetOutputVolume {
-                            volume: output_volume,
-                        });
-                    }
 
                     ui.separator();
 
                     // Status info
                     ui.label("Push-to-talk: Hold SPACE to transmit");
 
-                    if audio.is_capturing {
+                    if audio.is_transmitting {
                         ui.colored_label(egui::Color32::GREEN, "🎤 Transmitting...");
                     } else {
                         ui.label("🔇 Not transmitting");
-                    }
-
-                    if audio.is_playing {
-                        ui.label("🔊 Audio output active");
                     }
                 });
 
@@ -820,8 +660,8 @@ impl eframe::App for MyApp {
                             let new_name = self.rename_modal.room_name.trim().to_string();
                             if !new_name.is_empty() {
                                 if let Some(uuid) = self.rename_modal.room_uuid {
-                                    self.send_command(BackendCommand::RenameRoom {
-                                        room_uuid: uuid,
+                                    self.backend.send(Command::RenameRoom {
+                                        room_id: uuid,
                                         new_name,
                                     });
                                 }

@@ -2,11 +2,9 @@ syntax = "proto3";
 
 package rumble.api.v1;
 
-// Phase 2 additions: rooms, voice, and richer server events
-
-message Login {
-  string username = 1; // placeholder, real auth in phase 3
-}
+// =============================================================================
+// Core Types
+// =============================================================================
 
 // RoomId is a 16-byte UUID.
 // The Root room always has UUID 0 (all zeros).
@@ -19,34 +17,38 @@ message UserId {
   uint64 value = 1;
 }
 
-message JoinRoom {
-  RoomId room_id = 1;
+// =============================================================================
+// User and Room Definitions
+// =============================================================================
+
+// User identity and current room membership.
+// The current_room field tracks which room the user is in.
+message User {
+  UserId user_id = 1;
+  string username = 2;
+  RoomId current_room = 3;
 }
 
-message LeaveRoom {
-  RoomId room_id = 1;
-}
-
+// Room definition.
 message RoomInfo {
   RoomId id = 1;
   string name = 2;
 }
 
-message RoomState {
+// Full state snapshot sent on initial sync and resync.
+message ServerState {
   repeated RoomInfo rooms = 1;
-  repeated UserPresence users = 2; // users present per room
+  repeated User users = 2;
 }
 
-message UserPresence {
-  UserId user_id = 1;
-  RoomId room_id = 2;
-  string username = 3;
-}
+// =============================================================================
+// Voice Datagram (QUIC unreliable datagrams)
+// =============================================================================
 
-// Voice datagram sent via QUIC datagrams (unreliable, low-latency).
+// Voice data sent via QUIC datagrams (unreliable, low-latency).
 // This is a standalone message not wrapped in Envelope for minimal overhead.
 //
-// Client -> Server: Only opus_data and sequence are required.
+// Client -> Server: Only opus_data, sequence, and timestamp_us are set.
 //   The server determines sender_id and room_id from the connection.
 //
 // Server -> Client: All fields are populated by the server.
@@ -73,29 +75,31 @@ message VoiceDatagram {
   optional bytes room_id = 11;
 }
 
-// Extend the existing ServerEvent with additional variants for Phase 2.
+// =============================================================================
+// Envelope (Reliable Stream Messages)
+// =============================================================================
 
 // Generic envelope that carries a single payload and an optional state hash.
-// For simplicity we model payload as oneof of known types.
+// All reliable messages are wrapped in an Envelope.
 message Envelope {
-  bytes state_hash = 1; // protobuf-canonicalized checksum
+  bytes state_hash = 1; // BLAKE3 hash over canonical protobuf serialization
   oneof payload {
     ClientHello client_hello = 10;
     ServerHello server_hello = 11;
     ChatMessage chat_message = 12;
     Disconnect disconnect = 13;
     ServerEvent server_event = 14;
-    Login login = 15;
     JoinRoom join_room = 16;
-    LeaveRoom leave_room = 17;
-    RoomState room_state_msg = 18;
-    // Field 19 reserved: was VoiceFrame, now removed (voice uses datagrams only)
     CreateRoom create_room = 20;
     DeleteRoom delete_room = 21;
     RenameRoom rename_room = 22;
     RequestStateSync request_state_sync = 23;
   }
 }
+
+// =============================================================================
+// Client -> Server Messages
+// =============================================================================
 
 // Sent by client immediately after connecting and opening the control stream.
 message ClientHello {
@@ -104,18 +108,55 @@ message ClientHello {
   string password = 2;
 }
 
-// Initial response from server.
-message ServerHello {
-  string server_name = 1;
-  // The user_id assigned to this client by the server.
-  // This is determined by the server based on the connection, not claimed by the client.
-  uint64 user_id = 2;
+// Request to join a room.
+message JoinRoom {
+  RoomId room_id = 1;
+}
+
+// Room management requests
+message CreateRoom { 
+  string name = 1; 
+}
+
+message DeleteRoom { 
+  RoomId room_id = 1; 
+}
+
+message RenameRoom { 
+  RoomId room_id = 1; 
+  string new_name = 2; 
+}
+
+// Request a full state resync from the server.
+// Sent by the client when it detects a state hash mismatch.
+message RequestStateSync {
+  // The hash the client expected (for debugging/logging).
+  bytes expected_hash = 1;
+  // The hash the client computed locally (for debugging/logging).
+  bytes actual_hash = 2;
 }
 
 // Chat message sent from client to server.
 message ChatMessage {
   string sender = 1;
   string text = 2;
+}
+
+// Graceful disconnect notification.
+message Disconnect {
+  string reason = 1;
+}
+
+// =============================================================================
+// Server -> Client Messages
+// =============================================================================
+
+// Initial response from server after ClientHello.
+message ServerHello {
+  string server_name = 1;
+  // The user_id assigned to this client by the server.
+  // This is determined by the server based on the connection, not claimed by the client.
+  uint64 user_id = 2;
 }
 
 // Events pushed from server to clients.
@@ -125,16 +166,26 @@ message ServerEvent {
     // Periodic keep-alive ping from the server.
     KeepAlive keep_alive = 2;
     // Full state snapshot (used for initial sync and resync)
-    RoomState room_state_update = 3;
-    // Incremental user joined notification
-    UserPresence user_joined = 4;
-    // Incremental user left notification  
-    UserPresence user_left = 5;
-    // Field 6 reserved: was VoiceFrame, now removed (voice uses datagrams only)
+    ServerState server_state = 3;
     // Incremental state update with hash for verification
     StateUpdate state_update = 7;
   }
 }
+
+// Broadcast of a chat message to all connected clients in the same room.
+message ChatBroadcast {
+  string sender = 1;
+  string text = 2;
+}
+
+// Empty keep-alive message with optional timestamp.
+message KeepAlive {
+  uint64 epoch_ms = 1;
+}
+
+// =============================================================================
+// State Synchronization
+// =============================================================================
 
 // Incremental state update message.
 // Contains a single state change and the expected hash after applying it.
@@ -148,81 +199,50 @@ message StateUpdate {
   oneof update {
     // A user moved to a different room
     UserMoved user_moved = 10;
+    // A new user joined the server
+    UserJoined user_joined = 11;
+    // A user left the server
+    UserLeft user_left = 12;
     // A new room was created
-    RoomCreated room_created = 11;
+    RoomCreated room_created = 13;
     // A room was deleted
-    RoomDeleted room_deleted = 12;
+    RoomDeleted room_deleted = 14;
     // A room was renamed
-    RoomRenamed room_renamed = 13;
-    // A user's presence changed (joined server, left server, name change)
-    UserPresenceChanged user_presence_changed = 14;
+    RoomRenamed room_renamed = 15;
   }
 }
 
-// Incremental update: user moved to a different room
+// Incremental update: user moved to a different room.
+// The from_room is implicit (tracked on client from User.current_room).
 message UserMoved {
   UserId user_id = 1;
-  RoomId from_room_id = 2;
-  RoomId to_room_id = 3;
+  RoomId to_room_id = 2;
 }
 
-// Incremental update: new room created
+// Incremental update: new user joined the server.
+message UserJoined {
+  User user = 1;
+}
+
+// Incremental update: user left the server.
+message UserLeft {
+  UserId user_id = 1;
+}
+
+// Incremental update: new room created.
 message RoomCreated {
   RoomInfo room = 1;
 }
 
-// Incremental update: room deleted
+// Incremental update: room deleted.
+// Users that were in the room are moved to fallback_room_id (usually Root).
 message RoomDeleted {
   RoomId room_id = 1;
-  // Users that were in the room are moved to fallback_room_id (usually Root)
   RoomId fallback_room_id = 2;
 }
 
-// Incremental update: room renamed
+// Incremental update: room renamed.
 message RoomRenamed {
   RoomId room_id = 1;
-  string old_name = 2;
-  string new_name = 3;
-}
-
-// Incremental update: user presence changed
-message UserPresenceChanged {
-  UserPresence user = 1;
-  // Type of change
-  enum ChangeType {
-    JOINED_SERVER = 0;
-    LEFT_SERVER = 1;
-    NAME_CHANGED = 2;
-  }
-  ChangeType change_type = 2;
-}
-
-// Room management requests
-message CreateRoom { string name = 1; }
-message DeleteRoom { RoomId room_id = 1; }
-message RenameRoom { RoomId room_id = 1; string new_name = 2; }
-
-// Request a full state resync from the server.
-// Sent by the client when it detects a state hash mismatch.
-message RequestStateSync {
-  // The hash the client expected (for debugging/logging).
-  bytes expected_hash = 1;
-  // The hash the client computed locally (for debugging/logging).
-  bytes actual_hash = 2;
-}
-
-// Broadcast of a chat message to all connected clients.
-message ChatBroadcast {
-  string sender = 1;
-  string text = 2;
-}
-
-// Empty keep-alive message with optional timestamp.
-message KeepAlive {
-  uint64 epoch_ms = 1;
-}
-
-// Graceful disconnect notification.
-message Disconnect {
-  string reason = 1;
+  string new_name = 2;
 }

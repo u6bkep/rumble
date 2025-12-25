@@ -93,7 +93,6 @@ pub struct State {
     // Server state (when connected)
     pub rooms: Vec<RoomInfo>,
     pub users: Vec<User>,
-    pub memberships: Vec<(UserId, RoomId)>,
     pub my_user_id: Option<u64>,
     pub my_room_id: Option<Uuid>,
     

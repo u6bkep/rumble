@@ -95,17 +95,17 @@ pub fn compute_state_hash<M: Message>(msg: &M) -> Vec<u8> {
     digest.as_bytes().to_vec()
 }
 
-/// Compute a state hash from a RoomState message with canonical sorting.
+/// Compute a state hash from a ServerState message with canonical sorting.
 ///
-/// This function canonicalizes the RoomState by sorting rooms by ID and users
+/// This function canonicalizes the ServerState by sorting rooms by ID and users
 /// by user_id before hashing. This ensures deterministic hashes regardless of
 /// the order items were added.
 ///
 /// This is the standard hash function used for state synchronization between
 /// client and server.
-pub fn compute_room_state_hash(room_state: &proto::RoomState) -> Vec<u8> {
+pub fn compute_server_state_hash(server_state: &proto::ServerState) -> Vec<u8> {
     // Create a canonicalized copy with sorted rooms and users for determinism
-    let mut canonical = room_state.clone();
+    let mut canonical = server_state.clone();
 
     // Sort rooms by UUID bytes for deterministic ordering
     canonical.rooms.sort_by(|a, b| {

@@ -17,4 +17,4 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 cpal = "0.17.0"
 uuid = { version = "1.19.0", features = ["v4"] }
-opus = "0.3.0"
+opus = { path = "../../vendor/opus-rs" }

@@ -18,7 +18,7 @@
 
 use api::{
     ROOT_ROOM_UUID,
-    proto::{RoomInfo, UserId, UserPresence},
+    proto::{RoomInfo, User, UserId},
     room_id_from_uuid, root_room_id, uuid_from_room_id,
 };
 use dashmap::DashMap;
@@ -103,11 +103,11 @@ impl StateData {
     }
 }
 
-/// Compute a state hash from a RoomState message.
+/// Compute a state hash from a ServerState message.
 ///
 /// Re-exports the canonical hash function from the API crate.
-pub fn compute_room_state_hash(room_state: &api::proto::RoomState) -> Vec<u8> {
-    api::compute_room_state_hash(room_state)
+pub fn compute_server_state_hash(server_state: &api::proto::ServerState) -> Vec<u8> {
+    api::compute_server_state_hash(server_state)
 }
 
 /// The server's shared state.
@@ -282,12 +282,12 @@ impl ServerState {
         self.state_data.read().await.clone()
     }
 
-    /// Build the current user presence list.
+    /// Build the current user list.
     ///
     /// This is optimized to minimize lock contention:
     /// 1. Take a snapshot of memberships
     /// 2. Look up usernames from clients (lock-free DashMap access)
-    pub async fn build_presence_list(&self) -> Vec<UserPresence> {
+    pub async fn build_user_list(&self) -> Vec<User> {
         let data = self.state_data.read().await;
         let memberships = data.memberships.clone();
         drop(data); // Release the lock before async username lookups
@@ -296,9 +296,9 @@ impl ServerState {
         for (uid, rid) in memberships {
             if let Some(client) = self.get_client(uid) {
                 let username = client.get_username().await;
-                users.push(UserPresence {
+                users.push(User {
                     user_id: Some(UserId { value: uid }),
-                    room_id: Some(room_id_from_uuid(rid)),
+                    current_room: Some(room_id_from_uuid(rid)),
                     username,
                 });
             }

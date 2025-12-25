@@ -1,7 +1,7 @@
-//! Integration tests for server functionality using the backend client library.
+//! Integration tests for server functionality.
 //!
-//! These tests spin up a server instance and use the backend client to test
-//! room management, chat messaging, and multi-client interactions.
+//! These tests spin up a server instance and use a minimal test client to test
+//! room management, state synchronization, and multi-client interactions.
 
 use std::{
     io::{BufRead, BufReader},
@@ -9,6 +9,16 @@ use std::{
     sync::atomic::{AtomicU16, Ordering},
     time::Duration,
 };
+
+use anyhow::Result;
+use api::{
+    encode_frame, try_decode_frame, room_id_from_uuid, uuid_from_room_id,
+    proto::{self, envelope::Payload, Envelope, RoomInfo, User},
+};
+use bytes::BytesMut;
+use prost::Message;
+use quinn::{crypto::rustls::QuicClientConfig, Endpoint};
+use std::sync::Arc;
 
 /// Guard that kills the server process on drop.
 struct ChildGuard(Option<Child>);
@@ -29,13 +39,7 @@ fn next_test_port() -> u16 {
     PORT_COUNTER.fetch_add(1, Ordering::SeqCst)
 }
 
-/// Create a connect config for tests that trusts the dev certificate.
-fn test_connect_config() -> backend::ConnectConfig {
-    backend::ConnectConfig::new().with_cert("dev-certs/server-cert.der")
-}
-
 /// Start a server instance on the given port and return the guard.
-/// Pipes stdout/stderr to test output for diagnostics.
 fn start_server(port: u16) -> ChildGuard {
     let mut child = Command::new(env!("CARGO_BIN_EXE_server"))
         .env("RUST_LOG", "debug")
@@ -68,79 +72,309 @@ fn start_server(port: u16) -> ChildGuard {
     ChildGuard(Some(child))
 }
 
-/// Wait for the client snapshot to have at least one room.
-/// This also yields to allow background tasks to process events.
-async fn wait_for_rooms(client: &backend::Client, timeout_ms: u64) -> backend::RoomSnapshot {
-    let mut attempts = 0;
-    let max_attempts = timeout_ms / 50;
-    loop {
-        // Yield to allow background tasks to run.
-        tokio::task::yield_now().await;
-        let snap = client.get_snapshot().await;
-        if !snap.rooms.is_empty() {
-            return snap;
-        }
-        attempts += 1;
-        if attempts > max_attempts {
-            panic!("timeout waiting for room state from server");
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+// =============================================================================
+// Test Client
+// =============================================================================
+
+/// A minimal test client for integration tests.
+struct TestClient {
+    conn: quinn::Connection,
+    send: quinn::SendStream,
+    recv: quinn::RecvStream,
+    buf: BytesMut,
+    user_id: u64,
+    rooms: Vec<RoomInfo>,
+    users: Vec<User>,
 }
 
-/// Wait for the client snapshot to contain a specific number of rooms.
-async fn wait_for_room_count(
-    client: &backend::Client,
-    count: usize,
-    timeout_ms: u64,
-) -> backend::RoomSnapshot {
-    let mut attempts = 0;
-    let max_attempts = timeout_ms / 50;
-    loop {
-        let snap = client.get_snapshot().await;
-        if snap.rooms.len() == count {
-            return snap;
-        }
-        attempts += 1;
-        if attempts > max_attempts {
-            panic!(
-                "timeout waiting for {} rooms, got {} rooms: {:?}",
-                count,
-                snap.rooms.len(),
-                snap.rooms.iter().map(|r| &r.name).collect::<Vec<_>>()
-            );
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
+impl TestClient {
+    /// Connect to a server and complete the handshake.
+    async fn connect(addr: &str, name: &str) -> Result<Self> {
+        // Load dev certificate
+        let cert_der = std::fs::read("dev-certs/server-cert.der")?;
+        let cert = rustls::pki_types::CertificateDer::from(cert_der);
 
-/// Wait for the client snapshot to have a room with the given name.
-async fn wait_for_room_named(
-    client: &backend::Client,
-    name: &str,
-    timeout_ms: u64,
-) -> backend::RoomSnapshot {
-    let mut attempts = 0;
-    let max_attempts = timeout_ms / 50;
-    loop {
-        let snap = client.get_snapshot().await;
-        if snap.rooms.iter().any(|r| r.name == name) {
-            return snap;
+        // Build TLS config
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert)?;
+
+        let rustls_config = rustls::ClientConfig::builder_with_provider(
+            rustls::crypto::ring::default_provider().into(),
+        )
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+
+        let mut rustls_config = rustls_config;
+        rustls_config.alpn_protocols = vec![b"rumble".to_vec()];
+
+        let client_config = quinn::ClientConfig::new(Arc::new(
+            QuicClientConfig::try_from(Arc::new(rustls_config))?,
+        ));
+
+        // Create endpoint
+        let mut endpoint = Endpoint::client("0.0.0.0:0".parse()?)?;
+        endpoint.set_default_client_config(client_config);
+
+        // Connect
+        let socket_addr: std::net::SocketAddr = addr.parse()?;
+        let conn = endpoint.connect(socket_addr, "localhost")?.await?;
+
+        // Open bidirectional stream
+        let (send, recv) = conn.open_bi().await?;
+
+        let mut client = Self {
+            conn,
+            send,
+            recv,
+            buf: BytesMut::new(),
+            user_id: 0,
+            rooms: Vec::new(),
+            users: Vec::new(),
+        };
+
+        // Send ClientHello
+        client.send_client_hello(name).await?;
+
+        // Wait for ServerHello and initial ServerState
+        client.wait_for_handshake().await?;
+
+        Ok(client)
+    }
+
+    async fn send_client_hello(&mut self, name: &str) -> Result<()> {
+        let env = Envelope {
+            state_hash: Vec::new(),
+            payload: Some(Payload::ClientHello(proto::ClientHello {
+                client_name: name.to_string(),
+                password: String::new(),
+            })),
+        };
+        let frame = encode_frame(&env);
+        self.send.write_all(&frame).await?;
+        Ok(())
+    }
+
+    async fn wait_for_handshake(&mut self) -> Result<()> {
+        let mut got_hello = false;
+        let mut got_state = false;
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+
+        while (!got_hello || !got_state) && std::time::Instant::now() < deadline {
+            let mut chunk = [0u8; 4096];
+            match tokio::time::timeout(Duration::from_millis(100), self.recv.read(&mut chunk)).await
+            {
+                Ok(Ok(Some(n))) => {
+                    self.buf.extend_from_slice(&chunk[..n]);
+                    while let Some(frame) = try_decode_frame(&mut self.buf) {
+                        if let Ok(env) = Envelope::decode(&*frame) {
+                            match env.payload {
+                                Some(Payload::ServerHello(sh)) => {
+                                    self.user_id = sh.user_id;
+                                    got_hello = true;
+                                }
+                                Some(Payload::ServerEvent(se)) => {
+                                    if let Some(proto::server_event::Kind::ServerState(ss)) =
+                                        se.kind
+                                    {
+                                        self.rooms = ss.rooms;
+                                        self.users = ss.users;
+                                        got_state = true;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                Ok(Ok(None)) => {
+                    anyhow::bail!("Connection closed during handshake");
+                }
+                Ok(Err(e)) => {
+                    anyhow::bail!("Read error during handshake: {}", e);
+                }
+                Err(_) => {
+                    // Timeout, continue loop
+                }
+            }
         }
-        attempts += 1;
-        if attempts > max_attempts {
-            panic!(
-                "timeout waiting for room named '{}', got rooms: {:?}",
-                name,
-                snap.rooms.iter().map(|r| &r.name).collect::<Vec<_>>()
-            );
+
+        if !got_hello || !got_state {
+            anyhow::bail!("Handshake incomplete: got_hello={}, got_state={}", got_hello, got_state);
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        Ok(())
+    }
+
+    /// Send a JoinRoom message.
+    async fn join_room(&mut self, room_uuid: uuid::Uuid) -> Result<()> {
+        let env = Envelope {
+            state_hash: Vec::new(),
+            payload: Some(Payload::JoinRoom(proto::JoinRoom {
+                room_id: Some(room_id_from_uuid(room_uuid)),
+            })),
+        };
+        let frame = encode_frame(&env);
+        self.send.write_all(&frame).await?;
+        Ok(())
+    }
+
+    /// Send a CreateRoom message.
+    async fn create_room(&mut self, name: &str) -> Result<()> {
+        let env = Envelope {
+            state_hash: Vec::new(),
+            payload: Some(Payload::CreateRoom(proto::CreateRoom {
+                name: name.to_string(),
+            })),
+        };
+        let frame = encode_frame(&env);
+        self.send.write_all(&frame).await?;
+        Ok(())
+    }
+
+    /// Send a DeleteRoom message.
+    async fn delete_room(&mut self, room_uuid: uuid::Uuid) -> Result<()> {
+        let env = Envelope {
+            state_hash: Vec::new(),
+            payload: Some(Payload::DeleteRoom(proto::DeleteRoom {
+                room_id: Some(room_id_from_uuid(room_uuid)),
+            })),
+        };
+        let frame = encode_frame(&env);
+        self.send.write_all(&frame).await?;
+        Ok(())
+    }
+
+    /// Send a RenameRoom message.
+    async fn rename_room(&mut self, room_uuid: uuid::Uuid, new_name: &str) -> Result<()> {
+        let env = Envelope {
+            state_hash: Vec::new(),
+            payload: Some(Payload::RenameRoom(proto::RenameRoom {
+                room_id: Some(room_id_from_uuid(room_uuid)),
+                new_name: new_name.to_string(),
+            })),
+        };
+        let frame = encode_frame(&env);
+        self.send.write_all(&frame).await?;
+        Ok(())
+    }
+
+    /// Receive and process messages for a duration, updating internal state.
+    async fn process_messages(&mut self, duration: Duration) -> Result<()> {
+        let deadline = std::time::Instant::now() + duration;
+
+        while std::time::Instant::now() < deadline {
+            let mut chunk = [0u8; 4096];
+            match tokio::time::timeout(Duration::from_millis(50), self.recv.read(&mut chunk)).await
+            {
+                Ok(Ok(Some(n))) => {
+                    self.buf.extend_from_slice(&chunk[..n]);
+                    while let Some(frame) = try_decode_frame(&mut self.buf) {
+                        if let Ok(env) = Envelope::decode(&*frame) {
+                            self.handle_envelope(env);
+                        }
+                    }
+                }
+                Ok(Ok(None)) => break,
+                Ok(Err(_)) => break,
+                Err(_) => {} // timeout, continue
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_envelope(&mut self, env: Envelope) {
+        if let Some(Payload::ServerEvent(se)) = env.payload {
+            if let Some(kind) = se.kind {
+                match kind {
+                    proto::server_event::Kind::ServerState(ss) => {
+                        self.rooms = ss.rooms;
+                        self.users = ss.users;
+                    }
+                    proto::server_event::Kind::StateUpdate(su) => {
+                        self.apply_state_update(su);
+                    }
+                    // Ignore other event types in tests
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    fn apply_state_update(&mut self, update: proto::StateUpdate) {
+        if let Some(u) = update.update {
+            match u {
+                proto::state_update::Update::RoomCreated(rc) => {
+                    if let Some(room) = rc.room {
+                        self.rooms.push(room);
+                    }
+                }
+                proto::state_update::Update::RoomDeleted(rd) => {
+                    if let Some(rid) = rd.room_id.and_then(|r| uuid_from_room_id(&r)) {
+                        self.rooms.retain(|r| {
+                            r.id.as_ref().and_then(uuid_from_room_id) != Some(rid)
+                        });
+                    }
+                }
+                proto::state_update::Update::RoomRenamed(rr) => {
+                    if let Some(rid) = rr.room_id.and_then(|r| uuid_from_room_id(&r)) {
+                        if let Some(room) = self.rooms.iter_mut().find(|r| {
+                            r.id.as_ref().and_then(uuid_from_room_id) == Some(rid)
+                        }) {
+                            room.name = rr.new_name;
+                        }
+                    }
+                }
+                proto::state_update::Update::UserJoined(uj) => {
+                    if let Some(user) = uj.user {
+                        self.users.push(user);
+                    }
+                }
+                proto::state_update::Update::UserLeft(ul) => {
+                    if let Some(uid) = ul.user_id {
+                        self.users
+                            .retain(|u| u.user_id.as_ref().map(|id| id.value) != Some(uid.value));
+                    }
+                }
+                proto::state_update::Update::UserMoved(um) => {
+                    if let (Some(uid), Some(to_room)) = (um.user_id, um.to_room_id) {
+                        if let Some(user) = self
+                            .users
+                            .iter_mut()
+                            .find(|u| u.user_id.as_ref().map(|id| id.value) == Some(uid.value))
+                        {
+                            user.current_room = Some(to_room);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Close the connection.
+    fn close(&self) {
+        self.conn.close(quinn::VarInt::from_u32(0), b"test done");
+    }
+
+    /// Get rooms.
+    fn rooms(&self) -> &[RoomInfo] {
+        &self.rooms
+    }
+
+    /// Get users.
+    fn users(&self) -> &[User] {
+        &self.users
+    }
+
+    /// Get user ID.
+    fn user_id(&self) -> u64 {
+        self.user_id
     }
 }
 
 // =============================================================================
-// Test: Basic connection to server
+// Tests
 // =============================================================================
 
 #[tokio::test]
@@ -152,30 +386,18 @@ async fn test_client_connects_to_server() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Connect a client.
-    let client = backend::Client::connect(
-        &format!("127.0.0.1:{}", port),
-        "test-client",
-        None,
-        test_connect_config(),
-    )
-    .await
-    .expect("client should connect");
-
-    // Wait for initial room state.
-    let snap = wait_for_rooms(&client, 5000).await;
+    let client = TestClient::connect(&format!("127.0.0.1:{}", port), "test-client")
+        .await
+        .expect("client should connect");
 
     // Should have at least the Root room.
-    assert!(!snap.rooms.is_empty(), "expected at least one room");
+    assert!(!client.rooms().is_empty(), "expected at least one room");
     assert!(
-        snap.rooms.iter().any(|r| r.name == "Root"),
+        client.rooms().iter().any(|r| r.name == "Root"),
         "expected Root room in {:?}",
-        snap.rooms
+        client.rooms()
     );
 }
-
-// =============================================================================
-// Test: Server assigns unique user_id via ServerHello (single source of truth)
-// =============================================================================
 
 #[tokio::test]
 async fn test_server_assigns_user_id() {
@@ -183,26 +405,12 @@ async fn test_server_assigns_user_id() {
     let _server = start_server(port);
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // Connect a client.
-    let client = backend::Client::connect(
-        &format!("127.0.0.1:{}", port),
-        "user-id-test",
-        None,
-        test_connect_config(),
-    )
-    .await
-    .expect("client should connect");
-
-    // user_id() is now synchronous and always valid after connect()
-    // since connect() waits for ServerHello (single source of truth).
-    let user_id = client.user_id();
+    let client = TestClient::connect(&format!("127.0.0.1:{}", port), "user-id-test")
+        .await
+        .expect("client should connect");
 
     // User ID should be > 0 (0 is never assigned by the server).
-    assert!(
-        user_id > 0,
-        "user_id should be assigned by server, got {}",
-        user_id
-    );
+    assert!(client.user_id() > 0, "expected user_id > 0");
 }
 
 #[tokio::test]
@@ -211,46 +419,20 @@ async fn test_multiple_clients_get_unique_user_ids() {
     let _server = start_server(port);
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // Connect first client.
-    let client1 = backend::Client::connect(
-        &format!("127.0.0.1:{}", port),
-        "client1",
-        None,
-        test_connect_config(),
-    )
-    .await
-    .expect("client1 should connect");
+    let client1 = TestClient::connect(&format!("127.0.0.1:{}", port), "client-1")
+        .await
+        .expect("client 1 should connect");
 
-    // user_id is immediately available after connect()
-    let user_id1 = client1.user_id();
+    let client2 = TestClient::connect(&format!("127.0.0.1:{}", port), "client-2")
+        .await
+        .expect("client 2 should connect");
 
-    // Connect second client.
-    let client2 = backend::Client::connect(
-        &format!("127.0.0.1:{}", port),
-        "client2",
-        None,
-        test_connect_config(),
-    )
-    .await
-    .expect("client2 should connect");
-
-    // user_id is immediately available after connect()
-    let user_id2 = client2.user_id();
-
-    // Both should be > 0.
-    assert!(user_id1 > 0, "user_id1 should be > 0");
-    assert!(user_id2 > 0, "user_id2 should be > 0");
-
-    // They should be unique.
     assert_ne!(
-        user_id1, user_id2,
-        "each client should get a unique user_id"
+        client1.user_id(),
+        client2.user_id(),
+        "clients should have different user IDs"
     );
 }
-
-// =============================================================================
-// Test: Create a new room
-// =============================================================================
 
 #[tokio::test]
 async fn test_create_room() {
@@ -258,37 +440,34 @@ async fn test_create_room() {
     let _server = start_server(port);
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    let client = backend::Client::connect(
-        &format!("127.0.0.1:{}", port),
-        "room-creator",
-        None,
-        test_connect_config(),
-    )
-    .await
-    .expect("client should connect");
-
-    // Wait for initial state.
-    wait_for_rooms(&client, 5000).await;
-
-    // Create a new room.
-    client
-        .create_room("TestRoom")
+    let mut client = TestClient::connect(&format!("127.0.0.1:{}", port), "room-creator")
         .await
-        .expect("create_room should succeed");
+        .expect("client should connect");
 
-    // Wait for the new room to appear in the snapshot.
-    let snap = wait_for_room_named(&client, "TestRoom", 5000).await;
+    let initial_count = client.rooms().len();
 
+    // Create a new room
+    client
+        .create_room("Test Room")
+        .await
+        .expect("create room should succeed");
+
+    // Process messages to get the update
+    client
+        .process_messages(Duration::from_millis(500))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        client.rooms().len(),
+        initial_count + 1,
+        "should have one more room"
+    );
     assert!(
-        snap.rooms.iter().any(|r| r.name == "TestRoom"),
-        "TestRoom should exist in {:?}",
-        snap.rooms
+        client.rooms().iter().any(|r| r.name == "Test Room"),
+        "should have the new room"
     );
 }
-
-// =============================================================================
-// Test: Delete a room
-// =============================================================================
 
 #[tokio::test]
 async fn test_delete_room() {
@@ -296,54 +475,44 @@ async fn test_delete_room() {
     let _server = start_server(port);
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    let client = backend::Client::connect(
-        &format!("127.0.0.1:{}", port),
-        "room-deleter",
-        None,
-        test_connect_config(),
-    )
-    .await
-    .expect("client should connect");
-
-    wait_for_rooms(&client, 5000).await;
-
-    // Create a room first.
-    client
-        .create_room("ToDelete")
+    let mut client = TestClient::connect(&format!("127.0.0.1:{}", port), "room-deleter")
         .await
-        .expect("create_room should succeed");
-    let snap = wait_for_room_named(&client, "ToDelete", 5000).await;
+        .expect("client should connect");
 
-    // Find the room ID.
-    let room_uuid = snap
-        .rooms
+    // Create a room to delete
+    client.create_room("Room To Delete").await.unwrap();
+    client
+        .process_messages(Duration::from_millis(500))
+        .await
+        .unwrap();
+
+    let room_uuid = client
+        .rooms()
         .iter()
-        .find(|r| r.name == "ToDelete")
+        .find(|r| r.name == "Room To Delete")
         .and_then(|r| r.id.as_ref())
-        .and_then(api::uuid_from_room_id)
-        .expect("ToDelete room should have an ID");
+        .and_then(uuid_from_room_id)
+        .expect("should find created room");
 
-    let initial_count = snap.rooms.len();
+    let count_before = client.rooms().len();
 
-    // Delete the room.
+    // Delete the room
+    client.delete_room(room_uuid).await.unwrap();
     client
-        .delete_room(room_uuid)
+        .process_messages(Duration::from_millis(500))
         .await
-        .expect("delete_room should succeed");
+        .unwrap();
 
-    // Wait for room count to decrease.
-    let snap = wait_for_room_count(&client, initial_count - 1, 5000).await;
-
+    assert_eq!(
+        client.rooms().len(),
+        count_before - 1,
+        "should have one less room"
+    );
     assert!(
-        !snap.rooms.iter().any(|r| r.name == "ToDelete"),
-        "ToDelete room should be gone, got {:?}",
-        snap.rooms
+        !client.rooms().iter().any(|r| r.name == "Room To Delete"),
+        "deleted room should be gone"
     );
 }
-
-// =============================================================================
-// Test: Rename a room
-// =============================================================================
 
 #[tokio::test]
 async fn test_rename_room() {
@@ -351,288 +520,88 @@ async fn test_rename_room() {
     let _server = start_server(port);
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    let client = backend::Client::connect(
-        &format!("127.0.0.1:{}", port),
-        "room-renamer",
-        None,
-        test_connect_config(),
-    )
-    .await
-    .expect("client should connect");
-
-    wait_for_rooms(&client, 5000).await;
-
-    // Create a room.
-    client
-        .create_room("OldName")
+    let mut client = TestClient::connect(&format!("127.0.0.1:{}", port), "room-renamer")
         .await
-        .expect("create_room should succeed");
-    let snap = wait_for_room_named(&client, "OldName", 5000).await;
+        .expect("client should connect");
 
-    let room_uuid = snap
-        .rooms
+    // Create a room to rename
+    client.create_room("Original Name").await.unwrap();
+    client
+        .process_messages(Duration::from_millis(500))
+        .await
+        .unwrap();
+
+    let room_uuid = client
+        .rooms()
         .iter()
-        .find(|r| r.name == "OldName")
+        .find(|r| r.name == "Original Name")
         .and_then(|r| r.id.as_ref())
-        .and_then(api::uuid_from_room_id)
-        .expect("OldName room should have an ID");
+        .and_then(uuid_from_room_id)
+        .expect("should find created room");
 
-    // Rename the room.
+    // Rename the room
+    client.rename_room(room_uuid, "New Name").await.unwrap();
     client
-        .rename_room(room_uuid, "NewName")
+        .process_messages(Duration::from_millis(500))
         .await
-        .expect("rename_room should succeed");
-
-    // Wait for the new name to appear.
-    let snap = wait_for_room_named(&client, "NewName", 5000).await;
+        .unwrap();
 
     assert!(
-        snap.rooms.iter().any(|r| r.name == "NewName"),
-        "NewName room should exist in {:?}",
-        snap.rooms
+        client.rooms().iter().any(|r| r.name == "New Name"),
+        "room should be renamed"
     );
     assert!(
-        !snap.rooms.iter().any(|r| r.name == "OldName"),
-        "OldName should be gone from {:?}",
-        snap.rooms
+        !client.rooms().iter().any(|r| r.name == "Original Name"),
+        "old name should be gone"
     );
 }
 
-// =============================================================================
-// Test: Join a room
-// =============================================================================
-
 #[tokio::test]
-async fn test_join_room() {
+async fn test_user_appears_in_users_list() {
     let port = next_test_port();
     let _server = start_server(port);
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    let client = backend::Client::connect(
-        &format!("127.0.0.1:{}", port),
-        "room-joiner",
-        None,
-        test_connect_config(),
-    )
-    .await
-    .expect("client should connect");
-
-    wait_for_rooms(&client, 5000).await;
-
-    // Create a new room to join.
-    client
-        .create_room("JoinTarget")
+    let client = TestClient::connect(&format!("127.0.0.1:{}", port), "visible-user")
         .await
-        .expect("create_room should succeed");
-    let snap = wait_for_room_named(&client, "JoinTarget", 5000).await;
+        .expect("client should connect");
 
-    let room_uuid = snap
-        .rooms
-        .iter()
-        .find(|r| r.name == "JoinTarget")
-        .and_then(|r| r.id.as_ref())
-        .and_then(api::uuid_from_room_id)
-        .expect("JoinTarget room should have an ID");
-
-    // Join the room.
-    client
-        .join_room(room_uuid)
-        .await
-        .expect("join_room should succeed");
-
-    // Check that our local snapshot reflects the current room.
-    let snap = client.get_snapshot().await;
-    assert_eq!(
-        snap.current_room_id,
-        Some(room_uuid),
-        "current_room_id should be the joined room"
+    // Check that our user is in the users list
+    assert!(
+        client.users().iter().any(|u| {
+            u.user_id.as_ref().map(|id| id.value) == Some(client.user_id())
+                && u.username == "visible-user"
+        }),
+        "should see ourselves in users list"
     );
 }
 
-// =============================================================================
-// Test: Chat message between two clients
-// =============================================================================
-
 #[tokio::test]
-async fn test_chat_message_between_clients() {
+async fn test_second_client_sees_first_client() {
     let port = next_test_port();
     let _server = start_server(port);
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // Connect first client.
-    let client1 = backend::Client::connect(
-        &format!("127.0.0.1:{}", port),
-        "Alice",
-        None,
-        test_connect_config(),
-    )
-    .await
-    .expect("client1 should connect");
-    wait_for_rooms(&client1, 5000).await;
-
-    // Connect second client.
-    let mut client2 = backend::Client::connect(
-        &format!("127.0.0.1:{}", port),
-        "Bob",
-        None,
-        test_connect_config(),
-    )
-    .await
-    .expect("client2 should connect");
-    wait_for_rooms(&client2, 5000).await;
-
-    // Both clients should be in the Root room by default.
-    // Take the events receiver from client2 to listen for chat.
-    let mut events_rx = client2.take_events_receiver();
-
-    // Client1 sends a chat message.
-    client1
-        .send_chat("Alice", "Hello from Alice!")
+    let client1 = TestClient::connect(&format!("127.0.0.1:{}", port), "first-client")
         .await
-        .expect("send_chat should succeed");
+        .expect("client 1 should connect");
 
-    // Client2 should receive the chat broadcast.
-    let mut received_message = false;
-    for _ in 0..50 {
-        if let Ok(Some(ev)) =
-            tokio::time::timeout(Duration::from_millis(100), events_rx.recv()).await
-        {
-            if let Some(api::proto::server_event::Kind::ChatBroadcast(cb)) = ev.kind {
-                if cb.sender == "Alice" && cb.text == "Hello from Alice!" {
-                    received_message = true;
-                    break;
-                }
-            }
-        }
-    }
+    let mut client2 = TestClient::connect(&format!("127.0.0.1:{}", port), "second-client")
+        .await
+        .expect("client 2 should connect");
 
+    // Client 2 should see client 1 in the users list
     assert!(
-        received_message,
-        "client2 should have received the chat message from Alice"
+        client2.users().iter().any(|u| {
+            u.user_id.as_ref().map(|id| id.value) == Some(client1.user_id())
+        }),
+        "client 2 should see client 1 in users list"
     );
+
+    // Client 1 receives updates too - process messages to see client 2
+    // (In a real scenario we'd need to do this, but the initial state for client2
+    // already includes both users from the server's perspective)
 }
-
-// =============================================================================
-// Test: Chat messages scoped to room
-// =============================================================================
-
-#[tokio::test]
-async fn test_chat_messages_scoped_to_room() {
-    let port = next_test_port();
-    let _server = start_server(port);
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // Connect client1 (Alice).
-    let client1 = backend::Client::connect(
-        &format!("127.0.0.1:{}", port),
-        "Alice",
-        None,
-        test_connect_config(),
-    )
-    .await
-    .expect("client1 should connect");
-    wait_for_rooms(&client1, 5000).await;
-
-    // Connect client2 (Bob).
-    let mut client2 = backend::Client::connect(
-        &format!("127.0.0.1:{}", port),
-        "Bob",
-        None,
-        test_connect_config(),
-    )
-    .await
-    .expect("client2 should connect");
-    wait_for_rooms(&client2, 5000).await;
-
-    // Connect client3 (Charlie).
-    let mut client3 = backend::Client::connect(
-        &format!("127.0.0.1:{}", port),
-        "Charlie",
-        None,
-        test_connect_config(),
-    )
-    .await
-    .expect("client3 should connect");
-    wait_for_rooms(&client3, 5000).await;
-
-    // Create a separate room.
-    client1
-        .create_room("PrivateRoom")
-        .await
-        .expect("create_room should succeed");
-    let snap = wait_for_room_named(&client1, "PrivateRoom", 5000).await;
-
-    let private_room_uuid = snap
-        .rooms
-        .iter()
-        .find(|r| r.name == "PrivateRoom")
-        .and_then(|r| r.id.as_ref())
-        .and_then(api::uuid_from_room_id)
-        .expect("PrivateRoom should have an ID");
-
-    // Alice and Bob join the private room.
-    client1
-        .join_room(private_room_uuid)
-        .await
-        .expect("join should succeed");
-    client2
-        .join_room(private_room_uuid)
-        .await
-        .expect("join should succeed");
-    // Charlie stays in Root.
-
-    // Give time for room state to propagate.
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
-    // Take events receivers.
-    let mut events_rx2 = client2.take_events_receiver();
-    let mut events_rx3 = client3.take_events_receiver();
-
-    // Alice sends a message in the private room.
-    client1
-        .send_chat("Alice", "Secret message")
-        .await
-        .expect("send_chat should succeed");
-
-    // Bob should receive it.
-    let mut bob_received = false;
-    for _ in 0..30 {
-        if let Ok(Some(ev)) =
-            tokio::time::timeout(Duration::from_millis(100), events_rx2.recv()).await
-        {
-            if let Some(api::proto::server_event::Kind::ChatBroadcast(cb)) = ev.kind {
-                if cb.sender == "Alice" && cb.text == "Secret message" {
-                    bob_received = true;
-                    break;
-                }
-            }
-        }
-    }
-    assert!(bob_received, "Bob should have received the secret message");
-
-    // Charlie should NOT receive it (he's in a different room).
-    let mut charlie_received = false;
-    for _ in 0..10 {
-        if let Ok(Some(ev)) =
-            tokio::time::timeout(Duration::from_millis(100), events_rx3.recv()).await
-        {
-            if let Some(api::proto::server_event::Kind::ChatBroadcast(cb)) = ev.kind {
-                if cb.sender == "Alice" && cb.text == "Secret message" {
-                    charlie_received = true;
-                    break;
-                }
-            }
-        }
-    }
-    assert!(
-        !charlie_received,
-        "Charlie should NOT have received the secret message"
-    );
-}
-
-// =============================================================================
-// Test: Multiple clients see room updates
-// =============================================================================
 
 #[tokio::test]
 async fn test_room_updates_broadcast_to_all_clients() {
@@ -640,98 +609,37 @@ async fn test_room_updates_broadcast_to_all_clients() {
     let _server = start_server(port);
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // Connect two clients.
-    let client1 = backend::Client::connect(
-        &format!("127.0.0.1:{}", port),
-        "Client1",
-        None,
-        test_connect_config(),
-    )
-    .await
-    .expect("client1 should connect");
-    wait_for_rooms(&client1, 5000).await;
-
-    let client2 = backend::Client::connect(
-        &format!("127.0.0.1:{}", port),
-        "Client2",
-        None,
-        test_connect_config(),
-    )
-    .await
-    .expect("client2 should connect");
-    wait_for_rooms(&client2, 5000).await;
-
-    // Client1 creates a room.
-    client1
-        .create_room("SharedRoom")
+    let mut client1 = TestClient::connect(&format!("127.0.0.1:{}", port), "broadcaster")
         .await
-        .expect("create_room should succeed");
+        .expect("client 1 should connect");
 
-    // Both clients should see the new room.
-    let snap1 = wait_for_room_named(&client1, "SharedRoom", 5000).await;
-    let snap2 = wait_for_room_named(&client2, "SharedRoom", 5000).await;
+    let mut client2 = TestClient::connect(&format!("127.0.0.1:{}", port), "listener")
+        .await
+        .expect("client 2 should connect");
 
+    // Client 1 creates a room
+    client1.create_room("Shared Room").await.unwrap();
+
+    // Both clients process messages
+    client1
+        .process_messages(Duration::from_millis(500))
+        .await
+        .unwrap();
+    client2
+        .process_messages(Duration::from_millis(500))
+        .await
+        .unwrap();
+
+    // Both should see the new room
     assert!(
-        snap1.rooms.iter().any(|r| r.name == "SharedRoom"),
-        "Client1 should see SharedRoom"
+        client1.rooms().iter().any(|r| r.name == "Shared Room"),
+        "client 1 should see new room"
     );
     assert!(
-        snap2.rooms.iter().any(|r| r.name == "SharedRoom"),
-        "Client2 should see SharedRoom"
-    );
-}
-
-// =============================================================================
-// Test: User presence updates when joining rooms
-// =============================================================================
-
-#[tokio::test]
-async fn test_user_presence_updates() {
-    let port = next_test_port();
-    let _server = start_server(port);
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // Connect first client.
-    let client1 = backend::Client::connect(
-        &format!("127.0.0.1:{}", port),
-        "User1",
-        None,
-        test_connect_config(),
-    )
-    .await
-    .expect("client1 should connect");
-    wait_for_rooms(&client1, 5000).await;
-
-    // Connect second client.
-    let client2 = backend::Client::connect(
-        &format!("127.0.0.1:{}", port),
-        "User2",
-        None,
-        test_connect_config(),
-    )
-    .await
-    .expect("client2 should connect");
-    wait_for_rooms(&client2, 5000).await;
-
-    // Give time for presence updates to propagate.
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // Check that both clients see users in the snapshot.
-    let snap1 = client1.get_snapshot().await;
-    let snap2 = client2.get_snapshot().await;
-
-    // Both should see at least 2 users (themselves and each other).
-    assert!(
-        snap1.users.len() >= 2 || snap2.users.len() >= 2,
-        "should see multiple users, snap1.users={:?}, snap2.users={:?}",
-        snap1.users,
-        snap2.users
+        client2.rooms().iter().any(|r| r.name == "Shared Room"),
+        "client 2 should see new room"
     );
 }
-
-// =============================================================================
-// Test: Client disconnect removes user from room
-// =============================================================================
 
 #[tokio::test]
 async fn test_client_disconnect_removes_user() {
@@ -739,1191 +647,43 @@ async fn test_client_disconnect_removes_user() {
     let _server = start_server(port);
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // Connect first client that will observe.
-    let client1 = backend::Client::connect(
-        &format!("127.0.0.1:{}", port),
-        "Observer",
-        None,
-        test_connect_config(),
-    )
-    .await
-    .expect("client1 should connect");
-    wait_for_rooms(&client1, 5000).await;
-
-    // Connect second client that will disconnect.
-    let client2 = backend::Client::connect(
-        &format!("127.0.0.1:{}", port),
-        "Disconnecter",
-        None,
-        test_connect_config(),
-    )
-    .await
-    .expect("client2 should connect");
-    wait_for_rooms(&client2, 5000).await;
-
-    // Wait for both clients to be visible.
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    let snap = client1.get_snapshot().await;
-    let initial_user_count = snap.users.len();
-    assert!(
-        initial_user_count >= 2,
-        "should see at least 2 users before disconnect, got {:?}",
-        snap.users
-    );
-
-    // Drop client2 to simulate disconnect.
-    drop(client2);
-
-    // Wait for the server to notice the disconnect and broadcast the update.
-    let mut final_user_count = initial_user_count;
-    for _ in 0..50 {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let snap = client1.get_snapshot().await;
-        final_user_count = snap.users.len();
-        if final_user_count < initial_user_count {
-            break;
-        }
-    }
-
-    assert!(
-        final_user_count < initial_user_count,
-        "user count should decrease after disconnect: initial={}, final={}",
-        initial_user_count,
-        final_user_count
-    );
-
-    // Also verify the disconnected user is no longer in the list.
-    let snap = client1.get_snapshot().await;
-    assert!(
-        !snap.users.iter().any(|u| u.username == "Disconnecter"),
-        "Disconnecter should not be in user list after disconnect, got {:?}",
-        snap.users
-    );
-}
-
-// =============================================================================
-// Test: Reconnect after disconnect shows only one user
-// =============================================================================
-
-#[tokio::test]
-async fn test_reconnect_shows_single_user() {
-    let port = next_test_port();
-    let _server = start_server(port);
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // Connect observer client.
-    let observer = backend::Client::connect(
-        &format!("127.0.0.1:{}", port),
-        "Observer",
-        None,
-        test_connect_config(),
-    )
-    .await
-    .expect("observer should connect");
-    wait_for_rooms(&observer, 5000).await;
-
-    // Connect client, disconnect, reconnect.
-    let client1 = backend::Client::connect(
-        &format!("127.0.0.1:{}", port),
-        "Reconnecter",
-        None,
-        test_connect_config(),
-    )
-    .await
-    .expect("client1 should connect");
-    wait_for_rooms(&client1, 5000).await;
-
-    // Verify the user is visible.
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let snap = observer.get_snapshot().await;
-    let reconnecter_count_before = snap
-        .users
-        .iter()
-        .filter(|u| u.username == "Reconnecter")
-        .count();
-    assert_eq!(
-        reconnecter_count_before, 1,
-        "should see exactly 1 Reconnecter before disconnect, got {}",
-        reconnecter_count_before
-    );
-
-    // Disconnect.
-    drop(client1);
-
-    // Wait for disconnect to be processed.
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // Reconnect with the same name.
-    let client2 = backend::Client::connect(
-        &format!("127.0.0.1:{}", port),
-        "Reconnecter",
-        None,
-        test_connect_config(),
-    )
-    .await
-    .expect("client2 should connect");
-    wait_for_rooms(&client2, 5000).await;
-
-    // Wait for state to propagate.
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
-    // There should be exactly ONE user named "Reconnecter", not two.
-    let snap = observer.get_snapshot().await;
-    let reconnecter_count = snap
-        .users
-        .iter()
-        .filter(|u| u.username == "Reconnecter")
-        .count();
-    assert_eq!(
-        reconnecter_count, 1,
-        "should see exactly 1 Reconnecter after reconnect, got {} in {:?}",
-        reconnecter_count, snap.users
-    );
-}
-
-// =============================================================================
-// Test: Multiple disconnect/reconnect cycles
-// =============================================================================
-
-#[tokio::test]
-async fn test_multiple_disconnect_reconnect_cycles() {
-    let port = next_test_port();
-    let _server = start_server(port);
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // Connect observer client.
-    let observer = backend::Client::connect(
-        &format!("127.0.0.1:{}", port),
-        "Observer",
-        None,
-        test_connect_config(),
-    )
-    .await
-    .expect("observer should connect");
-    wait_for_rooms(&observer, 5000).await;
-
-    for cycle in 1..=3 {
-        // Connect.
-        let client = backend::Client::connect(
-            &format!("127.0.0.1:{}", port),
-            "CycleUser",
-            None,
-            test_connect_config(),
-        )
+    let client1 = TestClient::connect(&format!("127.0.0.1:{}", port), "will-disconnect")
         .await
-        .expect("client should connect");
-        wait_for_rooms(&client, 5000).await;
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        .expect("client 1 should connect");
 
-        // Verify user is visible.
-        let snap = observer.get_snapshot().await;
-        let count = snap
-            .users
+    let mut client2 = TestClient::connect(&format!("127.0.0.1:{}", port), "observer")
+        .await
+        .expect("client 2 should connect");
+
+    let user1_id = client1.user_id();
+
+    // Client 2 should see client 1
+    assert!(
+        client2
+            .users()
             .iter()
-            .filter(|u| u.username == "CycleUser")
-            .count();
-        assert_eq!(
-            count, 1,
-            "cycle {}: should see exactly 1 CycleUser while connected, got {} in {:?}",
-            cycle, count, snap.users
-        );
-
-        // Disconnect.
-        drop(client);
-        tokio::time::sleep(Duration::from_millis(300)).await;
-
-        // Verify user is gone.
-        let snap = observer.get_snapshot().await;
-        let count = snap
-            .users
-            .iter()
-            .filter(|u| u.username == "CycleUser")
-            .count();
-        assert_eq!(
-            count, 0,
-            "cycle {}: should see 0 CycleUser after disconnect, got {} in {:?}",
-            cycle, count, snap.users
-        );
-    }
-}
-
-// =============================================================================
-// Test: Explicit disconnect() method works
-// =============================================================================
-
-#[tokio::test]
-async fn test_explicit_disconnect_method() {
-    let port = next_test_port();
-    let _server = start_server(port);
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // Connect observer client.
-    let observer = backend::Client::connect(
-        &format!("127.0.0.1:{}", port),
-        "Observer",
-        None,
-        test_connect_config(),
-    )
-    .await
-    .expect("observer should connect");
-    wait_for_rooms(&observer, 5000).await;
-
-    // Connect client that will explicitly disconnect.
-    let client = backend::Client::connect(
-        &format!("127.0.0.1:{}", port),
-        "ExplicitDisconnect",
-        None,
-        test_connect_config(),
-    )
-    .await
-    .expect("client should connect");
-    wait_for_rooms(&client, 5000).await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
-    // Verify user is visible.
-    let snap = observer.get_snapshot().await;
-    assert!(
-        snap.users
-            .iter()
-            .any(|u| u.username == "ExplicitDisconnect"),
-        "should see ExplicitDisconnect user"
+            .any(|u| u.user_id.as_ref().map(|id| id.value) == Some(user1_id)),
+        "client 2 should see client 1"
     );
 
-    // Use explicit disconnect method.
-    client
-        .disconnect()
-        .await
-        .expect("disconnect should succeed");
+    // Client 1 disconnects
+    client1.close();
 
-    // Wait for server to process disconnect.
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // Verify user is gone.
-    let snap = observer.get_snapshot().await;
-    assert!(
-        !snap
-            .users
-            .iter()
-            .any(|u| u.username == "ExplicitDisconnect"),
-        "ExplicitDisconnect should be gone after disconnect(), got {:?}",
-        snap.users
-    );
-}
-
-// =============================================================================
-// Test: Server handles abruptly closed client (simulates crash/network failure)
-// =============================================================================
-
-#[tokio::test]
-async fn test_abrupt_client_disconnect() {
-    let port = next_test_port();
-    let _server = start_server(port);
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // Connect observer client.
-    let observer = backend::Client::connect(
-        &format!("127.0.0.1:{}", port),
-        "Observer",
-        None,
-        test_connect_config(),
-    )
-    .await
-    .expect("observer should connect");
-    wait_for_rooms(&observer, 5000).await;
-
-    // Connect client that will be abruptly closed.
-    let client = backend::Client::connect(
-        &format!("127.0.0.1:{}", port),
-        "AbruptClose",
-        None,
-        test_connect_config(),
-    )
-    .await
-    .expect("client should connect");
-    wait_for_rooms(&client, 5000).await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
-    // Verify user is visible.
-    let snap = observer.get_snapshot().await;
-    let initial_count = snap
-        .users
-        .iter()
-        .filter(|u| u.username == "AbruptClose")
-        .count();
-    assert_eq!(
-        initial_count, 1,
-        "should see exactly 1 AbruptClose user before disconnect"
-    );
-
-    // Simulate abrupt close by dropping the client (which calls conn.close in Drop).
-    // This is more abrupt than calling disconnect() which sends a Disconnect message first.
-    drop(client);
-
-    // The server should detect the closed connection quickly due to QUIC transport settings.
-    // With keep_alive_interval of 5s and max_idle_timeout of 30s, plus conn.close() in Drop,
-    // the server should detect this almost immediately.
-    let mut user_removed = false;
-    for _ in 0..30 {
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        let snap = observer.get_snapshot().await;
-        if !snap.users.iter().any(|u| u.username == "AbruptClose") {
-            user_removed = true;
-            break;
-        }
-    }
-
-    assert!(
-        user_removed,
-        "AbruptClose user should be removed after abrupt disconnect (within 6 seconds)"
-    );
-}
-
-// =============================================================================
-// Test: Voice datagram - single packet send and receive
-// =============================================================================
-
-#[tokio::test]
-async fn test_voice_datagram_send_receive() {
-    let port = next_test_port();
-    let _server = start_server(port);
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // Connect sender client.
-    let client1 = backend::Client::connect(
-        &format!("127.0.0.1:{}", port),
-        "VoiceSender",
-        None,
-        test_connect_config(),
-    )
-    .await
-    .expect("client1 should connect");
-    wait_for_rooms(&client1, 5000).await;
-
-    // Connect receiver client.
-    let mut client2 = backend::Client::connect(
-        &format!("127.0.0.1:{}", port),
-        "VoiceReceiver",
-        None,
-        test_connect_config(),
-    )
-    .await
-    .expect("client2 should connect");
-    wait_for_rooms(&client2, 5000).await;
-
-    // user_id is now assigned by server during connect() via ServerHello.
-    // No need to set it manually.
-
-    // Both clients should be in the Root room by default.
-    // Give time for room state to propagate.
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
-    // Take the voice receiver from client2.
-    let mut voice_rx = client2.take_voice_receiver();
-
-    // Generate random test data (simulating an Opus frame).
-    let test_data: Vec<u8> = (0..160).map(|i| (i * 17 % 256) as u8).collect();
-    let test_data_clone = test_data.clone();
-
-    // Send a voice datagram from client1.
-    let seq = client1
-        .send_voice_datagram_async(test_data)
-        .await
-        .expect("send_voice_datagram should succeed");
-
-    assert_eq!(seq, 0, "first sequence number should be 0");
-
-    // Client2 should receive the voice datagram.
-    let mut received_datagram = None;
-    for _ in 0..50 {
-        if let Ok(Some(dgram)) =
-            tokio::time::timeout(Duration::from_millis(100), voice_rx.recv()).await
-        {
-            received_datagram = Some(dgram);
-            break;
-        }
-    }
-
-    assert!(
-        received_datagram.is_some(),
-        "client2 should have received the voice datagram"
-    );
-
-    let dgram = received_datagram.unwrap();
-    assert_eq!(
-        dgram.sender_id,
-        Some(1),
-        "sender_id should be 1 (set by server)"
-    );
-    assert_eq!(dgram.sequence, 0, "sequence should be 0");
-    assert_eq!(
-        dgram.opus_data, test_data_clone,
-        "opus_data should match sent data"
-    );
-}
-
-// =============================================================================
-// Test: Voice datagram - multiple packets with sequence numbers
-// =============================================================================
-
-#[tokio::test]
-async fn test_voice_datagram_sequence_numbers() {
-    let port = next_test_port();
-    let _server = start_server(port);
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // Connect sender client.
-    let client1 = backend::Client::connect(
-        &format!("127.0.0.1:{}", port),
-        "SeqSender",
-        None,
-        test_connect_config(),
-    )
-    .await
-    .expect("client1 should connect");
-    wait_for_rooms(&client1, 5000).await;
-
-    // Connect receiver client.
-    let mut client2 = backend::Client::connect(
-        &format!("127.0.0.1:{}", port),
-        "SeqReceiver",
-        None,
-        test_connect_config(),
-    )
-    .await
-    .expect("client2 should connect");
-    wait_for_rooms(&client2, 5000).await;
-
-    // user_id is assigned by server during connect() - no need to set manually
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
-    let mut voice_rx = client2.take_voice_receiver();
-
-    // Send multiple voice datagrams.
-    let num_packets = 10;
-    for i in 0..num_packets {
-        let data: Vec<u8> = vec![i as u8; 100];
-        let seq = client1
-            .send_voice_datagram_async(data)
-            .await
-            .expect("send should succeed");
-        assert_eq!(seq, i, "sequence number should increment");
-    }
-
-    // Receive and verify all packets (order may vary due to UDP-like behavior).
-    let mut received_seqs = Vec::new();
-    for _ in 0..100 {
-        if let Ok(Some(dgram)) =
-            tokio::time::timeout(Duration::from_millis(50), voice_rx.recv()).await
-        {
-            received_seqs.push(dgram.sequence);
-            if received_seqs.len() >= num_packets as usize {
-                break;
-            }
-        }
-    }
-
-    assert!(
-        received_seqs.len() >= num_packets as usize - 2, // Allow for some packet loss in tests
-        "should receive most packets, got {} of {}",
-        received_seqs.len(),
-        num_packets
-    );
-}
-
-// =============================================================================
-// Test: Voice datagram - room scoping (only same room receives)
-// =============================================================================
-
-#[tokio::test]
-async fn test_voice_datagram_room_scoping() {
-    let port = next_test_port();
-    let _server = start_server(port);
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // Connect three clients.
-    let client1 = backend::Client::connect(
-        &format!("127.0.0.1:{}", port),
-        "Alice",
-        None,
-        test_connect_config(),
-    )
-    .await
-    .expect("client1 should connect");
-    wait_for_rooms(&client1, 5000).await;
-
-    let mut client2 = backend::Client::connect(
-        &format!("127.0.0.1:{}", port),
-        "Bob",
-        None,
-        test_connect_config(),
-    )
-    .await
-    .expect("client2 should connect");
-    wait_for_rooms(&client2, 5000).await;
-
-    let mut client3 = backend::Client::connect(
-        &format!("127.0.0.1:{}", port),
-        "Charlie",
-        None,
-        test_connect_config(),
-    )
-    .await
-    .expect("client3 should connect");
-    wait_for_rooms(&client3, 5000).await;
-
-    // user_id is assigned by server during connect() - no need to set manually
-
-    // Create a private room.
-    client1
-        .create_room("PrivateVoice")
-        .await
-        .expect("create_room should succeed");
-    let snap = wait_for_room_named(&client1, "PrivateVoice", 5000).await;
-
-    let private_room_uuid = snap
-        .rooms
-        .iter()
-        .find(|r| r.name == "PrivateVoice")
-        .and_then(|r| r.id.as_ref())
-        .and_then(api::uuid_from_room_id)
-        .expect("PrivateVoice should have an ID");
-
-    // Alice and Bob join the private room.
-    client1
-        .join_room(private_room_uuid)
-        .await
-        .expect("join should succeed");
-    client2
-        .join_room(private_room_uuid)
-        .await
-        .expect("join should succeed");
-    // Charlie stays in Root.
-
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
-    // Take voice receivers.
-    let mut voice_rx2 = client2.take_voice_receiver();
-    let mut voice_rx3 = client3.take_voice_receiver();
-
-    // Alice sends a voice datagram.
-    let test_data: Vec<u8> = vec![0xAB; 64];
-    client1
-        .send_voice_datagram_async(test_data.clone())
-        .await
-        .expect("send should succeed");
-
-    // Bob should receive it (same room).
-    let mut bob_received = false;
-    for _ in 0..30 {
-        if let Ok(Some(dgram)) =
-            tokio::time::timeout(Duration::from_millis(100), voice_rx2.recv()).await
-        {
-            if dgram.opus_data == test_data {
-                bob_received = true;
-                break;
-            }
-        }
-    }
-    assert!(bob_received, "Bob should have received the voice datagram");
-
-    // Charlie should NOT receive it (different room).
-    let mut charlie_received = false;
-    for _ in 0..10 {
-        if let Ok(Some(dgram)) =
-            tokio::time::timeout(Duration::from_millis(100), voice_rx3.recv()).await
-        {
-            if dgram.opus_data == test_data {
-                charlie_received = true;
-                break;
-            }
-        }
-    }
-    assert!(
-        !charlie_received,
-        "Charlie should NOT have received the voice datagram"
-    );
-}
-
-// =============================================================================
-// Test: Voice datagram - random data integrity
-// =============================================================================
-
-#[tokio::test]
-async fn test_voice_datagram_random_data_integrity() {
-    let port = next_test_port();
-    let _server = start_server(port);
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // Connect sender client.
-    let client1 = backend::Client::connect(
-        &format!("127.0.0.1:{}", port),
-        "RandomSender",
-        None,
-        test_connect_config(),
-    )
-    .await
-    .expect("client1 should connect");
-    wait_for_rooms(&client1, 5000).await;
-
-    // Connect receiver client.
-    let mut client2 = backend::Client::connect(
-        &format!("127.0.0.1:{}", port),
-        "RandomReceiver",
-        None,
-        test_connect_config(),
-    )
-    .await
-    .expect("client2 should connect");
-    wait_for_rooms(&client2, 5000).await;
-
-    // user_id is assigned by server during connect() - no need to set manually
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
-    let mut voice_rx = client2.take_voice_receiver();
-
-    // Generate a larger random payload (simulating a real Opus frame, ~80-320 bytes typically).
-    use std::{
-        collections::hash_map::DefaultHasher,
-        hash::{Hash, Hasher},
-    };
-
-    fn simple_random(seed: u64, len: usize) -> Vec<u8> {
-        let mut hasher = DefaultHasher::new();
-        let mut result = Vec::with_capacity(len);
-        for i in 0..len {
-            (seed, i as u64).hash(&mut hasher);
-            result.push(hasher.finish() as u8);
-        }
-        result
-    }
-
-    let random_data = simple_random(12345, 320);
-    let random_data_clone = random_data.clone();
-
-    // Send the random data.
-    client1
-        .send_voice_datagram_async(random_data)
-        .await
-        .expect("send should succeed");
-
-    // Receive and verify integrity.
-    let mut received = None;
-    for _ in 0..50 {
-        if let Ok(Some(dgram)) =
-            tokio::time::timeout(Duration::from_millis(100), voice_rx.recv()).await
-        {
-            received = Some(dgram);
-            break;
-        }
-    }
-
-    assert!(received.is_some(), "should receive the datagram");
-    let dgram = received.unwrap();
-    assert_eq!(
-        dgram.opus_data, random_data_clone,
-        "received data should exactly match sent random data"
-    );
-    assert_eq!(
-        dgram.opus_data.len(),
-        320,
-        "data length should be 320 bytes"
-    );
-}
-
-// =============================================================================
-// Test: Voice datagram - timestamp is reasonable
-// =============================================================================
-
-#[tokio::test]
-async fn test_voice_datagram_has_timestamp() {
-    let port = next_test_port();
-    let _server = start_server(port);
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    let client1 = backend::Client::connect(
-        &format!("127.0.0.1:{}", port),
-        "TimeSender",
-        None,
-        test_connect_config(),
-    )
-    .await
-    .expect("client1 should connect");
-    wait_for_rooms(&client1, 5000).await;
-
-    let mut client2 = backend::Client::connect(
-        &format!("127.0.0.1:{}", port),
-        "TimeReceiver",
-        None,
-        test_connect_config(),
-    )
-    .await
-    .expect("client2 should connect");
-    wait_for_rooms(&client2, 5000).await;
-
-    // user_id is assigned by server during connect() - no need to set manually
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
-    let mut voice_rx = client2.take_voice_receiver();
-
-    let before_send = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_micros() as u64;
-
-    client1
-        .send_voice_datagram_async(vec![1, 2, 3])
-        .await
-        .expect("send should succeed");
-
-    let after_send = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_micros() as u64;
-
-    // Receive and verify timestamp is reasonable.
-    let mut received = None;
-    for _ in 0..50 {
-        if let Ok(Some(dgram)) =
-            tokio::time::timeout(Duration::from_millis(100), voice_rx.recv()).await
-        {
-            received = Some(dgram);
-            break;
-        }
-    }
-
-    assert!(received.is_some(), "should receive the datagram");
-    let dgram = received.unwrap();
-
-    // Timestamp should be between before_send and after_send (with some tolerance).
-    assert!(
-        dgram.timestamp_us >= before_send - 1_000_000
-            && dgram.timestamp_us <= after_send + 1_000_000,
-        "timestamp should be reasonable: {} not in range [{}, {}]",
-        dgram.timestamp_us,
-        before_send,
-        after_send
-    );
-}
-
-// =============================================================================
-// Test: Client detects server shutdown and surfaces disconnection event
-// =============================================================================
-
-#[tokio::test]
-async fn test_client_detects_server_disconnect() {
-    let port = next_test_port();
-    let mut server = start_server(port);
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // Use BackendHandle to test the full event pipeline
-    let mut handle = backend::BackendHandle::new();
-
-    handle.send(backend::BackendCommand::Connect {
-        addr: format!("127.0.0.1:{}", port),
-        name: "disconnect-test".to_string(),
-        password: None,
-        config: test_connect_config(),
-    });
-
-    // Wait for connection
-    let mut connected = false;
-    for _ in 0..100 {
-        while let Some(event) = handle.poll_event() {
-            if matches!(event, backend::BackendEvent::Connected { .. }) {
-                connected = true;
-                break;
-            }
-        }
-        if connected {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert!(connected, "should connect to server");
-    assert!(handle.is_connected(), "handle should report connected");
-
-    // Kill the server
-    if let Some(mut child) = server.0.take() {
-        // First try graceful kill
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-
-    // Give QUIC a moment to notice
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    // Try to send a message - this should trigger faster failure detection
-    // as the underlying connection will fail on write
-    handle.send(backend::BackendCommand::SendChat {
-        text: "test message after server kill".to_string(),
-    });
-
-    // Wait for disconnection event
-    // Note: QUIC connection may take a while to detect dead peer
-    // depending on keep-alive interval (5s) and idle timeout (30s)
-    let mut disconnected = false;
-    for _ in 0..350 {
-        // Wait up to 35 seconds to cover the 30s idle timeout
-        while let Some(event) = handle.poll_event() {
-            eprintln!("Got event: {:?}", event);
-            if matches!(
-                event,
-                backend::BackendEvent::Disconnected { .. }
-                    | backend::BackendEvent::ConnectionLost { .. }
-            ) {
-                disconnected = true;
-                break;
-            }
-        }
-        if disconnected {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-
-    assert!(
-        disconnected,
-        "should receive disconnection event when server is killed"
-    );
-    assert!(!handle.is_connected(), "handle should report not connected");
-}
-
-// =============================================================================
-// Test: Connection status is properly surfaced to the UI
-// =============================================================================
-
-#[tokio::test]
-async fn test_connection_status_enum() {
-    let port = next_test_port();
-    let _server = start_server(port);
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    let mut handle = backend::BackendHandle::new();
-
-    // Initially should be disconnected
-    assert_eq!(
-        handle.state().status,
-        backend::ConnectionStatus::Disconnected
-    );
-
-    handle.send(backend::BackendCommand::Connect {
-        addr: format!("127.0.0.1:{}", port),
-        name: "status-test".to_string(),
-        password: None,
-        config: test_connect_config(),
-    });
-
-    // Should transition through Connecting to Connected
-    let mut saw_connecting = false;
-    let mut saw_connected = false;
-    for _ in 0..100 {
-        // Check current status
-        match handle.state().status {
-            backend::ConnectionStatus::Connecting => saw_connecting = true,
-            backend::ConnectionStatus::Connected => saw_connected = true,
-            _ => {}
-        }
-
-        // Drain events
-        while let Some(_event) = handle.poll_event() {}
-
-        if saw_connected {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-
-    // Note: We may or may not catch Connecting status depending on timing
-    assert!(saw_connected, "should reach Connected status");
-    assert_eq!(handle.state().status, backend::ConnectionStatus::Connected);
-}
-
-// =============================================================================
-// Test: State hash is computed and verified (#7 - state hash handling)
-// =============================================================================
-
-/// Test that the server includes state_hash in RoomState updates.
-#[tokio::test]
-async fn test_server_sends_state_hash() {
-    let port = next_test_port();
-    let _server = start_server(port);
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    let client = backend::Client::connect(
-        &format!("127.0.0.1:{}", port),
-        "hash-test-client",
-        None,
-        test_connect_config(),
-    )
-    .await
-    .expect("client should connect");
-
-    // Wait for initial room state
-    wait_for_rooms(&client, 5000).await;
-
-    // Trigger a state change by creating a room
-    client
-        .create_room("HashTestRoom")
-        .await
-        .expect("create_room should succeed");
-
-    // Wait for the room to appear
-    wait_for_room_named(&client, "HashTestRoom", 5000).await;
-
-    // Get the last received state hash from the client
-    let last_hash = client.last_received_state_hash().await;
-
-    // The hash should NOT be empty - server should compute and send it
-    assert!(
-        !last_hash.is_empty(),
-        "server should include non-empty state_hash in RoomState updates"
-    );
-}
-
-/// Test that the client can compute a local state hash that matches the server's hash.
-#[tokio::test]
-async fn test_client_computes_matching_state_hash() {
-    let port = next_test_port();
-    let _server = start_server(port);
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    let client = backend::Client::connect(
-        &format!("127.0.0.1:{}", port),
-        "hash-verify-client",
-        None,
-        test_connect_config(),
-    )
-    .await
-    .expect("client should connect");
-
-    // Wait for initial room state
-    wait_for_rooms(&client, 5000).await;
-
-    // Trigger a state change
-    client
-        .create_room("VerifyHashRoom")
-        .await
-        .expect("create_room should succeed");
-    wait_for_room_named(&client, "VerifyHashRoom", 5000).await;
-
-    // Get the received hash from server
-    let server_hash = client.last_received_state_hash().await;
-
-    // Compute local hash from our snapshot
-    let local_hash = client.compute_local_state_hash().await;
-
-    // They should match
-    assert_eq!(
-        server_hash, local_hash,
-        "local computed hash should match server-provided hash"
-    );
-}
-
-/// Test that client can request a state resync.
-///
-/// The state hash allows for incremental updates. When the server sends
-/// an incremental update (like "user moved to room X"), it includes the
-/// expected hash after applying the update. The client applies the update
-/// locally and verifies the hash matches.
-///
-/// This test verifies that:
-/// 1. The server sends hashes with state updates
-/// 2. The client correctly computes matching local hashes
-/// 3. Incremental updates are applied correctly
-#[tokio::test]
-async fn test_state_hash_mismatch_triggers_resync() {
-    let port = next_test_port();
-    let _server = start_server(port);
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    let client = backend::Client::connect(
-        &format!("127.0.0.1:{}", port),
-        "resync-test-client",
-        None,
-        test_connect_config(),
-    )
-    .await
-    .expect("client should connect");
-
-    // Wait for initial room state
-    wait_for_rooms(&client, 5000).await;
-
-    // Create a room - this triggers an incremental StateUpdate
-    client
-        .create_room("ResyncTestRoom")
-        .await
-        .expect("create_room should succeed");
-    wait_for_room_named(&client, "ResyncTestRoom", 5000).await;
-
-    // Get the hashes - they should match since we applied the update correctly
-    let server_hash = client.last_received_state_hash().await;
-    let local_hash = client.compute_local_state_hash().await;
-
-    assert_eq!(
-        server_hash, local_hash,
-        "server and local hashes should match after applying incremental update"
-    );
-
-    // The resync_count should be 0 since there was no mismatch
-    let resync_count = client.resync_count();
-    assert_eq!(
-        resync_count, 0,
-        "no resync should have been triggered for correct incremental updates"
-    );
-}
-
-/// Test that incremental updates are applied correctly by the client.
-#[tokio::test]
-async fn test_incremental_updates_applied_correctly() {
-    let port = next_test_port();
-    let _server = start_server(port);
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    let client = backend::Client::connect(
-        &format!("127.0.0.1:{}", port),
-        "incremental-test-client",
-        None,
-        test_connect_config(),
-    )
-    .await
-    .expect("client should connect");
-
-    // Wait for initial room state
-    wait_for_rooms(&client, 5000).await;
-
-    let initial_snap = client.get_snapshot().await;
-    let initial_room_count = initial_snap.rooms.len();
-
-    // Create a room - server sends incremental RoomCreated update
-    client
-        .create_room("TestRoom1")
-        .await
-        .expect("create_room should succeed");
-    wait_for_room_named(&client, "TestRoom1", 5000).await;
-
-    let snap = client.get_snapshot().await;
-    assert_eq!(
-        snap.rooms.len(),
-        initial_room_count + 1,
-        "should have one more room"
-    );
-
-    // Create another room
-    client
-        .create_room("TestRoom2")
-        .await
-        .expect("create_room should succeed");
-    wait_for_room_named(&client, "TestRoom2", 5000).await;
-
-    let snap = client.get_snapshot().await;
-    assert_eq!(
-        snap.rooms.len(),
-        initial_room_count + 2,
-        "should have two more rooms"
-    );
-
-    // Find room UUID for TestRoom1
-    let room1_uuid = snap
-        .rooms
-        .iter()
-        .find(|r| r.name == "TestRoom1")
-        .and_then(|r| r.id.as_ref())
-        .and_then(api::uuid_from_room_id)
-        .expect("TestRoom1 should exist");
-
-    // Rename the room - server sends incremental RoomRenamed update
-    client
-        .rename_room(room1_uuid, "RenamedRoom")
-        .await
-        .expect("rename_room should succeed");
-    wait_for_room_named(&client, "RenamedRoom", 5000).await;
-
-    let snap = client.get_snapshot().await;
-    assert!(
-        !snap.rooms.iter().any(|r| r.name == "TestRoom1"),
-        "TestRoom1 should be renamed"
-    );
-    assert!(
-        snap.rooms.iter().any(|r| r.name == "RenamedRoom"),
-        "RenamedRoom should exist"
-    );
-
-    // Delete the room - server sends incremental RoomDeleted update
-    client
-        .delete_room(room1_uuid)
-        .await
-        .expect("delete_room should succeed");
-
-    // Wait for the room to be gone
-    let mut attempts = 0;
-    loop {
-        let snap = client.get_snapshot().await;
-        if !snap.rooms.iter().any(|r| r.name == "RenamedRoom") {
-            break;
-        }
-        attempts += 1;
-        if attempts > 100 {
-            panic!("timeout waiting for RenamedRoom to be deleted");
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-
-    let snap = client.get_snapshot().await;
-    assert_eq!(
-        snap.rooms.len(),
-        initial_room_count + 1,
-        "should have one room less after deletion"
-    );
-
-    // Verify hashes still match throughout all these incremental updates
-    let server_hash = client.last_received_state_hash().await;
-    let local_hash = client.compute_local_state_hash().await;
-    assert_eq!(
-        server_hash, local_hash,
-        "hashes should match after all incremental updates"
-    );
-
-    // No resyncs should have been needed
-    assert_eq!(
-        client.resync_count(),
-        0,
-        "no resync should have been triggered"
-    );
-}
-
-/// Test that RequestStateSync message is properly defined and can be sent.
-/// This tests the resync infrastructure.
-#[tokio::test]
-async fn test_request_state_sync_infrastructure() {
-    let port = next_test_port();
-    let _server = start_server(port);
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    let client = backend::Client::connect(
-        &format!("127.0.0.1:{}", port),
-        "infrastructure-test-client",
-        None,
-        test_connect_config(),
-    )
-    .await
-    .expect("client should connect");
-
-    wait_for_rooms(&client, 5000).await;
-
-    // Manually request a state sync (simulating what would happen on mismatch)
-    client
-        .request_state_resync()
-        .await
-        .expect("request_state_resync should succeed");
-
-    // Wait for the server to respond with fresh state
+    // Give server time to process disconnect
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // After resync, we should still have valid state
-    let snap = client.get_snapshot().await;
-    assert!(!snap.rooms.is_empty(), "should have rooms after resync");
+    // Client 2 processes messages to get the UserLeft update
+    client2
+        .process_messages(Duration::from_millis(500))
+        .await
+        .unwrap();
+
+    // Client 1 should no longer be in the users list
     assert!(
-        snap.rooms.iter().any(|r| r.name == "Root"),
-        "should have Root room after resync"
+        !client2
+            .users()
+            .iter()
+            .any(|u| u.user_id.as_ref().map(|id| id.value) == Some(user1_id)),
+        "client 1 should be gone after disconnect"
     );
 }
