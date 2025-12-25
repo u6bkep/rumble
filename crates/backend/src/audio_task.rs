@@ -487,7 +487,7 @@ fn start_transmission(
         VoiceEncoder::new().expect("create encoder"),
     ));
 
-    let input = AudioInput::new(&device, &AudioConfig::default(), move |samples| {
+    let input = AudioInput::new(&device, &AudioConfig::default().with_denoise(), move |samples| {
         // Encode the audio frame
         if let Ok(mut enc) = encoder_mutex.lock() {
             match enc.encode(samples) {

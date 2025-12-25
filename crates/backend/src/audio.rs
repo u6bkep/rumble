@@ -8,6 +8,7 @@ use cpal::{
     Device, Host, SampleFormat, Stream, StreamConfig,
     traits::{DeviceTrait, HostTrait, StreamTrait},
 };
+use nnnoiseless::DenoiseState;
 use std::{
     collections::VecDeque,
     sync::{
@@ -16,6 +17,9 @@ use std::{
     },
 };
 use tracing::{debug, error, info, warn};
+
+/// Frame size used by nnnoiseless for denoising (480 samples = 10ms at 48kHz).
+const DENOISE_FRAME_SIZE: usize = DenoiseState::FRAME_SIZE;
 
 /// Audio sample rate used for voice communication.
 /// 48kHz is the native rate for Opus codec.
@@ -163,6 +167,8 @@ pub struct AudioConfig {
     pub sample_rate: u32,
     pub channels: u16,
     pub frame_size: usize,
+    /// Enable noise suppression on microphone input.
+    pub denoise: bool,
 }
 
 impl Default for AudioConfig {
@@ -171,6 +177,96 @@ impl Default for AudioConfig {
             sample_rate: SAMPLE_RATE,
             channels: CHANNELS,
             frame_size: FRAME_SIZE,
+            denoise: false,
+        }
+    }
+}
+
+impl AudioConfig {
+    /// Create a new audio config with denoising enabled.
+    pub fn with_denoise(mut self) -> Self {
+        self.denoise = true;
+        self
+    }
+}
+
+/// Processes audio input samples, optionally applying noise suppression.
+///
+/// This struct handles:
+/// - Accumulating samples until we have enough for a frame
+/// - Optionally applying nnnoiseless denoising (480-sample frames)
+/// - Outputting 960-sample frames for Opus encoding
+struct InputProcessor<F: FnMut(&[f32])> {
+    /// Buffer to accumulate incoming samples.
+    sample_buffer: Vec<f32>,
+    /// Denoiser state (None if denoising is disabled).
+    denoise_state: Option<Box<DenoiseState<'static>>>,
+    /// Buffer to accumulate denoised samples (only used when denoising).
+    denoise_output_buffer: Vec<f32>,
+    /// Whether the first denoise frame has been processed (discarded due to artifacts).
+    first_denoise_frame_done: bool,
+    /// Output frame size (typically 960 for Opus).
+    frame_size: usize,
+    /// Callback for completed frames.
+    on_frame: F,
+}
+
+impl<F: FnMut(&[f32])> InputProcessor<F> {
+    fn new(frame_size: usize, denoise: bool, on_frame: F) -> Self {
+        Self {
+            sample_buffer: Vec::with_capacity(frame_size * 2),
+            denoise_state: if denoise {
+                Some(DenoiseState::new())
+            } else {
+                None
+            },
+            denoise_output_buffer: Vec::with_capacity(frame_size),
+            first_denoise_frame_done: false,
+            frame_size,
+            on_frame,
+        }
+    }
+
+    /// Process incoming audio samples (in [-1.0, 1.0] range).
+    fn process_samples(&mut self, samples: &[f32]) {
+        self.sample_buffer.extend_from_slice(samples);
+
+        if let Some(ref mut denoise) = self.denoise_state {
+            // Process in 480-sample chunks for denoising
+            while self.sample_buffer.len() >= DENOISE_FRAME_SIZE {
+                let chunk: Vec<f32> = self.sample_buffer.drain(..DENOISE_FRAME_SIZE).collect();
+                
+                // Scale to i16 range for nnnoiseless
+                let scaled: Vec<f32> = chunk.iter().map(|&s| s * 32767.0).collect();
+                let mut out_buf = [0.0f32; DENOISE_FRAME_SIZE];
+                
+                denoise.process_frame(&mut out_buf, &scaled);
+                
+                // Skip the first frame due to fade-in artifacts
+                if !self.first_denoise_frame_done {
+                    self.first_denoise_frame_done = true;
+                    continue;
+                }
+                
+                // Scale back to [-1.0, 1.0] and accumulate
+                for &sample in &out_buf {
+                    self.denoise_output_buffer.push(sample / 32767.0);
+                }
+                
+                // Output full frames
+                while self.denoise_output_buffer.len() >= self.frame_size {
+                    let frame: Vec<f32> = self.denoise_output_buffer
+                        .drain(..self.frame_size)
+                        .collect();
+                    (self.on_frame)(&frame);
+                }
+            }
+        } else {
+            // No denoising - output frames directly
+            while self.sample_buffer.len() >= self.frame_size {
+                let frame: Vec<f32> = self.sample_buffer.drain(..self.frame_size).collect();
+                (self.on_frame)(&frame);
+            }
         }
     }
 }
@@ -179,9 +275,6 @@ impl Default for AudioConfig {
 pub struct AudioInput {
     stream: Stream,
     is_capturing: Arc<AtomicBool>,
-    /// Collected samples buffer, filled by the audio callback.
-    #[allow(dead_code)]
-    samples_buffer: Arc<Mutex<Vec<f32>>>,
 }
 
 impl AudioInput {
@@ -202,12 +295,9 @@ impl AudioInput {
         };
 
         let is_capturing = Arc::new(AtomicBool::new(true));
-        let samples_buffer = Arc::new(Mutex::new(Vec::with_capacity(config.frame_size * 2)));
 
-        let is_capturing_clone = is_capturing.clone();
-        let samples_buffer_clone = samples_buffer.clone();
         let frame_size = config.frame_size;
-        let on_frame = Arc::new(Mutex::new(on_frame));
+        let denoise_enabled = config.denoise;
 
         let err_fn = |err| error!("audio input error: {}", err);
 
@@ -226,26 +316,25 @@ impl AudioInput {
 
         let stream = if let Some(supported_config) = format {
             let sample_format = supported_config.sample_format();
-            debug!(sample_format = ?sample_format, "audio: using supported format");
+            debug!(sample_format = ?sample_format, denoise = denoise_enabled, "audio: using supported format");
 
             // TODO: make this generic over sample formats. see https://github.com/RustAudio/cpal/blob/5d571761f09474dc85a45639fe06b8ead40104b1/examples/beep.rs#L91
             match sample_format {
                 SampleFormat::F32 => {
+                    let is_capturing_clone = is_capturing.clone();
+                    let processor = Arc::new(Mutex::new(InputProcessor::new(
+                        frame_size,
+                        denoise_enabled,
+                        on_frame,
+                    )));
                     device.build_input_stream(
                         &stream_config,
                         move |data: &[f32], _: &cpal::InputCallbackInfo| {
                             if !is_capturing_clone.load(Ordering::Relaxed) {
                                 return;
                             }
-                            let mut buffer = samples_buffer_clone.lock().unwrap();
-                            buffer.extend_from_slice(data);
-
-                            // When we have enough samples, call the callback
-                            while buffer.len() >= frame_size {
-                                let frame: Vec<f32> = buffer.drain(..frame_size).collect();
-                                if let Ok(mut cb) = on_frame.lock() {
-                                    cb(&frame);
-                                }
+                            if let Ok(mut proc) = processor.lock() {
+                                proc.process_samples(data);
                             }
                         },
                         err_fn,
@@ -253,6 +342,12 @@ impl AudioInput {
                     )
                 }
                 SampleFormat::I16 => {
+                    let is_capturing_clone = is_capturing.clone();
+                    let processor = Arc::new(Mutex::new(InputProcessor::new(
+                        frame_size,
+                        denoise_enabled,
+                        on_frame,
+                    )));
                     device.build_input_stream(
                         &stream_config,
                         move |data: &[i16], _: &cpal::InputCallbackInfo| {
@@ -263,14 +358,8 @@ impl AudioInput {
                             let float_data: Vec<f32> =
                                 data.iter().map(|&s| s as f32 / i16::MAX as f32).collect();
 
-                            let mut buffer = samples_buffer_clone.lock().unwrap();
-                            buffer.extend_from_slice(&float_data);
-
-                            while buffer.len() >= frame_size {
-                                let frame: Vec<f32> = buffer.drain(..frame_size).collect();
-                                if let Ok(mut cb) = on_frame.lock() {
-                                    cb(&frame);
-                                }
+                            if let Ok(mut proc) = processor.lock() {
+                                proc.process_samples(&float_data);
                             }
                         },
                         err_fn,
@@ -278,6 +367,12 @@ impl AudioInput {
                     )
                 }
                 SampleFormat::U16 => {
+                    let is_capturing_clone = is_capturing.clone();
+                    let processor = Arc::new(Mutex::new(InputProcessor::new(
+                        frame_size,
+                        denoise_enabled,
+                        on_frame,
+                    )));
                     device.build_input_stream(
                         &stream_config,
                         move |data: &[u16], _: &cpal::InputCallbackInfo| {
@@ -290,14 +385,8 @@ impl AudioInput {
                                 .map(|&s| (s as f32 / u16::MAX as f32) * 2.0 - 1.0)
                                 .collect();
 
-                            let mut buffer = samples_buffer_clone.lock().unwrap();
-                            buffer.extend_from_slice(&float_data);
-
-                            while buffer.len() >= frame_size {
-                                let frame: Vec<f32> = buffer.drain(..frame_size).collect();
-                                if let Ok(mut cb) = on_frame.lock() {
-                                    cb(&frame);
-                                }
+                            if let Ok(mut proc) = processor.lock() {
+                                proc.process_samples(&float_data);
                             }
                         },
                         err_fn,
@@ -305,6 +394,12 @@ impl AudioInput {
                     )
                 }
                 SampleFormat::U8 => {
+                    let is_capturing_clone = is_capturing.clone();
+                    let processor = Arc::new(Mutex::new(InputProcessor::new(
+                        frame_size,
+                        denoise_enabled,
+                        on_frame,
+                    )));
                     device.build_input_stream(
                         &stream_config,
                         move |data: &[u8], _: &cpal::InputCallbackInfo| {
@@ -315,14 +410,8 @@ impl AudioInput {
                             let float_data: Vec<f32> =
                                 data.iter().map(|&s| (s as f32 - 128.0) / 128.0).collect();
 
-                            let mut buffer = samples_buffer_clone.lock().unwrap();
-                            buffer.extend_from_slice(&float_data);
-
-                            while buffer.len() >= frame_size {
-                                let frame: Vec<f32> = buffer.drain(..frame_size).collect();
-                                if let Ok(mut cb) = on_frame.lock() {
-                                    cb(&frame);
-                                }
+                            if let Ok(mut proc) = processor.lock() {
+                                proc.process_samples(&float_data);
                             }
                         },
                         err_fn,
@@ -334,20 +423,20 @@ impl AudioInput {
         } else {
             // Try default f32 format
             warn!("audio: no matching format found, trying f32 default");
+            let is_capturing_clone = is_capturing.clone();
+            let processor = Arc::new(Mutex::new(InputProcessor::new(
+                frame_size,
+                denoise_enabled,
+                on_frame,
+            )));
             device.build_input_stream(
                 &stream_config,
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
                     if !is_capturing_clone.load(Ordering::Relaxed) {
                         return;
                     }
-                    let mut buffer = samples_buffer_clone.lock().unwrap();
-                    buffer.extend_from_slice(data);
-
-                    while buffer.len() >= frame_size {
-                        let frame: Vec<f32> = buffer.drain(..frame_size).collect();
-                        if let Ok(mut cb) = on_frame.lock() {
-                            cb(&frame);
-                        }
+                    if let Ok(mut proc) = processor.lock() {
+                        proc.process_samples(data);
                     }
                 },
                 err_fn,
@@ -359,12 +448,11 @@ impl AudioInput {
         stream
             .play()
             .map_err(|e| format!("Failed to start input stream: {}", e))?;
-        info!("audio: input stream started");
+        info!(denoise = denoise_enabled, "audio: input stream started");
 
         Ok(Self {
             stream,
             is_capturing,
-            samples_buffer,
         })
     }
 

@@ -50,7 +50,7 @@ pub const OPUS_MAX_PACKET_SIZE: usize = 4000;
 
 /// Target bitrate for voice (in bits per second).
 /// 24-32 kbps is good quality for voice; we use 32kbps.
-pub const OPUS_BITRATE: i32 = 32000;
+pub const OPUS_BITRATE: i32 = 64000;
 
 /// Expected packet loss percentage for FEC configuration.
 /// 5% is a reasonable default for internet voice chat.
