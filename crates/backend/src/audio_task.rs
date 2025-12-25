@@ -120,8 +120,7 @@ impl UserAudioState {
 
         // Limit buffer size - remove oldest packets if too large
         while self.jitter_buffer.len() > JITTER_BUFFER_MAX_PACKETS {
-            if let Some(&oldest_seq) = self.jitter_buffer.keys().next() {
-                self.jitter_buffer.remove(&oldest_seq);
+            if let Some((oldest_seq, _)) = self.jitter_buffer.pop_first() {
                 // If we removed a packet we haven't played yet, skip it
                 if oldest_seq >= self.next_play_seq {
                     self.next_play_seq = oldest_seq.wrapping_add(1);
@@ -136,7 +135,11 @@ impl UserAudioState {
     }
 
     /// Get the next frame to play, decoding from jitter buffer.
-    /// Returns decoded PCM samples, using PLC if packet is missing.
+    /// Returns decoded PCM samples, using FEC recovery or PLC if packet is missing.
+    ///
+    /// FEC (Forward Error Correction) recovery works by using data embedded in the
+    /// *next* packet to reconstruct a lost packet. This provides better quality than
+    /// pure PLC (Packet Loss Concealment) which just interpolates/generates comfort noise.
     fn get_next_frame(&mut self) -> Option<Vec<f32>> {
         if !self.ready_to_play() {
             return None;
@@ -157,9 +160,23 @@ impl UserAudioState {
                 }
             }
         } else {
-            // Packet missing - use Opus PLC (Packet Loss Concealment)
-            trace!("Missing packet seq {}, using PLC", seq);
-            self.decoder.conceal(OPUS_FRAME_SIZE).ok()
+            // Packet missing - try FEC recovery using the next packet if available
+            let next_seq = seq.wrapping_add(1);
+            if let Some(next_opus_data) = self.jitter_buffer.get(&next_seq) {
+                // We have the next packet - use its FEC data to recover this frame
+                trace!("Missing packet seq {}, recovering with FEC from seq {}", seq, next_seq);
+                match self.decoder.decode_fec(next_opus_data) {
+                    Ok(pcm) => Some(pcm),
+                    Err(e) => {
+                        trace!("FEC recovery failed for seq {}: {}, falling back to PLC", seq, e);
+                        self.decoder.conceal(OPUS_FRAME_SIZE).ok()
+                    }
+                }
+            } else {
+                // No next packet available - fall back to pure PLC
+                trace!("Missing packet seq {}, no FEC available, using PLC", seq);
+                self.decoder.conceal(OPUS_FRAME_SIZE).ok()
+            }
         }
     }
 }

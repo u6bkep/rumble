@@ -324,16 +324,28 @@ impl VoiceDecoder {
         Ok(samples)
     }
 
-    /// Decode a packet with forward error correction.
+    /// Decode a packet using forward error correction to recover a lost frame.
     ///
-    /// This should be used when you know the previous packet was lost
-    /// and the current packet contains FEC data for it.
+    /// When a packet is lost but the *next* packet has arrived, call this method
+    /// with the next packet's data to recover an approximation of the lost frame.
+    /// Then call `decode()` normally on the same packet to get its actual content.
+    ///
+    /// # FEC Recovery Flow
+    /// ```ignore
+    /// // Packet N is missing, but packet N+1 arrived:
+    /// let recovered_n = decoder.decode_fec(&packet_n_plus_1)?;  // Recover lost frame N
+    /// let frame_n_plus_1 = decoder.decode(&packet_n_plus_1)?;   // Decode frame N+1 normally
+    /// ```
     ///
     /// # Arguments
-    /// * `opus_data` - Opus-encoded bytes that contain FEC for the lost packet
+    /// * `opus_data` - The packet that arrived *after* the lost packet (contains FEC data)
     ///
     /// # Returns
-    /// Reconstructed PCM samples for the lost packet.
+    /// Approximate PCM samples for the *previous* (lost) frame.
+    ///
+    /// # Note
+    /// FEC only works when the encoder has `set_inband_fec(true)` (enabled by default).
+    /// The recovered audio is lower quality than the original but better than PLC alone.
     pub fn decode_fec(&mut self, opus_data: &[u8]) -> Result<Vec<f32>, CodecError> {
         let samples = self
             .decoder
@@ -343,7 +355,7 @@ impl VoiceDecoder {
         self.frames_decoded += 1;
         self.frames_concealed += 1;
 
-        trace!(samples, "codec: decoded FEC frame");
+        trace!(samples, "codec: decoded FEC frame (recovered lost packet)");
 
         Ok(self.output_buffer[..samples].to_vec())
     }
