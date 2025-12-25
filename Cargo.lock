@@ -2705,6 +2705,7 @@ checksum = "d05e27ee213611ffe7d6348b942e8f942b37114c00cc03cec254295a4a17852e"
 [[package]]
 name = "opus"
 version = "0.3.0"
+source = "git+https://github.com/SpaceManiac/opus-rs?rev=834381e#834381efeaa864d06925e849992341926d358879"
 dependencies = [
  "audiopus_sys",
 ]
