@@ -190,6 +190,19 @@ impl AudioConfig {
     }
 }
 
+/// Returns a preference score for a sample format (higher is better).
+/// F32 is preferred as it's our internal format, followed by I16 which is common.
+fn sample_format_preference(format: SampleFormat) -> u8 {
+    match format {
+        SampleFormat::F32 => 5, // Best - native format, no conversion needed
+        SampleFormat::I16 => 4, // Good - common format, simple conversion
+        SampleFormat::I32 => 3, // OK - higher precision but needs scaling
+        SampleFormat::U16 => 2, // Less common, needs offset conversion
+        SampleFormat::U8 => 1,  // Low quality, needs offset conversion
+        _ => 0,                 // Unknown/unsupported formats
+    }
+}
+
 /// Processes audio input samples, optionally applying noise suppression.
 ///
 /// This struct handles:
@@ -301,7 +314,7 @@ impl AudioInput {
 
         let err_fn = |err| error!("audio input error: {}", err);
 
-        // Check supported formats and pick the best one
+        // Check supported formats and pick the best one based on preference
         let supported = device
             .supported_input_configs()
             .map_err(|e| format!("Failed to get supported input configs: {}", e))?;
@@ -312,7 +325,7 @@ impl AudioInput {
                 c.min_sample_rate() <= config.sample_rate
                     && c.max_sample_rate() >= config.sample_rate
             })
-            .next();
+            .max_by_key(|c| sample_format_preference(c.sample_format()));
 
         let stream = if let Some(supported_config) = format {
             let sample_format = supported_config.sample_format();
@@ -517,7 +530,7 @@ impl AudioOutput {
 
         let err_fn = |err| error!("audio output error: {}", err);
 
-        // Check supported formats
+        // Check supported formats and pick the best one based on preference
         let supported = device
             .supported_output_configs()
             .map_err(|e| format!("Failed to get supported output configs: {}", e))?;
@@ -528,7 +541,7 @@ impl AudioOutput {
                 c.min_sample_rate() <= config.sample_rate
                     && c.max_sample_rate() >= config.sample_rate
             })
-            .next();
+            .max_by_key(|c| sample_format_preference(c.sample_format()));
 
         let stream = if let Some(supported_config) = format {
             let sample_format = supported_config.sample_format();
