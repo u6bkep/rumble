@@ -14,7 +14,7 @@ use api::{
 use bytes::BytesMut;
 use prost::Message;
 use quinn::{Endpoint, ServerConfig};
-use std::{net::Ipv4Addr, sync::Arc};
+use std::{net::Ipv6Addr, sync::Arc};
 use tracing::{debug, error, info};
 
 /// Configuration for the server.
@@ -110,7 +110,7 @@ fn make_server_endpoint(config: Config) -> Result<Endpoint> {
     transport_config.datagram_receive_buffer_size(Some(65536));
     server_config.transport_config(Arc::new(transport_config));
 
-    let addr = (Ipv4Addr::UNSPECIFIED, config.port).into();
+    let addr = (Ipv6Addr::UNSPECIFIED, config.port).into();
     let endpoint = Endpoint::server(server_config, addr)?;
     Ok(endpoint)
 }

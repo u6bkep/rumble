@@ -439,12 +439,13 @@ async fn connect_to_server(
     Vec<proto::User>,
 )> {
     info!(server_addr = %addr, client_name, "Connecting to server");
-    let endpoint = make_client_endpoint(config)?;
 
     let socket_addr = addr
         .to_socket_addrs()?
         .next()
         .ok_or_else(|| anyhow::anyhow!("invalid address"))?;
+
+    let endpoint = make_client_endpoint(socket_addr, config)?;
 
     let conn = endpoint.connect(socket_addr, "localhost")?.await?;
     info!(remote = %conn.remote_address(), "Connected to server");
@@ -692,8 +693,14 @@ fn apply_state_update(
 }
 
 /// Create a QUIC client endpoint.
-fn make_client_endpoint(config: &ConnectConfig) -> anyhow::Result<Endpoint> {
-    let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap())?;
+fn make_client_endpoint(remote_addr: std::net::SocketAddr, config: &ConnectConfig) -> anyhow::Result<Endpoint> {
+    // Bind to the same address family as the remote address
+    let bind_addr: std::net::SocketAddr = if remote_addr.is_ipv6() {
+        "[::]:0".parse().unwrap()
+    } else {
+        "0.0.0.0:0".parse().unwrap()
+    };
+    let mut endpoint = Endpoint::client(bind_addr)?;
 
     // Start with webpki system roots
     let mut root_store = rustls::RootCertStore::empty();
