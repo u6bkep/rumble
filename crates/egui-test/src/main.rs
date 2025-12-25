@@ -209,7 +209,15 @@ impl eframe::App for MyApp {
         // Get current state from backend (clone to avoid borrow issues)
         let state = self.backend.state();
 
+        // Reset push-to-talk state if disconnected
+        if !state.connection.is_connected() && self.push_to_talk_active {
+            self.push_to_talk_active = false;
+        }
+
         // Handle push-to-talk (Space key)
+        // Always track Space key state and send commands - the backend handles
+        // mode-specific behavior (e.g., ignoring PTT in Continuous mode for
+        // start/stop, but still tracking the state for mode switches)
         let space_pressed = ctx.input(|i| i.key_down(egui::Key::Space));
         if space_pressed && !self.push_to_talk_active && state.connection.is_connected() {
             self.push_to_talk_active = true;
@@ -399,9 +407,9 @@ impl eframe::App for MyApp {
                                     let is_self = state.my_user_id == Some(user_id);
 
                                     // Check if user is talking
-                                    // For self, use push_to_talk_active; for others, check talking_users
+                                    // For self, use is_transmitting from backend; for others, check talking_users
                                     let is_talking = if is_self {
-                                        self.push_to_talk_active
+                                        state.audio.is_transmitting
                                     } else {
                                         state.audio.talking_users.contains(&user_id)
                                     };
@@ -618,8 +626,18 @@ impl eframe::App for MyApp {
 
                     ui.separator();
 
-                    // Status info
-                    ui.label("Push-to-talk: Hold SPACE to transmit");
+                    // Status info - show mode-appropriate message
+                    match audio.transmission_mode {
+                        TransmissionMode::PushToTalk => {
+                            ui.label("Push-to-talk: Hold SPACE to transmit");
+                        }
+                        TransmissionMode::Continuous => {
+                            ui.label("Continuous: Always transmitting when connected");
+                        }
+                        TransmissionMode::Muted => {
+                            ui.label("Muted: Not transmitting");
+                        }
+                    }
 
                     if audio.is_transmitting {
                         ui.colored_label(egui::Color32::GREEN, "🎤 Transmitting...");

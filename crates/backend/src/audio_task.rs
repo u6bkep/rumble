@@ -224,9 +224,6 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
     let mut audio_input: Option<AudioInput> = None;
     let mut audio_output: Option<AudioOutput> = None;
 
-    // Opus encoder for outgoing audio
-    let mut encoder: Option<VoiceEncoder> = None;
-
     // Per-user decoders and jitter buffers
     let mut user_audio: HashMap<u64, UserAudioState> = HashMap::new();
 
@@ -263,9 +260,16 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
                             audio_output = start_audio_output(&audio_system, &selected_output, &mut user_audio);
                         }
 
-                        // If in continuous mode, start transmitting
-                        if transmission_mode == TransmissionMode::Continuous {
-                            start_transmission(&audio_system, &selected_input, &encoded_tx, &mut audio_input, &mut encoder, &state, &repaint);
+                        // Start transmitting if mode requires it
+                        match transmission_mode {
+                            TransmissionMode::Continuous => {
+                                start_transmission(&audio_system, &selected_input, &encoded_tx, &mut audio_input, &state, &repaint);
+                            }
+                            TransmissionMode::PushToTalk if ptt_active => {
+                                // PTT key was held during reconnect
+                                start_transmission(&audio_system, &selected_input, &encoded_tx, &mut audio_input, &state, &repaint);
+                            }
+                            _ => {}
                         }
                     }
 
@@ -274,8 +278,9 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
                         connection = None;
                         my_user_id = 0;
 
-                        // Stop transmission
-                        stop_transmission(&mut audio_input, &mut encoder, &state, &repaint);
+                        // Stop transmission and reset PTT state
+                        stop_transmission(&mut audio_input, &state, &repaint);
+                        ptt_active = false;
 
                         // Clear talking users
                         {
@@ -298,8 +303,8 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
 
                         // Restart input if currently transmitting
                         if audio_input.is_some() {
-                            stop_transmission(&mut audio_input, &mut encoder, &state, &repaint);
-                            start_transmission(&audio_system, &selected_input, &encoded_tx, &mut audio_input, &mut encoder, &state, &repaint);
+                            stop_transmission(&mut audio_input, &state, &repaint);
+                            start_transmission(&audio_system, &selected_input, &encoded_tx, &mut audio_input, &state, &repaint);
                         }
                     }
 
@@ -319,18 +324,28 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
                     }
 
                     AudioCommand::StartTransmit => {
-                        if transmission_mode == TransmissionMode::PushToTalk && !ptt_active {
-                            ptt_active = true;
+                        // Always track PTT state, even if not in PTT mode.
+                        // This ensures ptt_active is correct when switching modes.
+                        let was_active = ptt_active;
+                        ptt_active = true;
+                        
+                        // Only start transmission if in PTT mode and wasn't already active
+                        if transmission_mode == TransmissionMode::PushToTalk && !was_active {
                             if connection.is_some() {
-                                start_transmission(&audio_system, &selected_input, &encoded_tx, &mut audio_input, &mut encoder, &state, &repaint);
+                                start_transmission(&audio_system, &selected_input, &encoded_tx, &mut audio_input, &state, &repaint);
                             }
                         }
                     }
 
                     AudioCommand::StopTransmit => {
-                        if transmission_mode == TransmissionMode::PushToTalk && ptt_active {
-                            ptt_active = false;
-                            stop_transmission(&mut audio_input, &mut encoder, &state, &repaint);
+                        // Always track PTT state, even if not in PTT mode.
+                        // This ensures ptt_active is correct when switching modes.
+                        let was_active = ptt_active;
+                        ptt_active = false;
+                        
+                        // Only stop transmission if in PTT mode and was active
+                        if transmission_mode == TransmissionMode::PushToTalk && was_active {
+                            stop_transmission(&mut audio_input, &state, &repaint);
                         }
                     }
 
@@ -349,16 +364,16 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
                             match (old_mode, mode) {
                                 // Switching to Continuous: start transmitting
                                 (_, TransmissionMode::Continuous) => {
-                                    start_transmission(&audio_system, &selected_input, &encoded_tx, &mut audio_input, &mut encoder, &state, &repaint);
+                                    start_transmission(&audio_system, &selected_input, &encoded_tx, &mut audio_input, &state, &repaint);
                                 }
                                 // Switching to Muted: stop transmitting
                                 (_, TransmissionMode::Muted) => {
-                                    stop_transmission(&mut audio_input, &mut encoder, &state, &repaint);
+                                    stop_transmission(&mut audio_input, &state, &repaint);
                                 }
                                 // Switching to PTT: stop unless PTT is pressed
                                 (_, TransmissionMode::PushToTalk) => {
                                     if !ptt_active {
-                                        stop_transmission(&mut audio_input, &mut encoder, &state, &repaint);
+                                        stop_transmission(&mut audio_input, &state, &repaint);
                                     }
                                 }
                             }
@@ -449,23 +464,12 @@ fn start_transmission(
     selected_input: &Option<String>,
     encoded_tx: &mpsc::UnboundedSender<Bytes>,
     audio_input: &mut Option<AudioInput>,
-    encoder: &mut Option<VoiceEncoder>,
     state: &Arc<RwLock<State>>,
     repaint: &Arc<dyn Fn() + Send + Sync>,
 ) {
     if audio_input.is_some() {
         return; // Already transmitting
     }
-
-    // Create encoder
-    let enc = match VoiceEncoder::new() {
-        Ok(e) => e,
-        Err(e) => {
-            error!("Failed to create Opus encoder: {}", e);
-            return;
-        }
-    };
-    *encoder = Some(enc);
 
     // Get input device
     let device = match selected_input {
@@ -481,12 +485,18 @@ fn start_transmission(
         }
     };
 
+    // Create encoder for the audio callback
+    let encoder = match VoiceEncoder::new() {
+        Ok(e) => e,
+        Err(e) => {
+            error!("Failed to create Opus encoder: {}", e);
+            return;
+        }
+    };
+    let encoder_mutex = std::sync::Arc::new(std::sync::Mutex::new(encoder));
+
     // Create audio input with encoding callback
     let encoded_tx = encoded_tx.clone();
-    let encoder_mutex = std::sync::Arc::new(std::sync::Mutex::new(
-        VoiceEncoder::new().expect("create encoder"),
-    ));
-
     let input = AudioInput::new(&device, &AudioConfig::default().with_denoise(), move |samples| {
         // Encode the audio frame
         if let Ok(mut enc) = encoder_mutex.lock() {
@@ -520,7 +530,6 @@ fn start_transmission(
 /// Stop audio transmission.
 fn stop_transmission(
     audio_input: &mut Option<AudioInput>,
-    encoder: &mut Option<VoiceEncoder>,
     state: &Arc<RwLock<State>>,
     repaint: &Arc<dyn Fn() + Send + Sync>,
 ) {
@@ -528,8 +537,9 @@ fn stop_transmission(
         return; // Not transmitting
     }
 
+    // The encoder is owned by the AudioInput's callback closure,
+    // so it will be dropped when we drop the AudioInput.
     *audio_input = None;
-    *encoder = None;
 
     {
         let mut s = state.write().unwrap();

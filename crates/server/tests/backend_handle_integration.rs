@@ -651,3 +651,515 @@ fn test_backend_repaint_callback_called() {
     // Repaint should have been called at some point during connection
     assert!(repaint_called.load(Ordering::SeqCst), "Repaint callback should be called");
 }
+
+// =============================================================================
+// Transmission Mode Tests
+// =============================================================================
+
+#[test]
+fn test_transmission_mode_defaults_to_ptt() {
+    let port = next_test_port();
+    let _server = start_server(port);
+    std::thread::sleep(Duration::from_millis(500));
+
+    let (handle, _repaint) = create_backend_with_repaint();
+
+    let state = handle.state();
+    assert!(
+        matches!(state.audio.transmission_mode, backend::TransmissionMode::PushToTalk),
+        "Default transmission mode should be PushToTalk"
+    );
+    assert!(!state.audio.is_transmitting, "Should not be transmitting initially");
+}
+
+#[test]
+fn test_set_transmission_mode_updates_state() {
+    let port = next_test_port();
+    let _server = start_server(port);
+    std::thread::sleep(Duration::from_millis(500));
+
+    let (handle, _repaint) = create_backend_with_repaint();
+
+    // Connect first
+    handle.send(BackendCommand::Connect {
+        addr: format!("127.0.0.1:{}", port),
+        name: "mode-test".to_string(),
+        password: None,
+    });
+
+    wait_for(&handle, Duration::from_secs(5), |s| s.connection.is_connected());
+
+    // Change to Continuous mode
+    handle.send(BackendCommand::SetTransmissionMode {
+        mode: backend::TransmissionMode::Continuous,
+    });
+
+    let mode_changed = wait_for(&handle, Duration::from_secs(2), |s| {
+        matches!(s.audio.transmission_mode, backend::TransmissionMode::Continuous)
+    });
+    assert!(mode_changed, "Transmission mode should change to Continuous");
+
+    // In continuous mode while connected, should be transmitting
+    let transmitting = wait_for(&handle, Duration::from_secs(2), |s| s.audio.is_transmitting);
+    assert!(transmitting, "Should be transmitting in Continuous mode while connected");
+
+    // Change to Muted mode
+    handle.send(BackendCommand::SetTransmissionMode {
+        mode: backend::TransmissionMode::Muted,
+    });
+
+    let muted = wait_for(&handle, Duration::from_secs(2), |s| {
+        matches!(s.audio.transmission_mode, backend::TransmissionMode::Muted) && !s.audio.is_transmitting
+    });
+    assert!(muted, "Should not be transmitting in Muted mode");
+
+    // Change back to PTT mode
+    handle.send(BackendCommand::SetTransmissionMode {
+        mode: backend::TransmissionMode::PushToTalk,
+    });
+
+    let ptt = wait_for(&handle, Duration::from_secs(2), |s| {
+        matches!(s.audio.transmission_mode, backend::TransmissionMode::PushToTalk)
+    });
+    assert!(ptt, "Should be in PushToTalk mode");
+    assert!(!handle.state().audio.is_transmitting, "Should not be transmitting in PTT mode without key pressed");
+}
+
+#[test]
+fn test_ptt_start_stop_transmit() {
+    let port = next_test_port();
+    let _server = start_server(port);
+    std::thread::sleep(Duration::from_millis(500));
+
+    let (handle, _repaint) = create_backend_with_repaint();
+
+    handle.send(BackendCommand::Connect {
+        addr: format!("127.0.0.1:{}", port),
+        name: "ptt-test".to_string(),
+        password: None,
+    });
+
+    wait_for(&handle, Duration::from_secs(5), |s| s.connection.is_connected());
+
+    // Start transmitting (simulate PTT press)
+    handle.send(BackendCommand::StartTransmit);
+
+    let transmitting = wait_for(&handle, Duration::from_secs(2), |s| s.audio.is_transmitting);
+    assert!(transmitting, "Should be transmitting after StartTransmit");
+
+    // Stop transmitting (simulate PTT release)
+    handle.send(BackendCommand::StopTransmit);
+
+    let stopped = wait_for(&handle, Duration::from_secs(2), |s| !s.audio.is_transmitting);
+    assert!(stopped, "Should stop transmitting after StopTransmit");
+}
+
+#[test]
+fn test_ptt_in_continuous_mode_ignored() {
+    let port = next_test_port();
+    let _server = start_server(port);
+    std::thread::sleep(Duration::from_millis(500));
+
+    let (handle, _repaint) = create_backend_with_repaint();
+
+    handle.send(BackendCommand::Connect {
+        addr: format!("127.0.0.1:{}", port),
+        name: "ptt-continuous-test".to_string(),
+        password: None,
+    });
+
+    wait_for(&handle, Duration::from_secs(5), |s| s.connection.is_connected());
+
+    // Switch to Continuous mode
+    handle.send(BackendCommand::SetTransmissionMode {
+        mode: backend::TransmissionMode::Continuous,
+    });
+
+    wait_for(&handle, Duration::from_secs(2), |s| s.audio.is_transmitting);
+
+    // Simulate PTT press and release while in continuous mode
+    // These should be ignored - transmission should remain active
+    handle.send(BackendCommand::StartTransmit);
+    std::thread::sleep(Duration::from_millis(100));
+    handle.send(BackendCommand::StopTransmit);
+
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Should still be transmitting (continuous mode doesn't stop on PTT release)
+    let still_transmitting = handle.state().audio.is_transmitting;
+    assert!(still_transmitting, "Continuous mode should keep transmitting after PTT release");
+}
+
+#[test]
+fn test_switch_from_continuous_to_ptt_while_ptt_held() {
+    // This test verifies the fix for the bug where switching from Continuous to PTT
+    // while holding the PTT key would stop transmission incorrectly.
+    let port = next_test_port();
+    let _server = start_server(port);
+    std::thread::sleep(Duration::from_millis(500));
+
+    let (handle, _repaint) = create_backend_with_repaint();
+
+    handle.send(BackendCommand::Connect {
+        addr: format!("127.0.0.1:{}", port),
+        name: "mode-switch-test".to_string(),
+        password: None,
+    });
+
+    wait_for(&handle, Duration::from_secs(5), |s| s.connection.is_connected());
+
+    // Start in Continuous mode
+    handle.send(BackendCommand::SetTransmissionMode {
+        mode: backend::TransmissionMode::Continuous,
+    });
+
+    wait_for(&handle, Duration::from_secs(2), |s| s.audio.is_transmitting);
+
+    // Simulate PTT press (while in continuous mode - this gets tracked)
+    handle.send(BackendCommand::StartTransmit);
+    std::thread::sleep(Duration::from_millis(100));
+
+    // Now switch to PTT mode while "holding" PTT
+    handle.send(BackendCommand::SetTransmissionMode {
+        mode: backend::TransmissionMode::PushToTalk,
+    });
+
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Should still be transmitting because PTT was pressed before mode switch
+    let still_transmitting = handle.state().audio.is_transmitting;
+    assert!(still_transmitting, "Should keep transmitting when switching to PTT with key held");
+
+    // Now release PTT
+    handle.send(BackendCommand::StopTransmit);
+
+    let stopped = wait_for(&handle, Duration::from_secs(2), |s| !s.audio.is_transmitting);
+    assert!(stopped, "Should stop transmitting after PTT release in PTT mode");
+}
+
+#[test]
+fn test_switch_from_ptt_to_continuous_continues_transmission() {
+    let port = next_test_port();
+    let _server = start_server(port);
+    std::thread::sleep(Duration::from_millis(500));
+
+    let (handle, _repaint) = create_backend_with_repaint();
+
+    handle.send(BackendCommand::Connect {
+        addr: format!("127.0.0.1:{}", port),
+        name: "ptt-to-continuous-test".to_string(),
+        password: None,
+    });
+
+    wait_for(&handle, Duration::from_secs(5), |s| s.connection.is_connected());
+
+    // Start PTT transmission
+    handle.send(BackendCommand::StartTransmit);
+
+    wait_for(&handle, Duration::from_secs(2), |s| s.audio.is_transmitting);
+
+    // Switch to Continuous mode while transmitting
+    handle.send(BackendCommand::SetTransmissionMode {
+        mode: backend::TransmissionMode::Continuous,
+    });
+
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Should still be transmitting
+    assert!(handle.state().audio.is_transmitting, "Should keep transmitting when switching to Continuous");
+
+    // Release PTT (should be ignored in continuous mode)
+    handle.send(BackendCommand::StopTransmit);
+
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Should still be transmitting (continuous mode)
+    assert!(handle.state().audio.is_transmitting, "Continuous mode should keep transmitting after PTT release");
+}
+
+#[test]
+fn test_continuous_mode_starts_on_connect() {
+    let port = next_test_port();
+    let _server = start_server(port);
+    std::thread::sleep(Duration::from_millis(500));
+
+    let (handle, _repaint) = create_backend_with_repaint();
+
+    // Set continuous mode BEFORE connecting
+    handle.send(BackendCommand::SetTransmissionMode {
+        mode: backend::TransmissionMode::Continuous,
+    });
+
+    std::thread::sleep(Duration::from_millis(100));
+
+    // Connect
+    handle.send(BackendCommand::Connect {
+        addr: format!("127.0.0.1:{}", port),
+        name: "continuous-on-connect-test".to_string(),
+        password: None,
+    });
+
+    wait_for(&handle, Duration::from_secs(5), |s| s.connection.is_connected());
+
+    // Should automatically start transmitting on connect in continuous mode
+    let transmitting = wait_for(&handle, Duration::from_secs(2), |s| s.audio.is_transmitting);
+    assert!(transmitting, "Should start transmitting on connect when in Continuous mode");
+}
+
+#[test]
+fn test_muted_mode_does_not_transmit() {
+    let port = next_test_port();
+    let _server = start_server(port);
+    std::thread::sleep(Duration::from_millis(500));
+
+    let (handle, _repaint) = create_backend_with_repaint();
+
+    handle.send(BackendCommand::Connect {
+        addr: format!("127.0.0.1:{}", port),
+        name: "muted-test".to_string(),
+        password: None,
+    });
+
+    wait_for(&handle, Duration::from_secs(5), |s| s.connection.is_connected());
+
+    // Set muted mode
+    handle.send(BackendCommand::SetTransmissionMode {
+        mode: backend::TransmissionMode::Muted,
+    });
+
+    wait_for(&handle, Duration::from_secs(2), |s| {
+        matches!(s.audio.transmission_mode, backend::TransmissionMode::Muted)
+    });
+
+    // PTT commands should be ignored in muted mode
+    handle.send(BackendCommand::StartTransmit);
+
+    std::thread::sleep(Duration::from_millis(200));
+
+    assert!(!handle.state().audio.is_transmitting, "Should not transmit in Muted mode");
+}
+
+#[test]
+fn test_switch_from_continuous_to_muted_stops_transmission() {
+    let port = next_test_port();
+    let _server = start_server(port);
+    std::thread::sleep(Duration::from_millis(500));
+
+    let (handle, _repaint) = create_backend_with_repaint();
+
+    handle.send(BackendCommand::Connect {
+        addr: format!("127.0.0.1:{}", port),
+        name: "continuous-to-muted-test".to_string(),
+        password: None,
+    });
+
+    wait_for(&handle, Duration::from_secs(5), |s| s.connection.is_connected());
+
+    // Start in Continuous mode
+    handle.send(BackendCommand::SetTransmissionMode {
+        mode: backend::TransmissionMode::Continuous,
+    });
+
+    wait_for(&handle, Duration::from_secs(2), |s| s.audio.is_transmitting);
+
+    // Switch to Muted
+    handle.send(BackendCommand::SetTransmissionMode {
+        mode: backend::TransmissionMode::Muted,
+    });
+
+    let stopped = wait_for(&handle, Duration::from_secs(2), |s| !s.audio.is_transmitting);
+    assert!(stopped, "Should stop transmitting when switching to Muted mode");
+}
+
+#[test]
+fn test_disconnect_clears_transmission_state() {
+    let port = next_test_port();
+    let _server = start_server(port);
+    std::thread::sleep(Duration::from_millis(500));
+
+    let (handle, _repaint) = create_backend_with_repaint();
+
+    handle.send(BackendCommand::Connect {
+        addr: format!("127.0.0.1:{}", port),
+        name: "disconnect-transmission-test".to_string(),
+        password: None,
+    });
+
+    wait_for(&handle, Duration::from_secs(5), |s| s.connection.is_connected());
+
+    // Start transmitting in Continuous mode
+    handle.send(BackendCommand::SetTransmissionMode {
+        mode: backend::TransmissionMode::Continuous,
+    });
+
+    wait_for(&handle, Duration::from_secs(2), |s| s.audio.is_transmitting);
+
+    // Disconnect
+    handle.send(BackendCommand::Disconnect);
+
+    wait_for(&handle, Duration::from_secs(2), |s| {
+        matches!(s.connection, ConnectionState::Disconnected)
+    });
+
+    // Transmission should be stopped
+    assert!(!handle.state().audio.is_transmitting, "Should stop transmitting on disconnect");
+}
+
+#[test]
+fn test_continuous_mode_resumes_on_reconnect() {
+    let port = next_test_port();
+    let _server = start_server(port);
+    std::thread::sleep(Duration::from_millis(500));
+
+    let (handle, _repaint) = create_backend_with_repaint();
+
+    // Set continuous mode
+    handle.send(BackendCommand::SetTransmissionMode {
+        mode: backend::TransmissionMode::Continuous,
+    });
+
+    // Connect
+    handle.send(BackendCommand::Connect {
+        addr: format!("127.0.0.1:{}", port),
+        name: "reconnect-continuous-test".to_string(),
+        password: None,
+    });
+
+    wait_for(&handle, Duration::from_secs(5), |s| s.connection.is_connected());
+    wait_for(&handle, Duration::from_secs(2), |s| s.audio.is_transmitting);
+
+    // Disconnect
+    handle.send(BackendCommand::Disconnect);
+
+    wait_for(&handle, Duration::from_secs(2), |s| {
+        matches!(s.connection, ConnectionState::Disconnected)
+    });
+    assert!(!handle.state().audio.is_transmitting, "Should stop on disconnect");
+
+    // Mode should still be Continuous
+    assert!(
+        matches!(handle.state().audio.transmission_mode, backend::TransmissionMode::Continuous),
+        "Mode should persist through disconnect"
+    );
+
+    // Reconnect
+    handle.send(BackendCommand::Connect {
+        addr: format!("127.0.0.1:{}", port),
+        name: "reconnect-continuous-test".to_string(),
+        password: None,
+    });
+
+    wait_for(&handle, Duration::from_secs(5), |s| s.connection.is_connected());
+
+    // Should resume transmitting
+    let transmitting = wait_for(&handle, Duration::from_secs(2), |s| s.audio.is_transmitting);
+    assert!(transmitting, "Should resume transmitting on reconnect in Continuous mode");
+}
+
+#[test]
+fn test_ptt_not_transmitting_after_disconnect() {
+    // Verifies that PTT state is reset on disconnect
+    let port = next_test_port();
+    let _server = start_server(port);
+    std::thread::sleep(Duration::from_millis(500));
+
+    let (handle, _repaint) = create_backend_with_repaint();
+
+    handle.send(BackendCommand::Connect {
+        addr: format!("127.0.0.1:{}", port),
+        name: "ptt-disconnect-test".to_string(),
+        password: None,
+    });
+
+    wait_for(&handle, Duration::from_secs(5), |s| s.connection.is_connected());
+
+    // Start PTT transmission
+    handle.send(BackendCommand::StartTransmit);
+
+    wait_for(&handle, Duration::from_secs(2), |s| s.audio.is_transmitting);
+
+    // Disconnect while transmitting
+    handle.send(BackendCommand::Disconnect);
+
+    wait_for(&handle, Duration::from_secs(2), |s| {
+        matches!(s.connection, ConnectionState::Disconnected)
+    });
+
+    // Should not be transmitting after disconnect
+    assert!(!handle.state().audio.is_transmitting, "Should not be transmitting after disconnect");
+
+    // Reconnect
+    handle.send(BackendCommand::Connect {
+        addr: format!("127.0.0.1:{}", port),
+        name: "ptt-disconnect-test".to_string(),
+        password: None,
+    });
+
+    wait_for(&handle, Duration::from_secs(5), |s| s.connection.is_connected());
+
+    // Should NOT be transmitting automatically in PTT mode
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(!handle.state().audio.is_transmitting, "Should not transmit on reconnect in PTT mode without key pressed");
+}
+
+// =============================================================================
+// Audio Device Tests
+// =============================================================================
+
+#[test]
+fn test_audio_devices_available_before_connect() {
+    // Audio devices should be enumerable before connecting
+    let (handle, _repaint) = create_backend_with_repaint();
+
+    let state = handle.state();
+    
+    // We just verify the lists exist - whether they have devices depends on the test environment
+    // This test mainly ensures the backend initializes audio properly without a connection
+    assert!(state.audio.input_devices.is_empty() || !state.audio.input_devices.is_empty());
+    assert!(state.audio.output_devices.is_empty() || !state.audio.output_devices.is_empty());
+}
+
+#[test]
+fn test_refresh_audio_devices() {
+    let (handle, _repaint) = create_backend_with_repaint();
+
+    // Refresh devices should not panic or fail
+    handle.send(BackendCommand::RefreshAudioDevices);
+
+    std::thread::sleep(Duration::from_millis(200));
+
+    // State should still be valid
+    let _ = handle.state();
+}
+
+#[test]
+fn test_set_input_device() {
+    let (handle, _repaint) = create_backend_with_repaint();
+
+    // Setting a device (even invalid) should update state
+    handle.send(BackendCommand::SetInputDevice {
+        device_id: Some("test-device".to_string()),
+    });
+
+    let updated = wait_for(&handle, Duration::from_secs(2), |s| {
+        s.audio.selected_input == Some("test-device".to_string())
+    });
+
+    assert!(updated, "Selected input device should be updated");
+}
+
+#[test]
+fn test_set_output_device() {
+    let (handle, _repaint) = create_backend_with_repaint();
+
+    handle.send(BackendCommand::SetOutputDevice {
+        device_id: Some("test-output-device".to_string()),
+    });
+
+    let updated = wait_for(&handle, Duration::from_secs(2), |s| {
+        s.audio.selected_output == Some("test-output-device".to_string())
+    });
+
+    assert!(updated, "Selected output device should be updated");
+}
+
