@@ -53,7 +53,7 @@ pub use audio::{
 // Opus codec for voice encoding/decoding
 pub mod codec;
 pub use codec::{
-    CodecError, DecoderStats, EncoderStats, OPUS_FRAME_SIZE, OPUS_MAX_PACKET_SIZE,
+    CodecError, DecoderStats, EncoderSettings, EncoderStats, OPUS_FRAME_SIZE, OPUS_MAX_PACKET_SIZE,
     OPUS_SAMPLE_RATE, VoiceDecoder, VoiceEncoder, opus_version,
 };
 
@@ -70,7 +70,7 @@ pub use audio_task::{AudioCommand, AudioTaskConfig, AudioTaskHandle, spawn_audio
 
 // State and command types
 pub mod events;
-pub use events::{AudioState, ChatMessage, Command, ConnectionState, State, TransmissionMode};
+pub use events::{AudioSettings, AudioState, AudioStats, ChatMessage, Command, ConnectionState, State, VoiceMode, TransmissionMode};
 
 // Backend handle
 pub mod handle;

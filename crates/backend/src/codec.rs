@@ -15,8 +15,12 @@
 //! ```ignore
 //! use backend::codec::{VoiceEncoder, VoiceDecoder, OPUS_FRAME_SIZE};
 //!
-//! // Encoding
-//! let mut encoder = VoiceEncoder::new()?;
+//! // Encoding with custom settings
+//! let mut encoder = VoiceEncoder::with_settings(EncoderSettings {
+//!     bitrate: 64000,
+//!     complexity: 10,
+//!     ..Default::default()
+//! })?;
 //! let pcm_samples: &[f32] = &[/* 960 samples */];
 //! let opus_data = encoder.encode(pcm_samples)?;
 //!
@@ -48,13 +52,62 @@ pub const OPUS_FRAME_SIZE: usize = 960;
 /// We use 4000 bytes to be safe with higher bitrates.
 pub const OPUS_MAX_PACKET_SIZE: usize = 4000;
 
-/// Target bitrate for voice (in bits per second).
-/// 24-32 kbps is good quality for voice; we use 32kbps.
-pub const OPUS_BITRATE: i32 = 64000;
+/// Default target bitrate for voice (in bits per second).
+/// 64 kbps provides good quality for voice.
+pub const OPUS_DEFAULT_BITRATE: i32 = 64000;
 
-/// Expected packet loss percentage for FEC configuration.
+/// Default encoder complexity (0-10).
+/// 10 is highest quality, most CPU intensive.
+pub const OPUS_DEFAULT_COMPLEXITY: i32 = 10;
+
+/// Default expected packet loss percentage for FEC configuration.
 /// 5% is a reasonable default for internet voice chat.
-pub const OPUS_PACKET_LOSS_PERC: i32 = 5;
+pub const OPUS_DEFAULT_PACKET_LOSS_PERC: i32 = 5;
+
+// =============================================================================
+// Encoder Settings
+// =============================================================================
+
+/// Configurable settings for the Opus encoder.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EncoderSettings {
+    /// Target bitrate in bits per second.
+    /// Range: 6000 - 510000. Recommended: 24000 - 96000 for voice.
+    pub bitrate: i32,
+    
+    /// Encoder complexity (0-10).
+    /// Higher values = better quality but more CPU usage.
+    pub complexity: i32,
+    
+    /// Enable Forward Error Correction for packet loss recovery.
+    pub fec_enabled: bool,
+    
+    /// Expected packet loss percentage (0-100) for FEC tuning.
+    pub packet_loss_percent: i32,
+    
+    /// Enable discontinuous transmission (silence compression).
+    pub dtx_enabled: bool,
+    
+    /// Enable variable bitrate for better quality/bandwidth trade-off.
+    pub vbr_enabled: bool,
+}
+
+impl Default for EncoderSettings {
+    fn default() -> Self {
+        Self {
+            bitrate: OPUS_DEFAULT_BITRATE,
+            complexity: OPUS_DEFAULT_COMPLEXITY,
+            fec_enabled: true,
+            packet_loss_percent: OPUS_DEFAULT_PACKET_LOSS_PERC,
+            dtx_enabled: true,
+            vbr_enabled: true,
+        }
+    }
+}
+
+// =============================================================================
+// Errors
+// =============================================================================
 
 /// Error type for codec operations.
 #[derive(Debug)]
@@ -106,46 +159,28 @@ pub struct VoiceEncoder {
     frames_encoded: u64,
     /// Total bytes produced (for statistics).
     bytes_produced: u64,
+    /// Current settings.
+    settings: EncoderSettings,
 }
 
 impl VoiceEncoder {
     /// Create a new voice encoder with default VoIP settings.
     pub fn new() -> Result<Self, CodecError> {
+        Self::with_settings(EncoderSettings::default())
+    }
+    
+    /// Create a new voice encoder with custom settings.
+    pub fn with_settings(settings: EncoderSettings) -> Result<Self, CodecError> {
         let mut encoder = Encoder::new(OPUS_SAMPLE_RATE, OPUS_CHANNELS, Application::Voip)
             .map_err(|e| CodecError::EncoderInit(e.description().to_string()))?;
 
-        // Configure for VoIP use
-        encoder
-            .set_bitrate(Bitrate::Bits(OPUS_BITRATE))
-            .map_err(|e| CodecError::EncoderInit(e.description().to_string()))?;
-
-        // Enable variable bitrate for better quality/bandwidth trade-off
-        encoder
-            .set_vbr(true)
-            .map_err(|e| CodecError::EncoderInit(e.description().to_string()))?;
-
-        // Enable discontinuous transmission (silence compression)
-        encoder
-            .set_dtx(true)
-            .map_err(|e| CodecError::EncoderInit(e.description().to_string()))?;
-
-        // Enable forward error correction for packet loss resilience
-        encoder
-            .set_inband_fec(true)
-            .map_err(|e| CodecError::EncoderInit(e.description().to_string()))?;
-
-        // Set expected packet loss for FEC tuning
-        encoder
-            .set_packet_loss_perc(OPUS_PACKET_LOSS_PERC)
-            .map_err(|e| CodecError::EncoderInit(e.description().to_string()))?;
-
-        // Use voice signal type hint for better compression
-        encoder
-            .set_signal(opus::Signal::Voice)
-            .map_err(|e| CodecError::EncoderInit(e.description().to_string()))?;
+        // Apply settings
+        Self::apply_settings_to_encoder(&mut encoder, &settings)?;
 
         debug!(
-            bitrate = OPUS_BITRATE,
+            bitrate = settings.bitrate,
+            complexity = settings.complexity,
+            fec = settings.fec_enabled,
             frame_size = OPUS_FRAME_SIZE,
             "codec: encoder initialized"
         );
@@ -155,7 +190,67 @@ impl VoiceEncoder {
             output_buffer: vec![0u8; OPUS_MAX_PACKET_SIZE],
             frames_encoded: 0,
             bytes_produced: 0,
+            settings,
         })
+    }
+    
+    /// Apply encoder settings to the underlying Opus encoder.
+    fn apply_settings_to_encoder(encoder: &mut Encoder, settings: &EncoderSettings) -> Result<(), CodecError> {
+        encoder
+            .set_bitrate(Bitrate::Bits(settings.bitrate))
+            .map_err(|e| CodecError::EncoderInit(e.description().to_string()))?;
+
+        encoder
+            .set_complexity(settings.complexity)
+            .map_err(|e| CodecError::EncoderInit(e.description().to_string()))?;
+
+        encoder
+            .set_vbr(settings.vbr_enabled)
+            .map_err(|e| CodecError::EncoderInit(e.description().to_string()))?;
+
+        encoder
+            .set_dtx(settings.dtx_enabled)
+            .map_err(|e| CodecError::EncoderInit(e.description().to_string()))?;
+
+        encoder
+            .set_inband_fec(settings.fec_enabled)
+            .map_err(|e| CodecError::EncoderInit(e.description().to_string()))?;
+
+        encoder
+            .set_packet_loss_perc(settings.packet_loss_percent)
+            .map_err(|e| CodecError::EncoderInit(e.description().to_string()))?;
+
+        encoder
+            .set_signal(opus::Signal::Voice)
+            .map_err(|e| CodecError::EncoderInit(e.description().to_string()))?;
+            
+        Ok(())
+    }
+    
+    /// Update encoder settings at runtime.
+    ///
+    /// Returns true if settings were changed, false if they were already the same.
+    pub fn update_settings(&mut self, new_settings: EncoderSettings) -> Result<bool, CodecError> {
+        if self.settings == new_settings {
+            return Ok(false);
+        }
+        
+        Self::apply_settings_to_encoder(&mut self.encoder, &new_settings)?;
+        
+        debug!(
+            bitrate = new_settings.bitrate,
+            complexity = new_settings.complexity,
+            fec = new_settings.fec_enabled,
+            "codec: encoder settings updated"
+        );
+        
+        self.settings = new_settings;
+        Ok(true)
+    }
+    
+    /// Get the current encoder settings.
+    pub fn settings(&self) -> &EncoderSettings {
+        &self.settings
     }
 
     /// Encode a frame of PCM audio samples to Opus.
@@ -554,5 +649,79 @@ mod tests {
         assert!(!version.is_empty());
         // Version string typically contains "libopus"
         println!("Opus version: {}", version);
+    }
+    
+    #[test]
+    fn test_encoder_with_custom_settings() {
+        let settings = EncoderSettings {
+            bitrate: 32000,
+            complexity: 5,
+            fec_enabled: true,
+            packet_loss_percent: 10,
+            dtx_enabled: true,
+            vbr_enabled: true,
+        };
+        
+        let encoder = VoiceEncoder::with_settings(settings.clone());
+        assert!(encoder.is_ok(), "encoder with custom settings should be created successfully");
+        
+        let encoder = encoder.unwrap();
+        assert_eq!(encoder.settings(), &settings);
+    }
+    
+    #[test]
+    fn test_encoder_update_settings() {
+        let mut encoder = VoiceEncoder::new().unwrap();
+        
+        let new_settings = EncoderSettings {
+            bitrate: 24000,
+            complexity: 3,
+            fec_enabled: false,
+            packet_loss_percent: 0,
+            dtx_enabled: false,
+            vbr_enabled: false,
+        };
+        
+        let changed = encoder.update_settings(new_settings.clone()).unwrap();
+        assert!(changed, "settings should have changed");
+        assert_eq!(encoder.settings(), &new_settings);
+        
+        // Updating with same settings should return false
+        let changed = encoder.update_settings(new_settings.clone()).unwrap();
+        assert!(!changed, "settings should not have changed");
+    }
+    
+    #[test]
+    fn test_bitrate_affects_frame_size() {
+        let pcm = vec![0.5f32; OPUS_FRAME_SIZE]; // Non-silent audio
+        
+        // Low bitrate encoder
+        let low_settings = EncoderSettings {
+            bitrate: 16000,
+            ..Default::default()
+        };
+        let mut low_encoder = VoiceEncoder::with_settings(low_settings).unwrap();
+        
+        // High bitrate encoder
+        let high_settings = EncoderSettings {
+            bitrate: 128000,
+            ..Default::default()
+        };
+        let mut high_encoder = VoiceEncoder::with_settings(high_settings).unwrap();
+        
+        // Encode several frames to get stable sizes
+        let mut low_sizes = Vec::new();
+        let mut high_sizes = Vec::new();
+        
+        for _ in 0..10 {
+            low_sizes.push(low_encoder.encode(&pcm).unwrap().len());
+            high_sizes.push(high_encoder.encode(&pcm).unwrap().len());
+        }
+        
+        let avg_low: f32 = low_sizes.iter().sum::<usize>() as f32 / low_sizes.len() as f32;
+        let avg_high: f32 = high_sizes.iter().sum::<usize>() as f32 / high_sizes.len() as f32;
+        
+        // Higher bitrate should produce larger frames
+        assert!(avg_high > avg_low, "higher bitrate should produce larger frames (low: {}, high: {})", avg_low, avg_high);
     }
 }

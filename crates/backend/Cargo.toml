@@ -6,12 +6,12 @@ edition = "2024"
 
 [dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "io-util"] }
-quinn = { version = "0.11", features = ["rustls"] }
+quinn = { version = "0.11", default-features = false, features = ["rustls-aws-lc-rs", "bloom", "log", "platform-verifier", "runtime-tokio"] }
 anyhow = "1"
 bytes = "1"
 api = { path = "../api" }
 prost = "0.14"
-rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+rustls = { version = "0.23", default-features = false, features = ["std"] }
 webpki-roots = "1.0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

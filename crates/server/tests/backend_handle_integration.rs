@@ -666,9 +666,11 @@ fn test_transmission_mode_defaults_to_ptt() {
 
     let state = handle.state();
     assert!(
-        matches!(state.audio.transmission_mode, backend::TransmissionMode::PushToTalk),
-        "Default transmission mode should be PushToTalk"
+        matches!(state.audio.voice_mode, backend::VoiceMode::PushToTalk),
+        "Default voice mode should be PushToTalk"
     );
+    assert!(!state.audio.self_muted, "Should not be muted initially");
+    assert!(!state.audio.self_deafened, "Should not be deafened initially");
     assert!(!state.audio.is_transmitting, "Should not be transmitting initially");
 }
 
@@ -690,36 +692,42 @@ fn test_set_transmission_mode_updates_state() {
     wait_for(&handle, Duration::from_secs(5), |s| s.connection.is_connected());
 
     // Change to Continuous mode
-    handle.send(BackendCommand::SetTransmissionMode {
-        mode: backend::TransmissionMode::Continuous,
+    handle.send(BackendCommand::SetVoiceMode {
+        mode: backend::VoiceMode::Continuous,
     });
 
     let mode_changed = wait_for(&handle, Duration::from_secs(2), |s| {
-        matches!(s.audio.transmission_mode, backend::TransmissionMode::Continuous)
+        matches!(s.audio.voice_mode, backend::VoiceMode::Continuous)
     });
-    assert!(mode_changed, "Transmission mode should change to Continuous");
+    assert!(mode_changed, "Voice mode should change to Continuous");
 
     // In continuous mode while connected, should be transmitting
     let transmitting = wait_for(&handle, Duration::from_secs(2), |s| s.audio.is_transmitting);
     assert!(transmitting, "Should be transmitting in Continuous mode while connected");
 
-    // Change to Muted mode
-    handle.send(BackendCommand::SetTransmissionMode {
-        mode: backend::TransmissionMode::Muted,
-    });
+    // Set muted
+    handle.send(BackendCommand::SetMuted { muted: true });
 
     let muted = wait_for(&handle, Duration::from_secs(2), |s| {
-        matches!(s.audio.transmission_mode, backend::TransmissionMode::Muted) && !s.audio.is_transmitting
+        s.audio.self_muted && !s.audio.is_transmitting
     });
-    assert!(muted, "Should not be transmitting in Muted mode");
+    assert!(muted, "Should not be transmitting when muted");
+
+    // Unmute
+    handle.send(BackendCommand::SetMuted { muted: false });
+
+    let unmuted = wait_for(&handle, Duration::from_secs(2), |s| {
+        !s.audio.self_muted && s.audio.is_transmitting
+    });
+    assert!(unmuted, "Should resume transmitting when unmuted in Continuous mode");
 
     // Change back to PTT mode
-    handle.send(BackendCommand::SetTransmissionMode {
-        mode: backend::TransmissionMode::PushToTalk,
+    handle.send(BackendCommand::SetVoiceMode {
+        mode: backend::VoiceMode::PushToTalk,
     });
 
     let ptt = wait_for(&handle, Duration::from_secs(2), |s| {
-        matches!(s.audio.transmission_mode, backend::TransmissionMode::PushToTalk)
+        matches!(s.audio.voice_mode, backend::VoiceMode::PushToTalk)
     });
     assert!(ptt, "Should be in PushToTalk mode");
     assert!(!handle.state().audio.is_transmitting, "Should not be transmitting in PTT mode without key pressed");
@@ -771,8 +779,8 @@ fn test_ptt_in_continuous_mode_ignored() {
     wait_for(&handle, Duration::from_secs(5), |s| s.connection.is_connected());
 
     // Switch to Continuous mode
-    handle.send(BackendCommand::SetTransmissionMode {
-        mode: backend::TransmissionMode::Continuous,
+    handle.send(BackendCommand::SetVoiceMode {
+        mode: backend::VoiceMode::Continuous,
     });
 
     wait_for(&handle, Duration::from_secs(2), |s| s.audio.is_transmitting);
@@ -809,8 +817,8 @@ fn test_switch_from_continuous_to_ptt_while_ptt_held() {
     wait_for(&handle, Duration::from_secs(5), |s| s.connection.is_connected());
 
     // Start in Continuous mode
-    handle.send(BackendCommand::SetTransmissionMode {
-        mode: backend::TransmissionMode::Continuous,
+    handle.send(BackendCommand::SetVoiceMode {
+        mode: backend::VoiceMode::Continuous,
     });
 
     wait_for(&handle, Duration::from_secs(2), |s| s.audio.is_transmitting);
@@ -820,8 +828,8 @@ fn test_switch_from_continuous_to_ptt_while_ptt_held() {
     std::thread::sleep(Duration::from_millis(100));
 
     // Now switch to PTT mode while "holding" PTT
-    handle.send(BackendCommand::SetTransmissionMode {
-        mode: backend::TransmissionMode::PushToTalk,
+    handle.send(BackendCommand::SetVoiceMode {
+        mode: backend::VoiceMode::PushToTalk,
     });
 
     std::thread::sleep(Duration::from_millis(200));
@@ -859,8 +867,8 @@ fn test_switch_from_ptt_to_continuous_continues_transmission() {
     wait_for(&handle, Duration::from_secs(2), |s| s.audio.is_transmitting);
 
     // Switch to Continuous mode while transmitting
-    handle.send(BackendCommand::SetTransmissionMode {
-        mode: backend::TransmissionMode::Continuous,
+    handle.send(BackendCommand::SetVoiceMode {
+        mode: backend::VoiceMode::Continuous,
     });
 
     std::thread::sleep(Duration::from_millis(200));
@@ -886,8 +894,8 @@ fn test_continuous_mode_starts_on_connect() {
     let (handle, _repaint) = create_backend_with_repaint();
 
     // Set continuous mode BEFORE connecting
-    handle.send(BackendCommand::SetTransmissionMode {
-        mode: backend::TransmissionMode::Continuous,
+    handle.send(BackendCommand::SetVoiceMode {
+        mode: backend::VoiceMode::Continuous,
     });
 
     std::thread::sleep(Duration::from_millis(100));
@@ -907,7 +915,7 @@ fn test_continuous_mode_starts_on_connect() {
 }
 
 #[test]
-fn test_muted_mode_does_not_transmit() {
+fn test_muted_does_not_transmit() {
     let port = next_test_port();
     let _server = start_server(port);
     std::thread::sleep(Duration::from_millis(500));
@@ -922,25 +930,21 @@ fn test_muted_mode_does_not_transmit() {
 
     wait_for(&handle, Duration::from_secs(5), |s| s.connection.is_connected());
 
-    // Set muted mode
-    handle.send(BackendCommand::SetTransmissionMode {
-        mode: backend::TransmissionMode::Muted,
-    });
+    // Set muted
+    handle.send(BackendCommand::SetMuted { muted: true });
 
-    wait_for(&handle, Duration::from_secs(2), |s| {
-        matches!(s.audio.transmission_mode, backend::TransmissionMode::Muted)
-    });
+    wait_for(&handle, Duration::from_secs(2), |s| s.audio.self_muted);
 
-    // PTT commands should be ignored in muted mode
+    // PTT commands should be ignored when muted
     handle.send(BackendCommand::StartTransmit);
 
     std::thread::sleep(Duration::from_millis(200));
 
-    assert!(!handle.state().audio.is_transmitting, "Should not transmit in Muted mode");
+    assert!(!handle.state().audio.is_transmitting, "Should not transmit when muted");
 }
 
 #[test]
-fn test_switch_from_continuous_to_muted_stops_transmission() {
+fn test_mute_stops_continuous_transmission() {
     let port = next_test_port();
     let _server = start_server(port);
     std::thread::sleep(Duration::from_millis(500));
@@ -956,19 +960,17 @@ fn test_switch_from_continuous_to_muted_stops_transmission() {
     wait_for(&handle, Duration::from_secs(5), |s| s.connection.is_connected());
 
     // Start in Continuous mode
-    handle.send(BackendCommand::SetTransmissionMode {
-        mode: backend::TransmissionMode::Continuous,
+    handle.send(BackendCommand::SetVoiceMode {
+        mode: backend::VoiceMode::Continuous,
     });
 
     wait_for(&handle, Duration::from_secs(2), |s| s.audio.is_transmitting);
 
-    // Switch to Muted
-    handle.send(BackendCommand::SetTransmissionMode {
-        mode: backend::TransmissionMode::Muted,
-    });
+    // Mute
+    handle.send(BackendCommand::SetMuted { muted: true });
 
     let stopped = wait_for(&handle, Duration::from_secs(2), |s| !s.audio.is_transmitting);
-    assert!(stopped, "Should stop transmitting when switching to Muted mode");
+    assert!(stopped, "Should stop transmitting when muted");
 }
 
 #[test]
@@ -988,8 +990,8 @@ fn test_disconnect_clears_transmission_state() {
     wait_for(&handle, Duration::from_secs(5), |s| s.connection.is_connected());
 
     // Start transmitting in Continuous mode
-    handle.send(BackendCommand::SetTransmissionMode {
-        mode: backend::TransmissionMode::Continuous,
+    handle.send(BackendCommand::SetVoiceMode {
+        mode: backend::VoiceMode::Continuous,
     });
 
     wait_for(&handle, Duration::from_secs(2), |s| s.audio.is_transmitting);
@@ -997,12 +999,13 @@ fn test_disconnect_clears_transmission_state() {
     // Disconnect
     handle.send(BackendCommand::Disconnect);
 
-    wait_for(&handle, Duration::from_secs(2), |s| {
-        matches!(s.connection, ConnectionState::Disconnected)
+    // Wait for both disconnect AND transmission to stop
+    let disconnected_and_stopped = wait_for(&handle, Duration::from_secs(2), |s| {
+        matches!(s.connection, ConnectionState::Disconnected) && !s.audio.is_transmitting
     });
 
     // Transmission should be stopped
-    assert!(!handle.state().audio.is_transmitting, "Should stop transmitting on disconnect");
+    assert!(disconnected_and_stopped, "Should stop transmitting on disconnect");
 }
 
 #[test]
@@ -1014,8 +1017,8 @@ fn test_continuous_mode_resumes_on_reconnect() {
     let (handle, _repaint) = create_backend_with_repaint();
 
     // Set continuous mode
-    handle.send(BackendCommand::SetTransmissionMode {
-        mode: backend::TransmissionMode::Continuous,
+    handle.send(BackendCommand::SetVoiceMode {
+        mode: backend::VoiceMode::Continuous,
     });
 
     // Connect
@@ -1038,8 +1041,8 @@ fn test_continuous_mode_resumes_on_reconnect() {
 
     // Mode should still be Continuous
     assert!(
-        matches!(handle.state().audio.transmission_mode, backend::TransmissionMode::Continuous),
-        "Mode should persist through disconnect"
+        matches!(handle.state().audio.voice_mode, backend::VoiceMode::Continuous),
+        "Voice mode should persist through disconnect"
     );
 
     // Reconnect

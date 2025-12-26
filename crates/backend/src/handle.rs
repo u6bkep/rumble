@@ -41,7 +41,7 @@
 use crate::{
     audio::AudioSystem,
     audio_task::{spawn_audio_task, AudioCommand, AudioTaskConfig, AudioTaskHandle},
-    events::{AudioState, Command, ConnectionState, State, TransmissionMode},
+    events::{AudioState, Command, ConnectionState, State, VoiceMode},
     ConnectConfig,
 };
 use api::{
@@ -116,9 +116,14 @@ impl BackendHandle {
                 output_devices,
                 selected_input: None,
                 selected_output: None,
-                transmission_mode: TransmissionMode::PushToTalk,
+                voice_mode: VoiceMode::PushToTalk,
+                self_muted: false,
+                self_deafened: false,
+                muted_users: HashSet::new(),
                 is_transmitting: false,
                 talking_users: HashSet::new(),
+                settings: Default::default(),
+                stats: Default::default(),
             },
             chat_messages: Vec::new(),
         };
@@ -192,8 +197,24 @@ impl BackendHandle {
                 });
                 return;
             }
-            Command::SetTransmissionMode { mode } => {
-                self.audio_task.send(AudioCommand::SetTransmissionMode { mode: *mode });
+            Command::SetVoiceMode { mode } => {
+                self.audio_task.send(AudioCommand::SetVoiceMode { mode: *mode });
+                return;
+            }
+            Command::SetMuted { muted } => {
+                self.audio_task.send(AudioCommand::SetMuted { muted: *muted });
+                return;
+            }
+            Command::SetDeafened { deafened } => {
+                self.audio_task.send(AudioCommand::SetDeafened { deafened: *deafened });
+                return;
+            }
+            Command::MuteUser { user_id } => {
+                self.audio_task.send(AudioCommand::MuteUser { user_id: *user_id });
+                return;
+            }
+            Command::UnmuteUser { user_id } => {
+                self.audio_task.send(AudioCommand::UnmuteUser { user_id: *user_id });
                 return;
             }
             Command::StartTransmit => {
@@ -202,6 +223,16 @@ impl BackendHandle {
             }
             Command::StopTransmit => {
                 self.audio_task.send(AudioCommand::StopTransmit);
+                return;
+            }
+            Command::UpdateAudioSettings { settings } => {
+                self.audio_task.send(AudioCommand::UpdateSettings {
+                    settings: settings.clone(),
+                });
+                return;
+            }
+            Command::ResetAudioStats => {
+                self.audio_task.send(AudioCommand::ResetStats);
                 return;
             }
             _ => {}
@@ -413,8 +444,14 @@ async fn run_connection_task(
                     | Command::StopTransmit
                     | Command::SetInputDevice { .. } 
                     | Command::SetOutputDevice { .. }
-                    | Command::SetTransmissionMode { .. }
-                    | Command::RefreshAudioDevices => {
+                    | Command::SetVoiceMode { .. }
+                    | Command::SetMuted { .. }
+                    | Command::SetDeafened { .. }
+                    | Command::MuteUser { .. }
+                    | Command::UnmuteUser { .. }
+                    | Command::RefreshAudioDevices
+                    | Command::UpdateAudioSettings { .. }
+                    | Command::ResetAudioStats => {
                         debug!("Audio command received in connection task - should be routed to audio task");
                     }
                 }
@@ -721,7 +758,7 @@ fn make_client_endpoint(remote_addr: std::net::SocketAddr, config: &ConnectConfi
     }
 
     let mut client_cfg = rustls::ClientConfig::builder_with_provider(
-        rustls::crypto::ring::default_provider().into(),
+        rustls::crypto::aws_lc_rs::default_provider().into(),
     )
     .with_protocol_versions(&[&rustls::version::TLS13])?
     .with_root_certificates(root_store)

@@ -7,10 +7,144 @@
 use crate::audio::AudioDeviceInfo;
 use api::proto::{RoomInfo, User};
 use std::collections::HashSet;
+use std::time::Instant;
 use uuid::Uuid;
 
 /// Re-export ROOT_ROOM_UUID for convenience
 pub use api::ROOT_ROOM_UUID;
+
+// =============================================================================
+// Audio Settings (Configurable)
+// =============================================================================
+
+/// Configurable audio pipeline settings.
+///
+/// These settings can be changed at runtime via the `UpdateAudioSettings` command.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AudioSettings {
+    /// Enable RNNoise denoising on microphone input.
+    pub denoise_enabled: bool,
+    
+    /// Opus encoder bitrate in bits per second.
+    /// Common values: 24000 (low), 32000 (medium), 64000 (high), 96000 (very high).
+    /// Range: 6000 - 510000.
+    pub bitrate: i32,
+    
+    /// Opus encoder complexity (0-10).
+    /// Higher values = better quality but more CPU usage.
+    /// Recommended: 5 for mobile, 10 for desktop.
+    pub encoder_complexity: i32,
+    
+    /// Number of packets to buffer before starting playback.
+    /// Higher values = more latency but smoother playback under jitter.
+    /// At 20ms per frame: 2 packets = 40ms, 3 packets = 60ms, 5 packets = 100ms.
+    pub jitter_buffer_delay_packets: u32,
+    
+    /// Enable Forward Error Correction for packet loss recovery.
+    pub fec_enabled: bool,
+    
+    /// Expected packet loss percentage (0-100) for FEC tuning.
+    /// Higher values add more redundancy at the cost of bitrate.
+    pub packet_loss_percent: i32,
+}
+
+impl Default for AudioSettings {
+    fn default() -> Self {
+        Self {
+            denoise_enabled: true,
+            bitrate: 64000,
+            encoder_complexity: 10,
+            jitter_buffer_delay_packets: 3,
+            fec_enabled: true,
+            packet_loss_percent: 5,
+        }
+    }
+}
+
+impl AudioSettings {
+    /// Bitrate presets for easy selection.
+    pub const BITRATE_LOW: i32 = 24000;
+    pub const BITRATE_MEDIUM: i32 = 32000;
+    pub const BITRATE_HIGH: i32 = 64000;
+    pub const BITRATE_VERY_HIGH: i32 = 96000;
+    
+    /// Get a human-readable description of the current bitrate.
+    pub fn bitrate_label(&self) -> &'static str {
+        match self.bitrate {
+            b if b <= 24000 => "Low (24 kbps)",
+            b if b <= 32000 => "Medium (32 kbps)",
+            b if b <= 64000 => "High (64 kbps)",
+            _ => "Very High (96+ kbps)",
+        }
+    }
+}
+
+// =============================================================================
+// Audio Statistics (Observable)
+// =============================================================================
+
+/// Runtime audio statistics for monitoring and debugging.
+///
+/// These are read-only values updated by the audio pipeline.
+#[derive(Debug, Clone, Default)]
+pub struct AudioStats {
+    /// Number of voice packets sent.
+    pub packets_sent: u64,
+    
+    /// Number of voice packets received.
+    pub packets_received: u64,
+    
+    /// Number of packets lost (detected via sequence gaps).
+    pub packets_lost: u64,
+    
+    /// Number of packets recovered via FEC.
+    pub packets_recovered_fec: u64,
+    
+    /// Number of frames concealed via PLC (packet loss concealment).
+    pub frames_concealed: u64,
+    
+    /// Total bytes of Opus data sent.
+    pub bytes_sent: u64,
+    
+    /// Total bytes of Opus data received.
+    pub bytes_received: u64,
+    
+    /// Average encoded frame size in bytes (rolling average).
+    pub avg_frame_size_bytes: f32,
+    
+    /// Estimated actual bitrate in bits per second (rolling average).
+    pub actual_bitrate_bps: f32,
+    
+    /// Current playback buffer level in packets (for jitter buffer monitoring).
+    pub playback_buffer_packets: u32,
+    
+    /// Number of buffer underruns (playback starvation events).
+    pub buffer_underruns: u64,
+    
+    /// Timestamp of last stats update.
+    pub last_update: Option<Instant>,
+}
+
+impl AudioStats {
+    /// Calculate packet loss percentage.
+    pub fn packet_loss_percent(&self) -> f32 {
+        let total = self.packets_received + self.packets_lost;
+        if total == 0 {
+            0.0
+        } else {
+            (self.packets_lost as f32 / total as f32) * 100.0
+        }
+    }
+    
+    /// Calculate FEC recovery percentage (of lost packets).
+    pub fn fec_recovery_percent(&self) -> f32 {
+        if self.packets_lost == 0 {
+            0.0
+        } else {
+            (self.packets_recovered_fec as f32 / self.packets_lost as f32) * 100.0
+        }
+    }
+}
 
 // =============================================================================
 // Connection State
@@ -56,21 +190,25 @@ impl ConnectionState {
 }
 
 // =============================================================================
-// Transmission Mode
+// Voice Mode (how voice is activated)
 // =============================================================================
 
-/// Voice transmission mode.
+/// Voice activation mode (how transmission is triggered).
+/// 
+/// Note: This is separate from mute state. A user can be in Continuous mode
+/// but still muted - mute is an orthogonal toggle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum TransmissionMode {
+pub enum VoiceMode {
     /// Only transmit while PTT key is held.
     #[default]
     PushToTalk,
-    /// Always transmitting when connected.
+    /// Always transmitting when connected (unless muted).
     Continuous,
-    /// Not transmitting (muted).
-    Muted,
     // Future: VoiceActivated { threshold: f32 }
 }
+
+/// For backwards compatibility during migration
+pub type TransmissionMode = VoiceMode;
 
 // =============================================================================
 // Audio State
@@ -87,18 +225,33 @@ pub struct AudioState {
     pub selected_input: Option<String>,
     /// Currently selected output device ID (None = system default).
     pub selected_output: Option<String>,
-    /// Current transmission mode.
-    pub transmission_mode: TransmissionMode,
+    /// Current voice activation mode (PTT vs Continuous).
+    pub voice_mode: VoiceMode,
+    /// Whether self is muted (not transmitting).
+    pub self_muted: bool,
+    /// Whether self is deafened (not receiving audio).
+    pub self_deafened: bool,
+    /// User IDs that are locally muted (we don't hear them).
+    pub muted_users: HashSet<u64>,
     /// Whether we are actually transmitting right now.
     pub is_transmitting: bool,
     /// User IDs of users currently transmitting voice.
     pub talking_users: HashSet<u64>,
+    /// Configurable audio pipeline settings.
+    pub settings: AudioSettings,
+    /// Runtime audio statistics.
+    pub stats: AudioStats,
 }
 
 impl AudioState {
     /// Create a new AudioState with default values.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Check if a specific user is locally muted.
+    pub fn is_user_muted(&self, user_id: u64) -> bool {
+        self.muted_users.contains(&user_id)
     }
 
     /// Get the selected input device info, if any.
@@ -244,12 +397,26 @@ pub enum Command {
     RefreshAudioDevices,
 
     // Transmission control
-    /// Set the transmission mode.
-    SetTransmissionMode { mode: TransmissionMode },
-    /// Start transmitting (only effective in PushToTalk mode).
+    /// Set the voice activation mode (PTT vs Continuous).
+    SetVoiceMode { mode: VoiceMode },
+    /// Set self-muted state (stops transmission).
+    SetMuted { muted: bool },
+    /// Set self-deafened state (stops receiving audio; implies muted).
+    SetDeafened { deafened: bool },
+    /// Mute a specific user locally (we won't hear them).
+    MuteUser { user_id: u64 },
+    /// Unmute a specific user locally.
+    UnmuteUser { user_id: u64 },
+    /// Start transmitting (only effective in PushToTalk mode when not muted).
     StartTransmit,
     /// Stop transmitting.
     StopTransmit,
+    
+    // Audio settings
+    /// Update audio pipeline settings (denoise, bitrate, complexity, etc.).
+    UpdateAudioSettings { settings: AudioSettings },
+    /// Reset audio statistics.
+    ResetAudioStats,
 }
 
 #[cfg(test)]
