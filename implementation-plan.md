@@ -309,6 +309,8 @@ message User {
   UserId user_id = 1;
   string username = 2;
   RoomId current_room = 3;
+  bool is_muted = 4;     // User has muted themselves (not transmitting)
+  bool is_deafened = 5;  // User has deafened themselves (not receiving audio; implies muted)
 }
 
 // Room definition
@@ -325,6 +327,13 @@ message ServerState {
 
 ```
 
+**User Status (Mute/Deafen):**
+- `is_muted`: The user has muted themselves and is not transmitting voice.
+- `is_deafened`: The user has deafened themselves and is not receiving audio. Deafen implies mute.
+- Clients send `SetUserStatus` to notify the server when their mute/deafen state changes.
+- The server broadcasts `UserStatusChanged` updates to all clients so they can display status icons.
+- This is distinct from local muting (where client A mutes client B locally).
+
 #### Incremental Updates
 
 State changes are sent as typed incremental updates with expected hash:
@@ -340,6 +349,7 @@ message StateUpdate {
     RoomCreated room_created = 13;
     RoomDeleted room_deleted = 14;
     RoomRenamed room_renamed = 15;
+    UserStatusChanged user_status_changed = 16;
   }
 }
 
@@ -347,6 +357,13 @@ message StateUpdate {
 message UserMoved {
   UserId user_id = 1;
   RoomId to_room_id = 2;
+}
+
+// Incremental update: user's mute/deafen status changed.
+message UserStatusChanged {
+  UserId user_id = 1;
+  bool is_muted = 2;
+  bool is_deafened = 3;
 }
 ```
 

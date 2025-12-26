@@ -81,6 +81,15 @@ impl ClientHandle {
     }
 }
 
+/// User status information (mute/deafen state).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UserStatus {
+    /// User has muted themselves (not transmitting).
+    pub is_muted: bool,
+    /// User has deafened themselves (not receiving audio; implies muted).
+    pub is_deafened: bool,
+}
+
 /// Inner state data protected by a single RwLock.
 /// This consolidates rooms and memberships to avoid nested lock acquisition.
 #[derive(Debug, Clone)]
@@ -89,6 +98,8 @@ pub struct StateData {
     pub rooms: Vec<RoomInfo>,
     /// Mapping of user_id to room UUID for room membership.
     pub memberships: Vec<(u64 /* user_id */, Uuid /* room_uuid */)>,
+    /// Mapping of user_id to mute/deafen status.
+    pub user_statuses: Vec<(u64 /* user_id */, UserStatus)>,
 }
 
 impl StateData {
@@ -99,6 +110,7 @@ impl StateData {
                 name: "Root".to_string(),
             }],
             memberships: Vec::new(),
+            user_statuses: Vec::new(),
         }
     }
 }
@@ -200,6 +212,25 @@ impl ServerState {
     pub async fn remove_user_membership(&self, user_id: u64) {
         let mut data = self.state_data.write().await;
         data.memberships.retain(|(uid, _)| *uid != user_id);
+        data.user_statuses.retain(|(uid, _)| *uid != user_id);
+    }
+
+    /// Set a user's mute/deafen status.
+    pub async fn set_user_status(&self, user_id: u64, status: UserStatus) {
+        let mut data = self.state_data.write().await;
+        // Remove existing status entry if present
+        data.user_statuses.retain(|(uid, _)| *uid != user_id);
+        data.user_statuses.push((user_id, status));
+    }
+
+    /// Get a user's mute/deafen status.
+    pub async fn get_user_status(&self, user_id: u64) -> UserStatus {
+        let data = self.state_data.read().await;
+        data.user_statuses
+            .iter()
+            .find(|(uid, _)| *uid == user_id)
+            .map(|(_, status)| *status)
+            .unwrap_or_default()
     }
 
     /// Get the room a user is currently in (read-only, fast).
@@ -285,21 +316,30 @@ impl ServerState {
     /// Build the current user list.
     ///
     /// This is optimized to minimize lock contention:
-    /// 1. Take a snapshot of memberships
+    /// 1. Take a snapshot of memberships and statuses
     /// 2. Look up usernames from clients (lock-free DashMap access)
     pub async fn build_user_list(&self) -> Vec<User> {
         let data = self.state_data.read().await;
         let memberships = data.memberships.clone();
+        let user_statuses = data.user_statuses.clone();
         drop(data); // Release the lock before async username lookups
 
         let mut users = Vec::with_capacity(memberships.len());
         for (uid, rid) in memberships {
             if let Some(client) = self.get_client(uid) {
                 let username = client.get_username().await;
+                // Find the user's status (default to not muted/deafened)
+                let status = user_statuses
+                    .iter()
+                    .find(|(id, _)| *id == uid)
+                    .map(|(_, s)| *s)
+                    .unwrap_or_default();
                 users.push(User {
                     user_id: Some(UserId { value: uid }),
                     current_room: Some(room_id_from_uuid(rid)),
                     username,
+                    is_muted: status.is_muted,
+                    is_deafened: status.is_deafened,
                 });
             }
         }

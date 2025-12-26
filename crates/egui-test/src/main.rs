@@ -589,7 +589,7 @@ impl eframe::App for MyApp {
                 }
                 
                 // Deafen button
-                let deafen_icon = if audio.self_deafened { "🔕" } else { "🔔" };
+                let deafen_icon = if audio.self_deafened { "🔇" } else { "🔊" };
                 let deafen_color = if audio.self_deafened { egui::Color32::RED } else { egui::Color32::GREEN };
                 if ui.add(egui::Button::new(egui::RichText::new(deafen_icon).size(18.0).color(deafen_color)))
                     .on_hover_text(if audio.self_deafened { "Undeafen" } else { "Deafen" })
@@ -602,7 +602,7 @@ impl eframe::App for MyApp {
                 
                 // Transmit mode dropdown
                 let mode_text = match audio.voice_mode {
-                    VoiceMode::PushToTalk => "🎙️ PTT",
+                    VoiceMode::PushToTalk => "🎤 PTT",
                     VoiceMode::Continuous => "📡 Continuous",
                 };
                 egui::ComboBox::from_id_salt("transmit_mode")
@@ -610,15 +610,17 @@ impl eframe::App for MyApp {
                     .show_ui(ui, |ui| {
                         if ui.selectable_label(
                             matches!(audio.voice_mode, VoiceMode::PushToTalk),
-                            "🎙️ Push-to-Talk"
+                            "🎤 Push-to-Talk"
                         ).clicked() {
                             self.backend.send(Command::SetVoiceMode { mode: VoiceMode::PushToTalk });
+                            self.save_settings();
                         }
                         if ui.selectable_label(
                             matches!(audio.voice_mode, VoiceMode::Continuous),
                             "📡 Continuous"
                         ).clicked() {
                             self.backend.send(Command::SetVoiceMode { mode: VoiceMode::Continuous });
+                            self.save_settings();
                         }
                     });
                 
@@ -784,18 +786,29 @@ impl eframe::App for MyApp {
                                         state.audio.talking_users.contains(&user_id)
                                     };
 
+                                    // Determine mute/deafen status
+                                    // For self, use local audio state; for others, use user proto fields
+                                    let (user_muted, user_deafened) = if is_self {
+                                        (state.audio.self_muted, state.audio.self_deafened)
+                                    } else {
+                                        (user.is_muted, user.is_deafened)
+                                    };
+
                                     ui.horizontal(|ui| {
+                                        // Microphone/talking indicator
                                         if is_talking {
-                                            ui.colored_label(egui::Color32::LIGHT_GREEN, "🎤");
-                                        } else if state.audio.self_muted {
+                                            ui.colored_label(egui::Color32::GREEN, "🎤");
+                                        } else if user_muted {
                                             ui.colored_label(egui::Color32::DARK_RED, "🎤");
-                                            
                                         } else {
                                             ui.colored_label(egui::Color32::DARK_GRAY, "🎤");
                                         }
-                                        if state.audio.self_deafened {
-                                            ui.colored_label(egui::Color32::DARK_RED, "🔊");
+                                        
+                                        // Deafen indicator (only show if deafened)
+                                        if user_deafened {
+                                            ui.colored_label(egui::Color32::DARK_RED, "🔇");
                                         }
+                                        
                                         ui.label(&user.username);
                                     });
                                 }

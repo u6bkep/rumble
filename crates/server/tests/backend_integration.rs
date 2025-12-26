@@ -99,7 +99,7 @@ impl TestClient {
         roots.add(cert)?;
 
         let rustls_config = rustls::ClientConfig::builder_with_provider(
-            rustls::crypto::ring::default_provider().into(),
+            rustls::crypto::aws_lc_rs::default_provider().into(),
         )
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .with_root_certificates(roots)
@@ -345,6 +345,18 @@ impl TestClient {
                             .find(|u| u.user_id.as_ref().map(|id| id.value) == Some(uid.value))
                         {
                             user.current_room = Some(to_room);
+                        }
+                    }
+                }
+                proto::state_update::Update::UserStatusChanged(usc) => {
+                    if let Some(uid) = usc.user_id {
+                        if let Some(user) = self
+                            .users
+                            .iter_mut()
+                            .find(|u| u.user_id.as_ref().map(|id| id.value) == Some(uid.value))
+                        {
+                            user.is_muted = usc.is_muted;
+                            user.is_deafened = usc.is_deafened;
                         }
                     }
                 }

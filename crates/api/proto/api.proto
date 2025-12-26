@@ -23,10 +23,13 @@ message UserId {
 
 // User identity and current room membership.
 // The current_room field tracks which room the user is in.
+// is_muted and is_deafened indicate the user's self-mute/deafen status.
 message User {
   UserId user_id = 1;
   string username = 2;
   RoomId current_room = 3;
+  bool is_muted = 4;     // User has muted themselves (not transmitting)
+  bool is_deafened = 5;  // User has deafened themselves (not receiving audio; implies muted)
 }
 
 // Room definition.
@@ -94,6 +97,7 @@ message Envelope {
     DeleteRoom delete_room = 21;
     RenameRoom rename_room = 22;
     RequestStateSync request_state_sync = 23;
+    SetUserStatus set_user_status = 24;
   }
 }
 
@@ -209,6 +213,8 @@ message StateUpdate {
     RoomDeleted room_deleted = 14;
     // A room was renamed
     RoomRenamed room_renamed = 15;
+    // A user's mute/deafen status changed
+    UserStatusChanged user_status_changed = 16;
   }
 }
 
@@ -245,4 +251,22 @@ message RoomDeleted {
 message RoomRenamed {
   RoomId room_id = 1;
   string new_name = 2;
+}
+
+// Incremental update: user's mute/deafen status changed.
+message UserStatusChanged {
+  UserId user_id = 1;
+  bool is_muted = 2;
+  bool is_deafened = 3;
+}
+
+// =============================================================================
+// Client -> Server: User Status
+// =============================================================================
+
+// Client notifies server of mute/deafen state changes.
+// Server will broadcast UserStatusChanged to all connected clients.
+message SetUserStatus {
+  bool is_muted = 1;
+  bool is_deafened = 2;
 }

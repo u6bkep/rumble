@@ -203,11 +203,13 @@ impl BackendHandle {
             }
             Command::SetMuted { muted } => {
                 self.audio_task.send(AudioCommand::SetMuted { muted: *muted });
-                return;
+                // Also notify connection task to inform server
+                // (don't return - let it fall through to send to connection task)
             }
             Command::SetDeafened { deafened } => {
                 self.audio_task.send(AudioCommand::SetDeafened { deafened: *deafened });
-                return;
+                // Also notify connection task to inform server
+                // (don't return - let it fall through to send to connection task)
             }
             Command::MuteUser { user_id } => {
                 self.audio_task.send(AudioCommand::MuteUser { user_id: *user_id });
@@ -440,13 +442,53 @@ async fn run_connection_task(
                     }
                     
                     // Audio commands are routed to audio task in BackendHandle::send()
+                    Command::SetMuted { muted } => {
+                        // Send status update to server
+                        if let Some(send) = &mut send_stream {
+                            let s = state.read().unwrap();
+                            let is_deafened = s.audio.self_deafened;
+                            drop(s);
+                            let env = proto::Envelope {
+                                state_hash: Vec::new(),
+                                payload: Some(Payload::SetUserStatus(proto::SetUserStatus {
+                                    is_muted: muted,
+                                    is_deafened,
+                                })),
+                            };
+                            let frame = encode_frame(&env);
+                            if let Err(e) = send.write_all(&frame).await {
+                                error!("Failed to send SetUserStatus: {}", e);
+                            }
+                        }
+                    }
+                    
+                    Command::SetDeafened { deafened } => {
+                        // Send status update to server
+                        // Note: deafen implies mute
+                        if let Some(send) = &mut send_stream {
+                            let s = state.read().unwrap();
+                            let is_muted = s.audio.self_muted || deafened;
+                            drop(s);
+                            let env = proto::Envelope {
+                                state_hash: Vec::new(),
+                                payload: Some(Payload::SetUserStatus(proto::SetUserStatus {
+                                    is_muted,
+                                    is_deafened: deafened,
+                                })),
+                            };
+                            let frame = encode_frame(&env);
+                            if let Err(e) = send.write_all(&frame).await {
+                                error!("Failed to send SetUserStatus: {}", e);
+                            }
+                        }
+                    }
+                    
+                    // Other audio commands are routed to audio task in BackendHandle::send()
                     Command::StartTransmit 
                     | Command::StopTransmit
                     | Command::SetInputDevice { .. } 
                     | Command::SetOutputDevice { .. }
                     | Command::SetVoiceMode { .. }
-                    | Command::SetMuted { .. }
-                    | Command::SetDeafened { .. }
                     | Command::MuteUser { .. }
                     | Command::UnmuteUser { .. }
                     | Command::RefreshAudioDevices
@@ -720,6 +762,16 @@ fn apply_state_update(
                     // Also update my_room_id if this is us
                     if s.my_user_id == Some(uid.value) {
                         s.my_room_id = api::uuid_from_room_id(&to_room_clone);
+                    }
+                }
+            }
+            proto::state_update::Update::UserStatusChanged(usc) => {
+                if let Some(uid) = usc.user_id {
+                    if let Some(user) = s.users.iter_mut().find(|u| {
+                        u.user_id.as_ref().map(|id| id.value) == Some(uid.value)
+                    }) {
+                        user.is_muted = usc.is_muted;
+                        user.is_deafened = usc.is_deafened;
                     }
                 }
             }

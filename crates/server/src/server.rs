@@ -92,7 +92,7 @@ impl Server {
 /// Create a QUIC server endpoint with the given configuration.
 fn make_server_endpoint(config: Config) -> Result<Endpoint> {
     let mut rustls_config = rustls::ServerConfig::builder_with_provider(
-        rustls::crypto::ring::default_provider().into(),
+        rustls::crypto::aws_lc_rs::default_provider().into(),
     )
     .with_protocol_versions(&[&rustls::version::TLS13])?
     .with_no_client_auth()

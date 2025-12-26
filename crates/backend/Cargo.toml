@@ -11,7 +11,7 @@ anyhow = "1"
 bytes = "1"
 api = { path = "../api" }
 prost = "0.14"
-rustls = { version = "0.23", default-features = false, features = ["std"] }
+rustls = { version = "0.23", default-features = true, features = [] }
 webpki-roots = "1.0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

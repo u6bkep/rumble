@@ -10,7 +10,7 @@
 //! - The voice path uses snapshots to avoid holding locks during relay
 //! - Client iteration is lock-free via DashMap
 
-use crate::state::{ClientHandle, ServerState, compute_server_state_hash};
+use crate::state::{ClientHandle, ServerState, UserStatus, compute_server_state_hash};
 use anyhow::Result;
 use api::{
     ROOT_ROOM_UUID, encode_frame,
@@ -62,6 +62,9 @@ pub async fn handle_envelope(
         }
         Some(Payload::RequestStateSync(rss)) => {
             handle_request_state_sync(rss, sender, state).await?;
+        }
+        Some(Payload::SetUserStatus(sus)) => {
+            handle_set_user_status(sus, sender, state).await?;
         }
         // Server-to-client messages or empty - ignore
         Some(Payload::ServerHello(_) | Payload::ServerEvent(_)) | None => {}
@@ -125,6 +128,8 @@ async fn handle_client_hello(
                 user_id: Some(proto::UserId { value: sender.user_id }),
                 username: ch.client_name,
                 current_room: Some(room_id_from_uuid(ROOT_ROOM_UUID)),
+                is_muted: false,
+                is_deafened: false,
             }),
         }),
     )
@@ -312,6 +317,39 @@ async fn handle_request_state_sync(
 
     // Send the current state to this client
     send_server_state_to_client(&sender, &state).await?;
+    Ok(())
+}
+
+/// Handle user status update (mute/deafen).
+async fn handle_set_user_status(
+    sus: proto::SetUserStatus,
+    sender: Arc<ClientHandle>,
+    state: Arc<ServerState>,
+) -> Result<()> {
+    info!(
+        user_id = sender.user_id,
+        is_muted = sus.is_muted,
+        is_deafened = sus.is_deafened,
+        "SetUserStatus"
+    );
+
+    // Update the user's status in state
+    let status = UserStatus {
+        is_muted: sus.is_muted,
+        is_deafened: sus.is_deafened,
+    };
+    state.set_user_status(sender.user_id, status).await;
+
+    // Broadcast the status change to all clients
+    broadcast_state_update(
+        &state,
+        proto::state_update::Update::UserStatusChanged(proto::UserStatusChanged {
+            user_id: Some(proto::UserId { value: sender.user_id }),
+            is_muted: sus.is_muted,
+            is_deafened: sus.is_deafened,
+        }),
+    )
+    .await?;
     Ok(())
 }
 

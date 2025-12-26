@@ -5,9 +5,9 @@ edition = "2024"
 
 [dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net", "time"] }
-quinn = "0.11"
-rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
-rcgen = "0.14"
+quinn = { version = "0.11", default-features = false, features = ["rustls-aws-lc-rs", "bloom", "log", "runtime-tokio"] }
+rustls = { version = "0.23", default-features = true, features = [] }
+rcgen = {version = "0.14", default-features = false, features = ["aws_lc_rs", "pem", "crypto"] }
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
@@ -23,7 +23,7 @@ uuid = { version = "1.19.0", features = ["v4"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-quinn = "0.11"
-rcgen = "0.14"
-rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+# quinn = "0.11"
+# rcgen = "0.14"
+# rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
 backend = { path = "../backend" }
