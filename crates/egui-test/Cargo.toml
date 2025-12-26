@@ -14,3 +14,7 @@ backend = { path = "../backend" }
 api = { path = "../api" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 clap = { version = "4.5.53", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+directories = "6.0"
+log = "0.4"

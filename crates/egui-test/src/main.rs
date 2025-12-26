@@ -1,7 +1,11 @@
 use backend::{AudioSettings, BackendHandle, Command, ConnectionState, ConnectConfig, VoiceMode};
 use clap::Parser;
+use directories::ProjectDirs;
 use eframe::egui;
 use egui::{CollapsingHeader, Modal};
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::PathBuf;
 use uuid::Uuid;
 
 /// Rumble - A voice chat client
@@ -27,6 +31,196 @@ struct Args {
     /// Path to a custom server certificate to trust
     #[arg(long)]
     cert: Option<String>,
+}
+
+// =============================================================================
+// Persistent Settings
+// =============================================================================
+
+/// Persistent settings saved to disk.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PersistentSettings {
+    // Connection settings
+    pub server_address: String,
+    pub server_password: String,
+    pub trust_dev_cert: bool,
+    pub custom_cert_path: Option<String>,
+    pub client_name: String,
+    
+    // Autoconnect
+    pub autoconnect_on_launch: bool,
+    
+    // Audio settings
+    pub audio: PersistentAudioSettings,
+    
+    // Voice mode
+    pub voice_mode: PersistentVoiceMode,
+    
+    // Selected devices (by ID)
+    pub input_device_id: Option<String>,
+    pub output_device_id: Option<String>,
+}
+
+impl Default for PersistentSettings {
+    fn default() -> Self {
+        Self {
+            server_address: String::new(),
+            server_password: String::new(),
+            trust_dev_cert: true,
+            custom_cert_path: None,
+            client_name: format!("user-{}", Uuid::new_v4().simple()),
+            autoconnect_on_launch: false,
+            audio: PersistentAudioSettings::default(),
+            voice_mode: PersistentVoiceMode::PushToTalk,
+            input_device_id: None,
+            output_device_id: None,
+        }
+    }
+}
+
+/// Serializable audio settings (mirrors backend::AudioSettings).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PersistentAudioSettings {
+    pub denoise_enabled: bool,
+    pub bitrate: i32,
+    pub encoder_complexity: i32,
+    pub jitter_buffer_delay_packets: u32,
+    pub fec_enabled: bool,
+    pub packet_loss_percent: i32,
+}
+
+impl Default for PersistentAudioSettings {
+    fn default() -> Self {
+        Self {
+            denoise_enabled: true,
+            bitrate: 64000,
+            encoder_complexity: 10,
+            jitter_buffer_delay_packets: 3,
+            fec_enabled: true,
+            packet_loss_percent: 5,
+        }
+    }
+}
+
+impl From<&AudioSettings> for PersistentAudioSettings {
+    fn from(s: &AudioSettings) -> Self {
+        Self {
+            denoise_enabled: s.denoise_enabled,
+            bitrate: s.bitrate,
+            encoder_complexity: s.encoder_complexity,
+            jitter_buffer_delay_packets: s.jitter_buffer_delay_packets,
+            fec_enabled: s.fec_enabled,
+            packet_loss_percent: s.packet_loss_percent,
+        }
+    }
+}
+
+impl From<&PersistentAudioSettings> for AudioSettings {
+    fn from(s: &PersistentAudioSettings) -> Self {
+        Self {
+            denoise_enabled: s.denoise_enabled,
+            bitrate: s.bitrate,
+            encoder_complexity: s.encoder_complexity,
+            jitter_buffer_delay_packets: s.jitter_buffer_delay_packets,
+            fec_enabled: s.fec_enabled,
+            packet_loss_percent: s.packet_loss_percent,
+        }
+    }
+}
+
+/// Serializable voice mode.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub enum PersistentVoiceMode {
+    PushToTalk,
+    Continuous,
+}
+
+impl Default for PersistentVoiceMode {
+    fn default() -> Self {
+        Self::PushToTalk
+    }
+}
+
+impl From<&VoiceMode> for PersistentVoiceMode {
+    fn from(m: &VoiceMode) -> Self {
+        match m {
+            VoiceMode::PushToTalk => Self::PushToTalk,
+            VoiceMode::Continuous => Self::Continuous,
+        }
+    }
+}
+
+impl From<PersistentVoiceMode> for VoiceMode {
+    fn from(m: PersistentVoiceMode) -> Self {
+        match m {
+            PersistentVoiceMode::PushToTalk => VoiceMode::PushToTalk,
+            PersistentVoiceMode::Continuous => VoiceMode::Continuous,
+        }
+    }
+}
+
+impl PersistentSettings {
+    /// Get the config directory path.
+    fn config_dir() -> Option<PathBuf> {
+        ProjectDirs::from("com", "rumble", "Rumble").map(|dirs| dirs.config_dir().to_path_buf())
+    }
+
+    /// Get the settings file path.
+    fn settings_path() -> Option<PathBuf> {
+        Self::config_dir().map(|dir| dir.join("settings.json"))
+    }
+
+    /// Load settings from disk, or return defaults if not found.
+    pub fn load() -> Self {
+        let Some(path) = Self::settings_path() else {
+            log::warn!("Could not determine config directory, using defaults");
+            return Self::default();
+        };
+
+        match fs::read_to_string(&path) {
+            Ok(contents) => match serde_json::from_str(&contents) {
+                Ok(settings) => {
+                    log::info!("Loaded settings from {}", path.display());
+                    settings
+                }
+                Err(e) => {
+                    log::warn!("Failed to parse settings file: {}, using defaults", e);
+                    Self::default()
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                log::info!("No settings file found, using defaults");
+                Self::default()
+            }
+            Err(e) => {
+                log::warn!("Failed to read settings file: {}, using defaults", e);
+                Self::default()
+            }
+        }
+    }
+
+    /// Save settings to disk.
+    pub fn save(&self) -> Result<(), String> {
+        let Some(dir) = Self::config_dir() else {
+            return Err("Could not determine config directory".to_string());
+        };
+
+        // Create config directory if it doesn't exist
+        if let Err(e) = fs::create_dir_all(&dir) {
+            return Err(format!("Failed to create config directory: {}", e));
+        }
+
+        let path = dir.join("settings.json");
+        let contents = serde_json::to_string_pretty(self)
+            .map_err(|e| format!("Failed to serialize settings: {}", e))?;
+
+        fs::write(&path, contents).map_err(|e| format!("Failed to write settings file: {}", e))?;
+
+        log::info!("Saved settings to {}", path.display());
+        Ok(())
+    }
 }
 
 fn main() -> eframe::Result<()> {
@@ -68,6 +262,10 @@ struct SettingsModalState {
     pending_output_device: Option<Option<String>>,
     /// Pending voice mode
     pending_voice_mode: Option<VoiceMode>,
+    /// Pending autoconnect setting
+    pending_autoconnect: Option<bool>,
+    /// Pending username
+    pending_username: Option<String>,
     /// Whether any settings have been modified
     dirty: bool,
 }
@@ -82,6 +280,11 @@ struct MyApp {
     chat_messages: Vec<String>,
     chat_input: String,
     client_name: String,
+    
+    // Persistent settings
+    persistent_settings: PersistentSettings,
+    /// Whether to autoconnect on launch
+    autoconnect_on_launch: bool,
 
     // Backend handle (manages connection, audio, and state)
     backend: BackendHandle,
@@ -111,12 +314,29 @@ impl Drop for MyApp {
 
 impl MyApp {
     fn new(ctx: egui::Context, args: Args) -> Self {
-        // Build connect config based on CLI args
+        // Load persistent settings
+        let mut persistent_settings = PersistentSettings::load();
+        
+        // CLI args override persistent settings
+        let server_address = args.server.clone().unwrap_or_else(|| persistent_settings.server_address.clone());
+        let server_password = args.password.clone().unwrap_or_else(|| persistent_settings.server_password.clone());
+        let client_name = args.name.clone().unwrap_or_else(|| {
+            if persistent_settings.client_name.is_empty() {
+                format!("user-{}", Uuid::new_v4().simple())
+            } else {
+                persistent_settings.client_name.clone()
+            }
+        });
+        let trust_dev_cert = args.trust_dev_cert || persistent_settings.trust_dev_cert;
+        
+        // Build connect config based on CLI args and persistent settings
         let mut config = ConnectConfig::new();
-        if args.trust_dev_cert {
+        if trust_dev_cert {
             config = config.with_cert("dev-certs/server-cert.der");
         }
         if let Some(cert_path) = &args.cert {
+            config = config.with_cert(cert_path);
+        } else if let Some(cert_path) = &persistent_settings.custom_cert_path {
             config = config.with_cert(cert_path);
         }
         if let Ok(cert_path) = std::env::var("RUMBLE_SERVER_CERT_PATH") {
@@ -131,12 +351,21 @@ impl MyApp {
             },
             config,
         );
-
-        // Use provided name or generate a random one
-        let client_name = args
-            .name
-            .clone()
-            .unwrap_or_else(|| format!("user-{}", Uuid::new_v4().simple()));
+        
+        // Apply persistent audio settings to backend
+        let audio_settings: AudioSettings = (&persistent_settings.audio).into();
+        backend.send(Command::UpdateAudioSettings { settings: audio_settings });
+        
+        // Apply voice mode
+        backend.send(Command::SetVoiceMode { mode: persistent_settings.voice_mode.into() });
+        
+        // Apply device selections if set
+        if persistent_settings.input_device_id.is_some() {
+            backend.send(Command::SetInputDevice { device_id: persistent_settings.input_device_id.clone() });
+        }
+        if persistent_settings.output_device_id.is_some() {
+            backend.send(Command::SetOutputDevice { device_id: persistent_settings.output_device_id.clone() });
+        }
 
         let mut chat_messages = Vec::new();
         chat_messages.push(format!(
@@ -144,22 +373,26 @@ impl MyApp {
             env!("CARGO_PKG_VERSION")
         ));
         chat_messages.push(format!("Client name: {}", client_name));
-
-        // Use provided server address or default empty
-        let connect_address = args.server.clone().unwrap_or_default();
-
-        // Use provided password or empty
-        let connect_password = args.password.clone().unwrap_or_default();
+        
+        // Update persistent settings with current values (in case CLI overrode them)
+        persistent_settings.server_address = server_address.clone();
+        persistent_settings.server_password = server_password.clone();
+        persistent_settings.client_name = client_name.clone();
+        persistent_settings.trust_dev_cert = trust_dev_cert;
+        
+        let autoconnect_on_launch = persistent_settings.autoconnect_on_launch;
 
         let mut app = Self {
             show_connect: false,
             show_settings: false,
-            connect_address: connect_address.clone(),
-            connect_password: connect_password.clone(),
-            trust_dev_cert: args.trust_dev_cert,
+            connect_address: server_address,
+            connect_password: server_password,
+            trust_dev_cert,
             chat_messages,
             chat_input: String::new(),
-            client_name: client_name.clone(),
+            client_name,
+            persistent_settings,
+            autoconnect_on_launch,
             backend,
             rename_modal: RenameModalState::default(),
             settings_modal: SettingsModalState::default(),
@@ -168,7 +401,11 @@ impl MyApp {
         };
 
         // If server was specified on command line, connect immediately
+        // Otherwise, check autoconnect setting
         if args.server.is_some() {
+            app.connect();
+        } else if autoconnect_on_launch && !app.connect_address.is_empty() {
+            app.chat_messages.push("Auto-connecting...".to_string());
             app.connect();
         }
 
@@ -195,6 +432,30 @@ impl MyApp {
             name,
             password,
         });
+    }
+    
+    /// Save current settings to persistent storage.
+    fn save_settings(&mut self) {
+        // Update persistent settings from current state
+        self.persistent_settings.server_address = self.connect_address.clone();
+        self.persistent_settings.server_password = self.connect_password.clone();
+        self.persistent_settings.client_name = self.client_name.clone();
+        self.persistent_settings.trust_dev_cert = self.trust_dev_cert;
+        self.persistent_settings.autoconnect_on_launch = self.autoconnect_on_launch;
+        
+        // Save audio settings from backend state
+        let audio = self.backend.state().audio.clone();
+        self.persistent_settings.audio = (&audio.settings).into();
+        self.persistent_settings.voice_mode = (&audio.voice_mode).into();
+        self.persistent_settings.input_device_id = audio.selected_input.clone();
+        self.persistent_settings.output_device_id = audio.selected_output.clone();
+        
+        if let Err(e) = self.persistent_settings.save() {
+            log::error!("Failed to save settings: {}", e);
+            self.chat_messages.push(format!("Failed to save settings: {}", e));
+        } else {
+            self.chat_messages.push("Settings saved.".to_string());
+        }
     }
 
     /// Attempt to reconnect with the last known connection parameters.
@@ -277,6 +538,8 @@ impl eframe::App for MyApp {
                             pending_input_device: Some(audio.selected_input.clone()),
                             pending_output_device: Some(audio.selected_output.clone()),
                             pending_voice_mode: Some(audio.voice_mode.clone()),
+                            pending_autoconnect: Some(self.autoconnect_on_launch),
+                            pending_username: Some(self.client_name.clone()),
                             dirty: false,
                         };
                         self.show_settings = true;
@@ -373,6 +636,8 @@ impl eframe::App for MyApp {
                         pending_input_device: Some(audio.selected_input.clone()),
                         pending_output_device: Some(audio.selected_output.clone()),
                         pending_voice_mode: Some(audio.voice_mode.clone()),
+                        pending_autoconnect: Some(self.autoconnect_on_launch),
+                        pending_username: Some(self.client_name.clone()),
                         dirty: false,
                     };
                     self.show_settings = true;
@@ -548,6 +813,8 @@ impl eframe::App for MyApp {
                 ui.heading("Connect to Server");
                 ui.label("Server address:");
                 ui.text_edit_singleline(&mut self.connect_address);
+                ui.label("Username:");
+                ui.text_edit_singleline(&mut self.client_name);
                 ui.label("Password (optional):");
                 ui.text_edit_singleline(&mut self.connect_password);
                 ui.checkbox(
@@ -584,6 +851,8 @@ impl eframe::App for MyApp {
                     pending_input_device: Some(audio.selected_input.clone()),
                     pending_output_device: Some(audio.selected_output.clone()),
                     pending_voice_mode: Some(audio.voice_mode.clone()),
+                    pending_autoconnect: Some(self.autoconnect_on_launch),
+                    pending_username: Some(self.client_name.clone()),
                     dirty: false,
                 };
             }
@@ -593,7 +862,7 @@ impl eframe::App for MyApp {
                 ui.set_width(400.0);
                 ui.heading("Settings");
 
-                // Connection info
+                // Connection settings
                 ui.collapsing("Connection", |ui| {
                     ui.horizontal(|ui| {
                         ui.label("Server:");
@@ -607,6 +876,32 @@ impl eframe::App for MyApp {
                             "Disconnected"
                         });
                     });
+                    
+                    ui.separator();
+                    
+                    // Username setting
+                    ui.label("Username:");
+                    let mut pending_username = self.settings_modal.pending_username.clone()
+                        .unwrap_or_else(|| self.client_name.clone());
+                    if ui.text_edit_singleline(&mut pending_username)
+                        .on_hover_text("Your display name shown to other users")
+                        .changed()
+                    {
+                        self.settings_modal.pending_username = Some(pending_username);
+                        self.settings_modal.dirty = true;
+                    }
+                    
+                    ui.separator();
+                    
+                    // Autoconnect on launch toggle
+                    let mut pending_autoconnect = self.settings_modal.pending_autoconnect.unwrap_or(self.autoconnect_on_launch);
+                    if ui.checkbox(&mut pending_autoconnect, "Autoconnect on launch")
+                        .on_hover_text("Automatically connect to the last server when the app starts")
+                        .changed() 
+                    {
+                        self.settings_modal.pending_autoconnect = Some(pending_autoconnect);
+                        self.settings_modal.dirty = true;
+                    }
                 });
 
                 ui.separator();
@@ -934,9 +1229,21 @@ impl eframe::App for MyApp {
                     ui,
                     |_l| {},
                     |ui| {
-                        // Apply button - commits all pending changes
+                        // Apply button - commits all pending changes and saves to disk
                         let apply_enabled = self.settings_modal.dirty;
                         if ui.add_enabled(apply_enabled, egui::Button::new("Apply")).clicked() {
+                            // Apply pending autoconnect setting
+                            if let Some(autoconnect) = self.settings_modal.pending_autoconnect {
+                                self.autoconnect_on_launch = autoconnect;
+                            }
+                            
+                            // Apply pending username
+                            if let Some(username) = self.settings_modal.pending_username.clone() {
+                                if !username.trim().is_empty() {
+                                    self.client_name = username;
+                                }
+                            }
+                            
                             // Apply pending audio settings
                             if let Some(settings) = self.settings_modal.pending_settings.clone() {
                                 self.backend.send(Command::UpdateAudioSettings { settings });
@@ -967,6 +1274,9 @@ impl eframe::App for MyApp {
                             }
                             
                             self.settings_modal.dirty = false;
+                            
+                            // Save settings to disk
+                            self.save_settings();
                         }
                         
                         if ui.button("Cancel").clicked() {
@@ -977,6 +1287,18 @@ impl eframe::App for MyApp {
                         if ui.button("Ok").clicked() {
                             // Apply changes before closing if dirty
                             if self.settings_modal.dirty {
+                                // Apply pending autoconnect setting
+                                if let Some(autoconnect) = self.settings_modal.pending_autoconnect {
+                                    self.autoconnect_on_launch = autoconnect;
+                                }
+                                
+                                // Apply pending username
+                                if let Some(username) = self.settings_modal.pending_username.clone() {
+                                    if !username.trim().is_empty() {
+                                        self.client_name = username;
+                                    }
+                                }
+                                
                                 if let Some(settings) = self.settings_modal.pending_settings.clone() {
                                     self.backend.send(Command::UpdateAudioSettings { settings });
                                 }
@@ -998,6 +1320,9 @@ impl eframe::App for MyApp {
                                         self.backend.send(Command::SetVoiceMode { mode });
                                     }
                                 }
+                                
+                                // Save settings to disk
+                                self.save_settings();
                             }
                             self.settings_modal = SettingsModalState::default();
                             self.show_settings = false;

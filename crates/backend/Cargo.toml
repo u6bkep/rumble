@@ -17,5 +17,5 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 cpal = "0.17.0"
 uuid = { version = "1.19.0", features = ["v4"] }
-opus = { git = "https://github.com/SpaceManiac/opus-rs", rev = "834381e"}
+opus = { git = "https://github.com/u6bkep/opus-rs.git", rev = "2c545dc"}
 nnnoiseless = { version = "0.5.2", default-features = false }
