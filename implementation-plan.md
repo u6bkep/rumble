@@ -115,21 +115,27 @@ pub struct AudioState {
     pub output_devices: Vec<AudioDeviceInfo>,
     pub selected_input: Option<String>,
     pub selected_output: Option<String>,
-    pub transmission_mode: TransmissionMode,
+    pub voice_mode: VoiceMode,
+    pub self_muted: bool,       // Orthogonal mute toggle
+    pub self_deafened: bool,    // Orthogonal deafen toggle (implies muted)
     pub is_transmitting: bool,  // Actual TX state
     pub talking_users: HashSet<u64>,  // Users currently transmitting
+    pub tx_pipeline: PipelineConfig,  // TX processing pipeline config
+    pub rx_pipeline_defaults: PipelineConfig,  // Default RX pipeline for new users
+    pub per_user_rx: HashMap<u64, UserRxConfig>,  // Per-user RX overrides
 }
 
-pub enum TransmissionMode {
+pub enum VoiceMode {
     /// Only transmit while PTT key is held
     PushToTalk,
     /// Always transmitting when connected
     Continuous,
-    /// Not transmitting (muted)
-    Muted,
-    // Future: VoiceActivated { threshold: f32 }
+    /// Transmit when voice is detected by VAD
+    VoiceActivated,
 }
 ```
+
+Note: `Muted` is now a separate orthogonal toggle (`self_muted`), not a voice mode.
 
 ### Backend Commands
 
@@ -148,19 +154,25 @@ pub enum Command {
     RenameRoom { room_id: Uuid, new_name: String },
     SendChat { text: String },
     
-    // Audio configuration (always available)
+    // Audio device configuration (always available)
     SetInputDevice { device_id: Option<String> },
     SetOutputDevice { device_id: Option<String> },
-    SetInputVolume { volume: f32 },
-    SetOutputVolume { volume: f32 },
     RefreshAudioDevices,
     
-    // Transmission control
-    SetTransmissionMode { mode: TransmissionMode },
+    // Voice mode and mute control
+    SetVoiceMode { mode: VoiceMode },
+    SetMuted { muted: bool },
+    SetDeafened { deafened: bool },
     /// For PTT: start transmitting (only effective in PushToTalk mode)
     StartTransmit,
     /// For PTT: stop transmitting
     StopTransmit,
+    
+    // Audio pipeline configuration
+    UpdateTxPipeline { config: PipelineConfig },
+    UpdateRxPipelineDefaults { config: PipelineConfig },
+    UpdateUserRxConfig { user_id: u64, config: UserRxConfig },
+    ClearUserRxOverride { user_id: u64 },
 }
 ```
 
@@ -241,21 +253,30 @@ let ctx = egui_ctx.clone();
 let backend = BackendHandle::new(move || ctx.request_repaint());
 ```
 
-### Audio Transmission Modes
+### Voice Modes
 
-**PushToTalk**: Default mode. User holds a key to transmit.
-- `StartTransmit` command begins capture and encoding
+Voice mode controls *when* transmission is triggered. Mute is a separate orthogonal toggle.
+
+**PushToTalk** (default): User holds a key to transmit.
+- `StartTransmit` command begins capture, processing, and encoding
 - `StopTransmit` command stops capture
 - `is_transmitting` in state reflects actual TX state
+- "Talking" indicator lights when PTT is active
 
-**Continuous**: Always transmitting when connected.
-- Transmission starts automatically on connection
+**Continuous**: Always transmitting when connected (unless muted).
+- Audio capture runs continuously while connected
+- All audio passes through the TX pipeline and is transmitted
+
+**VoiceActivated**: Transmit when voice is detected by the VAD processor.
 - Audio capture runs continuously
-- Future: VAD can be added to this mode to pause transmission during silence
+- TX pipeline runs, VAD processor sets `suppress` flag
+- Only transmits frames where VAD detects voice
+- "Talking" indicator lights when VAD detects voice (same behavior as PTT)
+- Configurable threshold and holdoff time in pipeline settings
 
-**Muted**: Never transmitting.
-- Audio capture is stopped
-- Can still receive and play audio from others
+**Mute Toggle** (orthogonal to voice mode):
+- When `self_muted = true`, never transmit regardless of voice mode
+- Can still receive and play audio from others (unless deafened)
 
 ### Client Identity
 
@@ -411,26 +432,308 @@ The state hash is computed using BLAKE3 over canonical protobuf serialization.
 Audio uses the Opus codec for efficient compression and low latency.
 
 ### Parameters
-- Sample rate: 48kHz
+- Sample rate: 48kHz (hardware), configurable encoding rate
 - Channels: Mono
-- Bitrate: Variable (Opus VBR)
-- Frame size: 20ms (960 samples)
+- Bitrate: Variable (Opus VBR), user-configurable
+- Frame size: 20ms default (960 samples at 48kHz), configurable
 - Mode: VOIP with DTX and FEC enabled
 
 ### Flow
 
-**Capture → Encode → Send:**
-1. cpal captures audio in callback, queues samples
-2. Audio task encodes with Opus
-3. Audio task sends directly: `connection.send_datagram()`
+**Capture → Process → Encode → Send:**
+1. cpal captures audio in callback at hardware sample rate
+2. Samples queued and batched into frames (default 20ms)
+3. TX pipeline processes frame (denoise → VAD → other stages)
+4. If `!suppress`: Opus encodes and audio task sends datagram
 
-**Receive → Decode → Play:**
-1. Audio task receives: `connection.read_datagram()`
-2. Extracts `sender_id`, routes to per-user jitter buffer (created lazily)
-3. Pulls from all active buffers by sequence number
-4. Missing packets → `decoder.decode(None)` for PLC
-5. Present packets → `decoder.decode(Some(data))`
-6. Mixed PCM from all users fed to cpal playback
+**Receive → Decode → Process → Mix → Play:**
+1. Audio task receives datagram, extracts `sender_id`
+2. Routes to per-user jitter buffer (created lazily)
+3. Opus decodes (or PLC for missing packets)
+4. Per-user RX pipeline processes decoded PCM
+5. Mixed PCM from all users fed to cpal playback
+
+---
+
+## Audio Processing Pipeline
+
+The audio processing pipeline provides a pluggable architecture for audio processing stages on both transmit (TX) and receive (RX) paths.
+
+### Design Principles
+
+1. **Unified interface**: All processors implement the same trait
+2. **Runtime configurable**: Processors can be enabled/disabled and configured at runtime
+3. **Per-user RX pipelines**: Each incoming user has their own pipeline instance
+4. **Global defaults with overrides**: UI can set defaults for all users, with per-user overrides
+5. **Frame-based processing**: Processors operate on fixed-size frames (default 20ms)
+6. **Adaptable parameters**: Frame size and sample rate can be adjusted for bandwidth/latency tradeoffs
+
+### Processor Trait
+
+```rust
+/// Result from processing an audio frame.
+pub struct ProcessorResult {
+    /// Suppress this frame from transmission/playback.
+    /// Pipeline uses OR logic: any processor returning true suppresses the frame.
+    pub suppress: bool,
+    
+    /// Audio level in dB (for metering UI). Last Some(x) wins.
+    pub level_db: Option<f32>,
+}
+
+impl Default for ProcessorResult {
+    fn default() -> Self {
+        Self { suppress: false, level_db: None }
+    }
+}
+
+/// A stage in the audio processing pipeline.
+pub trait AudioProcessor: Send + 'static {
+    /// Process a frame of audio samples in-place.
+    /// Frame size and sample rate are provided for processors that need them.
+    fn process(
+        &mut self, 
+        samples: &mut [f32], 
+        sample_rate: u32,
+    ) -> ProcessorResult;
+    
+    /// Human-readable name for debugging/UI.
+    fn name(&self) -> &'static str;
+    
+    /// Reset internal state (e.g., on transmission start/stop).
+    fn reset(&mut self) {}
+    
+    /// Get current configuration as a serializable value (for UI display).
+    fn config(&self) -> ProcessorConfig;
+    
+    /// Update configuration at runtime.
+    fn set_config(&mut self, config: &ProcessorConfig);
+    
+    /// Whether this processor is currently enabled.
+    fn is_enabled(&self) -> bool;
+    
+    /// Enable or disable this processor.
+    fn set_enabled(&mut self, enabled: bool);
+}
+
+/// Factory for creating processor instances from serialized config.
+/// Each processor type registers a factory function.
+pub trait ProcessorFactory: Send + Sync {
+    /// Unique identifier for this processor type (e.g., "builtin.denoise", "myplugin.autotune").
+    fn type_id(&self) -> &'static str;
+    
+    /// Human-readable name for UI.
+    fn display_name(&self) -> &'static str;
+    
+    /// Create a new processor instance with default settings.
+    fn create_default(&self) -> Box<dyn AudioProcessor>;
+    
+    /// Create a processor instance from serialized settings.
+    fn create_from_config(&self, config: &serde_json::Value) -> Result<Box<dyn AudioProcessor>, String>;
+    
+    /// Get the JSON schema for this processor's settings (for UI generation).
+    fn settings_schema(&self) -> serde_json::Value;
+}
+```
+
+### Pipeline Structure
+
+The pipeline uses dynamic configuration to support external processor implementations:
+
+```rust
+/// Configuration for a single processor instance.
+/// Uses JSON for settings to allow extensibility without enum variants.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ProcessorConfig {
+    /// Processor type identifier (e.g., "builtin.denoise", "builtin.vad").
+    pub type_id: String,
+    /// Whether this processor is enabled.
+    pub enabled: bool,
+    /// Processor-specific settings as JSON.
+    pub settings: serde_json::Value,
+}
+
+/// Registry for processor factories.
+/// Backend registers built-in processors; plugins can register additional ones.
+pub struct ProcessorRegistry {
+    factories: HashMap<String, Box<dyn ProcessorFactory>>,
+}
+
+impl ProcessorRegistry {
+    pub fn register(&mut self, factory: Box<dyn ProcessorFactory>) { ... }
+    pub fn create(&self, config: &ProcessorConfig) -> Result<Box<dyn AudioProcessor>, String> { ... }
+    pub fn list_available(&self) -> Vec<(&str, &str)> { ... }  // (type_id, display_name)
+}
+
+/// Complete pipeline configuration.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PipelineConfig {
+    /// Ordered list of processor configs. Order determines processing order.
+    pub processors: Vec<ProcessorConfig>,
+    /// Frame size in samples (default 960 = 20ms at 48kHz).
+    pub frame_size: usize,
+}
+
+/// Per-user RX configuration with optional overrides.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UserRxConfig {
+    /// If Some, use these overrides; if None, use global defaults.
+    pub pipeline_override: Option<PipelineConfig>,
+    /// Per-user volume adjustment (always available, in dB).
+    pub volume_db: f32,
+}
+```
+
+### Built-in Processor Type IDs
+
+Built-in processors use the `builtin.` prefix:
+- `builtin.denoise` - RNNoise denoising
+- `builtin.vad` - Voice activity detection
+- `builtin.gain` - Volume adjustment
+- `builtin.compressor` - Dynamic range compression
+- `builtin.noisegate` - Noise gate
+
+External crates can register processors with their own prefix (e.g., `myplugin.autotune`).
+
+### Built-in Processors
+
+**DenoiseProcessor** (`builtin.denoise`): RNNoise-based noise suppression.
+- Uses nnnoiseless library
+- Operates on 10ms chunks internally (480 samples at 48kHz)
+- No user-configurable parameters
+- TX default: enabled
+
+**VadProcessor**: Voice Activity Detection.
+- Energy-based detection with configurable threshold
+- Holdoff timer to avoid cutting off speech endings
+- Sets `suppress = true` when no voice detected
+- Used by VoiceActivated voice mode
+- TX only (in VoiceActivated mode)
+
+**GainProcessor**: Simple volume adjustment.
+- Configurable gain in dB
+- Used for per-user volume control on RX
+- RX default: 0 dB (unity gain)
+
+**CompressorProcessor**: Dynamic range compression.
+- Reduces dynamic range for more consistent levels
+- Configurable threshold, ratio, attack, release
+- Useful as global RX post-processor
+
+**NoiseGateProcessor**: Gate audio below threshold.
+- Sets `suppress = true` for frames below threshold
+- Configurable threshold, attack, release
+- Alternative to VAD for simple gating
+
+### Pipeline Execution
+
+```rust
+impl AudioPipeline {
+    pub fn process(&mut self, samples: &mut [f32], sample_rate: u32) -> ProcessorResult {
+        let mut result = ProcessorResult::default();
+        
+        for processor in &mut self.processors {
+            if processor.is_enabled() {
+                let r = processor.process(samples, sample_rate);
+                // OR logic for suppress
+                if r.suppress {
+                    result.suppress = true;
+                }
+                // Last level_db wins
+                if r.level_db.is_some() {
+                    result.level_db = r.level_db;
+                }
+            }
+        }
+        
+        result
+    }
+}
+```
+
+### TX Pipeline Integration
+
+The TX pipeline runs after audio capture, before Opus encoding:
+
+```
+cpal capture → frame buffer → [TX Pipeline] → Opus encode → send datagram
+                                    ↓
+                              ProcessorResult
+                                    ↓
+                         if voice_mode == VoiceActivated:
+                           is_transmitting = !result.suppress
+                           talking_indicator = !result.suppress
+```
+
+In VoiceActivated mode:
+- Pipeline always runs (to keep VAD state current)
+- `result.suppress` determines whether to transmit
+- "Talking" indicator follows `!result.suppress` (same as PTT behavior)
+
+### RX Pipeline Integration
+
+Each remote user has their own RX pipeline:
+
+```
+recv datagram → jitter buffer → Opus decode → [User RX Pipeline] → mix
+                                                      ↓
+                                              ProcessorResult
+                                                      ↓
+                                         if result.suppress: skip frame
+
+After mixing all users:
+[Global RX Pipeline (optional)] → cpal playback
+```
+
+Per-user pipeline allows:
+- Individual volume adjustment
+- Per-user noise reduction or gating
+- Muting specific users (via UI setting `suppress = true` always)
+
+### UI Configuration
+
+The UI provides:
+
+1. **TX Pipeline Settings panel:**
+   - Toggle each processor on/off
+   - Configure processor-specific settings
+   - Visual audio level meter (using `level_db` from result)
+
+2. **RX Defaults panel:**
+   - Configure default pipeline for all users
+   - Same controls as TX
+
+3. **Per-User RX (in user list):**
+   - Volume slider (maps to GainProcessor)
+   - "Use custom settings" checkbox
+   - If custom: full pipeline config like TX
+   - Local mute button (separate from server mute status)
+
+4. **Global RX Post-processing (optional):**
+   - Compressor or other processing after mixing
+   - Applies to final mixed output
+
+### Default Configurations
+
+**TX Pipeline (default):**
+1. DenoiseProcessor (enabled)
+2. VadProcessor (disabled by default, enabled when voice_mode = VoiceActivated)
+
+**RX Pipeline (default per-user):**
+1. GainProcessor at 0 dB
+
+**RX Global Post-processing (default):**
+- None (passthrough)
+
+### Sample Rate and Frame Size
+
+- Capture and playback use hardware's preferred sample rate (typically 48kHz)
+- Processors adapt to the actual sample rate
+- Frame size is configurable (default 20ms)
+- Opus encoder handles downsampling internally if bandwidth requires
+- Future: automatic adjustment based on network conditions
+
+---
 
 ### Jitter Buffer
 
@@ -497,14 +800,20 @@ struct RemoteUserAudio {
 4. Text chat over QUIC streams
 5. State synchronization with hash verification
 
+### Current Development
+1. **Audio Processing Pipeline**: Pluggable processor architecture for TX/RX
+2. **Voice Activity Detection (VAD)**: VoiceActivated mode with configurable threshold
+3. **Per-user RX processing**: Volume control and optional processing per user
+
 ### Later Features
 1. User roles and ACLs for fine-grained permissions
-2. Voice activity detection (VAD) transmission mode
-3. File transfers using BitTorrent with server as tracker
-4. Chat history snapshot sharing via torrent
-5. Mobile client support (Android, iOS, WASM)
-6. Server admin interface (CLI or web UI)
-7. Server plugins (RPC interface, scripting, loadable modules)
+2. File transfers using BitTorrent with server as tracker
+3. Chat history snapshot sharing via torrent
+4. Mobile client support (Android, iOS, WASM)
+5. Server admin interface (CLI or web UI)
+6. Server plugins (RPC interface, scripting, loadable modules)
+7. Adaptive bitrate/quality based on network conditions
+8. Advanced audio processors (AGC, equalizer, limiter)
 
 ---
 
@@ -513,10 +822,22 @@ struct RemoteUserAudio {
 ```
 crates/
 ├── api/           Protocol Buffers, message types, state structures, hash computation
+├── pipeline/      Audio processing pipeline traits and registry (no dependencies on backend)
 ├── server/        Server binary: connections, room management, message routing
-├── backend/       Client library: connection, audio, state management
+├── backend/       Client library: connection, audio, state management, built-in processors
 └── egui-test/     Desktop GUI using egui
 ```
+
+The `pipeline` crate is intentionally minimal with few dependencies, containing only:
+- `AudioProcessor` trait
+- `ProcessorFactory` trait  
+- `ProcessorResult` struct
+- `ProcessorConfig` struct (serde-serializable)
+- `PipelineConfig` struct
+- `ProcessorRegistry` 
+
+This allows external crates to depend only on `pipeline` to implement custom processors,
+without pulling in the full `backend` dependency tree.
 
 ---
 
@@ -526,4 +847,3 @@ crates/
 2. **Audio Tuning**: Optimal jitter buffer size, FEC settings, bitrate targets
 3. **TLS/ACME**: Challenge type, built-in vs external proxy
 4. **Per-User Decoder Lifetime**: How long to keep decoder state for inactive users (LRU?)
-5. **Continuous Mode + VAD**: When VAD is added, should it auto-mute during silence or just mark state?
