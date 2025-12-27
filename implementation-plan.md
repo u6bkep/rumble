@@ -128,14 +128,14 @@ pub struct AudioState {
 pub enum VoiceMode {
     /// Only transmit while PTT key is held
     PushToTalk,
-    /// Always transmitting when connected
+    /// Always transmitting when connected (subject to pipeline suppression)
     Continuous,
-    /// Transmit when voice is detected by VAD
-    VoiceActivated,
 }
 ```
 
 Note: `Muted` is now a separate orthogonal toggle (`self_muted`), not a voice mode.
+
+Note: Voice Activity Detection (VAD) is not a voice mode but rather a pipeline processor. To achieve "voice activated" transmission, use Continuous mode with the VAD processor enabled in the TX pipeline.
 
 ### Backend Commands
 
@@ -262,17 +262,14 @@ Voice mode controls *when* transmission is triggered. Mute is a separate orthogo
 - `StopTransmit` command stops capture
 - `is_transmitting` in state reflects actual TX state
 - "Talking" indicator lights when PTT is active
+- TX pipeline still runs on captured audio (for processing)
 
-**Continuous**: Always transmitting when connected (unless muted).
+**Continuous**: Always transmitting when connected (unless muted or suppressed by pipeline).
 - Audio capture runs continuously while connected
-- All audio passes through the TX pipeline and is transmitted
-
-**VoiceActivated**: Transmit when voice is detected by the VAD processor.
-- Audio capture runs continuously
-- TX pipeline runs, VAD processor sets `suppress` flag
-- Only transmits frames where VAD detects voice
-- "Talking" indicator lights when VAD detects voice (same behavior as PTT)
-- Configurable threshold and holdoff time in pipeline settings
+- All audio passes through the TX pipeline
+- If VAD processor is enabled, it can suppress transmission when no voice is detected
+- This effectively provides "voice activated" behavior when VAD is enabled
+- "Talking" indicator lights when audio is actually transmitted (not suppressed)
 
 **Mute Toggle** (orthogonal to voice mode):
 - When `self_muted = true`, never transmit regardless of voice mode
@@ -603,12 +600,13 @@ External crates can register processors with their own prefix (e.g., `myplugin.a
 - No user-configurable parameters
 - TX default: enabled
 
-**VadProcessor**: Voice Activity Detection.
+**VadProcessor** (`builtin.vad`): Voice Activity Detection.
 - Energy-based detection with configurable threshold
 - Holdoff timer to avoid cutting off speech endings
 - Sets `suppress = true` when no voice detected
-- Used by VoiceActivated voice mode
-- TX only (in VoiceActivated mode)
+- In Continuous mode with VAD enabled, provides "voice activated" behavior
+- Can also be used in PTT mode to avoid transmitting silence/noise
+- TX only
 
 **GainProcessor**: Simple volume adjustment.
 - Configurable gain in dB
@@ -660,15 +658,15 @@ cpal capture → frame buffer → [TX Pipeline] → Opus encode → send datagra
                                     ↓
                               ProcessorResult
                                     ↓
-                         if voice_mode == VoiceActivated:
-                           is_transmitting = !result.suppress
-                           talking_indicator = !result.suppress
+                         if result.suppress: skip frame
+                         is_transmitting = !result.suppress
+                         talking_indicator = !result.suppress
 ```
 
-In VoiceActivated mode:
-- Pipeline always runs (to keep VAD state current)
-- `result.suppress` determines whether to transmit
-- "Talking" indicator follows `!result.suppress` (same as PTT behavior)
+The pipeline runs in both voice modes:
+- **PTT mode**: Pipeline processes audio while key is held; `result.suppress` can still prevent transmission
+- **Continuous mode**: Pipeline runs continuously; VAD processor (if enabled) sets `suppress` to provide voice-activated behavior
+- "Talking" indicator reflects actual transmission state (`!result.suppress`)
 
 ### RX Pipeline Integration
 
@@ -717,7 +715,7 @@ The UI provides:
 
 **TX Pipeline (default):**
 1. DenoiseProcessor (enabled)
-2. VadProcessor (disabled by default, enabled when voice_mode = VoiceActivated)
+2. VadProcessor (disabled by default; enable for voice-activated transmission in Continuous mode)
 
 **RX Pipeline (default per-user):**
 1. GainProcessor at 0 dB
@@ -802,7 +800,7 @@ struct RemoteUserAudio {
 
 ### Current Development
 1. **Audio Processing Pipeline**: Pluggable processor architecture for TX/RX
-2. **Voice Activity Detection (VAD)**: VoiceActivated mode with configurable threshold
+2. **Voice Activity Detection (VAD)**: Pipeline processor for voice-gated transmission in Continuous mode
 3. **Per-user RX processing**: Volume control and optional processing per user, with the UI exposing a global rx pipeline that is internally implemented as applying the same pipeline to each user unless overridden.
 
 ### Later Features

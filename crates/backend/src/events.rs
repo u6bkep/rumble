@@ -198,30 +198,27 @@ impl ConnectionState {
 /// 
 /// Note: This is separate from mute state. A user can be in Continuous mode
 /// but still muted - mute is an orthogonal toggle.
+/// 
+/// Note: Voice Activity Detection (VAD) is not a voice mode but a pipeline
+/// processor. To achieve "voice activated" transmission, use Continuous mode
+/// with the VAD processor enabled in the TX pipeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum VoiceMode {
     /// Only transmit while PTT key is held.
     #[default]
     PushToTalk,
-    /// Always transmitting when connected (unless muted).
+    /// Always transmitting when connected (unless muted or suppressed by pipeline).
+    /// When VAD processor is enabled, this provides voice-activated behavior.
     Continuous,
-    /// Transmit when voice is detected by VAD processor.
-    /// The "talking" indicator lights when voice is detected (same as PTT).
-    VoiceActivated,
 }
 
 impl VoiceMode {
     /// Check if this mode requires the audio pipeline to run continuously.
     /// 
     /// In PTT mode, the pipeline only runs when PTT is pressed.
-    /// In Continuous and VoiceActivated modes, it runs continuously.
+    /// In Continuous mode, it runs continuously.
     pub fn requires_continuous_capture(&self) -> bool {
-        matches!(self, VoiceMode::Continuous | VoiceMode::VoiceActivated)
-    }
-    
-    /// Check if this mode uses VAD to determine transmission.
-    pub fn uses_vad(&self) -> bool {
-        matches!(self, VoiceMode::VoiceActivated)
+        matches!(self, VoiceMode::Continuous)
     }
 }
 
@@ -243,7 +240,7 @@ pub struct AudioState {
     pub selected_input: Option<String>,
     /// Currently selected output device ID (None = system default).
     pub selected_output: Option<String>,
-    /// Current voice activation mode (PTT, Continuous, or VoiceActivated).
+    /// Current voice activation mode (PTT or Continuous).
     pub voice_mode: VoiceMode,
     /// Whether self is muted (not transmitting).
     pub self_muted: bool,

@@ -390,8 +390,8 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
     // after updating its piece, eliminating bugs from inconsistent logic.
     
     /// Determine if we should be capturing audio based on current state.
-    /// Note: For VoiceActivated mode, we capture continuously but only transmit
-    /// when VAD detects voice. This function determines if capture should be active.
+    /// Note: VAD is a pipeline processor, not a voice mode. In Continuous mode
+    /// with VAD enabled, the pipeline's suppress flag gates actual transmission.
     #[inline]
     fn should_capture(
         voice_mode: VoiceMode,
@@ -405,8 +405,6 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
         match voice_mode {
             VoiceMode::Continuous => true,
             VoiceMode::PushToTalk => ptt_active,
-            // VoiceActivated captures continuously; VAD determines actual transmission
-            VoiceMode::VoiceActivated => true,
         }
     }
 
@@ -436,7 +434,6 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
                     &audio_settings,
                     &tx_pipeline_config,
                     &processor_registry,
-                    voice_mode,
                     &mut audio_input,
                     &state,
                     &repaint,
@@ -835,7 +832,6 @@ fn start_transmission(
     audio_settings: &AudioSettings,
     tx_pipeline_config: &pipeline::PipelineConfig,
     processor_registry: &pipeline::ProcessorRegistry,
-    voice_mode: VoiceMode,
     audio_input: &mut Option<AudioInput>,
     state: &Arc<RwLock<State>>,
     repaint: &Arc<dyn Fn() + Send + Sync>,
@@ -887,9 +883,6 @@ fn start_transmission(
     };
     let pipeline_mutex = std::sync::Arc::new(std::sync::Mutex::new(tx_pipeline));
     
-    // Track whether we're in VAD mode (determines if suppress gates transmission)
-    let is_vad_mode = voice_mode == VoiceMode::VoiceActivated;
-    
     // State reference for updating input_level_db
     let state_for_callback = state.clone();
 
@@ -915,22 +908,19 @@ fn start_transmission(
         };
         
         // Update input level and transmitting state in state (for UI metering)
-        // In VAD mode, is_transmitting reflects whether VAD is allowing audio through
+        // is_transmitting reflects whether audio is actually being transmitted
+        // (not suppressed by VAD or other pipeline processors)
         if let Ok(mut s) = state_for_callback.write() {
             if let Some(level_db) = pipeline_result.level_db {
                 s.audio.input_level_db = Some(level_db);
             }
             // Update is_transmitting to reflect actual transmission state
-            // In VAD mode: only true when not suppressed
-            // In other modes: always true while input is active
-            let actually_transmitting = !(is_vad_mode && pipeline_result.suppress);
-            s.audio.is_transmitting = actually_transmitting;
+            s.audio.is_transmitting = !pipeline_result.suppress;
         }
         
-        // In VAD mode, suppress flag gates actual transmission
-        // In other modes, we always encode and send
-        if is_vad_mode && pipeline_result.suppress {
-            // VAD says no voice, don't encode/send
+        // Pipeline suppress flag gates actual transmission
+        // This allows VAD (or any other processor) to prevent encoding/sending
+        if pipeline_result.suppress {
             return;
         }
         
@@ -1308,7 +1298,6 @@ mod tests {
         match voice_mode {
             VoiceMode::Continuous => true,
             VoiceMode::PushToTalk => ptt_active,
-            VoiceMode::VoiceActivated => true, // Capture continuously, VAD determines transmission
         }
     }
     
@@ -1341,16 +1330,6 @@ mod tests {
     fn test_should_capture_ptt_muted() {
         // Even if PTT is active, mute should prevent capture
         assert!(!should_capture(VoiceMode::PushToTalk, true, true, true));
-    }
-    
-    #[test]
-    fn test_should_capture_voice_activated() {
-        // VoiceActivated should capture continuously when connected and not muted
-        assert!(should_capture(VoiceMode::VoiceActivated, false, false, true));
-        // But not when muted
-        assert!(!should_capture(VoiceMode::VoiceActivated, true, false, true));
-        // Or disconnected
-        assert!(!should_capture(VoiceMode::VoiceActivated, false, false, false));
     }
     
     /// Test sync_transmission logic: updating settings while in continuous mode

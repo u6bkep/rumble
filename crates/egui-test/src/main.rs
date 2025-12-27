@@ -140,7 +140,6 @@ impl From<&PersistentAudioSettings> for AudioSettings {
 pub enum PersistentVoiceMode {
     PushToTalk,
     Continuous,
-    VoiceActivated,
 }
 
 impl Default for PersistentVoiceMode {
@@ -154,7 +153,6 @@ impl From<&VoiceMode> for PersistentVoiceMode {
         match m {
             VoiceMode::PushToTalk => Self::PushToTalk,
             VoiceMode::Continuous => Self::Continuous,
-            VoiceMode::VoiceActivated => Self::VoiceActivated,
         }
     }
 }
@@ -164,7 +162,6 @@ impl From<PersistentVoiceMode> for VoiceMode {
         match m {
             PersistentVoiceMode::PushToTalk => VoiceMode::PushToTalk,
             PersistentVoiceMode::Continuous => VoiceMode::Continuous,
-            PersistentVoiceMode::VoiceActivated => VoiceMode::VoiceActivated,
         }
     }
 }
@@ -381,10 +378,11 @@ impl MyApp {
         let tx_pipeline_config = if let Some(config) = persistent_settings.audio.tx_pipeline.clone() {
             config
         } else {
-            // Build default pipeline based on voice mode and denoise setting
+            // Build default pipeline with denoise setting
+            // VAD is disabled by default - user can enable it for voice-activated behavior
             build_default_tx_pipeline(
                 &processor_registry,
-                matches!(voice_mode, VoiceMode::VoiceActivated),
+                false, // VAD disabled by default
                 persistent_settings.audio.denoise_enabled,
             )
         };
@@ -524,7 +522,8 @@ impl MyApp {
 }
 
 /// Build a default TX pipeline config using the processor registry for defaults.
-/// If enable_vad is true, includes VAD processor with defaults.
+/// If enable_vad is true, includes VAD processor. VAD can be used in Continuous mode
+/// to provide voice-activated transmission behavior.
 fn build_default_tx_pipeline(
     registry: &ProcessorRegistry,
     enable_vad: bool,
@@ -797,7 +796,6 @@ impl eframe::App for MyApp {
                 let mode_text = match audio.voice_mode {
                     VoiceMode::PushToTalk => "🎤 PTT",
                     VoiceMode::Continuous => "📡 Continuous",
-                    VoiceMode::VoiceActivated => "🎙️ VAD",
                 };
                 egui::ComboBox::from_id_salt("transmit_mode")
                     .selected_text(mode_text)
@@ -814,13 +812,6 @@ impl eframe::App for MyApp {
                             "📡 Continuous"
                         ).clicked() {
                             self.backend.send(Command::SetVoiceMode { mode: VoiceMode::Continuous });
-                            self.save_settings();
-                        }
-                        if ui.selectable_label(
-                            matches!(audio.voice_mode, VoiceMode::VoiceActivated),
-                            "🎙️ Voice Activated"
-                        ).clicked() {
-                            self.backend.send(Command::SetVoiceMode { mode: VoiceMode::VoiceActivated });
                             self.save_settings();
                         }
                     });
@@ -854,9 +845,9 @@ impl eframe::App for MyApp {
                         ui.colored_label(egui::Color32::GREEN, "🎤 TX");
                     }
                     
-                    // Compact level meter (only when transmitting or in continuous/VAD mode)
+                    // Compact level meter (only when transmitting or in continuous mode)
                     let show_meter = audio.is_transmitting || 
-                        matches!(audio.voice_mode, VoiceMode::Continuous | VoiceMode::VoiceActivated);
+                        matches!(audio.voice_mode, VoiceMode::Continuous);
                     if show_meter {
                         if let Some(level_db) = audio.input_level_db {
                             // Normalize level_db to 0.0-1.0 range (assuming -60dB to 0dB range)
@@ -1316,15 +1307,8 @@ impl eframe::App for MyApp {
                         if ui.selectable_label(
                             matches!(pending_voice_mode, VoiceMode::Continuous),
                             "📡 Continuous",
-                        ).on_hover_text("Always transmitting when connected").clicked() {
+                        ).on_hover_text("Always transmitting when connected. Enable VAD processor for voice-activated behavior.").clicked() {
                             self.settings_modal.pending_voice_mode = Some(VoiceMode::Continuous);
-                            self.settings_modal.dirty = true;
-                        }
-                        if ui.selectable_label(
-                            matches!(pending_voice_mode, VoiceMode::VoiceActivated),
-                            "🎙️ VAD",
-                        ).on_hover_text("Voice Activated: Transmit when speaking").clicked() {
-                            self.settings_modal.pending_voice_mode = Some(VoiceMode::VoiceActivated);
                             self.settings_modal.dirty = true;
                         }
                     });
@@ -1451,10 +1435,7 @@ impl eframe::App for MyApp {
                                 ui.label("Push-to-talk: Hold SPACE to transmit");
                             }
                             VoiceMode::Continuous => {
-                                ui.label("Continuous: Always transmitting when connected");
-                            }
-                            VoiceMode::VoiceActivated => {
-                                ui.label("Voice Activated: Transmit when speaking");
+                                ui.label("Continuous: Always transmitting (enable VAD for voice activation)");
                             }
                         }
                     }

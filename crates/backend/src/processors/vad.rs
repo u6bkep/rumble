@@ -1,8 +1,9 @@
 //! Voice Activity Detection (VAD) processor.
 //!
 //! This processor detects when voice is present in the audio stream and
-//! sets the `suppress` flag when no voice is detected. It's used by the
-//! VoiceActivated transmission mode to automatically start/stop transmission.
+//! sets the `suppress` flag when no voice is detected. When enabled in the
+//! TX pipeline, it provides voice-activated transmission in Continuous mode.
+//! It can also be used in PTT mode to avoid transmitting silence/noise.
 //!
 //! The current implementation uses energy-based detection with a configurable
 //! threshold and holdoff timer to avoid cutting off speech endings.
