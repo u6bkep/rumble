@@ -124,6 +124,10 @@ impl BackendHandle {
                 talking_users: HashSet::new(),
                 settings: Default::default(),
                 stats: Default::default(),
+                tx_pipeline: Default::default(),
+                rx_pipeline_defaults: Default::default(),
+                per_user_rx: Default::default(),
+                input_level_db: None,
             },
             chat_messages: Vec::new(),
         };
@@ -235,6 +239,38 @@ impl BackendHandle {
             }
             Command::ResetAudioStats => {
                 self.audio_task.send(AudioCommand::ResetStats);
+                return;
+            }
+            Command::UpdateTxPipeline { config } => {
+                self.audio_task.send(AudioCommand::UpdateTxPipeline {
+                    config: config.clone(),
+                });
+                return;
+            }
+            Command::UpdateRxPipelineDefaults { config } => {
+                self.audio_task.send(AudioCommand::UpdateRxPipelineDefaults {
+                    config: config.clone(),
+                });
+                return;
+            }
+            Command::UpdateUserRxConfig { user_id, config } => {
+                self.audio_task.send(AudioCommand::UpdateUserRxConfig {
+                    user_id: *user_id,
+                    config: config.clone(),
+                });
+                return;
+            }
+            Command::ClearUserRxOverride { user_id } => {
+                self.audio_task.send(AudioCommand::ClearUserRxOverride {
+                    user_id: *user_id,
+                });
+                return;
+            }
+            Command::SetUserVolume { user_id, volume_db } => {
+                self.audio_task.send(AudioCommand::SetUserVolume {
+                    user_id: *user_id,
+                    volume_db: *volume_db,
+                });
                 return;
             }
             _ => {}
@@ -493,7 +529,12 @@ async fn run_connection_task(
                     | Command::UnmuteUser { .. }
                     | Command::RefreshAudioDevices
                     | Command::UpdateAudioSettings { .. }
-                    | Command::ResetAudioStats => {
+                    | Command::ResetAudioStats
+                    | Command::UpdateTxPipeline { .. }
+                    | Command::UpdateRxPipelineDefaults { .. }
+                    | Command::UpdateUserRxConfig { .. }
+                    | Command::ClearUserRxOverride { .. }
+                    | Command::SetUserVolume { .. } => {
                         debug!("Audio command received in connection task - should be routed to audio task");
                     }
                 }

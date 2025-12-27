@@ -76,6 +76,22 @@ pub use events::{AudioSettings, AudioState, AudioStats, ChatMessage, Command, Co
 pub mod handle;
 pub use handle::BackendHandle;
 
+// Audio processing pipeline - processors
+pub mod processors;
+pub use processors::{
+    register_builtin_processors,
+    GainProcessor, GainProcessorFactory,
+    DenoiseProcessor, DenoiseProcessorFactory,
+    VadProcessor, VadProcessorFactory,
+};
+
+// Re-export pipeline crate types
+pub use pipeline::{
+    AudioPipeline, AudioProcessor, ProcessorConfig, ProcessorFactory,
+    ProcessorRegistry, ProcessorResult, PipelineConfig, UserRxConfig,
+    calculate_rms_db, calculate_peak_db, db_to_linear, linear_to_db,
+};
+
 // Re-exports from api crate
 pub use api::proto::VoiceDatagram;
 pub use api::ROOT_ROOM_UUID;

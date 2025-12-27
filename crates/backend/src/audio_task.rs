@@ -31,6 +31,7 @@ use crate::{
 };
 use api::proto::VoiceDatagram;
 use bytes::Bytes;
+use pipeline;
 use prost::Message;
 use std::{
     collections::{BTreeMap, HashMap},
@@ -74,6 +75,16 @@ pub enum AudioCommand {
     UpdateSettings { settings: AudioSettings },
     /// Reset audio statistics.
     ResetStats,
+    /// Update TX pipeline configuration.
+    UpdateTxPipeline { config: pipeline::PipelineConfig },
+    /// Update RX pipeline defaults (for new users).
+    UpdateRxPipelineDefaults { config: pipeline::PipelineConfig },
+    /// Update a specific user's RX configuration.
+    UpdateUserRxConfig { user_id: u64, config: pipeline::UserRxConfig },
+    /// Clear per-user RX override (use defaults).
+    ClearUserRxOverride { user_id: u64 },
+    /// Set volume for a specific user.
+    SetUserVolume { user_id: u64, volume_db: f32 },
     /// Shutdown the audio task.
     Shutdown,
 }
@@ -106,6 +117,10 @@ struct UserAudioState {
     frames_concealed: u64,
     /// Statistics: bytes received.
     bytes_received: u64,
+    /// Per-user RX pipeline for processing audio before playback.
+    rx_pipeline: Option<pipeline::AudioPipeline>,
+    /// Per-user volume adjustment in dB.
+    volume_db: f32,
 }
 
 /// Maximum jitter buffer size (drop old packets beyond this).
@@ -131,7 +146,19 @@ impl UserAudioState {
             packets_recovered_fec: 0,
             frames_concealed: 0,
             bytes_received: 0,
+            rx_pipeline: None,
+            volume_db: 0.0,
         })
+    }
+    
+    /// Apply volume adjustment to samples.
+    fn apply_volume(&self, samples: &mut [f32]) {
+        if self.volume_db != 0.0 {
+            let gain = 10.0f32.powf(self.volume_db / 20.0);
+            for sample in samples.iter_mut() {
+                *sample = (*sample * gain).clamp(-1.0, 1.0);
+            }
+        }
     }
 
     /// Insert a packet into the jitter buffer.
@@ -320,6 +347,26 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
         let s = state.read().unwrap();
         s.audio.settings.clone()
     };
+    
+    // TX pipeline configuration (start with defaults from state)
+    let mut tx_pipeline_config = {
+        let s = state.read().unwrap();
+        s.audio.tx_pipeline.clone()
+    };
+    
+    // RX pipeline defaults and per-user configs
+    let mut rx_pipeline_defaults = {
+        let s = state.read().unwrap();
+        s.audio.rx_pipeline_defaults.clone()
+    };
+    let mut per_user_rx: HashMap<u64, pipeline::UserRxConfig> = {
+        let s = state.read().unwrap();
+        s.audio.per_user_rx.clone()
+    };
+    
+    // Create processor registry with built-in processors
+    let mut processor_registry = pipeline::ProcessorRegistry::new();
+    crate::processors::register_builtin_processors(&mut processor_registry);
 
     // Channel for encoded audio frames to send
     let (encoded_tx, mut encoded_rx) = mpsc::unbounded_channel::<EncodedFrame>();
@@ -342,10 +389,11 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
     // Every handler that changes relevant state just calls sync_transmission_state()
     // after updating its piece, eliminating bugs from inconsistent logic.
     
-    /// Determine if we should be transmitting based on current state.
-    /// This is the SINGLE SOURCE OF TRUTH for transmission decisions.
+    /// Determine if we should be capturing audio based on current state.
+    /// Note: For VoiceActivated mode, we capture continuously but only transmit
+    /// when VAD detects voice. This function determines if capture should be active.
     #[inline]
-    fn should_transmit(
+    fn should_capture(
         voice_mode: VoiceMode,
         self_muted: bool,
         ptt_active: bool,
@@ -357,6 +405,8 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
         match voice_mode {
             VoiceMode::Continuous => true,
             VoiceMode::PushToTalk => ptt_active,
+            // VoiceActivated captures continuously; VAD determines actual transmission
+            VoiceMode::VoiceActivated => true,
         }
     }
 
@@ -371,15 +421,26 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
 
     info!("Audio task started");
     
-    /// Macro to sync transmission state after any state change.
-    /// This ensures transmission is started/stopped to match the desired state.
+    /// Macro to sync capture state after any state change.
+    /// This ensures capture is started/stopped to match the desired state.
     macro_rules! sync_transmission {
         () => {{
-            let want = should_transmit(voice_mode, self_muted, ptt_active, connection.is_some());
+            let want = should_capture(voice_mode, self_muted, ptt_active, connection.is_some());
             let have = audio_input.is_some();
             
             if want && !have {
-                start_transmission(&audio_system, &selected_input, &encoded_tx, &audio_settings, &mut audio_input, &state, &repaint);
+                start_transmission(
+                    &audio_system,
+                    &selected_input,
+                    &encoded_tx,
+                    &audio_settings,
+                    &tx_pipeline_config,
+                    &processor_registry,
+                    voice_mode,
+                    &mut audio_input,
+                    &state,
+                    &repaint,
+                );
             } else if !want && have {
                 stop_transmission(&mut audio_input, &state, &repaint);
             }
@@ -583,6 +644,102 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
                         repaint();
                     }
 
+                    AudioCommand::UpdateTxPipeline { config } => {
+                        info!("Audio task: updating TX pipeline config");
+                        tx_pipeline_config = config.clone();
+                        {
+                            let mut s = state.write().unwrap();
+                            s.audio.tx_pipeline = config;
+                        }
+                        repaint();
+                        
+                        // Restart transmission to rebuild pipeline with new config
+                        if audio_input.is_some() {
+                            stop_transmission(&mut audio_input, &state, &repaint);
+                            sync_transmission!();
+                        }
+                    }
+
+                    AudioCommand::UpdateRxPipelineDefaults { config } => {
+                        info!("Audio task: updating RX pipeline defaults");
+                        rx_pipeline_defaults = config.clone();
+                        {
+                            let mut s = state.write().unwrap();
+                            s.audio.rx_pipeline_defaults = config;
+                        }
+                        // Rebuild pipelines for users without overrides
+                        for (user_id, user_state) in user_audio.iter_mut() {
+                            if !per_user_rx.contains_key(user_id) {
+                                match pipeline::AudioPipeline::from_config(&rx_pipeline_defaults, &processor_registry) {
+                                    Ok(p) => user_state.rx_pipeline = Some(p),
+                                    Err(e) => warn!("Failed to rebuild RX pipeline for user {}: {}", user_id, e),
+                                }
+                            }
+                        }
+                        repaint();
+                    }
+
+                    AudioCommand::UpdateUserRxConfig { user_id, config } => {
+                        info!("Audio task: updating RX config for user {}", user_id);
+                        let volume_db = config.volume_db;
+                        // Clone the pipeline config before moving config
+                        let pipeline_config_owned = config.pipeline_override.clone();
+                        per_user_rx.insert(user_id, config.clone());
+                        {
+                            let mut s = state.write().unwrap();
+                            s.audio.per_user_rx.insert(user_id, config);
+                        }
+                        // Rebuild this user's pipeline if they exist
+                        if let Some(user_state) = user_audio.get_mut(&user_id) {
+                            let pipeline_config = pipeline_config_owned.as_ref().unwrap_or(&rx_pipeline_defaults);
+                            match pipeline::AudioPipeline::from_config(pipeline_config, &processor_registry) {
+                                Ok(p) => user_state.rx_pipeline = Some(p),
+                                Err(e) => warn!("Failed to rebuild RX pipeline for user {}: {}", user_id, e),
+                            }
+                            user_state.volume_db = volume_db;
+                        }
+                        repaint();
+                    }
+
+                    AudioCommand::ClearUserRxOverride { user_id } => {
+                        info!("Audio task: clearing RX override for user {}", user_id);
+                        per_user_rx.remove(&user_id);
+                        {
+                            let mut s = state.write().unwrap();
+                            s.audio.per_user_rx.remove(&user_id);
+                        }
+                        // Rebuild user's pipeline with defaults
+                        if let Some(user_state) = user_audio.get_mut(&user_id) {
+                            match pipeline::AudioPipeline::from_config(&rx_pipeline_defaults, &processor_registry) {
+                                Ok(p) => user_state.rx_pipeline = Some(p),
+                                Err(e) => warn!("Failed to rebuild RX pipeline for user {}: {}", user_id, e),
+                            }
+                            user_state.volume_db = 0.0;
+                        }
+                        repaint();
+                    }
+
+                    AudioCommand::SetUserVolume { user_id, volume_db } => {
+                        info!("Audio task: setting volume for user {} to {} dB", user_id, volume_db);
+                        // Update per-user config
+                        let user_rx = per_user_rx
+                            .entry(user_id)
+                            .or_insert_with(pipeline::UserRxConfig::default);
+                        user_rx.volume_db = volume_db;
+                        {
+                            let mut s = state.write().unwrap();
+                            let user_rx = s.audio.per_user_rx
+                                .entry(user_id)
+                                .or_insert_with(pipeline::UserRxConfig::default);
+                            user_rx.volume_db = volume_db;
+                        }
+                        // Update live user state if they exist
+                        if let Some(user_state) = user_audio.get_mut(&user_id) {
+                            user_state.volume_db = volume_db;
+                        }
+                        repaint();
+                    }
+
                     AudioCommand::Shutdown => {
                         info!("Audio task shutting down");
                         break;
@@ -635,6 +792,9 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
                                         voice.opus_data,
                                         &mut user_audio,
                                         &audio_settings,
+                                        &rx_pipeline_defaults,
+                                        &per_user_rx,
+                                        &processor_registry,
                                         &state,
                                         &repaint,
                                     );
@@ -673,6 +833,9 @@ fn start_transmission(
     selected_input: &Option<String>,
     encoded_tx: &mpsc::UnboundedSender<EncodedFrame>,
     audio_settings: &AudioSettings,
+    tx_pipeline_config: &pipeline::PipelineConfig,
+    processor_registry: &pipeline::ProcessorRegistry,
+    voice_mode: VoiceMode,
     audio_input: &mut Option<AudioInput>,
     state: &Arc<RwLock<State>>,
     repaint: &Arc<dyn Fn() + Send + Sync>,
@@ -714,19 +877,66 @@ fn start_transmission(
     };
     let encoder_mutex = std::sync::Arc::new(std::sync::Mutex::new(encoder));
 
-    // Create audio config with denoise setting
+    // Build the TX pipeline from config
+    let tx_pipeline = match pipeline::AudioPipeline::from_config(tx_pipeline_config, processor_registry) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!("Failed to build TX pipeline, using empty pipeline: {}", e);
+            pipeline::AudioPipeline::new(tx_pipeline_config.frame_size)
+        }
+    };
+    let pipeline_mutex = std::sync::Arc::new(std::sync::Mutex::new(tx_pipeline));
+    
+    // Track whether we're in VAD mode (determines if suppress gates transmission)
+    let is_vad_mode = voice_mode == VoiceMode::VoiceActivated;
+    
+    // State reference for updating input_level_db
+    let state_for_callback = state.clone();
+
+    // Create audio config - note: legacy denoise is separate from pipeline denoise
+    // The AudioConfig denoise runs in the audio callback before the pipeline
     let audio_config = if audio_settings.denoise_enabled {
         AudioConfig::default().with_denoise()
     } else {
         AudioConfig::default()
     };
 
-    // Create audio input with encoding callback
+    // Create audio input with pipeline + encoding callback
     let encoded_tx = encoded_tx.clone();
     let input = AudioInput::new(&device, &audio_config, move |samples| {
-        // Encode the audio frame
+        // Run samples through the TX pipeline
+        // We make a mutable copy since the callback receives &[f32]
+        let mut processed_samples = samples.to_vec();
+        
+        let pipeline_result = if let Ok(mut pipe) = pipeline_mutex.lock() {
+            pipe.process(&mut processed_samples, 48000)
+        } else {
+            pipeline::ProcessorResult::default()
+        };
+        
+        // Update input level and transmitting state in state (for UI metering)
+        // In VAD mode, is_transmitting reflects whether VAD is allowing audio through
+        if let Ok(mut s) = state_for_callback.write() {
+            if let Some(level_db) = pipeline_result.level_db {
+                s.audio.input_level_db = Some(level_db);
+            }
+            // Update is_transmitting to reflect actual transmission state
+            // In VAD mode: only true when not suppressed
+            // In other modes: always true while input is active
+            let actually_transmitting = !(is_vad_mode && pipeline_result.suppress);
+            s.audio.is_transmitting = actually_transmitting;
+        }
+        
+        // In VAD mode, suppress flag gates actual transmission
+        // In other modes, we always encode and send
+        if is_vad_mode && pipeline_result.suppress {
+            // VAD says no voice, don't encode/send
+            return;
+        }
+        
+        // Encode the processed audio frame
         if let Ok(mut enc) = encoder_mutex.lock() {
-            match enc.encode(samples) {
+            match enc.encode(&processed_samples) {
                 Ok(encoded) => {
                     let size_bytes = encoded.len();
                     let _ = encoded_tx.send(EncodedFrame {
@@ -749,7 +959,7 @@ fn start_transmission(
                 s.audio.is_transmitting = true;
             }
             repaint();
-            info!("Started audio transmission");
+            info!("Started audio transmission with pipeline ({} processors)", tx_pipeline_config.processors.len());
         }
         Err(e) => {
             error!("Failed to start audio input: {}", e);
@@ -821,13 +1031,37 @@ fn handle_voice_datagram(
     opus_data: Vec<u8>,
     user_audio: &mut HashMap<u64, UserAudioState>,
     audio_settings: &AudioSettings,
+    rx_pipeline_defaults: &pipeline::PipelineConfig,
+    per_user_rx: &HashMap<u64, pipeline::UserRxConfig>,
+    processor_registry: &pipeline::ProcessorRegistry,
     state: &Arc<RwLock<State>>,
     repaint: &Arc<dyn Fn() + Send + Sync>,
 ) {
     // Get or create per-user audio state
     let jitter_delay = audio_settings.jitter_buffer_delay_packets;
     let user_state = user_audio.entry(sender_id).or_insert_with(|| {
-        UserAudioState::new(jitter_delay).expect("create user audio state")
+        // Determine pipeline config and volume for this user
+        let (pipeline_config, volume_db) = match per_user_rx.get(&sender_id) {
+            Some(user_rx) => {
+                let config = user_rx.pipeline_override.as_ref().unwrap_or(rx_pipeline_defaults);
+                (config, user_rx.volume_db)
+            }
+            None => (rx_pipeline_defaults, 0.0),
+        };
+        
+        // Build the RX pipeline
+        let rx_pipeline = match pipeline::AudioPipeline::from_config(pipeline_config, processor_registry) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                warn!("Failed to build RX pipeline for user {}: {}", sender_id, e);
+                None
+            }
+        };
+        
+        let mut user_state = UserAudioState::new(jitter_delay).expect("create user audio state");
+        user_state.rx_pipeline = rx_pipeline;
+        user_state.volume_db = volume_db;
+        user_state
     });
 
     // Insert packet into jitter buffer
@@ -869,7 +1103,19 @@ fn mix_and_play_audio(
         }
 
         // Get next frame (decoded or PLC)
-        if let Some(pcm) = user_state.get_next_frame() {
+        if let Some(mut pcm) = user_state.get_next_frame() {
+            // Run through user's RX pipeline if present
+            if let Some(ref mut pipeline) = user_state.rx_pipeline {
+                let result = pipeline.process(&mut pcm, 48000);
+                // For RX, suppress means don't play this frame (noise gate, etc.)
+                if result.suppress {
+                    continue;
+                }
+            }
+            
+            // Apply per-user volume adjustment
+            user_state.apply_volume(&mut pcm);
+            
             has_audio = true;
             // Mix by summing with clamping to [-1.0, 1.0]
             for (i, &sample) in pcm.iter().enumerate() {
@@ -1049,8 +1295,8 @@ mod tests {
         assert_eq!(state.next_play_seq, 1, "next_play_seq should not change for normal packets");
     }
 
-    // Helper: simulate should_transmit logic
-    fn should_transmit(
+    // Helper: simulate should_capture logic (renamed from should_transmit)
+    fn should_capture(
         voice_mode: VoiceMode,
         self_muted: bool,
         ptt_active: bool,
@@ -1062,38 +1308,49 @@ mod tests {
         match voice_mode {
             VoiceMode::Continuous => true,
             VoiceMode::PushToTalk => ptt_active,
+            VoiceMode::VoiceActivated => true, // Capture continuously, VAD determines transmission
         }
     }
     
     #[test]
-    fn test_should_transmit_continuous_connected() {
-        assert!(should_transmit(VoiceMode::Continuous, false, false, true));
+    fn test_should_capture_continuous_connected() {
+        assert!(should_capture(VoiceMode::Continuous, false, false, true));
     }
     
     #[test]
-    fn test_should_transmit_continuous_muted() {
-        assert!(!should_transmit(VoiceMode::Continuous, true, false, true));
+    fn test_should_capture_continuous_muted() {
+        assert!(!should_capture(VoiceMode::Continuous, true, false, true));
     }
     
     #[test]
-    fn test_should_transmit_continuous_disconnected() {
-        assert!(!should_transmit(VoiceMode::Continuous, false, false, false));
+    fn test_should_capture_continuous_disconnected() {
+        assert!(!should_capture(VoiceMode::Continuous, false, false, false));
     }
     
     #[test]
-    fn test_should_transmit_ptt_active() {
-        assert!(should_transmit(VoiceMode::PushToTalk, false, true, true));
+    fn test_should_capture_ptt_active() {
+        assert!(should_capture(VoiceMode::PushToTalk, false, true, true));
     }
     
     #[test]
-    fn test_should_transmit_ptt_inactive() {
-        assert!(!should_transmit(VoiceMode::PushToTalk, false, false, true));
+    fn test_should_capture_ptt_inactive() {
+        assert!(!should_capture(VoiceMode::PushToTalk, false, false, true));
     }
     
     #[test]
-    fn test_should_transmit_ptt_muted() {
-        // Even if PTT is active, mute should prevent transmission
-        assert!(!should_transmit(VoiceMode::PushToTalk, true, true, true));
+    fn test_should_capture_ptt_muted() {
+        // Even if PTT is active, mute should prevent capture
+        assert!(!should_capture(VoiceMode::PushToTalk, true, true, true));
+    }
+    
+    #[test]
+    fn test_should_capture_voice_activated() {
+        // VoiceActivated should capture continuously when connected and not muted
+        assert!(should_capture(VoiceMode::VoiceActivated, false, false, true));
+        // But not when muted
+        assert!(!should_capture(VoiceMode::VoiceActivated, true, false, true));
+        // Or disconnected
+        assert!(!should_capture(VoiceMode::VoiceActivated, false, false, false));
     }
     
     /// Test sync_transmission logic: updating settings while in continuous mode
@@ -1109,7 +1366,7 @@ mod tests {
         audio_input_present = false;
         
         // sync_transmission! would do:
-        let want = should_transmit(voice_mode, self_muted, ptt_active, connected);
+        let want = should_capture(voice_mode, self_muted, ptt_active, connected);
         let have = audio_input_present;
         
         if want && !have {
@@ -1118,19 +1375,19 @@ mod tests {
             audio_input_present = false; // stop_transmission would be called
         }
         
-        assert!(audio_input_present, "Should restart transmission in continuous mode");
+        assert!(audio_input_present, "Should restart capture in continuous mode");
     }
     
-    /// Test sync_transmission logic: muting stops transmission
+    /// Test sync_transmission logic: muting stops capture
     #[test]
     fn test_sync_transmission_mute() {
         let voice_mode = VoiceMode::Continuous;
         let self_muted = true; // NOW MUTED
         let ptt_active = false;
         let connected = true;
-        let mut audio_input_present = true; // Currently transmitting
+        let mut audio_input_present = true; // Currently capturing
         
-        let want = should_transmit(voice_mode, self_muted, ptt_active, connected);
+        let want = should_capture(voice_mode, self_muted, ptt_active, connected);
         let have = audio_input_present;
         
         if want && !have {
@@ -1139,19 +1396,19 @@ mod tests {
             audio_input_present = false; // stop_transmission should be called
         }
         
-        assert!(!audio_input_present, "Should stop transmission when muted");
+        assert!(!audio_input_present, "Should stop capture when muted");
     }
     
-    /// Test sync_transmission logic: unmuting resumes transmission
+    /// Test sync_transmission logic: unmuting resumes capture
     #[test]
     fn test_sync_transmission_unmute() {
         let voice_mode = VoiceMode::Continuous;
         let self_muted = false; // UNMUTED
         let ptt_active = false;
         let connected = true;
-        let mut audio_input_present = false; // Currently not transmitting (was muted)
+        let mut audio_input_present = false; // Currently not capturing (was muted)
         
-        let want = should_transmit(voice_mode, self_muted, ptt_active, connected);
+        let want = should_capture(voice_mode, self_muted, ptt_active, connected);
         let have = audio_input_present;
         
         if want && !have {
@@ -1160,7 +1417,7 @@ mod tests {
             audio_input_present = false;
         }
         
-        assert!(audio_input_present, "Should resume transmission when unmuted in continuous mode");
+        assert!(audio_input_present, "Should resume capture when unmuted in continuous mode");
     }
     
     /// Test sync_transmission logic: PTT release in PTT mode
@@ -1170,9 +1427,9 @@ mod tests {
         let self_muted = false;
         let ptt_active = false; // PTT released
         let connected = true;
-        let mut audio_input_present = true; // Was transmitting
+        let mut audio_input_present = true; // Was capturing
         
-        let want = should_transmit(voice_mode, self_muted, ptt_active, connected);
+        let want = should_capture(voice_mode, self_muted, ptt_active, connected);
         let have = audio_input_present;
         
         if want && !have {
@@ -1181,6 +1438,6 @@ mod tests {
             audio_input_present = false; // stop_transmission should be called
         }
         
-        assert!(!audio_input_present, "Should stop transmission when PTT released");
+        assert!(!audio_input_present, "Should stop capture when PTT released");
     }
 }

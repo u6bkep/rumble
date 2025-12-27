@@ -6,7 +6,8 @@
 
 use crate::audio::AudioDeviceInfo;
 use api::proto::{RoomInfo, User};
-use std::collections::HashSet;
+use pipeline::{PipelineConfig, UserRxConfig};
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 use uuid::Uuid;
 
@@ -204,7 +205,24 @@ pub enum VoiceMode {
     PushToTalk,
     /// Always transmitting when connected (unless muted).
     Continuous,
-    // Future: VoiceActivated { threshold: f32 }
+    /// Transmit when voice is detected by VAD processor.
+    /// The "talking" indicator lights when voice is detected (same as PTT).
+    VoiceActivated,
+}
+
+impl VoiceMode {
+    /// Check if this mode requires the audio pipeline to run continuously.
+    /// 
+    /// In PTT mode, the pipeline only runs when PTT is pressed.
+    /// In Continuous and VoiceActivated modes, it runs continuously.
+    pub fn requires_continuous_capture(&self) -> bool {
+        matches!(self, VoiceMode::Continuous | VoiceMode::VoiceActivated)
+    }
+    
+    /// Check if this mode uses VAD to determine transmission.
+    pub fn uses_vad(&self) -> bool {
+        matches!(self, VoiceMode::VoiceActivated)
+    }
 }
 
 /// For backwards compatibility during migration
@@ -225,7 +243,7 @@ pub struct AudioState {
     pub selected_input: Option<String>,
     /// Currently selected output device ID (None = system default).
     pub selected_output: Option<String>,
-    /// Current voice activation mode (PTT vs Continuous).
+    /// Current voice activation mode (PTT, Continuous, or VoiceActivated).
     pub voice_mode: VoiceMode,
     /// Whether self is muted (not transmitting).
     pub self_muted: bool,
@@ -237,10 +255,21 @@ pub struct AudioState {
     pub is_transmitting: bool,
     /// User IDs of users currently transmitting voice.
     pub talking_users: HashSet<u64>,
-    /// Configurable audio pipeline settings.
+    /// Configurable audio pipeline settings (legacy, for Opus encoder config).
     pub settings: AudioSettings,
     /// Runtime audio statistics.
     pub stats: AudioStats,
+    
+    // Pipeline configuration
+    /// TX (transmit) pipeline configuration.
+    pub tx_pipeline: PipelineConfig,
+    /// Default RX (receive) pipeline configuration for all users.
+    pub rx_pipeline_defaults: PipelineConfig,
+    /// Per-user RX configuration overrides.
+    pub per_user_rx: HashMap<u64, UserRxConfig>,
+    
+    /// Current audio input level in dB (from TX pipeline, for UI metering).
+    pub input_level_db: Option<f32>,
 }
 
 impl AudioState {
@@ -417,6 +446,18 @@ pub enum Command {
     UpdateAudioSettings { settings: AudioSettings },
     /// Reset audio statistics.
     ResetAudioStats,
+    
+    // Pipeline configuration
+    /// Update the TX (transmit) pipeline configuration.
+    UpdateTxPipeline { config: PipelineConfig },
+    /// Update the default RX (receive) pipeline configuration for all users.
+    UpdateRxPipelineDefaults { config: PipelineConfig },
+    /// Update configuration for a specific user's RX pipeline.
+    UpdateUserRxConfig { user_id: u64, config: UserRxConfig },
+    /// Remove per-user RX override, reverting to defaults.
+    ClearUserRxOverride { user_id: u64 },
+    /// Set per-user volume (convenience command, updates UserRxConfig).
+    SetUserVolume { user_id: u64, volume_db: f32 },
 }
 
 #[cfg(test)]

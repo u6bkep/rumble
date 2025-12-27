@@ -803,7 +803,7 @@ struct RemoteUserAudio {
 ### Current Development
 1. **Audio Processing Pipeline**: Pluggable processor architecture for TX/RX
 2. **Voice Activity Detection (VAD)**: VoiceActivated mode with configurable threshold
-3. **Per-user RX processing**: Volume control and optional processing per user
+3. **Per-user RX processing**: Volume control and optional processing per user, with the UI exposing a global rx pipeline that is internally implemented as applying the same pipeline to each user unless overridden.
 
 ### Later Features
 1. User roles and ACLs for fine-grained permissions

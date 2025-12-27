@@ -1,4 +1,4 @@
-use backend::{AudioSettings, BackendHandle, Command, ConnectionState, ConnectConfig, VoiceMode};
+use backend::{AudioSettings, BackendHandle, Command, ConnectionState, ConnectConfig, PipelineConfig, ProcessorRegistry, VoiceMode, register_builtin_processors};
 use clap::Parser;
 use directories::ProjectDirs;
 use eframe::egui;
@@ -89,6 +89,8 @@ pub struct PersistentAudioSettings {
     pub jitter_buffer_delay_packets: u32,
     pub fec_enabled: bool,
     pub packet_loss_percent: i32,
+    /// TX pipeline configuration (processors and their settings)
+    pub tx_pipeline: Option<PipelineConfig>,
 }
 
 impl Default for PersistentAudioSettings {
@@ -100,6 +102,7 @@ impl Default for PersistentAudioSettings {
             jitter_buffer_delay_packets: 3,
             fec_enabled: true,
             packet_loss_percent: 5,
+            tx_pipeline: None,
         }
     }
 }
@@ -113,6 +116,8 @@ impl From<&AudioSettings> for PersistentAudioSettings {
             jitter_buffer_delay_packets: s.jitter_buffer_delay_packets,
             fec_enabled: s.fec_enabled,
             packet_loss_percent: s.packet_loss_percent,
+            // TX pipeline is stored separately, not in AudioSettings
+            tx_pipeline: None,
         }
     }
 }
@@ -135,6 +140,7 @@ impl From<&PersistentAudioSettings> for AudioSettings {
 pub enum PersistentVoiceMode {
     PushToTalk,
     Continuous,
+    VoiceActivated,
 }
 
 impl Default for PersistentVoiceMode {
@@ -148,6 +154,7 @@ impl From<&VoiceMode> for PersistentVoiceMode {
         match m {
             VoiceMode::PushToTalk => Self::PushToTalk,
             VoiceMode::Continuous => Self::Continuous,
+            VoiceMode::VoiceActivated => Self::VoiceActivated,
         }
     }
 }
@@ -157,6 +164,7 @@ impl From<PersistentVoiceMode> for VoiceMode {
         match m {
             PersistentVoiceMode::PushToTalk => VoiceMode::PushToTalk,
             PersistentVoiceMode::Continuous => VoiceMode::Continuous,
+            PersistentVoiceMode::VoiceActivated => VoiceMode::VoiceActivated,
         }
     }
 }
@@ -266,6 +274,8 @@ struct SettingsModalState {
     pending_autoconnect: Option<bool>,
     /// Pending username
     pending_username: Option<String>,
+    /// Pending TX pipeline configuration
+    pending_tx_pipeline: Option<PipelineConfig>,
     /// Whether any settings have been modified
     dirty: bool,
 }
@@ -288,6 +298,9 @@ struct MyApp {
 
     // Backend handle (manages connection, audio, and state)
     backend: BackendHandle,
+    
+    // Processor registry for schema lookups
+    processor_registry: ProcessorRegistry,
 
     // Rename modal state
     rename_modal: RenameModalState,
@@ -354,10 +367,28 @@ impl MyApp {
         
         // Apply persistent audio settings to backend
         let audio_settings: AudioSettings = (&persistent_settings.audio).into();
-        backend.send(Command::UpdateAudioSettings { settings: audio_settings });
+        backend.send(Command::UpdateAudioSettings { settings: audio_settings.clone() });
         
         // Apply voice mode
-        backend.send(Command::SetVoiceMode { mode: persistent_settings.voice_mode.into() });
+        let voice_mode: VoiceMode = persistent_settings.voice_mode.into();
+        backend.send(Command::SetVoiceMode { mode: voice_mode });
+        
+        // Create processor registry for schema lookups
+        let mut processor_registry = ProcessorRegistry::new();
+        register_builtin_processors(&mut processor_registry);
+        
+        // Apply TX pipeline from persistent config, or build a default one
+        let tx_pipeline_config = if let Some(config) = persistent_settings.audio.tx_pipeline.clone() {
+            config
+        } else {
+            // Build default pipeline based on voice mode and denoise setting
+            build_default_tx_pipeline(
+                &processor_registry,
+                matches!(voice_mode, VoiceMode::VoiceActivated),
+                persistent_settings.audio.denoise_enabled,
+            )
+        };
+        backend.send(Command::UpdateTxPipeline { config: tx_pipeline_config });
         
         // Apply device selections if set
         if persistent_settings.input_device_id.is_some() {
@@ -394,6 +425,7 @@ impl MyApp {
             persistent_settings,
             autoconnect_on_launch,
             backend,
+            processor_registry,
             rename_modal: RenameModalState::default(),
             settings_modal: SettingsModalState::default(),
             push_to_talk_active: false,
@@ -445,8 +477,17 @@ impl MyApp {
         
         // Save audio settings from backend state
         let audio = self.backend.state().audio.clone();
-        self.persistent_settings.audio = (&audio.settings).into();
-        self.persistent_settings.voice_mode = (&audio.voice_mode).into();
+        let mut persistent_audio: PersistentAudioSettings = (&audio.settings).into();
+        
+        // Save the TX pipeline config - prefer pending modal config if available
+        // (the async command to backend might not have processed yet)
+        persistent_audio.tx_pipeline = self.settings_modal.pending_tx_pipeline.clone()
+            .or_else(|| Some(audio.tx_pipeline.clone()));
+        
+        self.persistent_settings.audio = persistent_audio;
+        self.persistent_settings.voice_mode = self.settings_modal.pending_voice_mode.clone()
+            .map(|m| (&m).into())
+            .unwrap_or_else(|| (&audio.voice_mode).into());
         self.persistent_settings.input_device_id = audio.selected_input.clone();
         self.persistent_settings.output_device_id = audio.selected_output.clone();
         
@@ -482,12 +523,163 @@ impl MyApp {
     }
 }
 
+/// Build a default TX pipeline config using the processor registry for defaults.
+/// If enable_vad is true, includes VAD processor with defaults.
+fn build_default_tx_pipeline(
+    registry: &ProcessorRegistry,
+    enable_vad: bool,
+    denoise_enabled: bool,
+) -> PipelineConfig {
+    let mut processors = Vec::new();
+    
+    // Add gain processor first (mic input level adjustment)
+    if let Some(config) = registry.default_config("builtin.gain") {
+        processors.push(config);
+    }
+    
+    // Add denoise processor if enabled
+    if denoise_enabled {
+        if let Some(config) = registry.default_config("builtin.denoise") {
+            processors.push(config);
+        }
+    }
+    
+    // Add VAD processor if in VAD mode
+    if enable_vad {
+        if let Some(config) = registry.default_config("builtin.vad") {
+            processors.push(config);
+        }
+    }
+    
+    PipelineConfig {
+        processors,
+        ..Default::default()
+    }
+}
+
+/// Render a single schema field and return true if it was modified.
+fn render_schema_field(
+    ui: &mut egui::Ui,
+    key: &str,
+    prop_schema: &serde_json::Value,
+    settings: &mut serde_json::Value,
+) -> bool {
+    let title = prop_schema.get("title")
+        .and_then(|t| t.as_str())
+        .unwrap_or(key);
+    let description = prop_schema.get("description")
+        .and_then(|d| d.as_str())
+        .unwrap_or("");
+    let prop_type = prop_schema.get("type")
+        .and_then(|t| t.as_str())
+        .unwrap_or("string");
+    
+    let mut changed = false;
+    
+    ui.horizontal(|ui| {
+        ui.label(format!("{}:", title));
+        
+        match prop_type {
+            "number" => {
+                let default = prop_schema.get("default")
+                    .and_then(|d| d.as_f64())
+                    .unwrap_or(0.0) as f32;
+                let min = prop_schema.get("minimum")
+                    .and_then(|m| m.as_f64())
+                    .unwrap_or(-100.0) as f32;
+                let max = prop_schema.get("maximum")
+                    .and_then(|m| m.as_f64())
+                    .unwrap_or(100.0) as f32;
+                
+                let mut value = settings.get(key)
+                    .and_then(|v| v.as_f64())
+                    .map(|v| v as f32)
+                    .unwrap_or(default);
+                
+                if ui.add(egui::Slider::new(&mut value, min..=max))
+                    .on_hover_text(description)
+                    .changed()
+                {
+                    settings[key] = serde_json::json!(value);
+                    changed = true;
+                }
+            }
+            "integer" => {
+                let default = prop_schema.get("default")
+                    .and_then(|d| d.as_i64())
+                    .unwrap_or(0) as i32;
+                let min = prop_schema.get("minimum")
+                    .and_then(|m| m.as_i64())
+                    .unwrap_or(0) as i32;
+                let max = prop_schema.get("maximum")
+                    .and_then(|m| m.as_i64())
+                    .unwrap_or(1000) as i32;
+                
+                let mut value = settings.get(key)
+                    .and_then(|v| v.as_i64())
+                    .map(|v| v as i32)
+                    .unwrap_or(default);
+                
+                if ui.add(egui::Slider::new(&mut value, min..=max))
+                    .on_hover_text(description)
+                    .changed()
+                {
+                    settings[key] = serde_json::json!(value);
+                    changed = true;
+                }
+            }
+            "boolean" => {
+                let default = prop_schema.get("default")
+                    .and_then(|d| d.as_bool())
+                    .unwrap_or(false);
+                let mut value = settings.get(key)
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(default);
+                
+                if ui.checkbox(&mut value, "")
+                    .on_hover_text(description)
+                    .changed()
+                {
+                    settings[key] = serde_json::json!(value);
+                    changed = true;
+                }
+            }
+            _ => {
+                // String or unknown type - show as text field
+                let default = prop_schema.get("default")
+                    .and_then(|d| d.as_str())
+                    .unwrap_or("");
+                let mut value = settings.get(key)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(default)
+                    .to_string();
+                
+                if ui.text_edit_singleline(&mut value)
+                    .on_hover_text(description)
+                    .changed()
+                {
+                    settings[key] = serde_json::json!(value);
+                    changed = true;
+                }
+            }
+        }
+    });
+    
+    changed
+}
+
 impl eframe::App for MyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.egui_ctx = ctx.clone();
 
         // Get current state from backend (clone to avoid borrow issues)
         let state = self.backend.state();
+
+        // Request periodic repaint when audio is active (for level meters and TX indicators)
+        // This ensures the UI updates even when no user interaction occurs
+        if state.audio.input_level_db.is_some() || state.audio.is_transmitting {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50)); // 20 FPS for meters
+        }
 
         // Reset push-to-talk state if disconnected
         if !state.connection.is_connected() && self.push_to_talk_active {
@@ -540,6 +732,7 @@ impl eframe::App for MyApp {
                             pending_voice_mode: Some(audio.voice_mode.clone()),
                             pending_autoconnect: Some(self.autoconnect_on_launch),
                             pending_username: Some(self.client_name.clone()),
+                            pending_tx_pipeline: Some(audio.tx_pipeline.clone()),
                             dirty: false,
                         };
                         self.show_settings = true;
@@ -604,6 +797,7 @@ impl eframe::App for MyApp {
                 let mode_text = match audio.voice_mode {
                     VoiceMode::PushToTalk => "🎤 PTT",
                     VoiceMode::Continuous => "📡 Continuous",
+                    VoiceMode::VoiceActivated => "🎙️ VAD",
                 };
                 egui::ComboBox::from_id_salt("transmit_mode")
                     .selected_text(mode_text)
@@ -620,6 +814,13 @@ impl eframe::App for MyApp {
                             "📡 Continuous"
                         ).clicked() {
                             self.backend.send(Command::SetVoiceMode { mode: VoiceMode::Continuous });
+                            self.save_settings();
+                        }
+                        if ui.selectable_label(
+                            matches!(audio.voice_mode, VoiceMode::VoiceActivated),
+                            "🎙️ Voice Activated"
+                        ).clicked() {
+                            self.backend.send(Command::SetVoiceMode { mode: VoiceMode::VoiceActivated });
                             self.save_settings();
                         }
                     });
@@ -640,15 +841,44 @@ impl eframe::App for MyApp {
                         pending_voice_mode: Some(audio.voice_mode.clone()),
                         pending_autoconnect: Some(self.autoconnect_on_launch),
                         pending_username: Some(self.client_name.clone()),
+                        pending_tx_pipeline: Some(audio.tx_pipeline.clone()),
                         dirty: false,
                     };
                     self.show_settings = true;
                 }
                 
-                // Transmitting indicator
+                // Transmitting indicator and level meter
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // TX indicator
                     if audio.is_transmitting {
                         ui.colored_label(egui::Color32::GREEN, "🎤 TX");
+                    }
+                    
+                    // Compact level meter (only when transmitting or in continuous/VAD mode)
+                    let show_meter = audio.is_transmitting || 
+                        matches!(audio.voice_mode, VoiceMode::Continuous | VoiceMode::VoiceActivated);
+                    if show_meter {
+                        if let Some(level_db) = audio.input_level_db {
+                            // Normalize level_db to 0.0-1.0 range (assuming -60dB to 0dB range)
+                            let normalized = ((level_db + 60.0) / 60.0).clamp(0.0, 1.0);
+                            let color = if level_db > -3.0 {
+                                egui::Color32::RED
+                            } else if level_db > -12.0 {
+                                egui::Color32::YELLOW
+                            } else {
+                                egui::Color32::GREEN
+                            };
+                            let (rect, _response) = ui.allocate_exact_size(
+                                egui::vec2(60.0, 12.0),
+                                egui::Sense::hover(),
+                            );
+                            ui.painter().rect_filled(rect, 2.0, egui::Color32::from_gray(40));
+                            let filled_rect = egui::Rect::from_min_size(
+                                rect.min,
+                                egui::vec2(rect.width() * normalized, rect.height()),
+                            );
+                            ui.painter().rect_filled(filled_rect, 2.0, color);
+                        }
                     }
                 });
             });
@@ -809,7 +1039,65 @@ impl eframe::App for MyApp {
                                             ui.colored_label(egui::Color32::DARK_RED, "🔇");
                                         }
                                         
-                                        ui.label(&user.username);
+                                        // Local mute indicator (we muted them locally)
+                                        let is_locally_muted = state.audio.muted_users.contains(&user_id);
+                                        if is_locally_muted && !is_self {
+                                            ui.colored_label(egui::Color32::YELLOW, "🔕");
+                                        }
+                                        
+                                        let resp = ui.label(&user.username);
+                                        
+                                        // Context menu for other users (not self)
+                                        if !is_self {
+                                            resp.context_menu(|ui| {
+                                                ui.label(format!("User: {}", user.username));
+                                                ui.separator();
+                                                
+                                                // Local mute toggle
+                                                if is_locally_muted {
+                                                    if ui.button("🔔 Unmute Locally").clicked() {
+                                                        self.backend.send(Command::UnmuteUser { user_id });
+                                                        ui.close();
+                                                    }
+                                                } else {
+                                                    if ui.button("🔕 Mute Locally").clicked() {
+                                                        self.backend.send(Command::MuteUser { user_id });
+                                                        ui.close();
+                                                    }
+                                                }
+                                                
+                                                ui.separator();
+                                                
+                                                // Volume adjustment
+                                                ui.label("Volume:");
+                                                let current_volume = state.audio.per_user_rx
+                                                    .get(&user_id)
+                                                    .map(|c| c.volume_db)
+                                                    .unwrap_or(0.0);
+                                                let mut volume = current_volume;
+                                                if ui.add(egui::Slider::new(&mut volume, -20.0..=12.0)
+                                                    .suffix(" dB")
+                                                    .text(""))
+                                                    .changed()
+                                                {
+                                                    self.backend.send(Command::SetUserVolume { 
+                                                        user_id, 
+                                                        volume_db: volume 
+                                                    });
+                                                }
+                                                
+                                                // Reset volume button
+                                                if current_volume != 0.0 {
+                                                    if ui.button("Reset Volume").clicked() {
+                                                        self.backend.send(Command::SetUserVolume { 
+                                                            user_id, 
+                                                            volume_db: 0.0 
+                                                        });
+                                                        ui.close();
+                                                    }
+                                                }
+                                            });
+                                        }
                                     });
                                 }
                             }
@@ -866,6 +1154,7 @@ impl eframe::App for MyApp {
                     pending_voice_mode: Some(audio.voice_mode.clone()),
                     pending_autoconnect: Some(self.autoconnect_on_launch),
                     pending_username: Some(self.client_name.clone()),
+                    pending_tx_pipeline: Some(audio.tx_pipeline.clone()),
                     dirty: false,
                 };
             }
@@ -1019,19 +1308,114 @@ impl eframe::App for MyApp {
                     ui.horizontal(|ui| {
                         if ui.selectable_label(
                             matches!(pending_voice_mode, VoiceMode::PushToTalk),
-                            "Push-to-Talk",
-                        ).clicked() {
+                            "🎤 PTT",
+                        ).on_hover_text("Push-to-Talk: Hold SPACE to transmit").clicked() {
                             self.settings_modal.pending_voice_mode = Some(VoiceMode::PushToTalk);
                             self.settings_modal.dirty = true;
                         }
                         if ui.selectable_label(
                             matches!(pending_voice_mode, VoiceMode::Continuous),
-                            "Continuous",
-                        ).clicked() {
+                            "📡 Continuous",
+                        ).on_hover_text("Always transmitting when connected").clicked() {
                             self.settings_modal.pending_voice_mode = Some(VoiceMode::Continuous);
                             self.settings_modal.dirty = true;
                         }
+                        if ui.selectable_label(
+                            matches!(pending_voice_mode, VoiceMode::VoiceActivated),
+                            "🎙️ VAD",
+                        ).on_hover_text("Voice Activated: Transmit when speaking").clicked() {
+                            self.settings_modal.pending_voice_mode = Some(VoiceMode::VoiceActivated);
+                            self.settings_modal.dirty = true;
+                        }
                     });
+                    
+                    // TX Pipeline Configuration (generic, schema-driven UI)
+                    ui.separator();
+                    ui.label("TX Pipeline Processors:");
+                    
+                    // Get processor info from registry for display names
+                    let processor_info: std::collections::HashMap<&str, (&str, &str)> = self.processor_registry
+                        .list_available()
+                        .into_iter()
+                        .map(|(type_id, display_name, desc)| (type_id, (display_name, desc)))
+                        .collect();
+                    
+                    if let Some(ref mut pending_pipeline) = self.settings_modal.pending_tx_pipeline {
+                        let mut pipeline_changed = false;
+                        
+                        for proc_config in pending_pipeline.processors.iter_mut() {
+                            // Look up the processor info for display name and description
+                            let (display_name, description) = processor_info
+                                .get(proc_config.type_id.as_str())
+                                .copied()
+                                .unwrap_or((&proc_config.type_id, "Unknown processor"));
+                            
+                            ui.horizontal(|ui| {
+                                // Enabled checkbox
+                                if ui.checkbox(&mut proc_config.enabled, display_name)
+                                    .on_hover_text(description)
+                                    .changed()
+                                {
+                                    pipeline_changed = true;
+                                }
+                            });
+                            
+                            // Show settings if processor is enabled
+                            if proc_config.enabled {
+                                if let Some(schema) = self.processor_registry.settings_schema(&proc_config.type_id) {
+                                    if let Some(properties) = schema.get("properties").and_then(|p| p.as_object()) {
+                                        if !properties.is_empty() {
+                                            ui.indent(proc_config.type_id.as_str(), |ui| {
+                                                for (key, prop_schema) in properties {
+                                                    if render_schema_field(ui, key, prop_schema, &mut proc_config.settings) {
+                                                        pipeline_changed = true;
+                                                    }
+                                                }
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        
+                        if pipeline_changed {
+                            self.settings_modal.dirty = true;
+                        }
+                    }
+
+                    ui.separator();
+                    
+                    // Audio Input Level Meter
+                    if let Some(level_db) = audio.input_level_db {
+                        ui.horizontal(|ui| {
+                            ui.label("Input Level:");
+                            // Normalize level_db to 0.0-1.0 range (assuming -60dB to 0dB range)
+                            let normalized = ((level_db + 60.0) / 60.0).clamp(0.0, 1.0);
+                            let color = if level_db > -3.0 {
+                                egui::Color32::RED // Clipping
+                            } else if level_db > -12.0 {
+                                egui::Color32::YELLOW // Loud
+                            } else {
+                                egui::Color32::GREEN // Normal
+                            };
+                            let (rect, _response) = ui.allocate_exact_size(
+                                egui::vec2(150.0, 16.0),
+                                egui::Sense::hover(),
+                            );
+                            ui.painter().rect_filled(rect, 2.0, egui::Color32::DARK_GRAY);
+                            let filled_rect = egui::Rect::from_min_size(
+                                rect.min,
+                                egui::vec2(rect.width() * normalized, rect.height()),
+                            );
+                            ui.painter().rect_filled(filled_rect, 2.0, color);
+                            ui.label(format!("{:.0} dB", level_db));
+                        });
+                    } else {
+                        ui.horizontal(|ui| {
+                            ui.label("Input Level:");
+                            ui.colored_label(egui::Color32::GRAY, "—");
+                        });
+                    }
 
                     ui.separator();
                     
@@ -1068,6 +1452,9 @@ impl eframe::App for MyApp {
                             }
                             VoiceMode::Continuous => {
                                 ui.label("Continuous: Always transmitting when connected");
+                            }
+                            VoiceMode::VoiceActivated => {
+                                ui.label("Voice Activated: Transmit when speaking");
                             }
                         }
                     }
@@ -1282,8 +1669,13 @@ impl eframe::App for MyApp {
                             if let Some(mode) = self.settings_modal.pending_voice_mode.clone() {
                                 let current = self.backend.state().audio.voice_mode.clone();
                                 if mode != current {
-                                    self.backend.send(Command::SetVoiceMode { mode });
+                                    self.backend.send(Command::SetVoiceMode { mode: mode.clone() });
                                 }
+                            }
+                            
+                            // Apply pending TX pipeline
+                            if let Some(config) = self.settings_modal.pending_tx_pipeline.clone() {
+                                self.backend.send(Command::UpdateTxPipeline { config });
                             }
                             
                             self.settings_modal.dirty = false;
@@ -1330,8 +1722,13 @@ impl eframe::App for MyApp {
                                 if let Some(mode) = self.settings_modal.pending_voice_mode.clone() {
                                     let current = self.backend.state().audio.voice_mode.clone();
                                     if mode != current {
-                                        self.backend.send(Command::SetVoiceMode { mode });
+                                        self.backend.send(Command::SetVoiceMode { mode: mode.clone() });
                                     }
+                                }
+                                
+                                // Apply pending TX pipeline
+                                if let Some(config) = self.settings_modal.pending_tx_pipeline.clone() {
+                                    self.backend.send(Command::UpdateTxPipeline { config });
                                 }
                                 
                                 // Save settings to disk
