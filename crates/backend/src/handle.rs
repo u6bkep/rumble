@@ -560,10 +560,16 @@ async fn connect_to_server(
 )> {
     info!(server_addr = %addr, client_name, "Connecting to server");
 
-    let socket_addr = addr
-        .to_socket_addrs()?
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("invalid address"))?;
+    // Try parsing as a direct SocketAddr first (no DNS needed),
+    // then fall back to DNS resolution for hostnames
+    let socket_addr: std::net::SocketAddr = addr
+        .parse()
+        .or_else(|_| {
+            addr.to_socket_addrs()
+                .map_err(|e| anyhow::anyhow!("DNS resolution failed: {}", e))?
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("no addresses found for hostname"))
+        })?;
 
     let endpoint = make_client_endpoint(socket_addr, config)?;
 
