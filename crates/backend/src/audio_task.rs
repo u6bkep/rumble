@@ -121,15 +121,23 @@ struct UserAudioState {
     rx_pipeline: Option<pipeline::AudioPipeline>,
     /// Per-user volume adjustment in dB.
     volume_db: f32,
+    /// Whether the sender has signaled end of stream.
+    /// When true, we stop expecting more packets and won't count missing packets as lost.
+    stream_ended: bool,
 }
 
 /// Maximum jitter buffer size (drop old packets beyond this).
 const JITTER_BUFFER_MAX_PACKETS: usize = 20;
 
-/// An encoded audio frame with metadata for statistics tracking.
-struct EncodedFrame {
-    data: Bytes,
-    size_bytes: usize,
+/// Message sent from audio capture callback to main loop.
+enum CaptureMessage {
+    /// An encoded audio frame ready to send.
+    EncodedFrame {
+        data: Bytes,
+        size_bytes: usize,
+    },
+    /// End of stream marker - transmission has stopped (VAD suppressed, PTT released, etc.)
+    EndOfStream,
 }
 
 impl UserAudioState {
@@ -148,6 +156,7 @@ impl UserAudioState {
             bytes_received: 0,
             rx_pipeline: None,
             volume_db: 0.0,
+            stream_ended: false,
         })
     }
     
@@ -166,6 +175,9 @@ impl UserAudioState {
         self.last_received = Instant::now();
         self.packets_received += 1;
         self.bytes_received += opus_data.len() as u64;
+        
+        // New audio arrived - stream is active (reset end-of-stream state)
+        self.stream_ended = false;
 
         // If not started, set the initial sequence
         if !self.started && self.packets_received == 1 {
@@ -224,6 +236,13 @@ impl UserAudioState {
         if !self.ready_to_play() {
             return None;
         }
+        
+        // If stream ended and buffer is empty, don't try to play more
+        // (this avoids counting "missing" packets as lost when transmission intentionally stopped)
+        if self.stream_ended && self.jitter_buffer.is_empty() {
+            return None;
+        }
+        
         self.started = true;
 
         let seq = self.next_play_seq;
@@ -241,7 +260,13 @@ impl UserAudioState {
                 }
             }
         } else {
-            // Packet missing - track as lost
+            // Packet missing
+            // If stream ended, don't count as lost - the sender intentionally stopped
+            if self.stream_ended {
+                return None;
+            }
+            
+            // Track as lost (this is a real packet loss, not end of stream)
             self.packets_lost += 1;
             
             // Try FEC recovery using the next packet if available
@@ -368,8 +393,8 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
     let mut processor_registry = pipeline::ProcessorRegistry::new();
     crate::processors::register_builtin_processors(&mut processor_registry);
 
-    // Channel for encoded audio frames to send
-    let (encoded_tx, mut encoded_rx) = mpsc::unbounded_channel::<EncodedFrame>();
+    // Channel for encoded audio frames and end-of-stream signals
+    let (encoded_tx, mut encoded_rx) = mpsc::unbounded_channel::<CaptureMessage>();
 
     // Sequence number for outgoing voice packets
     let mut send_sequence: u32 = 0;
@@ -439,6 +464,9 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
                     &repaint,
                 );
             } else if !want && have {
+                // Send end-of-stream before stopping transmission
+                // (PTT released, muted, disconnected, etc.)
+                let _ = encoded_tx.send(CaptureMessage::EndOfStream);
                 stop_transmission(&mut audio_input, &state, &repaint);
             }
         }};
@@ -744,22 +772,35 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
                 }
             }
 
-            // Send encoded audio as datagrams
-            Some(encoded_frame) = encoded_rx.recv() => {
+            // Send encoded audio or end-of-stream as datagrams
+            Some(capture_msg) = encoded_rx.recv() => {
                 if let Some(conn) = &connection {
+                    let (opus_data, size_bytes, end_of_stream) = match capture_msg {
+                        CaptureMessage::EncodedFrame { data, size_bytes } => {
+                            (data.to_vec(), size_bytes, false)
+                        }
+                        CaptureMessage::EndOfStream => {
+                            // Send empty datagram with end_of_stream flag
+                            (Vec::new(), 0, true)
+                        }
+                    };
+                    
                     let datagram = VoiceDatagram {
                         sender_id: Some(my_user_id),
                         room_id: None, // TODO: set room ID
                         sequence: send_sequence,
                         timestamp_us: 0, // TODO: track timestamp
-                        opus_data: encoded_frame.data.to_vec(),
+                        opus_data,
+                        end_of_stream,
                     };
                     send_sequence = send_sequence.wrapping_add(1);
                     let datagram_bytes = datagram.encode_to_vec();
                     
-                    // Track statistics
-                    packets_sent += 1;
-                    bytes_sent += encoded_frame.size_bytes as u64;
+                    // Track statistics (only for actual audio, not EOS)
+                    if !end_of_stream {
+                        packets_sent += 1;
+                        bytes_sent += size_bytes as u64;
+                    }
 
                     if let Err(e) = conn.send_datagram(Bytes::from(datagram_bytes)) {
                         warn!("Failed to send voice datagram: {}", e);
@@ -787,6 +828,7 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
                                         sender_id,
                                         voice.sequence,
                                         voice.opus_data,
+                                        voice.end_of_stream,
                                         &mut user_audio,
                                         &audio_settings,
                                         &rx_pipeline_defaults,
@@ -828,7 +870,7 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
 fn start_transmission(
     audio_system: &AudioSystem,
     selected_input: &Option<String>,
-    encoded_tx: &mpsc::UnboundedSender<EncodedFrame>,
+    encoded_tx: &mpsc::UnboundedSender<CaptureMessage>,
     audio_settings: &AudioSettings,
     tx_pipeline_config: &pipeline::PipelineConfig,
     processor_registry: &pipeline::ProcessorRegistry,
@@ -885,6 +927,10 @@ fn start_transmission(
     
     // State reference for updating input_level_db
     let state_for_callback = state.clone();
+    
+    // Track whether we were transmitting (for detecting suppress transitions)
+    let was_transmitting = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let was_transmitting_for_callback = was_transmitting.clone();
 
     // Audio config uses defaults - audio processing (denoise, VAD, etc.)
     // is handled by the TX pipeline, not by AudioConfig
@@ -914,18 +960,29 @@ fn start_transmission(
             s.audio.is_transmitting = !pipeline_result.suppress;
         }
         
+        // Detect transition from transmitting to suppressed (VAD, etc.)
+        let was_tx = was_transmitting_for_callback.load(std::sync::atomic::Ordering::Relaxed);
+        
         // Pipeline suppress flag gates actual transmission
         // This allows VAD (or any other processor) to prevent encoding/sending
         if pipeline_result.suppress {
+            // If we were transmitting and now we're suppressed, send end-of-stream
+            if was_tx {
+                was_transmitting_for_callback.store(false, std::sync::atomic::Ordering::Relaxed);
+                let _ = encoded_tx.send(CaptureMessage::EndOfStream);
+            }
             return;
         }
+        
+        // We're transmitting now
+        was_transmitting_for_callback.store(true, std::sync::atomic::Ordering::Relaxed);
         
         // Encode the processed audio frame
         if let Ok(mut enc) = encoder_mutex.lock() {
             match enc.encode(&processed_samples) {
                 Ok(encoded) => {
                     let size_bytes = encoded.len();
-                    let _ = encoded_tx.send(EncodedFrame {
+                    let _ = encoded_tx.send(CaptureMessage::EncodedFrame {
                         data: Bytes::from(encoded),
                         size_bytes,
                     });
@@ -1010,11 +1067,12 @@ fn start_audio_output(
     }
 }
 
-/// Handle received voice datagram - insert into jitter buffer.
+/// Handle received voice datagram - insert into jitter buffer or handle end-of-stream.
 fn handle_voice_datagram(
     sender_id: u64,
     sequence: u32,
     opus_data: Vec<u8>,
+    end_of_stream: bool,
     user_audio: &mut HashMap<u64, UserAudioState>,
     audio_settings: &AudioSettings,
     rx_pipeline_defaults: &pipeline::PipelineConfig,
@@ -1023,6 +1081,18 @@ fn handle_voice_datagram(
     state: &Arc<RwLock<State>>,
     repaint: &Arc<dyn Fn() + Send + Sync>,
 ) {
+    // Handle end-of-stream: mark the user's stream as ended
+    if end_of_stream {
+        if let Some(user_state) = user_audio.get_mut(&sender_id) {
+            user_state.stream_ended = true;
+            // Set the last sequence we should expect
+            // The EOS packet's sequence is the first one NOT to expect
+            user_state.next_play_seq = sequence;
+            debug!("User {} stream ended at sequence {}", sender_id, sequence);
+        }
+        return;
+    }
+    
     // Get or create per-user audio state
     let jitter_delay = audio_settings.jitter_buffer_delay_packets;
     let user_state = user_audio.entry(sender_id).or_insert_with(|| {

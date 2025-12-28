@@ -58,7 +58,7 @@ message ServerState {
 //   sender_id and room_id are set by the server based on the sender's
 //   authenticated identity and current room membership.
 message VoiceDatagram {
-  // Opus-encoded audio frame (required)
+  // Opus-encoded audio frame (may be empty if end_of_stream is true)
   bytes opus_data = 1;
   
   // Sequence number for ordering/jitter buffer (client should increment)
@@ -67,6 +67,13 @@ message VoiceDatagram {
   // Timestamp in microseconds (client's capture time, for jitter buffer sync)
   // Optional: if not set, receiver can use arrival time
   uint64 timestamp_us = 3;
+  
+  // End of stream marker. When true, indicates the sender has stopped
+  // transmitting (PTT released, VAD triggered, muted, etc.).
+  // The receiver should stop expecting packets after this sequence number
+  // and not count subsequent missing packets as lost.
+  // opus_data may be empty when this is true.
+  bool end_of_stream = 4;
   
   // --- Fields set by server on relay, ignored if sent by client ---
   
