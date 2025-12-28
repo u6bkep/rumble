@@ -107,6 +107,10 @@ struct UserAudioState {
     last_received: Instant,
     /// Number of packets received (for initial buffering).
     packets_received: u32,
+    /// Number of packets buffered since the last stream start.
+    /// This is reset when a new stream starts (after EOS) to ensure proper
+    /// jitter buffer fill before playback begins.
+    buffered_since_stream_start: u32,
     /// Configurable delay in packets before starting playback.
     jitter_buffer_delay: u32,
     /// Statistics: packets lost (detected via sequence gaps).
@@ -149,6 +153,7 @@ impl UserAudioState {
             started: false,
             last_received: Instant::now(),
             packets_received: 0,
+            buffered_since_stream_start: 0,
             jitter_buffer_delay,
             packets_lost: 0,
             packets_recovered_fec: 0,
@@ -176,11 +181,34 @@ impl UserAudioState {
         self.packets_received += 1;
         self.bytes_received += opus_data.len() as u64;
         
-        // New audio arrived - stream is active (reset end-of-stream state)
+        // Detect new stream start: first packet after end-of-stream
+        // We need to reset buffering state to ensure proper jitter absorption
+        // before playback begins. This prevents crackling at the start of
+        // voice-activated transmissions.
+        let was_stream_ended = self.stream_ended;
         self.stream_ended = false;
+        
+        if was_stream_ended {
+            // New stream starting after EOS - reset buffering state
+            debug!(
+                "New stream starting after EOS: seq {}, resetting buffer state",
+                sequence
+            );
+            self.jitter_buffer.clear();
+            self.next_play_seq = sequence;
+            self.started = false;
+            self.buffered_since_stream_start = 0;
+            // Reset decoder to clear any stale internal state from the previous stream
+            if let Ok(new_decoder) = VoiceDecoder::new() {
+                self.decoder = new_decoder;
+            }
+        }
+        
+        // Increment buffering counter for this stream
+        self.buffered_since_stream_start += 1;
 
         // If not started, set the initial sequence
-        if !self.started && self.packets_received == 1 {
+        if !self.started && self.buffered_since_stream_start == 1 {
             self.next_play_seq = sequence;
         }
 
@@ -201,6 +229,7 @@ impl UserAudioState {
             self.jitter_buffer.clear();
             self.next_play_seq = sequence;
             self.started = false;
+            self.buffered_since_stream_start = 1; // Count this packet
             // Reset decoder to clear any internal state
             if let Ok(new_decoder) = VoiceDecoder::new() {
                 self.decoder = new_decoder;
@@ -223,7 +252,7 @@ impl UserAudioState {
 
     /// Check if we have enough buffered to start playback.
     fn ready_to_play(&self) -> bool {
-        self.packets_received >= self.jitter_buffer_delay
+        self.buffered_since_stream_start >= self.jitter_buffer_delay
     }
 
     /// Get the next frame to play, decoding from jitter buffer.
