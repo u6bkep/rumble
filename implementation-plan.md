@@ -383,6 +383,15 @@ message UserStatusChanged {
   bool is_muted = 2;
   bool is_deafened = 3;
 }
+
+// Client notifies server of mute/deafen state changes.
+message SetUserStatus {
+  bool is_muted = 1;
+  bool is_deafened = 2;
+}
+```
+
+> **Note**: The full protocol is implemented in `crates/api/proto/api.proto`. The examples above are excerpts.
 ```
 
 #### Voice Datagrams
@@ -395,6 +404,7 @@ message VoiceDatagram {
   bytes opus_data = 1;
   uint32 sequence = 2;
   uint64 timestamp_us = 3;
+  bool end_of_stream = 4;  // Signals intentional end of voice (for DTX vs PLC)
   
   // Server-set fields (ignored if sent by client)
   optional uint64 sender_id = 10;
@@ -404,23 +414,33 @@ message VoiceDatagram {
 
 The server stamps each datagram with `sender_id` and `room_id` before relaying to room members.
 
-**No explicit start/stop messages** - talking state is derived from jitter buffer contents:
-- User is "talking" when their jitter buffer has packets
-- User "stopped talking" when buffer drains and timeout expires
+**End-of-stream signaling:**
+- When the user stops transmitting (PTT release, VAD silence, or mute), the final packet has `end_of_stream = true`
+- Receivers use this to distinguish intentional silence from packet loss:
+  - `end_of_stream = true`: Stop playback cleanly, no PLC needed
+  - Missing packets without EOS: Invoke Opus PLC to conceal the gap
+- This enables proper DTX behavior where the encoder stops sending during silence
+- `opus_data` may be empty when `end_of_stream = true`
+
+**Talking state detection:**
+- User is "talking" when their jitter buffer has packets and no EOS received
+- User "stopped talking" when EOS packet received or buffer drains with timeout
 
 ### State Synchronization
 
 Both client and server maintain a shared logical state:
-- The room list
+- The room list (with Root room at UUID 0 always present)
 - Which users are in which rooms
 - User state (muted, deafened, roles, ACLs)
 
 When a client connects:
 1. Server sends current full state with hash
 2. Subsequent changes are sent as incremental updates with expected hash
-3. If client's computed hash doesn't match, it requests full resync
+3. If client's computed hash doesn't match, it requests full resync via `RequestStateSync`
 
-The state hash is computed using BLAKE3 over canonical protobuf serialization.
+The state hash is computed using BLAKE3 over canonical protobuf serialization. The `ServerState` is canonicalized by sorting rooms by UUID and users by user_id before hashing to ensure deterministic results.
+
+> **Note**: State hash computation is implemented in `crates/api/src/lib.rs` via `compute_server_state_hash()`.
 
 ---
 
@@ -435,20 +455,70 @@ Audio uses the Opus codec for efficient compression and low latency.
 - Frame size: 20ms default (960 samples at 48kHz), configurable
 - Mode: VOIP with DTX and FEC enabled
 
+### DTX (Discontinuous Transmission)
+
+Opus DTX allows bandwidth savings during silence:
+- Encoder outputs frames with length ≤2 bytes when it detects silence
+- These "DTX frames" signal that the audio is silent and can be skipped
+- Sender tracks consecutive DTX frames and skips sending most of them
+- To help receivers distinguish DTX silence from network drops, send a DTX keepalive frame every ~400ms
+- This is separate from VAD suppression: DTX operates at the codec level even when VAD is disabled or has long hold times
+
+### Codec Lifecycle
+
+**Encoder (TX):**
+- Created when connection is established, destroyed on disconnect
+- Persists for the entire connection lifetime (never reset mid-session)
+- When `suppress = true` (VAD/PTT/mute): stop audio capture and encoding entirely
+- Encoder remains allocated but idle; resumes cleanly when transmission restarts
+- On transmission stop, send final packet with `end_of_stream = true`
+
+**DTX frame handling (TX):**
+- After encoding, check if output frame length ≤2 bytes (DTX silence frame)
+- Track time since last send
+- If DTX frame and last sent was <400ms ago: skip sending entirely
+- If DTX frame and last sent was ≥400ms ago: send as keepalive, increment sequence
+- If non-DTX frame (voice): send immediately, increment sequence
+- Sequence number only increments when a packet is actually sent
+- Receiver uses time-based detection (>500ms gap) for true packet loss
+
+**Decoders (RX):**
+- Created/destroyed based on server state, not packet arrival
+- When a user joins the same room: create their RX pipeline (decoder + jitter buffer + processors)
+- When a user leaves the room: destroy their RX pipeline
+- This ensures decoder state is ready before first packet arrives
+- Decoder persists through silence periods (DTX) to maintain PLC state
+- Use `end_of_stream` flag to distinguish intentional stop from packet loss
+
+**DTX and drop detection (RX):**
+- Sequence numbers are consecutive (no gaps from DTX skipping)
+- Any sequence gap indicates true packet loss - invoke PLC for missing frames
+- If `end_of_stream = true`: user stopped, no PLC needed
+- DTX keepalive frames (≤2 bytes) decode to silence, confirming stream is alive
+
 ### Flow
 
 **Capture → Process → Encode → Send:**
 1. cpal captures audio in callback at hardware sample rate
 2. Samples queued and batched into frames (default 20ms)
 3. TX pipeline processes frame (denoise → VAD → other stages)
-4. If `!suppress`: Opus encodes and audio task sends datagram
+4. If `suppress`: send `end_of_stream = true` packet (if transitioning), then stop capture
+5. If `!suppress`: encode frame through Opus
+6. Check encoded frame length:
+   - If >2 bytes (voice): send datagram with next sequence number
+   - If ≤2 bytes (DTX silence) and <400ms since last send: skip entirely
+   - If ≤2 bytes (DTX silence) and ≥400ms since last send: send keepalive with next sequence number
+7. Sequence number only increments when packet is sent
+8. If `suppress`: encoder sits idle (not reset), waiting for next transmission
 
 **Receive → Decode → Process → Mix → Play:**
 1. Audio task receives datagram, extracts `sender_id`
-2. Routes to per-user jitter buffer (created lazily)
-3. Opus decodes (or PLC for missing packets)
-4. Per-user RX pipeline processes decoded PCM
-5. Mixed PCM from all users fed to cpal playback
+2. Routes to per-user jitter buffer (pre-created based on room membership)
+3. If `end_of_stream`: mark user as not talking, stop expecting more packets
+4. For missing sequence numbers: invoke Opus PLC (sequence gaps or 500ms since last packet = real packet loss)
+5. Opus decodes frame (DTX frames ≤2 bytes decode to silence)
+6. Per-user RX pipeline processes decoded PCM
+7. Mixed PCM from all users fed to cpal playback
 
 ---
 
@@ -654,14 +724,20 @@ impl AudioPipeline {
 The TX pipeline runs after audio capture, before Opus encoding:
 
 ```
-cpal capture → frame buffer → [TX Pipeline] → Opus encode → send datagram
-                                    ↓
-                              ProcessorResult
-                                    ↓
-                         if result.suppress: skip frame
-                         is_transmitting = !result.suppress
-                         talking_indicator = !result.suppress
+cpal capture → frame buffer → [TX Pipeline] → Opus encode → conditional send
+                                    ↓                              ↓
+                              ProcessorResult              if !suppress: send datagram
+                                    ↓                      if transitioning to suppress:
+                         track suppress state                send with end_of_transmission=true
+                         is_transmitting = !suppress       if suppress: don't send (DTX)
 ```
+
+**Key points:**
+- Audio is captured and processed through the pipeline when active (PTT held or Continuous mode)
+- When transitioning from `!suppress` to `suppress`, send a final packet with `end_of_stream = true`
+- When `suppress = true`: stop capture and encoding; encoder sits idle but is not reset
+- This allows receivers to distinguish intentional silence (EOS) from packet loss (needs PLC)
+- Encoder remains allocated for the connection lifetime, avoiding reset overhead on each PTT cycle
 
 The pipeline runs in both voice modes:
 - **PTT mode**: Pipeline processes audio while key is held; `result.suppress` can still prevent transmission
@@ -742,30 +818,44 @@ struct RemoteUserAudio {
     user_id: u64,
     decoder: OpusDecoder,
     jitter_buffer: JitterBuffer,
-    last_packet_time: Instant,
+    rx_pipeline: AudioPipeline,
+    is_talking: bool,
+    received_eos: bool,       // End-of-stream received
+    last_packet_time: Instant, // For DTX vs drop detection
 }
 ```
 
 **Jitter buffer behavior:**
 - Packets inserted by sequence number (handles out-of-order arrival)
 - Fixed initial delay (e.g., 60ms / 3 frames) before starting playback
-- When a packet is missing at playback time, feed `None` to Opus decoder (triggers PLC)
+- Track `last_packet_time` for DTX-aware drop detection
 - Adaptive sizing based on observed jitter (optional enhancement, use fixed size for MVP)
 
-**Talking detection:**
-- User is "talking" when packets are in their buffer or recently played
-- User "stopped talking" after ~200ms with no new packets
-- This naturally handles network drops without explicit signaling
+**Packet loss detection:**
+- Sequence numbers are consecutive - any gap indicates actual network loss
+- Invoke PLC for each missing sequence number
+- DTX keepalive frames (≤2 bytes) arrive every ~400ms during silence, decode to silence
+- When `received_eos = true`: stop playback cleanly, no PLC needed
 
-**Decoder lifecycle:**
-- Create decoder lazily on first packet from a user
-- Keep decoder alive for some time after user stops (maintains PLC state)
-- Eventually evict inactive decoders when server send message indicating user left room.
+**Talking detection:**
+- User is "talking" when packets are in their buffer and `!received_eos`
+- User "stopped talking" when `end_of_stream` packet received
+- On new packet after EOS: clear `received_eos`, user is talking again
+- Fallback timeout (~500ms) for cases where EOS packet is lost
+
+**RX pipeline lifecycle (server-state-driven):**
+- When server state indicates user joined our room: create `RemoteUserAudio` (decoder + jitter buffer + pipeline)
+- When server state indicates user left our room: destroy their `RemoteUserAudio`
+- When we change rooms: destroy all existing pipelines, create new ones for users in new room
+- Pipelines are created proactively, not lazily on first packet
+- This ensures decoder state is initialized and ready before audio arrives
+- Decoder state persists through DTX silence periods within the session
 
 **Packet loss concealment:**
-- When sequence gap detected, call `decoder.decode(None)` for each missing packet
-- Opus PLC generates comfort audio to mask the gap
-- Better audio quality than silence insertion
+- Sequence gaps indicate real packet loss (sequence only increments on send)
+- Invoke Opus PLC (`decoder.decode(None)`) for each missing sequence number
+- PLC generates comfort audio to mask network drops
+- When `received_eos = true`: no PLC, silence is intentional
 
 ---
 
@@ -844,4 +934,3 @@ without pulling in the full `backend` dependency tree.
 1. **ACL Schema**: Detailed permission list, inheritance rules, conflict resolution
 2. **Audio Tuning**: Optimal jitter buffer size, FEC settings, bitrate targets
 3. **TLS/ACME**: Challenge type, built-in vs external proxy
-4. **Per-User Decoder Lifetime**: How long to keep decoder state for inactive users (LRU?)

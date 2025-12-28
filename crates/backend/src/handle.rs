@@ -681,7 +681,7 @@ async fn run_receiver_task(
                 buf.extend_from_slice(&chunk[..n]);
                 while let Some(frame) = try_decode_frame(&mut buf) {
                     if let Ok(env) = proto::Envelope::decode(&*frame) {
-                        handle_server_message(env, &state, &repaint);
+                        handle_server_message(env, &state, &repaint, &audio_task);
                     }
                 }
             }
@@ -726,6 +726,7 @@ fn handle_server_message(
     env: proto::Envelope,
     state: &Arc<RwLock<State>>,
     repaint: &Arc<dyn Fn() + Send + Sync>,
+    audio_task: &AudioTaskHandle,
 ) {
     if let Some(Payload::ServerEvent(se)) = env.payload {
         if let Some(kind) = se.kind {
@@ -734,12 +735,31 @@ fn handle_server_message(
                     // Full state replacement
                     let mut s = state.write().unwrap();
                     s.rooms = ss.rooms;
-                    s.users = ss.users;
-                    drop(s);
+                    s.users = ss.users.clone();
+                    
+                    // Notify audio task about users in our room (for proactive decoder creation)
+                    if let Some(my_room_id) = &s.my_room_id {
+                        let my_user_id = s.my_user_id;
+                        let user_ids_in_room: Vec<u64> = ss.users.iter()
+                            .filter_map(|u| {
+                                let user_id = u.user_id.as_ref().map(|id| id.value)?;
+                                let user_room = u.current_room.as_ref().and_then(api::uuid_from_room_id)?;
+                                if user_room == *my_room_id && Some(user_id) != my_user_id {
+                                    Some(user_id)
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+                        drop(s);
+                        audio_task.send(AudioCommand::RoomChanged { user_ids_in_room });
+                    } else {
+                        drop(s);
+                    }
                     repaint();
                 }
                 proto::server_event::Kind::StateUpdate(su) => {
-                    apply_state_update(su, state, repaint);
+                    apply_state_update(su, state, repaint, audio_task);
                 }
                 proto::server_event::Kind::ChatBroadcast(cb) => {
                     let mut s = state.write().unwrap();
@@ -768,6 +788,7 @@ fn apply_state_update(
     update: proto::StateUpdate,
     state: &Arc<RwLock<State>>,
     repaint: &Arc<dyn Fn() + Send + Sync>,
+    audio_task: &AudioTaskHandle,
 ) {
     if let Some(u) = update.update {
         let mut s = state.write().unwrap();
@@ -797,33 +818,111 @@ fn apply_state_update(
                 if let Some(user) = uj.user {
                     // Only add if user doesn't already exist (avoid duplicates from
                     // receiving our own UserJoined broadcast after initial ServerState)
-                    let user_id = user.user_id.as_ref().map(|id| id.value);
+                    let user_id_value = user.user_id.as_ref().map(|id| id.value);
                     let already_exists = s.users.iter().any(|u| {
-                        u.user_id.as_ref().map(|id| id.value) == user_id
+                        u.user_id.as_ref().map(|id| id.value) == user_id_value
                     });
                     if !already_exists {
+                        // Check if this user is joining our room - if so, notify audio task
+                        let my_room_id = s.my_room_id;
+                        let user_room = user.current_room.as_ref().and_then(api::uuid_from_room_id);
+                        let notify_audio = user_id_value.is_some() 
+                            && my_room_id.is_some() 
+                            && user_room == my_room_id;
+                        
                         s.users.push(user);
+                        
+                        if notify_audio {
+                            if let Some(uid) = user_id_value {
+                                drop(s);
+                                audio_task.send(AudioCommand::UserJoinedRoom { user_id: uid });
+                                repaint();
+                                return;
+                            }
+                        }
                     }
                 }
             }
             proto::state_update::Update::UserLeft(ul) => {
                 if let Some(uid) = ul.user_id {
+                    // Check if the leaving user was in our room
+                    let my_room_id = s.my_room_id;
+                    let was_in_our_room = s.users.iter().find(|u| {
+                        u.user_id.as_ref().map(|id| id.value) == Some(uid.value)
+                    }).map(|u| {
+                        u.current_room.as_ref().and_then(api::uuid_from_room_id) == my_room_id
+                    }).unwrap_or(false);
+                    
                     s.users.retain(|u| {
                         u.user_id.as_ref().map(|id| id.value) != Some(uid.value)
                     });
+                    
+                    // Notify audio task if user was in our room
+                    if was_in_our_room && my_room_id.is_some() {
+                        drop(s);
+                        audio_task.send(AudioCommand::UserLeftRoom { user_id: uid.value });
+                        repaint();
+                        return;
+                    }
                 }
             }
             proto::state_update::Update::UserMoved(um) => {
-                if let (Some(uid), Some(to_room)) = (um.user_id, um.to_room_id.clone()) {
+                if let (Some(uid), Some(to_room)) = (um.user_id.clone(), um.to_room_id.clone()) {
                     let to_room_clone = to_room.clone();
+                    let to_room_id = api::uuid_from_room_id(&to_room_clone);
+                    let my_room_id = s.my_room_id;
+                    let my_user_id = s.my_user_id;
+                    
+                    // Look up where the user was before (from_room is implicit in User.current_room)
+                    let from_room_id = s.users.iter()
+                        .find(|u| u.user_id.as_ref().map(|id| id.value) == Some(uid.value))
+                        .and_then(|u| u.current_room.as_ref().and_then(api::uuid_from_room_id));
+                    
+                    // Now update the user's current room
                     if let Some(user) = s.users.iter_mut().find(|u| {
                         u.user_id.as_ref().map(|id| id.value) == Some(uid.value)
                     }) {
                         user.current_room = Some(to_room);
                     }
-                    // Also update my_room_id if this is us
-                    if s.my_user_id == Some(uid.value) {
-                        s.my_room_id = api::uuid_from_room_id(&to_room_clone);
+                    
+                    // Check if this is us moving
+                    if my_user_id == Some(uid.value) {
+                        s.my_room_id = to_room_id;
+                        
+                        // We changed rooms - rebuild decoder list
+                        if let Some(new_room_id) = to_room_id {
+                            let user_ids_in_room: Vec<u64> = s.users.iter()
+                                .filter_map(|u| {
+                                    let user_id = u.user_id.as_ref().map(|id| id.value)?;
+                                    let user_room = u.current_room.as_ref().and_then(api::uuid_from_room_id)?;
+                                    if user_room == new_room_id && Some(user_id) != my_user_id {
+                                        Some(user_id)
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect();
+                            drop(s);
+                            audio_task.send(AudioCommand::RoomChanged { user_ids_in_room });
+                            repaint();
+                            return;
+                        }
+                    } else {
+                        // Another user moved - check if they joined/left our room
+                        let joined_our_room = my_room_id.is_some() && to_room_id == my_room_id;
+                        let left_our_room = my_room_id.is_some() && from_room_id == my_room_id;
+                        
+                        if joined_our_room {
+                            drop(s);
+                            audio_task.send(AudioCommand::UserJoinedRoom { user_id: uid.value });
+                            repaint();
+                            return;
+                        } else if left_our_room {
+                            drop(s);
+                            audio_task.send(AudioCommand::UserLeftRoom { user_id: uid.value });
+                            repaint();
+                            return;
+                        }
                     }
                 }
             }

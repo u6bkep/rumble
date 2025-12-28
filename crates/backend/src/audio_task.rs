@@ -26,7 +26,7 @@
 
 use crate::{
     audio::{AudioConfig, AudioInput, AudioOutput, AudioSystem, FRAME_SIZE},
-    codec::{EncoderSettings, VoiceDecoder, VoiceEncoder, OPUS_FRAME_SIZE},
+    codec::{is_dtx_frame, EncoderSettings, VoiceDecoder, VoiceEncoder, OPUS_FRAME_SIZE},
     events::{AudioSettings, AudioStats, State, VoiceMode},
 };
 use api::proto::VoiceDatagram;
@@ -85,6 +85,12 @@ pub enum AudioCommand {
     ClearUserRxOverride { user_id: u64 },
     /// Set volume for a specific user.
     SetUserVolume { user_id: u64, volume_db: f32 },
+    /// A user joined our current room - create their decoder/pipeline proactively.
+    UserJoinedRoom { user_id: u64 },
+    /// A user left our current room - destroy their decoder/pipeline.
+    UserLeftRoom { user_id: u64 },
+    /// We changed rooms - destroy all decoders, create new ones for users in new room.
+    RoomChanged { user_ids_in_room: Vec<u64> },
     /// Shutdown the audio task.
     Shutdown,
 }
@@ -185,23 +191,24 @@ impl UserAudioState {
         // We need to reset buffering state to ensure proper jitter absorption
         // before playback begins. This prevents crackling at the start of
         // voice-activated transmissions.
+        //
+        // IMPORTANT: We do NOT reset the decoder here. The decoder persists
+        // through DTX silence periods to maintain internal state. This is part
+        // of the server-state-driven decoder lifecycle design.
         let was_stream_ended = self.stream_ended;
         self.stream_ended = false;
         
         if was_stream_ended {
-            // New stream starting after EOS - reset buffering state
+            // New stream starting after EOS - reset buffering state only
             debug!(
-                "New stream starting after EOS: seq {}, resetting buffer state",
+                "New stream starting after EOS: seq {}, resetting buffer state (decoder persisted)",
                 sequence
             );
             self.jitter_buffer.clear();
             self.next_play_seq = sequence;
             self.started = false;
             self.buffered_since_stream_start = 0;
-            // Reset decoder to clear any stale internal state from the previous stream
-            if let Ok(new_decoder) = VoiceDecoder::new() {
-                self.decoder = new_decoder;
-            }
+            // NOTE: Decoder is NOT reset - it persists for the entire user session
         }
         
         // Increment buffering counter for this stream
@@ -212,28 +219,27 @@ impl UserAudioState {
             self.next_play_seq = sequence;
         }
 
-        // Detect sender restart: if the incoming sequence is earlier than next_play_seq,
-        // the sender has restarted transmission. Reset our state.
-        // We use wrapping subtraction to handle wrapping correctly.
-        // If behind_by is less than half the sequence space, the packet is truly behind.
-        // If behind_by is greater than half, it means the packet is actually ahead (wrapped).
+        // Handle sequence number discontinuity (sender restart or sequence wrap)
+        // With DTX handling on the TX side, sequence numbers are now consecutive
+        // (no gaps from skipped DTX frames). Any gap indicates:
+        // 1. True packet loss (small gap) - let jitter buffer and PLC handle it
+        // 2. Sender restart (sequence jumps backward or large forward jump)
+        //
+        // For sender restart, we reset the jitter buffer but NOT the decoder.
         let behind_by = self.next_play_seq.wrapping_sub(sequence);
         const HALF_SEQ_SPACE: u32 = u32::MAX / 2;
 
         if self.started && behind_by > 0 && behind_by < HALF_SEQ_SPACE {
-            // Sender has restarted - reset decoder and jitter buffer state
+            // Sender has restarted - reset jitter buffer state only
             debug!(
-                "Detected sender restart: received seq {} but expected around {}, resetting",
+                "Detected sender restart: received seq {} but expected around {}, resetting buffer (decoder persisted)",
                 sequence, self.next_play_seq
             );
             self.jitter_buffer.clear();
             self.next_play_seq = sequence;
             self.started = false;
             self.buffered_since_stream_start = 1; // Count this packet
-            // Reset decoder to clear any internal state
-            if let Ok(new_decoder) = VoiceDecoder::new() {
-                self.decoder = new_decoder;
-            }
+            // NOTE: Decoder is NOT reset - it persists for the entire user session
         }
 
         // Insert into buffer
@@ -426,11 +432,31 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
     let (encoded_tx, mut encoded_rx) = mpsc::unbounded_channel::<CaptureMessage>();
 
     // Sequence number for outgoing voice packets
+    // Only incremented when a packet is actually sent (not for skipped DTX frames)
     let mut send_sequence: u32 = 0;
     
     // Statistics tracking
     let mut packets_sent: u64 = 0;
     let mut bytes_sent: u64 = 0;
+    
+    // =============================================================================
+    // Connection-Scoped Encoder
+    // =============================================================================
+    // The encoder is created when a connection is established and persists for the
+    // entire connection lifetime. It is NOT reset between PTT presses or voice
+    // activations - this allows Opus to maintain state for better DTX behavior.
+    let encoder: Arc<std::sync::Mutex<Option<VoiceEncoder>>> = Arc::new(std::sync::Mutex::new(None));
+    
+    // =============================================================================
+    // DTX (Discontinuous Transmission) Handling
+    // =============================================================================
+    // DTX frames are very small (≤2 bytes) silence indicators from Opus.
+    // Instead of sending every DTX frame, we:
+    // 1. Skip DTX frames if we sent something within the last 400ms
+    // 2. Send DTX frames as keepalives every ~400ms during silence
+    // 3. Only increment sequence number when we actually send a packet
+    const DTX_KEEPALIVE_INTERVAL: Duration = Duration::from_millis(400);
+    let last_send_time: Arc<std::sync::Mutex<Option<Instant>>> = Arc::new(std::sync::Mutex::new(None));
     
     // =========================================================================
     // Transmission State Machine
@@ -488,6 +514,7 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
                     &audio_settings,
                     &tx_pipeline_config,
                     &processor_registry,
+                    &encoder,
                     &mut audio_input,
                     &state,
                     &repaint,
@@ -511,6 +538,33 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
                         connection = Some(conn);
                         my_user_id = uid;
 
+                        // Create connection-scoped encoder
+                        // The encoder persists for the entire connection, not per-transmission
+                        let encoder_settings = EncoderSettings {
+                            bitrate: audio_settings.bitrate,
+                            complexity: audio_settings.encoder_complexity,
+                            fec_enabled: audio_settings.fec_enabled,
+                            packet_loss_percent: audio_settings.packet_loss_percent,
+                            dtx_enabled: true,
+                            vbr_enabled: true,
+                        };
+                        match VoiceEncoder::with_settings(encoder_settings) {
+                            Ok(enc) => {
+                                if let Ok(mut guard) = encoder.lock() {
+                                    *guard = Some(enc);
+                                }
+                                info!("Created connection-scoped encoder");
+                            }
+                            Err(e) => {
+                                error!("Failed to create connection-scoped encoder: {}", e);
+                            }
+                        }
+                        
+                        // Reset DTX tracking for new connection
+                        if let Ok(mut guard) = last_send_time.lock() {
+                            *guard = None;
+                        }
+
                         // Start audio output for receiving (unless deafened)
                         if audio_output.is_none() && !self_deafened {
                             audio_output = start_audio_output(&audio_system, &selected_output, &mut user_audio);
@@ -527,6 +581,11 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
 
                         // Stop transmission (sync will handle this since connected=false)
                         sync_transmission!();
+                        
+                        // Destroy connection-scoped encoder
+                        if let Ok(mut guard) = encoder.lock() {
+                            *guard = None;
+                        }
                         
                         // Reset PTT state on disconnect
                         ptt_active = false;
@@ -794,6 +853,100 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
                         repaint();
                     }
 
+                    AudioCommand::UserJoinedRoom { user_id } => {
+                        // Proactively create decoder/pipeline for this user before packets arrive
+                        // Skip if it's our own user ID
+                        if user_id != my_user_id && !user_audio.contains_key(&user_id) {
+                            debug!("Audio task: user {} joined room, creating decoder proactively", user_id);
+                            let jitter_delay = audio_settings.jitter_buffer_delay_packets;
+                            
+                            // Determine pipeline config and volume for this user
+                            let (pipeline_config, volume_db) = match per_user_rx.get(&user_id) {
+                                Some(user_rx) => {
+                                    let config = user_rx.pipeline_override.as_ref().unwrap_or(&rx_pipeline_defaults);
+                                    (config, user_rx.volume_db)
+                                }
+                                None => (&rx_pipeline_defaults, 0.0),
+                            };
+                            
+                            // Build the RX pipeline
+                            let rx_pipeline = match pipeline::AudioPipeline::from_config(pipeline_config, &processor_registry) {
+                                Ok(p) => Some(p),
+                                Err(e) => {
+                                    warn!("Failed to build RX pipeline for user {}: {}", user_id, e);
+                                    None
+                                }
+                            };
+                            
+                            if let Ok(mut user_state) = UserAudioState::new(jitter_delay) {
+                                user_state.rx_pipeline = rx_pipeline;
+                                user_state.volume_db = volume_db;
+                                user_audio.insert(user_id, user_state);
+                            }
+                        }
+                    }
+
+                    AudioCommand::UserLeftRoom { user_id } => {
+                        // Destroy decoder/pipeline for this user
+                        if user_audio.remove(&user_id).is_some() {
+                            debug!("Audio task: user {} left room, destroyed decoder", user_id);
+                            // Also remove from talking users
+                            let mut needs_repaint = false;
+                            {
+                                let mut s = state.write().unwrap();
+                                if s.audio.talking_users.remove(&user_id) {
+                                    needs_repaint = true;
+                                }
+                            }
+                            if needs_repaint {
+                                repaint();
+                            }
+                        }
+                    }
+
+                    AudioCommand::RoomChanged { user_ids_in_room } => {
+                        // We changed rooms - destroy all existing decoders, create new ones
+                        debug!("Audio task: room changed, rebuilding decoders for {} users", user_ids_in_room.len());
+                        
+                        // Clear all existing user audio state
+                        user_audio.clear();
+                        {
+                            let mut s = state.write().unwrap();
+                            s.audio.talking_users.clear();
+                        }
+                        
+                        // Create decoders for all users in the new room (except ourselves)
+                        let jitter_delay = audio_settings.jitter_buffer_delay_packets;
+                        for user_id in user_ids_in_room {
+                            if user_id != my_user_id {
+                                // Determine pipeline config and volume for this user
+                                let (pipeline_config, volume_db) = match per_user_rx.get(&user_id) {
+                                    Some(user_rx) => {
+                                        let config = user_rx.pipeline_override.as_ref().unwrap_or(&rx_pipeline_defaults);
+                                        (config, user_rx.volume_db)
+                                    }
+                                    None => (&rx_pipeline_defaults, 0.0),
+                                };
+                                
+                                // Build the RX pipeline
+                                let rx_pipeline = match pipeline::AudioPipeline::from_config(pipeline_config, &processor_registry) {
+                                    Ok(p) => Some(p),
+                                    Err(e) => {
+                                        warn!("Failed to build RX pipeline for user {}: {}", user_id, e);
+                                        None
+                                    }
+                                };
+                                
+                                if let Ok(mut user_state) = UserAudioState::new(jitter_delay) {
+                                    user_state.rx_pipeline = rx_pipeline;
+                                    user_state.volume_db = volume_db;
+                                    user_audio.insert(user_id, user_state);
+                                }
+                            }
+                        }
+                        repaint();
+                    }
+
                     AudioCommand::Shutdown => {
                         info!("Audio task shutting down");
                         break;
@@ -814,26 +967,63 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
                         }
                     };
                     
-                    let datagram = VoiceDatagram {
-                        sender_id: Some(my_user_id),
-                        room_id: None, // TODO: set room ID
-                        sequence: send_sequence,
-                        timestamp_us: 0, // TODO: track timestamp
-                        opus_data,
-                        end_of_stream,
-                    };
-                    send_sequence = send_sequence.wrapping_add(1);
-                    let datagram_bytes = datagram.encode_to_vec();
+                    // DTX handling: Skip sending DTX frames unless enough time has passed
+                    // DTX frames are very small (≤2 bytes) and indicate silence.
+                    // We skip them to save bandwidth, but send periodic keepalives.
+                    let now = Instant::now();
+                    let is_dtx = !end_of_stream && is_dtx_frame(&opus_data);
                     
-                    // Track statistics (only for actual audio, not EOS)
-                    if !end_of_stream {
-                        packets_sent += 1;
-                        bytes_sent += size_bytes as u64;
-                    }
+                    let should_send = if is_dtx {
+                        // Check if we need to send a keepalive
+                        let send_keepalive = if let Ok(guard) = last_send_time.lock() {
+                            match *guard {
+                                Some(last) => now.duration_since(last) >= DTX_KEEPALIVE_INTERVAL,
+                                None => true, // First packet, always send
+                            }
+                        } else {
+                            true
+                        };
+                        
+                        if send_keepalive {
+                            trace!("Sending DTX keepalive frame");
+                            true
+                        } else {
+                            trace!("Skipping DTX frame (keepalive not needed yet)");
+                            false
+                        }
+                    } else {
+                        // Non-DTX frame (actual voice) or EOS - always send
+                        true
+                    };
+                    
+                    if should_send {
+                        let datagram = VoiceDatagram {
+                            sender_id: Some(my_user_id),
+                            room_id: None, // TODO: set room ID
+                            sequence: send_sequence,
+                            timestamp_us: 0, // TODO: track timestamp
+                            opus_data,
+                            end_of_stream,
+                        };
+                        // Only increment sequence when we actually send
+                        send_sequence = send_sequence.wrapping_add(1);
+                        let datagram_bytes = datagram.encode_to_vec();
+                        
+                        // Update last send time for DTX tracking
+                        if let Ok(mut guard) = last_send_time.lock() {
+                            *guard = Some(now);
+                        }
+                        
+                        // Track statistics (only for actual audio, not EOS)
+                        if !end_of_stream {
+                            packets_sent += 1;
+                            bytes_sent += size_bytes as u64;
+                        }
 
-                    if let Err(e) = conn.send_datagram(Bytes::from(datagram_bytes)) {
-                        warn!("Failed to send voice datagram: {}", e);
-                        // Connection might be closed - will be detected by read_datagram
+                        if let Err(e) = conn.send_datagram(Bytes::from(datagram_bytes)) {
+                            warn!("Failed to send voice datagram: {}", e);
+                            // Connection might be closed - will be detected by read_datagram
+                        }
                     }
                 }
             }
@@ -903,6 +1093,7 @@ fn start_transmission(
     audio_settings: &AudioSettings,
     tx_pipeline_config: &pipeline::PipelineConfig,
     processor_registry: &pipeline::ProcessorRegistry,
+    encoder: &Arc<std::sync::Mutex<Option<VoiceEncoder>>>,
     audio_input: &mut Option<AudioInput>,
     state: &Arc<RwLock<State>>,
     repaint: &Arc<dyn Fn() + Send + Sync>,
@@ -925,24 +1116,38 @@ fn start_transmission(
         }
     };
 
-    // Create encoder with current settings
-    let encoder_settings = EncoderSettings {
-        bitrate: audio_settings.bitrate,
-        complexity: audio_settings.encoder_complexity,
-        fec_enabled: audio_settings.fec_enabled,
-        packet_loss_percent: audio_settings.packet_loss_percent,
-        dtx_enabled: true,
-        vbr_enabled: true,
-    };
-    
-    let encoder = match VoiceEncoder::with_settings(encoder_settings) {
-        Ok(e) => e,
-        Err(e) => {
-            error!("Failed to create Opus encoder: {}", e);
+    // Use the connection-scoped encoder (already created on ConnectionEstablished)
+    // We just verify it exists and update settings if needed
+    {
+        let encoder_settings = EncoderSettings {
+            bitrate: audio_settings.bitrate,
+            complexity: audio_settings.encoder_complexity,
+            fec_enabled: audio_settings.fec_enabled,
+            packet_loss_percent: audio_settings.packet_loss_percent,
+            dtx_enabled: true,
+            vbr_enabled: true,
+        };
+        
+        if let Ok(mut guard) = encoder.lock() {
+            if guard.is_none() {
+                // Encoder not created yet (shouldn't happen if connected)
+                error!("Connection-scoped encoder not available");
+                return;
+            }
+            // Update settings if they've changed
+            if let Some(enc) = guard.as_mut() {
+                if let Err(e) = enc.update_settings(encoder_settings) {
+                    warn!("Failed to update encoder settings: {}", e);
+                }
+            }
+        } else {
+            error!("Failed to lock encoder");
             return;
         }
-    };
-    let encoder_mutex = std::sync::Arc::new(std::sync::Mutex::new(encoder));
+    }
+    
+    // Clone Arc for use in callback
+    let encoder_for_callback = encoder.clone();
 
     // Build the TX pipeline from config
     let tx_pipeline = match pipeline::AudioPipeline::from_config(tx_pipeline_config, processor_registry) {
@@ -1015,18 +1220,20 @@ fn start_transmission(
         // We're transmitting now
         was_transmitting_for_callback.store(true, std::sync::atomic::Ordering::Relaxed);
         
-        // Encode the processed audio frame
-        if let Ok(mut enc) = encoder_mutex.lock() {
-            match enc.encode(&processed_samples) {
-                Ok(encoded) => {
-                    let size_bytes = encoded.len();
-                    let _ = encoded_tx.send(CaptureMessage::EncodedFrame {
-                        data: Bytes::from(encoded),
-                        size_bytes,
-                    });
-                }
-                Err(e) => {
-                    trace!("Encode error: {}", e);
+        // Encode the processed audio frame using the connection-scoped encoder
+        if let Ok(mut guard) = encoder_for_callback.lock() {
+            if let Some(enc) = guard.as_mut() {
+                match enc.encode(&processed_samples) {
+                    Ok(encoded) => {
+                        let size_bytes = encoded.len();
+                        let _ = encoded_tx.send(CaptureMessage::EncodedFrame {
+                            data: Bytes::from(encoded),
+                            size_bytes,
+                        });
+                    }
+                    Err(e) => {
+                        trace!("Encode error: {}", e);
+                    }
                 }
             }
         }

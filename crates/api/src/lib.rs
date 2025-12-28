@@ -83,18 +83,6 @@ pub fn try_decode_frame(src: &mut BytesMut) -> Option<Vec<u8>> {
     Some(frame.to_vec())
 }
 
-/// Compute a portable state hash over a protobuf `Message` by hashing its
-/// canonical prost encoding bytes. This function should only be used on
-/// messages that do not include the `state_hash` field to avoid recursion.
-pub fn compute_state_hash<M: Message>(msg: &M) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(msg.encoded_len());
-    msg.encode(&mut buf).expect("prost encode failed");
-    let mut hasher = Hasher::new();
-    hasher.update(&buf);
-    let digest = hasher.finalize();
-    digest.as_bytes().to_vec()
-}
-
 /// Compute a state hash from a ServerState message with canonical sorting.
 ///
 /// This function canonicalizes the ServerState by sorting rooms by ID and users

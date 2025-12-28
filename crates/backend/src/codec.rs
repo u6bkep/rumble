@@ -64,6 +64,22 @@ pub const OPUS_DEFAULT_COMPLEXITY: i32 = 10;
 /// 5% is a reasonable default for internet voice chat.
 pub const OPUS_DEFAULT_PACKET_LOSS_PERC: i32 = 5;
 
+/// Maximum size in bytes for a DTX (discontinuous transmission) silence frame.
+/// When Opus DTX is enabled and the encoder detects silence, it produces very
+/// small frames (typically 1-2 bytes). We use ≤2 bytes as the threshold to
+/// identify these DTX frames for the purpose of skipping/keepalive logic.
+pub const DTX_FRAME_MAX_SIZE: usize = 2;
+
+/// Check if an encoded Opus frame is a DTX (discontinuous transmission) silence frame.
+///
+/// When DTX is enabled and the encoder detects silence, it produces very small
+/// frames (typically 1-2 bytes). These can be skipped to save bandwidth, with
+/// periodic keepalives to maintain the connection.
+#[inline]
+pub fn is_dtx_frame(encoded: &[u8]) -> bool {
+    encoded.len() <= DTX_FRAME_MAX_SIZE
+}
+
 // =============================================================================
 // Encoder Settings
 // =============================================================================
@@ -723,5 +739,39 @@ mod tests {
         
         // Higher bitrate should produce larger frames
         assert!(avg_high > avg_low, "higher bitrate should produce larger frames (low: {}, high: {})", avg_low, avg_high);
+    }
+    
+    #[test]
+    fn test_is_dtx_frame() {
+        // DTX frames are ≤2 bytes
+        assert!(is_dtx_frame(&[]), "empty frame should be DTX");
+        assert!(is_dtx_frame(&[0x00]), "1-byte frame should be DTX");
+        assert!(is_dtx_frame(&[0x00, 0x01]), "2-byte frame should be DTX");
+        assert!(!is_dtx_frame(&[0x00, 0x01, 0x02]), "3-byte frame should not be DTX");
+        assert!(!is_dtx_frame(&[0x00; 100]), "100-byte frame should not be DTX");
+    }
+    
+    #[test]
+    fn test_dtx_produces_small_frames_on_silence() {
+        // With DTX enabled, silence should produce very small frames (≤2 bytes)
+        let settings = EncoderSettings {
+            dtx_enabled: true,
+            ..Default::default()
+        };
+        let mut encoder = VoiceEncoder::with_settings(settings).unwrap();
+        
+        // Encode many silent frames to ensure encoder reaches DTX state
+        let silent_pcm = vec![0.0f32; OPUS_FRAME_SIZE];
+        let mut dtx_frames = 0;
+        
+        for _ in 0..50 {
+            let encoded = encoder.encode(&silent_pcm).unwrap();
+            if is_dtx_frame(&encoded) {
+                dtx_frames += 1;
+            }
+        }
+        
+        // After many silent frames, most should be DTX frames
+        assert!(dtx_frames > 30, "Expected most frames to be DTX on silence, got {}/50", dtx_frames);
     }
 }
