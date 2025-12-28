@@ -1,4 +1,4 @@
-use backend::{AudioSettings, BackendHandle, Command, ConnectionState, ConnectConfig, PipelineConfig, ProcessorRegistry, VoiceMode, register_builtin_processors};
+use backend::{AudioSettings, BackendHandle, Command, ConnectionState, ConnectConfig, PipelineConfig, ProcessorRegistry, VoiceMode, register_builtin_processors, build_default_tx_pipeline, merge_with_default_tx_pipeline};
 use clap::Parser;
 use directories::ProjectDirs;
 use eframe::egui;
@@ -79,11 +79,12 @@ impl Default for PersistentSettings {
     }
 }
 
-/// Serializable audio settings (mirrors backend::AudioSettings).
+/// Serializable audio settings (mirrors backend::AudioSettings encoder settings).
+/// 
+/// Audio processing settings (denoise, VAD, gain) are stored in `tx_pipeline`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PersistentAudioSettings {
-    pub denoise_enabled: bool,
     pub bitrate: i32,
     pub encoder_complexity: i32,
     pub jitter_buffer_delay_packets: u32,
@@ -96,7 +97,6 @@ pub struct PersistentAudioSettings {
 impl Default for PersistentAudioSettings {
     fn default() -> Self {
         Self {
-            denoise_enabled: true,
             bitrate: 64000,
             encoder_complexity: 10,
             jitter_buffer_delay_packets: 3,
@@ -110,7 +110,6 @@ impl Default for PersistentAudioSettings {
 impl From<&AudioSettings> for PersistentAudioSettings {
     fn from(s: &AudioSettings) -> Self {
         Self {
-            denoise_enabled: s.denoise_enabled,
             bitrate: s.bitrate,
             encoder_complexity: s.encoder_complexity,
             jitter_buffer_delay_packets: s.jitter_buffer_delay_packets,
@@ -125,7 +124,6 @@ impl From<&AudioSettings> for PersistentAudioSettings {
 impl From<&PersistentAudioSettings> for AudioSettings {
     fn from(s: &PersistentAudioSettings) -> Self {
         Self {
-            denoise_enabled: s.denoise_enabled,
             bitrate: s.bitrate,
             encoder_complexity: s.encoder_complexity,
             jitter_buffer_delay_packets: s.jitter_buffer_delay_packets,
@@ -375,16 +373,13 @@ impl MyApp {
         register_builtin_processors(&mut processor_registry);
         
         // Apply TX pipeline from persistent config, or build a default one
-        let tx_pipeline_config = if let Some(config) = persistent_settings.audio.tx_pipeline.clone() {
-            config
+        // Use merge to ensure new processors are added to existing configs
+        let tx_pipeline_config = if let Some(ref config) = persistent_settings.audio.tx_pipeline {
+            // Merge persisted config with default to add any new processors
+            merge_with_default_tx_pipeline(config, &processor_registry)
         } else {
-            // Build default pipeline with denoise setting
-            // VAD is disabled by default - user can enable it for voice-activated behavior
-            build_default_tx_pipeline(
-                &processor_registry,
-                false, // VAD disabled by default
-                persistent_settings.audio.denoise_enabled,
-            )
+            // No persisted config - build fresh default
+            build_default_tx_pipeline(&processor_registry)
         };
         backend.send(Command::UpdateTxPipeline { config: tx_pipeline_config });
         
@@ -518,41 +513,6 @@ impl MyApp {
     #[allow(dead_code)]
     fn is_connected(&self) -> bool {
         self.backend.state().connection.is_connected()
-    }
-}
-
-/// Build a default TX pipeline config using the processor registry for defaults.
-/// If enable_vad is true, includes VAD processor. VAD can be used in Continuous mode
-/// to provide voice-activated transmission behavior.
-fn build_default_tx_pipeline(
-    registry: &ProcessorRegistry,
-    enable_vad: bool,
-    denoise_enabled: bool,
-) -> PipelineConfig {
-    let mut processors = Vec::new();
-    
-    // Add gain processor first (mic input level adjustment)
-    if let Some(config) = registry.default_config("builtin.gain") {
-        processors.push(config);
-    }
-    
-    // Add denoise processor if enabled
-    if denoise_enabled {
-        if let Some(config) = registry.default_config("builtin.denoise") {
-            processors.push(config);
-        }
-    }
-    
-    // Add VAD processor if in VAD mode
-    if enable_vad {
-        if let Some(config) = registry.default_config("builtin.vad") {
-            processors.push(config);
-        }
-    }
-    
-    PipelineConfig {
-        processors,
-        ..Default::default()
     }
 }
 
@@ -869,6 +829,23 @@ impl eframe::App for MyApp {
                                 egui::vec2(rect.width() * normalized, rect.height()),
                             );
                             ui.painter().rect_filled(filled_rect, 2.0, color);
+                            
+                            // Draw VAD threshold line if VAD is enabled
+                            // Look up threshold from pipeline config (schema-driven, not hardcoded)
+                            let vad_threshold = audio.tx_pipeline.processors.iter()
+                                .find(|p| p.type_id.ends_with("vad") && p.enabled)
+                                .and_then(|p| p.settings.get("threshold_db"))
+                                .and_then(|v| v.as_f64())
+                                .map(|t| t as f32);
+                            
+                            if let Some(threshold_db) = vad_threshold {
+                                let threshold_normalized = ((threshold_db + 60.0) / 60.0).clamp(0.0, 1.0);
+                                let threshold_x = rect.min.x + rect.width() * threshold_normalized;
+                                ui.painter().line_segment(
+                                    [egui::pos2(threshold_x, rect.min.y), egui::pos2(threshold_x, rect.max.y)],
+                                    egui::Stroke::new(1.5, egui::Color32::WHITE),
+                                );
+                            }
                         }
                     }
                 });
@@ -1315,7 +1292,8 @@ impl eframe::App for MyApp {
                     
                     // TX Pipeline Configuration (generic, schema-driven UI)
                     ui.separator();
-                    ui.label("TX Pipeline Processors:");
+                    ui.heading("TX Pipeline Processors");
+                    ui.label("Audio processing chain applied before encoding:");
                     
                     // Get processor info from registry for display names
                     let processor_info: std::collections::HashMap<&str, (&str, &str)> = self.processor_registry
@@ -1392,6 +1370,26 @@ impl eframe::App for MyApp {
                                 egui::vec2(rect.width() * normalized, rect.height()),
                             );
                             ui.painter().rect_filled(filled_rect, 2.0, color);
+                            
+                            // Draw VAD threshold line if VAD is enabled
+                            // Use pending pipeline config if available (for real-time preview while editing)
+                            let pipeline = self.settings_modal.pending_tx_pipeline.as_ref()
+                                .unwrap_or(&audio.tx_pipeline);
+                            let vad_threshold = pipeline.processors.iter()
+                                .find(|p| p.type_id == "builtin.vad" && p.enabled)
+                                .and_then(|p| p.settings.get("threshold_db"))
+                                .and_then(|v| v.as_f64())
+                                .map(|t| t as f32);
+                            
+                            if let Some(threshold_db) = vad_threshold {
+                                let threshold_normalized = ((threshold_db + 60.0) / 60.0).clamp(0.0, 1.0);
+                                let threshold_x = rect.min.x + rect.width() * threshold_normalized;
+                                ui.painter().line_segment(
+                                    [egui::pos2(threshold_x, rect.min.y), egui::pos2(threshold_x, rect.max.y)],
+                                    egui::Stroke::new(2.0, egui::Color32::WHITE),
+                                );
+                            }
+                            
                             ui.label(format!("{:.0} dB", level_db));
                         });
                     } else {
@@ -1452,17 +1450,10 @@ impl eframe::App for MyApp {
                     
                     ui.separator();
                     
-                    // Audio Pipeline Settings (using pending state)
-                    ui.heading("Audio Pipeline Settings");
+                    // Encoder Settings (Opus codec and network settings)
+                    ui.heading("Encoder Settings");
                     
                     if let Some(ref mut settings) = self.settings_modal.pending_settings {
-                        // RNNoise toggle
-                        if ui.checkbox(&mut settings.denoise_enabled, "Enable RNNoise Denoising")
-                            .on_hover_text("Apply noise suppression to microphone input")
-                            .changed() {
-                            self.settings_modal.dirty = true;
-                        }
-                        
                         // FEC toggle
                         if ui.checkbox(&mut settings.fec_enabled, "Enable Forward Error Correction")
                             .on_hover_text("Add redundancy for packet loss recovery")

@@ -21,11 +21,11 @@ pub use api::ROOT_ROOM_UUID;
 /// Configurable audio pipeline settings.
 ///
 /// These settings can be changed at runtime via the `UpdateAudioSettings` command.
+/// 
+/// Note: Audio processing (denoise, VAD, etc.) is configured via the TX pipeline,
+/// not via these settings.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AudioSettings {
-    /// Enable RNNoise denoising on microphone input.
-    pub denoise_enabled: bool,
-    
     /// Opus encoder bitrate in bits per second.
     /// Common values: 24000 (low), 32000 (medium), 64000 (high), 96000 (very high).
     /// Range: 6000 - 510000.
@@ -52,7 +52,6 @@ pub struct AudioSettings {
 impl Default for AudioSettings {
     fn default() -> Self {
         Self {
-            denoise_enabled: true,
             bitrate: 64000,
             encoder_complexity: 10,
             jitter_buffer_delay_packets: 3,

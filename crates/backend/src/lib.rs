@@ -80,6 +80,8 @@ pub use handle::BackendHandle;
 pub mod processors;
 pub use processors::{
     register_builtin_processors,
+    build_default_tx_pipeline,
+    merge_with_default_tx_pipeline,
     GainProcessor, GainProcessorFactory,
     DenoiseProcessor, DenoiseProcessorFactory,
     VadProcessor, VadProcessorFactory,

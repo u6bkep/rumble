@@ -886,13 +886,9 @@ fn start_transmission(
     // State reference for updating input_level_db
     let state_for_callback = state.clone();
 
-    // Create audio config - note: legacy denoise is separate from pipeline denoise
-    // The AudioConfig denoise runs in the audio callback before the pipeline
-    let audio_config = if audio_settings.denoise_enabled {
-        AudioConfig::default().with_denoise()
-    } else {
-        AudioConfig::default()
-    };
+    // Audio config uses defaults - audio processing (denoise, VAD, etc.)
+    // is handled by the TX pipeline, not by AudioConfig
+    let audio_config = AudioConfig::default();
 
     // Create audio input with pipeline + encoding callback
     let encoded_tx = encoded_tx.clone();
