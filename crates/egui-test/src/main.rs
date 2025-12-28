@@ -634,9 +634,9 @@ impl eframe::App for MyApp {
         // Get current state from backend (clone to avoid borrow issues)
         let state = self.backend.state();
 
-        // Request periodic repaint when audio is active (for level meters and TX indicators)
+        // Request periodic repaint when settings dialog is open (for level meters)
         // This ensures the UI updates even when no user interaction occurs
-        if state.audio.input_level_db.is_some() || state.audio.is_transmitting {
+        if self.show_settings {
             ctx.request_repaint_after(std::time::Duration::from_millis(50)); // 20 FPS for meters
         }
 
@@ -797,58 +797,6 @@ impl eframe::App for MyApp {
                     };
                     self.show_settings = true;
                 }
-                
-                // Transmitting indicator and level meter
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    // TX indicator
-                    if audio.is_transmitting {
-                        ui.colored_label(egui::Color32::GREEN, "🎤 TX");
-                    }
-                    
-                    // Compact level meter (only when transmitting or in continuous mode)
-                    let show_meter = audio.is_transmitting || 
-                        matches!(audio.voice_mode, VoiceMode::Continuous);
-                    if show_meter {
-                        if let Some(level_db) = audio.input_level_db {
-                            // Normalize level_db to 0.0-1.0 range (assuming -60dB to 0dB range)
-                            let normalized = ((level_db + 60.0) / 60.0).clamp(0.0, 1.0);
-                            let color = if level_db > -3.0 {
-                                egui::Color32::RED
-                            } else if level_db > -12.0 {
-                                egui::Color32::YELLOW
-                            } else {
-                                egui::Color32::GREEN
-                            };
-                            let (rect, _response) = ui.allocate_exact_size(
-                                egui::vec2(60.0, 12.0),
-                                egui::Sense::hover(),
-                            );
-                            ui.painter().rect_filled(rect, 2.0, egui::Color32::from_gray(40));
-                            let filled_rect = egui::Rect::from_min_size(
-                                rect.min,
-                                egui::vec2(rect.width() * normalized, rect.height()),
-                            );
-                            ui.painter().rect_filled(filled_rect, 2.0, color);
-                            
-                            // Draw VAD threshold line if VAD is enabled
-                            // Look up threshold from pipeline config (schema-driven, not hardcoded)
-                            let vad_threshold = audio.tx_pipeline.processors.iter()
-                                .find(|p| p.type_id.ends_with("vad") && p.enabled)
-                                .and_then(|p| p.settings.get("threshold_db"))
-                                .and_then(|v| v.as_f64())
-                                .map(|t| t as f32);
-                            
-                            if let Some(threshold_db) = vad_threshold {
-                                let threshold_normalized = ((threshold_db + 60.0) / 60.0).clamp(0.0, 1.0);
-                                let threshold_x = rect.min.x + rect.width() * threshold_normalized;
-                                ui.painter().line_segment(
-                                    [egui::pos2(threshold_x, rect.min.y), egui::pos2(threshold_x, rect.max.y)],
-                                    egui::Stroke::new(1.5, egui::Color32::WHITE),
-                                );
-                            }
-                        }
-                    }
-                });
             });
         });
 

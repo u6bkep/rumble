@@ -931,6 +931,9 @@ fn start_transmission(
     // Track whether we were transmitting (for detecting suppress transitions)
     let was_transmitting = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let was_transmitting_for_callback = was_transmitting.clone();
+    
+    // Repaint callback for notifying UI of VAD state changes
+    let repaint_for_callback = repaint.clone();
 
     // Audio config uses defaults - audio processing (denoise, VAD, etc.)
     // is handled by the TX pipeline, not by AudioConfig
@@ -949,6 +952,10 @@ fn start_transmission(
             pipeline::ProcessorResult::default()
         };
         
+        // Track previous transmitting state to detect changes
+        let was_tx = was_transmitting_for_callback.load(std::sync::atomic::Ordering::Relaxed);
+        let is_tx_now = !pipeline_result.suppress;
+        
         // Update input level and transmitting state in state (for UI metering)
         // is_transmitting reflects whether audio is actually being transmitted
         // (not suppressed by VAD or other pipeline processors)
@@ -957,11 +964,13 @@ fn start_transmission(
                 s.audio.input_level_db = Some(level_db);
             }
             // Update is_transmitting to reflect actual transmission state
-            s.audio.is_transmitting = !pipeline_result.suppress;
+            s.audio.is_transmitting = is_tx_now;
         }
         
-        // Detect transition from transmitting to suppressed (VAD, etc.)
-        let was_tx = was_transmitting_for_callback.load(std::sync::atomic::Ordering::Relaxed);
+        // Notify UI if transmission state changed (VAD triggered on/off)
+        if was_tx != is_tx_now {
+            repaint_for_callback();
+        }
         
         // Pipeline suppress flag gates actual transmission
         // This allows VAD (or any other processor) to prevent encoding/sending
