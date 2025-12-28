@@ -558,18 +558,33 @@ async fn connect_to_server(
     Vec<proto::RoomInfo>,
     Vec<proto::User>,
 )> {
+    use std::net::SocketAddr;
+    use url::Url;
+    
+    const DEFAULT_PORT: u16 = 5000;
+    
     info!(server_addr = %addr, client_name, "Connecting to server");
 
-    // Try parsing as a direct SocketAddr first (no DNS needed),
-    // then fall back to DNS resolution for hostnames
-    let socket_addr: std::net::SocketAddr = addr
-        .parse()
-        .or_else(|_| {
-            addr.to_socket_addrs()
-                .map_err(|e| anyhow::anyhow!("DNS resolution failed: {}", e))?
-                .next()
-                .ok_or_else(|| anyhow::anyhow!("no addresses found for hostname"))
-        })?;
+    // Parse address using URL crate with rumble:// scheme
+    // Supports: "rumble://host:port", "rumble://host", "host:port", "host", IP addresses
+    let addr_as_url = if addr.contains("://") {
+        addr.to_string()
+    } else {
+        format!("rumble://{}", addr)
+    };
+    
+    let url = Url::parse(&addr_as_url)
+        .map_err(|e| anyhow::anyhow!("Invalid server address: {}", e))?;
+    
+    let host = url.host_str()
+        .ok_or_else(|| anyhow::anyhow!("No host in server address"))?;
+    let port = url.port().unwrap_or(DEFAULT_PORT);
+    
+    let socket_addr: SocketAddr = format!("{}:{}", host, port)
+        .to_socket_addrs()
+        .map_err(|e| anyhow::anyhow!("Failed to resolve address: {}", e))?
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("No addresses found for hostname"))?;
 
     let endpoint = make_client_endpoint(socket_addr, config)?;
 
