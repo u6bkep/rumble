@@ -477,6 +477,22 @@ async fn run_connection_task(
                         }
                     }
                     
+                    Command::LocalMessage { text } => {
+                        let mut s = state.write().unwrap();
+                        s.chat_messages.push(crate::events::ChatMessage {
+                            sender: String::new(),
+                            text,
+                            timestamp: std::time::SystemTime::now(),
+                            is_local: true,
+                        });
+                        // Keep only recent messages
+                        if s.chat_messages.len() > 100 {
+                            s.chat_messages.remove(0);
+                        }
+                        drop(s);
+                        repaint();
+                    }
+                    
                     // Audio commands are routed to audio task in BackendHandle::send()
                     Command::SetMuted { muted } => {
                         // Send status update to server
@@ -766,7 +782,8 @@ fn handle_server_message(
                     s.chat_messages.push(crate::events::ChatMessage {
                         sender: cb.sender,
                         text: cb.text,
-                        timestamp: std::time::Instant::now(),
+                        timestamp: std::time::SystemTime::now(),
+                        is_local: false,
                     });
                     // Keep only recent messages
                     if s.chat_messages.len() > 100 {

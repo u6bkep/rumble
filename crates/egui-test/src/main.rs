@@ -37,6 +37,129 @@ struct Args {
 // Persistent Settings
 // =============================================================================
 
+/// Timestamp format options for chat messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum TimestampFormat {
+    /// 24-hour format: 14:30:05
+    #[default]
+    Time24h,
+    /// 12-hour format: 2:30:05 PM
+    Time12h,
+    /// 24-hour with date: 2025-01-15 14:30:05
+    DateTime24h,
+    /// 12-hour with date: 2025-01-15 2:30:05 PM
+    DateTime12h,
+    /// Relative time: 5m ago
+    Relative,
+}
+
+impl TimestampFormat {
+    fn all() -> &'static [TimestampFormat] {
+        &[
+            TimestampFormat::Time24h,
+            TimestampFormat::Time12h,
+            TimestampFormat::DateTime24h,
+            TimestampFormat::DateTime12h,
+            TimestampFormat::Relative,
+        ]
+    }
+    
+    fn label(&self) -> &'static str {
+        match self {
+            TimestampFormat::Time24h => "24-hour (14:30:05)",
+            TimestampFormat::Time12h => "12-hour (2:30:05 PM)",
+            TimestampFormat::DateTime24h => "Date + 24-hour",
+            TimestampFormat::DateTime12h => "Date + 12-hour",
+            TimestampFormat::Relative => "Relative (5m ago)",
+        }
+    }
+    
+    /// Format a SystemTime according to this format.
+    fn format(&self, time: std::time::SystemTime) -> String {
+        use std::time::{Duration, UNIX_EPOCH};
+        
+        // Get duration since UNIX epoch
+        let duration = time.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO);
+        let secs = duration.as_secs();
+        
+        // Calculate date/time components (simplified, no timezone handling)
+        let days_since_epoch = secs / 86400;
+        let time_of_day = secs % 86400;
+        let hours = (time_of_day / 3600) as u32;
+        let minutes = ((time_of_day % 3600) / 60) as u32;
+        let seconds = (time_of_day % 60) as u32;
+        
+        match self {
+            TimestampFormat::Time24h => {
+                format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
+            }
+            TimestampFormat::Time12h => {
+                let (h12, ampm) = if hours == 0 {
+                    (12, "AM")
+                } else if hours < 12 {
+                    (hours, "AM")
+                } else if hours == 12 {
+                    (12, "PM")
+                } else {
+                    (hours - 12, "PM")
+                };
+                format!("{}:{:02}:{:02} {}", h12, minutes, seconds, ampm)
+            }
+            TimestampFormat::DateTime24h | TimestampFormat::DateTime12h => {
+                // Calculate year/month/day (simplified algorithm)
+                let (year, month, day) = days_to_ymd(days_since_epoch);
+                let time_str = if matches!(self, TimestampFormat::DateTime24h) {
+                    format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
+                } else {
+                    let (h12, ampm) = if hours == 0 {
+                        (12, "AM")
+                    } else if hours < 12 {
+                        (hours, "AM")
+                    } else if hours == 12 {
+                        (12, "PM")
+                    } else {
+                        (hours - 12, "PM")
+                    };
+                    format!("{}:{:02}:{:02} {}", h12, minutes, seconds, ampm)
+                };
+                format!("{:04}-{:02}-{:02} {}", year, month, day, time_str)
+            }
+            TimestampFormat::Relative => {
+                let now = std::time::SystemTime::now();
+                let elapsed = now.duration_since(time).unwrap_or(Duration::ZERO);
+                let secs = elapsed.as_secs();
+                
+                if secs < 60 {
+                    "just now".to_string()
+                } else if secs < 3600 {
+                    format!("{}m ago", secs / 60)
+                } else if secs < 86400 {
+                    format!("{}h ago", secs / 3600)
+                } else {
+                    format!("{}d ago", secs / 86400)
+                }
+            }
+        }
+    }
+}
+
+/// Convert days since UNIX epoch to (year, month, day).
+fn days_to_ymd(days: u64) -> (i32, u32, u32) {
+    // Simplified algorithm for converting days since epoch to Y/M/D
+    let days = days as i64;
+    let z = days + 719468;
+    let era = if z >= 0 { z / 146097 } else { (z - 146096) / 146097 };
+    let doe = (z - era * 146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y as i32, m, d)
+}
+
 /// Persistent settings saved to disk.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -60,6 +183,10 @@ pub struct PersistentSettings {
     // Selected devices (by ID)
     pub input_device_id: Option<String>,
     pub output_device_id: Option<String>,
+    
+    // Chat settings
+    pub show_chat_timestamps: bool,
+    pub chat_timestamp_format: TimestampFormat,
 }
 
 impl Default for PersistentSettings {
@@ -75,6 +202,8 @@ impl Default for PersistentSettings {
             voice_mode: PersistentVoiceMode::PushToTalk,
             input_device_id: None,
             output_device_id: None,
+            show_chat_timestamps: false,
+            chat_timestamp_format: TimestampFormat::default(),
         }
     }
 }
@@ -263,6 +392,7 @@ enum SettingsCategory {
     Voice,
     Processing,
     Encoder,
+    Chat,
     Statistics,
 }
 
@@ -274,6 +404,7 @@ impl SettingsCategory {
             SettingsCategory::Voice,
             SettingsCategory::Processing,
             SettingsCategory::Encoder,
+            SettingsCategory::Chat,
             SettingsCategory::Statistics,
         ]
     }
@@ -285,6 +416,7 @@ impl SettingsCategory {
             SettingsCategory::Voice => "🎤 Voice",
             SettingsCategory::Processing => "⚙ Processing",
             SettingsCategory::Encoder => "📦 Encoder",
+            SettingsCategory::Chat => "💬 Chat",
             SettingsCategory::Statistics => "📊 Statistics",
         }
     }
@@ -309,6 +441,10 @@ struct SettingsModalState {
     pending_username: Option<String>,
     /// Pending TX pipeline configuration
     pending_tx_pipeline: Option<PipelineConfig>,
+    /// Pending show timestamps setting
+    pending_show_timestamps: Option<bool>,
+    /// Pending timestamp format
+    pending_timestamp_format: Option<TimestampFormat>,
     /// Whether any settings have been modified
     dirty: bool,
 }
@@ -320,7 +456,6 @@ struct MyApp {
     connect_address: String,
     connect_password: String,
     trust_dev_cert: bool,
-    chat_messages: Vec<String>,
     chat_input: String,
     client_name: String,
     
@@ -429,12 +564,13 @@ impl MyApp {
             backend.send(Command::SetOutputDevice { device_id: persistent_settings.output_device_id.clone() });
         }
 
-        let mut chat_messages = Vec::new();
-        chat_messages.push(format!(
-            "Rumble Client v{}",
-            env!("CARGO_PKG_VERSION")
-        ));
-        chat_messages.push(format!("Client name: {}", client_name));
+        // Send initial status messages via backend
+        backend.send(Command::LocalMessage {
+            text: format!("Rumble Client v{}", env!("CARGO_PKG_VERSION")),
+        });
+        backend.send(Command::LocalMessage {
+            text: format!("Client name: {}", client_name),
+        });
         
         // Update persistent settings with current values (in case CLI overrode them)
         persistent_settings.server_address = server_address.clone();
@@ -450,7 +586,6 @@ impl MyApp {
             connect_address: server_address,
             connect_password: server_password,
             trust_dev_cert,
-            chat_messages,
             chat_input: String::new(),
             client_name,
             persistent_settings,
@@ -468,7 +603,9 @@ impl MyApp {
         if args.server.is_some() {
             app.connect();
         } else if autoconnect_on_launch && !app.connect_address.is_empty() {
-            app.chat_messages.push("Auto-connecting...".to_string());
+            app.backend.send(Command::LocalMessage {
+                text: "Auto-connecting...".to_string(),
+            });
             app.connect();
         }
 
@@ -489,7 +626,9 @@ impl MyApp {
             Some(self.connect_password.trim().to_string())
         };
 
-        self.chat_messages.push(format!("Connecting to {}...", addr));
+        self.backend.send(Command::LocalMessage {
+            text: format!("Connecting to {}...", addr),
+        });
         self.backend.send(Command::Connect {
             addr,
             name,
@@ -522,18 +661,25 @@ impl MyApp {
         self.persistent_settings.input_device_id = audio.selected_input.clone();
         self.persistent_settings.output_device_id = audio.selected_output.clone();
         
+        // Chat settings are already in persistent_settings (applied in apply_pending_settings)
+        
         if let Err(e) = self.persistent_settings.save() {
             log::error!("Failed to save settings: {}", e);
-            self.chat_messages.push(format!("Failed to save settings: {}", e));
+            self.backend.send(Command::LocalMessage {
+                text: format!("Failed to save settings: {}", e),
+            });
         } else {
-            self.chat_messages.push("Settings saved.".to_string());
+            self.backend.send(Command::LocalMessage {
+                text: "Settings saved.".to_string(),
+            });
         }
     }
 
     /// Attempt to reconnect with the last known connection parameters.
     fn reconnect(&mut self) {
-        self.chat_messages
-            .push(format!("Reconnecting to {}...", self.connect_address));
+        self.backend.send(Command::LocalMessage {
+            text: format!("Reconnecting to {}...", self.connect_address),
+        });
         self.connect();
     }
 
@@ -599,6 +745,14 @@ impl MyApp {
         // Apply pending TX pipeline
         if let Some(config) = self.settings_modal.pending_tx_pipeline.clone() {
             self.backend.send(Command::UpdateTxPipeline { config });
+        }
+        
+        // Apply pending chat settings (these are UI-only, stored in persistent_settings)
+        if let Some(show) = self.settings_modal.pending_show_timestamps {
+            self.persistent_settings.show_chat_timestamps = show;
+        }
+        if let Some(format) = self.settings_modal.pending_timestamp_format {
+            self.persistent_settings.chat_timestamp_format = format;
         }
     }
     
@@ -1146,6 +1300,52 @@ impl MyApp {
             self.backend.send(Command::ResetAudioStats);
         }
     }
+    
+    /// Render the Chat settings category.
+    fn render_settings_chat(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Chat Settings");
+        ui.add_space(8.0);
+        
+        // Show timestamps toggle
+        let show_timestamps = self.settings_modal.pending_show_timestamps
+            .unwrap_or(self.persistent_settings.show_chat_timestamps);
+        let mut pending_show = show_timestamps;
+        if ui.checkbox(&mut pending_show, "Show timestamps")
+            .on_hover_text("Display timestamps next to chat messages")
+            .changed()
+        {
+            self.settings_modal.pending_show_timestamps = Some(pending_show);
+            self.settings_modal.dirty = true;
+        }
+        
+        ui.add_space(8.0);
+        
+        // Timestamp format dropdown (only enabled when timestamps are shown)
+        ui.add_enabled_ui(pending_show, |ui| {
+            ui.label("Timestamp format:");
+            let current_format = self.settings_modal.pending_timestamp_format
+                .unwrap_or(self.persistent_settings.chat_timestamp_format);
+            
+            // Ensure pending_timestamp_format is set so we can mutate it
+            if self.settings_modal.pending_timestamp_format.is_none() {
+                self.settings_modal.pending_timestamp_format = Some(current_format);
+            }
+            
+            egui::ComboBox::from_id_salt("timestamp_format")
+                .selected_text(current_format.label())
+                .show_ui(ui, |ui| {
+                    for format in TimestampFormat::all() {
+                        if ui.selectable_value(
+                            self.settings_modal.pending_timestamp_format.as_mut().unwrap(),
+                            *format,
+                            format.label(),
+                        ).changed() {
+                            self.settings_modal.dirty = true;
+                        }
+                    }
+                });
+        });
+    }
 }
 
 /// Render a single schema field and return true if it was modified.
@@ -1325,6 +1525,8 @@ impl eframe::App for MyApp {
                             pending_autoconnect: Some(self.autoconnect_on_launch),
                             pending_username: Some(self.client_name.clone()),
                             pending_tx_pipeline: Some(audio.tx_pipeline.clone()),
+                            pending_show_timestamps: Some(self.persistent_settings.show_chat_timestamps),
+                            pending_timestamp_format: Some(self.persistent_settings.chat_timestamp_format),
                             dirty: false,
                         };
                         self.show_settings = true;
@@ -1427,6 +1629,8 @@ impl eframe::App for MyApp {
                         pending_autoconnect: Some(self.autoconnect_on_launch),
                         pending_username: Some(self.client_name.clone()),
                         pending_tx_pipeline: Some(audio.tx_pipeline.clone()),
+                        pending_show_timestamps: Some(self.persistent_settings.show_chat_timestamps),
+                        pending_timestamp_format: Some(self.persistent_settings.chat_timestamp_format),
                         dirty: false,
                     };
                     self.show_settings = true;
@@ -1450,8 +1654,24 @@ impl eframe::App for MyApp {
                                 .auto_shrink([false; 2])
                                 .stick_to_bottom(true)
                                 .show(ui, |ui| {
-                                    for msg in &self.chat_messages {
-                                        ui.label(msg);
+                                    let show_timestamps = self.persistent_settings.show_chat_timestamps;
+                                    let timestamp_format = self.persistent_settings.chat_timestamp_format;
+                                    
+                                    for msg in &state.chat_messages {
+                                        let timestamp_prefix = if show_timestamps {
+                                            format!("[{}] ", timestamp_format.format(msg.timestamp))
+                                        } else {
+                                            String::new()
+                                        };
+                                        
+                                        if msg.is_local {
+                                            // Local status messages in gray italics
+                                            let text = format!("{}{}", timestamp_prefix, msg.text);
+                                            ui.label(egui::RichText::new(text).italics().color(egui::Color32::GRAY));
+                                        } else {
+                                            // Chat messages from other users
+                                            ui.label(format!("{}{}: {}", timestamp_prefix, msg.sender, msg.text));
+                                        }
                                     }
                                 });
                         });
@@ -1706,6 +1926,8 @@ impl eframe::App for MyApp {
                     pending_autoconnect: Some(self.autoconnect_on_launch),
                     pending_username: Some(self.client_name.clone()),
                     pending_tx_pipeline: Some(audio.tx_pipeline.clone()),
+                    pending_show_timestamps: Some(self.persistent_settings.show_chat_timestamps),
+                    pending_timestamp_format: Some(self.persistent_settings.chat_timestamp_format),
                     dirty: false,
                 };
             }
@@ -1833,6 +2055,9 @@ impl eframe::App for MyApp {
                                             }
                                             SettingsCategory::Encoder => {
                                                 self.render_settings_encoder(ui);
+                                            }
+                                            SettingsCategory::Chat => {
+                                                self.render_settings_chat(ui);
                                             }
                                             SettingsCategory::Statistics => {
                                                 self.render_settings_statistics(ui, &state);

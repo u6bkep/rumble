@@ -305,7 +305,10 @@ impl AudioState {
 pub struct ChatMessage {
     pub sender: String,
     pub text: String,
-    pub timestamp: std::time::Instant,
+    /// Wall-clock time when the message was received/created.
+    pub timestamp: std::time::SystemTime,
+    /// True if this is a local status message (not from the server).
+    pub is_local: bool,
 }
 
 // =============================================================================
@@ -412,6 +415,8 @@ pub enum Command {
     RenameRoom { room_id: Uuid, new_name: String },
     /// Send a chat message.
     SendChat { text: String },
+    /// Add a local status message (not sent to server).
+    LocalMessage { text: String },
 
     // Audio configuration (always available)
     /// Set the input (microphone) device by ID.
