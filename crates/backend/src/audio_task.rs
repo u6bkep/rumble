@@ -1650,10 +1650,9 @@ mod tests {
         let self_muted = false;
         let ptt_active = false;
         let connected = true;
-        let mut audio_input_present = true;
         
         // Simulate stopping for settings update
-        audio_input_present = false;
+        let mut audio_input_present = false;
         
         // sync_transmission! would do:
         let want = should_capture(voice_mode, self_muted, ptt_active, connected);

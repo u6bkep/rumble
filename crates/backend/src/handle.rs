@@ -75,7 +75,7 @@ pub struct BackendHandle {
     audio_task: AudioTaskHandle,
     /// Background thread running the tokio runtime for connection task.
     _runtime_thread: std::thread::JoinHandle<()>,
-    /// Connection configuration (certificates, etc.)
+    /// Connection configuration (certificates, etc.). stored incase we want to inspect it later.
     _connect_config: ConnectConfig,
 }
 

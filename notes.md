@@ -20,3 +20,8 @@
 - add a `pin` toggle to each setting (in a right click menu) to pin the setting to the main window to access it outside of the settings window
 - rework settings window to have a sidebar with categories and a main panel with the settings for the selected category
   - add scrollbars so the settings fit in the default window size
+
+## server
+- maybe a multi host server mode where a single server process can manage multiple host:port combinations, each with their own server state like mumble-server does with virtual servers.
+  - this coudld be done with a declarative config file that defines the various hosts and their settings.
+  - different or the same database backends for each virtual server?

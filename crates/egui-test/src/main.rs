@@ -254,9 +254,47 @@ struct RenameModalState {
     room_name: String,
 }
 
+/// Categories for the settings sidebar
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+enum SettingsCategory {
+    #[default]
+    Connection,
+    Devices,
+    Voice,
+    Processing,
+    Encoder,
+    Statistics,
+}
+
+impl SettingsCategory {
+    fn all() -> &'static [SettingsCategory] {
+        &[
+            SettingsCategory::Connection,
+            SettingsCategory::Devices,
+            SettingsCategory::Voice,
+            SettingsCategory::Processing,
+            SettingsCategory::Encoder,
+            SettingsCategory::Statistics,
+        ]
+    }
+    
+    fn label(&self) -> &'static str {
+        match self {
+            SettingsCategory::Connection => "🔗 Connection",
+            SettingsCategory::Devices => "🔊 Devices",
+            SettingsCategory::Voice => "🎤 Voice",
+            SettingsCategory::Processing => "⚙ Processing",
+            SettingsCategory::Encoder => "📦 Encoder",
+            SettingsCategory::Statistics => "📊 Statistics",
+        }
+    }
+}
+
 /// State for the settings modal with pending changes
 #[derive(Default)]
 struct SettingsModalState {
+    /// Currently selected settings categories (Ctrl+click to multi-select)
+    selected_categories: std::collections::HashSet<SettingsCategory>,
     /// Pending audio settings (initialized when modal opens)
     pending_settings: Option<AudioSettings>,
     /// Pending input device selection
@@ -514,6 +552,600 @@ impl MyApp {
     fn is_connected(&self) -> bool {
         self.backend.state().connection.is_connected()
     }
+    
+    /// Apply all pending settings from the settings modal to the backend.
+    fn apply_pending_settings(&mut self) {
+        // Apply pending autoconnect setting
+        if let Some(autoconnect) = self.settings_modal.pending_autoconnect {
+            self.autoconnect_on_launch = autoconnect;
+        }
+        
+        // Apply pending username
+        if let Some(username) = self.settings_modal.pending_username.clone() {
+            if !username.trim().is_empty() {
+                self.client_name = username;
+            }
+        }
+        
+        // Apply pending audio settings
+        if let Some(settings) = self.settings_modal.pending_settings.clone() {
+            self.backend.send(Command::UpdateAudioSettings { settings });
+        }
+        
+        // Apply pending input device
+        if let Some(device_id) = self.settings_modal.pending_input_device.clone() {
+            let current = self.backend.state().audio.selected_input.clone();
+            if device_id != current {
+                self.backend.send(Command::SetInputDevice { device_id });
+            }
+        }
+        
+        // Apply pending output device
+        if let Some(device_id) = self.settings_modal.pending_output_device.clone() {
+            let current = self.backend.state().audio.selected_output.clone();
+            if device_id != current {
+                self.backend.send(Command::SetOutputDevice { device_id });
+            }
+        }
+        
+        // Apply pending voice mode
+        if let Some(mode) = self.settings_modal.pending_voice_mode.clone() {
+            let current = self.backend.state().audio.voice_mode.clone();
+            if mode != current {
+                self.backend.send(Command::SetVoiceMode { mode: mode.clone() });
+            }
+        }
+        
+        // Apply pending TX pipeline
+        if let Some(config) = self.settings_modal.pending_tx_pipeline.clone() {
+            self.backend.send(Command::UpdateTxPipeline { config });
+        }
+    }
+    
+    /// Render the Connection settings category.
+    fn render_settings_connection(&mut self, ui: &mut egui::Ui, state: &backend::State) {
+        ui.heading("Connection");
+        ui.add_space(8.0);
+        
+        ui.horizontal(|ui| {
+            ui.label("Server:");
+            ui.label(&self.connect_address);
+        });
+        ui.horizontal(|ui| {
+            ui.label("Status:");
+            ui.label(if state.connection.is_connected() {
+                "Connected"
+            } else {
+                "Disconnected"
+            });
+        });
+        
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(8.0);
+        
+        // Username setting
+        ui.label("Username:");
+        let mut pending_username = self.settings_modal.pending_username.clone()
+            .unwrap_or_else(|| self.client_name.clone());
+        if ui.text_edit_singleline(&mut pending_username)
+            .on_hover_text("Your display name shown to other users")
+            .changed()
+        {
+            self.settings_modal.pending_username = Some(pending_username);
+            self.settings_modal.dirty = true;
+        }
+        
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(8.0);
+        
+        // Autoconnect on launch toggle
+        let mut pending_autoconnect = self.settings_modal.pending_autoconnect.unwrap_or(self.autoconnect_on_launch);
+        if ui.checkbox(&mut pending_autoconnect, "Autoconnect on launch")
+            .on_hover_text("Automatically connect to the last server when the app starts")
+            .changed() 
+        {
+            self.settings_modal.pending_autoconnect = Some(pending_autoconnect);
+            self.settings_modal.dirty = true;
+        }
+    }
+    
+    /// Render the Devices settings category.
+    fn render_settings_devices(&mut self, ui: &mut egui::Ui, state: &backend::State) {
+        ui.heading("Audio Devices");
+        ui.add_space(8.0);
+        
+        let audio = &state.audio;
+        
+        // Refresh button (immediate action, not deferred)
+        if ui.button("🔄 Refresh Devices").clicked() {
+            self.backend.send(Command::RefreshAudioDevices);
+        }
+        
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(8.0);
+        
+        // Input device selection (using pending state)
+        ui.label("Input Device (Microphone):");
+        let pending_input = self.settings_modal.pending_input_device.clone().flatten();
+        let current_input_name = pending_input.as_ref()
+            .and_then(|id| audio.input_devices.iter().find(|d| &d.id == id))
+            .map(|d| d.name.clone())
+            .unwrap_or_else(|| "Default".to_string());
+
+        egui::ComboBox::from_id_salt("input_device")
+            .selected_text(&current_input_name)
+            .show_ui(ui, |ui| {
+                // Default option
+                if ui
+                    .selectable_label(pending_input.is_none(), "Default")
+                    .clicked()
+                {
+                    self.settings_modal.pending_input_device = Some(None);
+                    self.settings_modal.dirty = true;
+                }
+
+                for device in &audio.input_devices {
+                    let label = if device.is_default {
+                        format!("{} (default)", device.name)
+                    } else {
+                        device.name.clone()
+                    };
+                    if ui
+                        .selectable_label(
+                            pending_input.as_ref() == Some(&device.id),
+                            &label,
+                        )
+                        .clicked()
+                    {
+                        self.settings_modal.pending_input_device = Some(Some(device.id.clone()));
+                        self.settings_modal.dirty = true;
+                    }
+                }
+            });
+        
+        ui.add_space(8.0);
+        
+        // Output device selection (using pending state)
+        ui.label("Output Device (Speakers):");
+        let pending_output = self.settings_modal.pending_output_device.clone().flatten();
+        let current_output_name = pending_output.as_ref()
+            .and_then(|id| audio.output_devices.iter().find(|d| &d.id == id))
+            .map(|d| d.name.clone())
+            .unwrap_or_else(|| "Default".to_string());
+
+        egui::ComboBox::from_id_salt("output_device")
+            .selected_text(&current_output_name)
+            .show_ui(ui, |ui| {
+                // Default option
+                if ui
+                    .selectable_label(pending_output.is_none(), "Default")
+                    .clicked()
+                {
+                    self.settings_modal.pending_output_device = Some(None);
+                    self.settings_modal.dirty = true;
+                }
+
+                for device in &audio.output_devices {
+                    let label = if device.is_default {
+                        format!("{} (default)", device.name)
+                    } else {
+                        device.name.clone()
+                    };
+                    if ui
+                        .selectable_label(
+                            pending_output.as_ref() == Some(&device.id),
+                            &label,
+                        )
+                        .clicked()
+                    {
+                        self.settings_modal.pending_output_device = Some(Some(device.id.clone()));
+                        self.settings_modal.dirty = true;
+                    }
+                }
+            });
+        
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(8.0);
+        
+        // Audio Input Level Meter
+        ui.label("Input Level:");
+        if let Some(level_db) = audio.input_level_db {
+            ui.horizontal(|ui| {
+                // Normalize level_db to 0.0-1.0 range (assuming -60dB to 0dB range)
+                let normalized = ((level_db + 60.0_f32) / 60.0_f32).clamp(0.0, 1.0);
+                let color = if level_db > -3.0 {
+                    egui::Color32::RED // Clipping
+                } else if level_db > -12.0 {
+                    egui::Color32::YELLOW // Loud
+                } else {
+                    egui::Color32::GREEN // Normal
+                };
+                let (rect, _response) = ui.allocate_exact_size(
+                    egui::vec2(200.0, 16.0),
+                    egui::Sense::hover(),
+                );
+                ui.painter().rect_filled(rect, 2.0, egui::Color32::DARK_GRAY);
+                let filled_rect = egui::Rect::from_min_size(
+                    rect.min,
+                    egui::vec2(rect.width() * normalized, rect.height()),
+                );
+                ui.painter().rect_filled(filled_rect, 2.0, color);
+                
+                // Draw VAD threshold line if VAD is enabled
+                let pipeline = self.settings_modal.pending_tx_pipeline.as_ref()
+                    .unwrap_or(&audio.tx_pipeline);
+                let vad_threshold = pipeline.processors.iter()
+                    .find(|p| p.type_id == "builtin.vad" && p.enabled)
+                    .and_then(|p| p.settings.get("threshold_db"))
+                    .and_then(|v| v.as_f64())
+                    .map(|t| t as f32);
+                
+                if let Some(threshold_db) = vad_threshold {
+                    let threshold_normalized = ((threshold_db + 60.0) / 60.0).clamp(0.0, 1.0);
+                    let threshold_x = rect.min.x + rect.width() * threshold_normalized;
+                    ui.painter().line_segment(
+                        [egui::pos2(threshold_x, rect.min.y), egui::pos2(threshold_x, rect.max.y)],
+                        egui::Stroke::new(2.0, egui::Color32::WHITE),
+                    );
+                }
+                
+                ui.label(format!("{:.0} dB", level_db));
+            });
+        } else {
+            ui.colored_label(egui::Color32::GRAY, "—");
+        }
+    }
+    
+    /// Render the Voice settings category.
+    fn render_settings_voice(&mut self, ui: &mut egui::Ui, state: &backend::State) {
+        ui.heading("Voice Mode");
+        ui.add_space(8.0);
+        
+        let audio = &state.audio;
+        
+        // Voice mode selector (using pending state)
+        let pending_voice_mode = self.settings_modal.pending_voice_mode.clone().unwrap_or(audio.voice_mode.clone());
+        ui.horizontal(|ui| {
+            if ui.selectable_label(
+                matches!(pending_voice_mode, VoiceMode::PushToTalk),
+                "🎤 Push-to-Talk",
+            ).on_hover_text("Hold SPACE to transmit").clicked() {
+                self.settings_modal.pending_voice_mode = Some(VoiceMode::PushToTalk);
+                self.settings_modal.dirty = true;
+            }
+            if ui.selectable_label(
+                matches!(pending_voice_mode, VoiceMode::Continuous),
+                "📡 Continuous",
+            ).on_hover_text("Always transmitting when connected. Enable VAD processor for voice-activated behavior.").clicked() {
+                self.settings_modal.pending_voice_mode = Some(VoiceMode::Continuous);
+                self.settings_modal.dirty = true;
+            }
+        });
+        
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(8.0);
+        
+        // Mute and Deafen toggles (immediate action - these are real-time controls)
+        ui.label("Quick Controls:");
+        ui.horizontal(|ui| {
+            let mute_text = if audio.self_muted { "🔇 Muted" } else { "🎤 Unmuted" };
+            let mute_color = if audio.self_muted { egui::Color32::RED } else { egui::Color32::GREEN };
+            if ui.add(egui::Button::new(egui::RichText::new(mute_text).color(mute_color)))
+                .on_hover_text("Toggle self-mute (stops transmitting)")
+                .clicked()
+            {
+                self.backend.send(Command::SetMuted { muted: !audio.self_muted });
+            }
+            
+            let deafen_text = if audio.self_deafened { "🔕 Deafened" } else { "🔔 Hearing" };
+            let deafen_color = if audio.self_deafened { egui::Color32::RED } else { egui::Color32::GREEN };
+            if ui.add(egui::Button::new(egui::RichText::new(deafen_text).color(deafen_color)))
+                .on_hover_text("Toggle self-deafen (stops receiving audio; also mutes)")
+                .clicked()
+            {
+                self.backend.send(Command::SetDeafened { deafened: !audio.self_deafened });
+            }
+        });
+
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(8.0);
+
+        // Status info - show mode-appropriate message
+        ui.label("Status:");
+        if audio.self_muted {
+            ui.colored_label(egui::Color32::RED, "🔇 Muted");
+        } else {
+            match audio.voice_mode {
+                VoiceMode::PushToTalk => {
+                    ui.label("Push-to-talk: Hold SPACE to transmit");
+                }
+                VoiceMode::Continuous => {
+                    ui.label("Continuous: Always transmitting (enable VAD for voice activation)");
+                }
+            }
+        }
+        
+        if audio.self_deafened {
+            ui.colored_label(egui::Color32::RED, "🔕 Deafened (not receiving audio)");
+        }
+
+        if audio.is_transmitting {
+            ui.colored_label(egui::Color32::GREEN, "🎤 Transmitting...");
+        } else if !audio.self_muted {
+            ui.label("🔇 Not transmitting");
+        }
+    }
+    
+    /// Render the Processing settings category.
+    fn render_settings_processing(&mut self, ui: &mut egui::Ui, state: &backend::State) {
+        ui.heading("Audio Processing");
+        ui.add_space(8.0);
+        
+        ui.label("TX Pipeline - Audio processing chain applied before encoding:");
+        ui.add_space(4.0);
+        
+        // Get processor info from registry for display names
+        let processor_info: std::collections::HashMap<&str, (&str, &str)> = self.processor_registry
+            .list_available()
+            .into_iter()
+            .map(|(type_id, display_name, desc)| (type_id, (display_name, desc)))
+            .collect();
+        
+        if let Some(ref mut pending_pipeline) = self.settings_modal.pending_tx_pipeline {
+            let mut pipeline_changed = false;
+            
+            for proc_config in pending_pipeline.processors.iter_mut() {
+                // Look up the processor info for display name and description
+                let (display_name, description) = processor_info
+                    .get(proc_config.type_id.as_str())
+                    .copied()
+                    .unwrap_or((&proc_config.type_id, "Unknown processor"));
+                
+                ui.horizontal(|ui| {
+                    // Enabled checkbox
+                    if ui.checkbox(&mut proc_config.enabled, display_name)
+                        .on_hover_text(description)
+                        .changed()
+                    {
+                        pipeline_changed = true;
+                    }
+                });
+                
+                // Show settings if processor is enabled
+                if proc_config.enabled {
+                    if let Some(schema) = self.processor_registry.settings_schema(&proc_config.type_id) {
+                        if let Some(properties) = schema.get("properties").and_then(|p| p.as_object()) {
+                            if !properties.is_empty() {
+                                ui.indent(proc_config.type_id.as_str(), |ui| {
+                                    for (key, prop_schema) in properties {
+                                        if render_schema_field(ui, key, prop_schema, &mut proc_config.settings) {
+                                            pipeline_changed = true;
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                    }
+                }
+                ui.add_space(4.0);
+            }
+            
+            if pipeline_changed {
+                self.settings_modal.dirty = true;
+            }
+        }
+        
+        // Show input level meter with VAD threshold
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(8.0);
+        
+        let audio = &state.audio;
+        ui.label("Input Level (with VAD threshold):");
+        if let Some(level_db) = audio.input_level_db {
+            ui.horizontal(|ui| {
+                let normalized = ((level_db + 60.0_f32) / 60.0_f32).clamp(0.0, 1.0);
+                let color = if level_db > -3.0 {
+                    egui::Color32::RED
+                } else if level_db > -12.0 {
+                    egui::Color32::YELLOW
+                } else {
+                    egui::Color32::GREEN
+                };
+                let (rect, _response) = ui.allocate_exact_size(
+                    egui::vec2(200.0, 16.0),
+                    egui::Sense::hover(),
+                );
+                ui.painter().rect_filled(rect, 2.0, egui::Color32::DARK_GRAY);
+                let filled_rect = egui::Rect::from_min_size(
+                    rect.min,
+                    egui::vec2(rect.width() * normalized, rect.height()),
+                );
+                ui.painter().rect_filled(filled_rect, 2.0, color);
+                
+                // Draw VAD threshold line if VAD is enabled
+                let pipeline = self.settings_modal.pending_tx_pipeline.as_ref()
+                    .unwrap_or(&audio.tx_pipeline);
+                let vad_threshold = pipeline.processors.iter()
+                    .find(|p| p.type_id == "builtin.vad" && p.enabled)
+                    .and_then(|p| p.settings.get("threshold_db"))
+                    .and_then(|v| v.as_f64())
+                    .map(|t| t as f32);
+                
+                if let Some(threshold_db) = vad_threshold {
+                    let threshold_normalized = ((threshold_db + 60.0) / 60.0).clamp(0.0, 1.0);
+                    let threshold_x = rect.min.x + rect.width() * threshold_normalized;
+                    ui.painter().line_segment(
+                        [egui::pos2(threshold_x, rect.min.y), egui::pos2(threshold_x, rect.max.y)],
+                        egui::Stroke::new(2.0, egui::Color32::WHITE),
+                    );
+                }
+                
+                ui.label(format!("{:.0} dB", level_db));
+            });
+        } else {
+            ui.colored_label(egui::Color32::GRAY, "—");
+        }
+    }
+    
+    /// Render the Encoder settings category.
+    fn render_settings_encoder(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Encoder Settings");
+        ui.add_space(8.0);
+        
+        ui.label("Opus codec and network settings:");
+        ui.add_space(4.0);
+        
+        if let Some(ref mut settings) = self.settings_modal.pending_settings {
+            // FEC toggle
+            if ui.checkbox(&mut settings.fec_enabled, "Enable Forward Error Correction")
+                .on_hover_text("Add redundancy for packet loss recovery")
+                .changed() {
+                self.settings_modal.dirty = true;
+            }
+            
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(8.0);
+            
+            // Bitrate selection
+            ui.label("Encoder Bitrate:");
+            ui.horizontal(|ui| {
+                if ui.selectable_label(settings.bitrate == AudioSettings::BITRATE_LOW, "24 kbps")
+                    .on_hover_text("Low quality, minimal bandwidth")
+                    .clicked() {
+                    settings.bitrate = AudioSettings::BITRATE_LOW;
+                    self.settings_modal.dirty = true;
+                }
+                if ui.selectable_label(settings.bitrate == AudioSettings::BITRATE_MEDIUM, "32 kbps")
+                    .on_hover_text("Medium quality, good for voice")
+                    .clicked() {
+                    settings.bitrate = AudioSettings::BITRATE_MEDIUM;
+                    self.settings_modal.dirty = true;
+                }
+                if ui.selectable_label(settings.bitrate == AudioSettings::BITRATE_HIGH, "64 kbps")
+                    .on_hover_text("High quality (default)")
+                    .clicked() {
+                    settings.bitrate = AudioSettings::BITRATE_HIGH;
+                    self.settings_modal.dirty = true;
+                }
+                if ui.selectable_label(settings.bitrate == AudioSettings::BITRATE_VERY_HIGH, "96 kbps")
+                    .on_hover_text("Very high quality, more bandwidth")
+                    .clicked() {
+                    settings.bitrate = AudioSettings::BITRATE_VERY_HIGH;
+                    self.settings_modal.dirty = true;
+                }
+            });
+            
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(8.0);
+            
+            // Encoder complexity slider
+            ui.horizontal(|ui| {
+                ui.label("Encoder Complexity:");
+                if ui.add(egui::Slider::new(&mut settings.encoder_complexity, 0..=10)
+                    .text(""))
+                    .on_hover_text("Higher = better quality but more CPU (0-10)")
+                    .changed() {
+                    self.settings_modal.dirty = true;
+                }
+            });
+            
+            ui.add_space(4.0);
+            
+            // Jitter buffer delay slider
+            ui.horizontal(|ui| {
+                ui.label("Jitter Buffer Delay:");
+                if ui.add(egui::Slider::new(&mut settings.jitter_buffer_delay_packets, 1..=10)
+                    .text("packets"))
+                    .on_hover_text("Packets to buffer before playback (1-10). Higher = more latency, smoother audio")
+                    .changed() {
+                    self.settings_modal.dirty = true;
+                }
+            });
+            let jitter_delay_ms = settings.jitter_buffer_delay_packets * 20;
+            ui.label(format!("  Playback delay: ~{}ms", jitter_delay_ms));
+            
+            ui.add_space(4.0);
+            
+            // Packet loss percentage for FEC tuning
+            ui.horizontal(|ui| {
+                ui.label("Expected Packet Loss:");
+                if ui.add(egui::Slider::new(&mut settings.packet_loss_percent, 0..=25)
+                    .text("%"))
+                    .on_hover_text("Expected network packet loss for FEC tuning (0-25%)")
+                    .changed() {
+                    self.settings_modal.dirty = true;
+                }
+            });
+        }
+    }
+    
+    /// Render the Statistics settings category.
+    fn render_settings_statistics(&mut self, ui: &mut egui::Ui, state: &backend::State) {
+        ui.heading("Audio Statistics");
+        ui.add_space(8.0);
+        
+        let stats = &state.audio.stats;
+        
+        egui::Grid::new("stats_grid")
+            .num_columns(2)
+            .spacing([20.0, 4.0])
+            .show(ui, |ui| {
+                ui.label("Actual Bitrate:");
+                ui.label(format!("{:.1} kbps", stats.actual_bitrate_bps / 1000.0));
+                ui.end_row();
+                
+                ui.label("Avg Frame Size:");
+                ui.label(format!("{:.1} bytes", stats.avg_frame_size_bytes));
+                ui.end_row();
+                
+                ui.label("Packets Sent:");
+                ui.label(format!("{}", stats.packets_sent));
+                ui.end_row();
+                
+                ui.label("Packets Received:");
+                ui.label(format!("{}", stats.packets_received));
+                ui.end_row();
+                
+                ui.label("Packet Loss:");
+                let loss_pct = stats.packet_loss_percent();
+                let color = if loss_pct > 5.0 {
+                    egui::Color32::RED
+                } else if loss_pct > 1.0 {
+                    egui::Color32::YELLOW
+                } else {
+                    egui::Color32::GREEN
+                };
+                ui.colored_label(color, format!("{:.1}% ({} lost)", loss_pct, stats.packets_lost));
+                ui.end_row();
+                
+                ui.label("FEC Recovered:");
+                ui.label(format!("{}", stats.packets_recovered_fec));
+                ui.end_row();
+                
+                ui.label("Frames Concealed:");
+                ui.label(format!("{}", stats.frames_concealed));
+                ui.end_row();
+                
+                ui.label("Buffer Level:");
+                ui.label(format!("{} packets", stats.playback_buffer_packets));
+                ui.end_row();
+            });
+        
+        ui.add_space(8.0);
+        
+        if ui.button("Reset Statistics").clicked() {
+            self.backend.send(Command::ResetAudioStats);
+        }
+    }
 }
 
 /// Render a single schema field and return true if it was modified.
@@ -685,6 +1317,7 @@ impl eframe::App for MyApp {
                         // Initialize pending settings from current state
                         let audio = self.backend.state().audio.clone();
                         self.settings_modal = SettingsModalState {
+                            selected_categories: std::iter::once(SettingsCategory::default()).collect(),
                             pending_settings: Some(audio.settings.clone()),
                             pending_input_device: Some(audio.selected_input.clone()),
                             pending_output_device: Some(audio.selected_output.clone()),
@@ -786,6 +1419,7 @@ impl eframe::App for MyApp {
                     // Initialize pending settings from current state
                     let audio = self.backend.state().audio.clone();
                     self.settings_modal = SettingsModalState {
+                        selected_categories: std::iter::once(SettingsCategory::default()).collect(),
                         pending_settings: Some(audio.settings.clone()),
                         pending_input_device: Some(audio.selected_input.clone()),
                         pending_output_device: Some(audio.selected_output.clone()),
@@ -1064,6 +1698,7 @@ impl eframe::App for MyApp {
             if self.settings_modal.pending_settings.is_none() {
                 let audio = state.audio.clone();
                 self.settings_modal = SettingsModalState {
+                    selected_categories: std::iter::once(SettingsCategory::default()).collect(),
                     pending_settings: Some(audio.settings.clone()),
                     pending_input_device: Some(audio.selected_input.clone()),
                     pending_output_device: Some(audio.selected_output.clone()),
@@ -1077,588 +1712,136 @@ impl eframe::App for MyApp {
             
             let modal = Modal::new(egui::Id::new("settings_modal"))
                 .show(ctx, |ui| {
-                ui.set_width(400.0);
-                ui.heading("Settings");
-
-                // Connection settings
-                ui.collapsing("Connection", |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("Server:");
-                        ui.label(&self.connect_address);
+                ui.set_min_size(egui::vec2(600.0, 400.0));
+                ui.set_max_size(egui::vec2(800.0, 600.0));
+                
+                // Header
+                ui.horizontal(|ui| {
+                    ui.heading("Settings");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if self.settings_modal.dirty {
+                            ui.colored_label(egui::Color32::YELLOW, "⚠ Unsaved changes");
+                        }
                     });
-                    ui.horizontal(|ui| {
-                        ui.label("Status:");
-                        ui.label(if state.connection.is_connected() {
-                            "Connected"
-                        } else {
-                            "Disconnected"
-                        });
-                    });
-                    
-                    ui.separator();
-                    
-                    // Username setting
-                    ui.label("Username:");
-                    let mut pending_username = self.settings_modal.pending_username.clone()
-                        .unwrap_or_else(|| self.client_name.clone());
-                    if ui.text_edit_singleline(&mut pending_username)
-                        .on_hover_text("Your display name shown to other users")
-                        .changed()
-                    {
-                        self.settings_modal.pending_username = Some(pending_username);
-                        self.settings_modal.dirty = true;
-                    }
-                    
-                    ui.separator();
-                    
-                    // Autoconnect on launch toggle
-                    let mut pending_autoconnect = self.settings_modal.pending_autoconnect.unwrap_or(self.autoconnect_on_launch);
-                    if ui.checkbox(&mut pending_autoconnect, "Autoconnect on launch")
-                        .on_hover_text("Automatically connect to the last server when the app starts")
-                        .changed() 
-                    {
-                        self.settings_modal.pending_autoconnect = Some(pending_autoconnect);
-                        self.settings_modal.dirty = true;
-                    }
                 });
-
                 ui.separator();
-
-                // Audio settings
-                ui.collapsing("Audio", |ui| {
-                    // Clone audio state to avoid borrow conflicts
-                    let audio = state.audio.clone();
-
-                    // Refresh button (immediate action, not deferred)
-                    if ui.button("🔄 Refresh Devices").clicked() {
-                        self.backend.send(Command::RefreshAudioDevices);
-                    }
-
-                    ui.separator();
-
-                    // Input device selection (using pending state)
-                    ui.label("Input Device (Microphone):");
-                    let pending_input = self.settings_modal.pending_input_device.clone().flatten();
-                    let current_input_name = pending_input.as_ref()
-                        .and_then(|id| audio.input_devices.iter().find(|d| &d.id == id))
-                        .map(|d| d.name.clone())
-                        .unwrap_or_else(|| "Default".to_string());
-
-                    egui::ComboBox::from_id_salt("input_device")
-                        .selected_text(&current_input_name)
-                        .show_ui(ui, |ui| {
-                            // Default option
-                            if ui
-                                .selectable_label(pending_input.is_none(), "Default")
-                                .clicked()
-                            {
-                                self.settings_modal.pending_input_device = Some(None);
-                                self.settings_modal.dirty = true;
-                            }
-
-                            for device in &audio.input_devices {
-                                let label = if device.is_default {
-                                    format!("{} (default)", device.name)
-                                } else {
-                                    device.name.clone()
-                                };
-                                if ui
-                                    .selectable_label(
-                                        pending_input.as_ref() == Some(&device.id),
-                                        &label,
-                                    )
-                                    .clicked()
-                                {
-                                    self.settings_modal.pending_input_device = Some(Some(device.id.clone()));
-                                    self.settings_modal.dirty = true;
-                                }
-                            }
-                        });
-
-                    ui.separator();
-
-                    // Output device selection (using pending state)
-                    ui.label("Output Device (Speakers):");
-                    let pending_output = self.settings_modal.pending_output_device.clone().flatten();
-                    let current_output_name = pending_output.as_ref()
-                        .and_then(|id| audio.output_devices.iter().find(|d| &d.id == id))
-                        .map(|d| d.name.clone())
-                        .unwrap_or_else(|| "Default".to_string());
-
-                    egui::ComboBox::from_id_salt("output_device")
-                        .selected_text(&current_output_name)
-                        .show_ui(ui, |ui| {
-                            // Default option
-                            if ui
-                                .selectable_label(pending_output.is_none(), "Default")
-                                .clicked()
-                            {
-                                self.settings_modal.pending_output_device = Some(None);
-                                self.settings_modal.dirty = true;
-                            }
-
-                            for device in &audio.output_devices {
-                                let label = if device.is_default {
-                                    format!("{} (default)", device.name)
-                                } else {
-                                    device.name.clone()
-                                };
-                                if ui
-                                    .selectable_label(
-                                        pending_output.as_ref() == Some(&device.id),
-                                        &label,
-                                    )
-                                    .clicked()
-                                {
-                                    self.settings_modal.pending_output_device = Some(Some(device.id.clone()));
-                                    self.settings_modal.dirty = true;
-                                }
-                            }
-                        });
-
-                    ui.separator();
-
-                    // Voice mode selector (using pending state)
-                    ui.label("Voice Mode:");
-                    let pending_voice_mode = self.settings_modal.pending_voice_mode.clone().unwrap_or(audio.voice_mode.clone());
-                    ui.horizontal(|ui| {
-                        if ui.selectable_label(
-                            matches!(pending_voice_mode, VoiceMode::PushToTalk),
-                            "🎤 PTT",
-                        ).on_hover_text("Push-to-Talk: Hold SPACE to transmit").clicked() {
-                            self.settings_modal.pending_voice_mode = Some(VoiceMode::PushToTalk);
-                            self.settings_modal.dirty = true;
+                
+                // Main content area with sidebar and content panel
+                egui::TopBottomPanel::bottom("settings_footer")
+                    .frame(egui::Frame::NONE)
+                    .show_inside(ui, |ui| {
+                        ui.add_space(4.0);
+                        // Show dirty indicator
+                        if self.settings_modal.dirty {
+                            ui.colored_label(egui::Color32::YELLOW, "⚠ Unsaved changes");
                         }
-                        if ui.selectable_label(
-                            matches!(pending_voice_mode, VoiceMode::Continuous),
-                            "📡 Continuous",
-                        ).on_hover_text("Always transmitting when connected. Enable VAD processor for voice-activated behavior.").clicked() {
-                            self.settings_modal.pending_voice_mode = Some(VoiceMode::Continuous);
-                            self.settings_modal.dirty = true;
-                        }
-                    });
-                    
-                    // TX Pipeline Configuration (generic, schema-driven UI)
-                    ui.separator();
-                    ui.heading("TX Pipeline Processors");
-                    ui.label("Audio processing chain applied before encoding:");
-                    
-                    // Get processor info from registry for display names
-                    let processor_info: std::collections::HashMap<&str, (&str, &str)> = self.processor_registry
-                        .list_available()
-                        .into_iter()
-                        .map(|(type_id, display_name, desc)| (type_id, (display_name, desc)))
-                        .collect();
-                    
-                    if let Some(ref mut pending_pipeline) = self.settings_modal.pending_tx_pipeline {
-                        let mut pipeline_changed = false;
                         
-                        for proc_config in pending_pipeline.processors.iter_mut() {
-                            // Look up the processor info for display name and description
-                            let (display_name, description) = processor_info
-                                .get(proc_config.type_id.as_str())
-                                .copied()
-                                .unwrap_or((&proc_config.type_id, "Unknown processor"));
-                            
-                            ui.horizontal(|ui| {
-                                // Enabled checkbox
-                                if ui.checkbox(&mut proc_config.enabled, display_name)
-                                    .on_hover_text(description)
-                                    .changed()
-                                {
-                                    pipeline_changed = true;
+                        egui::Sides::new().show(
+                            ui,
+                            |_l| {},
+                            |ui| {
+                                // Apply button - commits all pending changes and saves to disk
+                                let apply_enabled = self.settings_modal.dirty;
+                                if ui.add_enabled(apply_enabled, egui::Button::new("Apply")).clicked() {
+                                    self.apply_pending_settings();
+                                    self.settings_modal.dirty = false;
+                                    self.save_settings();
                                 }
-                            });
-                            
-                            // Show settings if processor is enabled
-                            if proc_config.enabled {
-                                if let Some(schema) = self.processor_registry.settings_schema(&proc_config.type_id) {
-                                    if let Some(properties) = schema.get("properties").and_then(|p| p.as_object()) {
-                                        if !properties.is_empty() {
-                                            ui.indent(proc_config.type_id.as_str(), |ui| {
-                                                for (key, prop_schema) in properties {
-                                                    if render_schema_field(ui, key, prop_schema, &mut proc_config.settings) {
-                                                        pipeline_changed = true;
-                                                    }
+                                
+                                if ui.button("Cancel").clicked() {
+                                    self.settings_modal = SettingsModalState::default();
+                                    self.show_settings = false;
+                                }
+                                
+                                if ui.button("Ok").clicked() {
+                                    // Apply changes before closing if dirty
+                                    if self.settings_modal.dirty {
+                                        self.apply_pending_settings();
+                                        self.save_settings();
+                                    }
+                                    self.settings_modal = SettingsModalState::default();
+                                    self.show_settings = false;
+                                }
+                            },
+                        );
+                    });
+                
+                egui::SidePanel::left("settings_sidebar_panel")
+                    .resizable(false)
+                    .default_width(130.0)
+                    .frame(egui::Frame::NONE)
+                    .show_inside(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .id_salt("settings_sidebar")
+                            .show(ui, |ui| {
+                                ui.add_space(4.0);
+                                let ctrl_held = ui.input(|i| i.modifiers.ctrl);
+                                for category in SettingsCategory::all() {
+                                    let selected = self.settings_modal.selected_categories.contains(category);
+                                    if ui.selectable_label(selected, category.label()).clicked() {
+                                        if ctrl_held {
+                                            // Ctrl+click: toggle this category in the set
+                                            if selected {
+                                                self.settings_modal.selected_categories.remove(category);
+                                                // Ensure at least one category is selected
+                                                if self.settings_modal.selected_categories.is_empty() {
+                                                    self.settings_modal.selected_categories.insert(*category);
                                                 }
-                                            });
+                                            } else {
+                                                self.settings_modal.selected_categories.insert(*category);
+                                            }
+                                        } else {
+                                            // Normal click: select only this category
+                                            self.settings_modal.selected_categories.clear();
+                                            self.settings_modal.selected_categories.insert(*category);
                                         }
                                     }
                                 }
-                            }
-                        }
-                        
-                        if pipeline_changed {
-                            self.settings_modal.dirty = true;
-                        }
-                    }
-
-                    ui.separator();
-                    
-                    // Audio Input Level Meter
-                    if let Some(level_db) = audio.input_level_db {
-                        ui.horizontal(|ui| {
-                            ui.label("Input Level:");
-                            // Normalize level_db to 0.0-1.0 range (assuming -60dB to 0dB range)
-                            let normalized = ((level_db + 60.0) / 60.0).clamp(0.0, 1.0);
-                            let color = if level_db > -3.0 {
-                                egui::Color32::RED // Clipping
-                            } else if level_db > -12.0 {
-                                egui::Color32::YELLOW // Loud
-                            } else {
-                                egui::Color32::GREEN // Normal
-                            };
-                            let (rect, _response) = ui.allocate_exact_size(
-                                egui::vec2(150.0, 16.0),
-                                egui::Sense::hover(),
-                            );
-                            ui.painter().rect_filled(rect, 2.0, egui::Color32::DARK_GRAY);
-                            let filled_rect = egui::Rect::from_min_size(
-                                rect.min,
-                                egui::vec2(rect.width() * normalized, rect.height()),
-                            );
-                            ui.painter().rect_filled(filled_rect, 2.0, color);
-                            
-                            // Draw VAD threshold line if VAD is enabled
-                            // Use pending pipeline config if available (for real-time preview while editing)
-                            let pipeline = self.settings_modal.pending_tx_pipeline.as_ref()
-                                .unwrap_or(&audio.tx_pipeline);
-                            let vad_threshold = pipeline.processors.iter()
-                                .find(|p| p.type_id == "builtin.vad" && p.enabled)
-                                .and_then(|p| p.settings.get("threshold_db"))
-                                .and_then(|v| v.as_f64())
-                                .map(|t| t as f32);
-                            
-                            if let Some(threshold_db) = vad_threshold {
-                                let threshold_normalized = ((threshold_db + 60.0) / 60.0).clamp(0.0, 1.0);
-                                let threshold_x = rect.min.x + rect.width() * threshold_normalized;
-                                ui.painter().line_segment(
-                                    [egui::pos2(threshold_x, rect.min.y), egui::pos2(threshold_x, rect.max.y)],
-                                    egui::Stroke::new(2.0, egui::Color32::WHITE),
-                                );
-                            }
-                            
-                            ui.label(format!("{:.0} dB", level_db));
-                        });
-                    } else {
-                        ui.horizontal(|ui| {
-                            ui.label("Input Level:");
-                            ui.colored_label(egui::Color32::GRAY, "—");
-                        });
-                    }
-
-                    ui.separator();
-                    
-                    // Mute and Deafen toggles (immediate action - these are real-time controls)
-                    ui.horizontal(|ui| {
-                        let mute_text = if audio.self_muted { "🔇 Muted" } else { "🎤 Unmuted" };
-                        let mute_color = if audio.self_muted { egui::Color32::RED } else { egui::Color32::GREEN };
-                        if ui.add(egui::Button::new(egui::RichText::new(mute_text).color(mute_color)))
-                            .on_hover_text("Toggle self-mute (stops transmitting)")
-                            .clicked()
-                        {
-                            self.backend.send(Command::SetMuted { muted: !audio.self_muted });
-                        }
-                        
-                        let deafen_text = if audio.self_deafened { "🔕 Deafened" } else { "🔔 Hearing" };
-                        let deafen_color = if audio.self_deafened { egui::Color32::RED } else { egui::Color32::GREEN };
-                        if ui.add(egui::Button::new(egui::RichText::new(deafen_text).color(deafen_color)))
-                            .on_hover_text("Toggle self-deafen (stops receiving audio; also mutes)")
-                            .clicked()
-                        {
-                            self.backend.send(Command::SetDeafened { deafened: !audio.self_deafened });
-                        }
+                            });
                     });
-
-                    ui.separator();
-
-                    // Status info - show mode-appropriate message
-                    if audio.self_muted {
-                        ui.colored_label(egui::Color32::RED, "🔇 Muted");
-                    } else {
-                        match audio.voice_mode {
-                            VoiceMode::PushToTalk => {
-                                ui.label("Push-to-talk: Hold SPACE to transmit");
-                            }
-                            VoiceMode::Continuous => {
-                                ui.label("Continuous: Always transmitting (enable VAD for voice activation)");
-                            }
-                        }
-                    }
-                    
-                    if audio.self_deafened {
-                        ui.colored_label(egui::Color32::RED, "🔕 Deafened (not receiving audio)");
-                    }
-
-                    if audio.is_transmitting {
-                        ui.colored_label(egui::Color32::GREEN, "🎤 Transmitting...");
-                    } else if !audio.self_muted {
-                        ui.label("🔇 Not transmitting");
-                    }
-                    
-                    ui.separator();
-                    
-                    // Encoder Settings (Opus codec and network settings)
-                    ui.heading("Encoder Settings");
-                    
-                    if let Some(ref mut settings) = self.settings_modal.pending_settings {
-                        // FEC toggle
-                        if ui.checkbox(&mut settings.fec_enabled, "Enable Forward Error Correction")
-                            .on_hover_text("Add redundancy for packet loss recovery")
-                            .changed() {
-                            self.settings_modal.dirty = true;
-                        }
-                        
-                        ui.separator();
-                        
-                        // Bitrate selection
-                        ui.label("Encoder Bitrate:");
-                        ui.horizontal(|ui| {
-                            if ui.selectable_label(settings.bitrate == AudioSettings::BITRATE_LOW, "24 kbps")
-                                .on_hover_text("Low quality, minimal bandwidth")
-                                .clicked() {
-                                settings.bitrate = AudioSettings::BITRATE_LOW;
-                                self.settings_modal.dirty = true;
-                            }
-                            if ui.selectable_label(settings.bitrate == AudioSettings::BITRATE_MEDIUM, "32 kbps")
-                                .on_hover_text("Medium quality, good for voice")
-                                .clicked() {
-                                settings.bitrate = AudioSettings::BITRATE_MEDIUM;
-                                self.settings_modal.dirty = true;
-                            }
-                            if ui.selectable_label(settings.bitrate == AudioSettings::BITRATE_HIGH, "64 kbps")
-                                .on_hover_text("High quality (default)")
-                                .clicked() {
-                                settings.bitrate = AudioSettings::BITRATE_HIGH;
-                                self.settings_modal.dirty = true;
-                            }
-                            if ui.selectable_label(settings.bitrate == AudioSettings::BITRATE_VERY_HIGH, "96 kbps")
-                                .on_hover_text("Very high quality, more bandwidth")
-                                .clicked() {
-                                settings.bitrate = AudioSettings::BITRATE_VERY_HIGH;
-                                self.settings_modal.dirty = true;
-                            }
-                        });
-                        
-                        ui.separator();
-                        
-                        // Encoder complexity slider
-                        ui.horizontal(|ui| {
-                            ui.label("Encoder Complexity:");
-                            if ui.add(egui::Slider::new(&mut settings.encoder_complexity, 0..=10)
-                                .text(""))
-                                .on_hover_text("Higher = better quality but more CPU (0-10)")
-                                .changed() {
-                                self.settings_modal.dirty = true;
-                            }
-                        });
-                        
-                        // Jitter buffer delay slider
-                        ui.horizontal(|ui| {
-                            ui.label("Jitter Buffer Delay:");
-                            if ui.add(egui::Slider::new(&mut settings.jitter_buffer_delay_packets, 1..=10)
-                                .text("packets"))
-                                .on_hover_text("Packets to buffer before playback (1-10). Higher = more latency, smoother audio")
-                                .changed() {
-                                self.settings_modal.dirty = true;
-                            }
-                        });
-                        let jitter_delay_ms = settings.jitter_buffer_delay_packets * 20;
-                        ui.label(format!("  Playback delay: ~{}ms", jitter_delay_ms));
-                        
-                        // Packet loss percentage for FEC tuning
-                        ui.horizontal(|ui| {
-                            ui.label("Expected Packet Loss:");
-                            if ui.add(egui::Slider::new(&mut settings.packet_loss_percent, 0..=25)
-                                .text("%"))
-                                .on_hover_text("Expected network packet loss for FEC tuning (0-25%)")
-                                .changed() {
-                                self.settings_modal.dirty = true;
-                            }
-                        });
-                    }
-                    
-                    ui.separator();
-                    
-                    // Audio Statistics
-                    ui.heading("Audio Statistics");
-                    
-                    let stats = &audio.stats;
-                    
-                    ui.horizontal(|ui| {
-                        ui.label("Actual Bitrate:");
-                        ui.label(format!("{:.1} kbps", stats.actual_bitrate_bps / 1000.0));
-                    });
-                    
-                    ui.horizontal(|ui| {
-                        ui.label("Avg Frame Size:");
-                        ui.label(format!("{:.1} bytes", stats.avg_frame_size_bytes));
-                    });
-                    
-                    ui.horizontal(|ui| {
-                        ui.label("Packets Sent:");
-                        ui.label(format!("{}", stats.packets_sent));
-                    });
-                    
-                    ui.horizontal(|ui| {
-                        ui.label("Packets Received:");
-                        ui.label(format!("{}", stats.packets_received));
-                    });
-                    
-                    ui.horizontal(|ui| {
-                        ui.label("Packet Loss:");
-                        let loss_pct = stats.packet_loss_percent();
-                        let color = if loss_pct > 5.0 {
-                            egui::Color32::RED
-                        } else if loss_pct > 1.0 {
-                            egui::Color32::YELLOW
-                        } else {
-                            egui::Color32::GREEN
-                        };
-                        ui.colored_label(color, format!("{:.1}% ({} lost)", loss_pct, stats.packets_lost));
-                    });
-                    
-                    ui.horizontal(|ui| {
-                        ui.label("FEC Recovered:");
-                        ui.label(format!("{}", stats.packets_recovered_fec));
-                    });
-                    
-                    ui.horizontal(|ui| {
-                        ui.label("Frames Concealed:");
-                        ui.label(format!("{}", stats.frames_concealed));
-                    });
-                    
-                    ui.horizontal(|ui| {
-                        ui.label("Buffer Level:");
-                        ui.label(format!("{} packets", stats.playback_buffer_packets));
-                    });
-                    
-                    if ui.button("Reset Statistics").clicked() {
-                        self.backend.send(Command::ResetAudioStats);
-                    }
-                });
-
-                ui.separator();
                 
-                // Show dirty indicator
-                if self.settings_modal.dirty {
-                    ui.colored_label(egui::Color32::YELLOW, "⚠ Unsaved changes");
-                }
-                
-                egui::Sides::new().show(
-                    ui,
-                    |_l| {},
-                    |ui| {
-                        // Apply button - commits all pending changes and saves to disk
-                        let apply_enabled = self.settings_modal.dirty;
-                        if ui.add_enabled(apply_enabled, egui::Button::new("Apply")).clicked() {
-                            // Apply pending autoconnect setting
-                            if let Some(autoconnect) = self.settings_modal.pending_autoconnect {
-                                self.autoconnect_on_launch = autoconnect;
-                            }
-                            
-                            // Apply pending username
-                            if let Some(username) = self.settings_modal.pending_username.clone() {
-                                if !username.trim().is_empty() {
-                                    self.client_name = username;
-                                }
-                            }
-                            
-                            // Apply pending audio settings
-                            if let Some(settings) = self.settings_modal.pending_settings.clone() {
-                                self.backend.send(Command::UpdateAudioSettings { settings });
-                            }
-                            
-                            // Apply pending input device
-                            if let Some(device_id) = self.settings_modal.pending_input_device.clone() {
-                                let current = self.backend.state().audio.selected_input.clone();
-                                if device_id != current {
-                                    self.backend.send(Command::SetInputDevice { device_id });
-                                }
-                            }
-                            
-                            // Apply pending output device
-                            if let Some(device_id) = self.settings_modal.pending_output_device.clone() {
-                                let current = self.backend.state().audio.selected_output.clone();
-                                if device_id != current {
-                                    self.backend.send(Command::SetOutputDevice { device_id });
-                                }
-                            }
-                            
-                            // Apply pending voice mode
-                            if let Some(mode) = self.settings_modal.pending_voice_mode.clone() {
-                                let current = self.backend.state().audio.voice_mode.clone();
-                                if mode != current {
-                                    self.backend.send(Command::SetVoiceMode { mode: mode.clone() });
-                                }
-                            }
-                            
-                            // Apply pending TX pipeline
-                            if let Some(config) = self.settings_modal.pending_tx_pipeline.clone() {
-                                self.backend.send(Command::UpdateTxPipeline { config });
-                            }
-                            
-                            self.settings_modal.dirty = false;
-                            
-                            // Save settings to disk
-                            self.save_settings();
-                        }
-                        
-                        if ui.button("Cancel").clicked() {
-                            self.settings_modal = SettingsModalState::default();
-                            self.show_settings = false;
-                        }
-                        
-                        if ui.button("Ok").clicked() {
-                            // Apply changes before closing if dirty
-                            if self.settings_modal.dirty {
-                                // Apply pending autoconnect setting
-                                if let Some(autoconnect) = self.settings_modal.pending_autoconnect {
-                                    self.autoconnect_on_launch = autoconnect;
-                                }
-                                
-                                // Apply pending username
-                                if let Some(username) = self.settings_modal.pending_username.clone() {
-                                    if !username.trim().is_empty() {
-                                        self.client_name = username;
+                // Content panel takes remaining space
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show_inside(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .id_salt("settings_content")
+                            .show(ui, |ui| {
+                                // Render all selected categories in order
+                                let mut first = true;
+                                for category in SettingsCategory::all() {
+                                    if self.settings_modal.selected_categories.contains(category) {
+                                        if !first {
+                                            ui.add_space(16.0);
+                                            ui.separator();
+                                            ui.add_space(8.0);
+                                        }
+                                        first = false;
+                                        
+                                        match category {
+                                            SettingsCategory::Connection => {
+                                                self.render_settings_connection(ui, &state);
+                                            }
+                                            SettingsCategory::Devices => {
+                                                self.render_settings_devices(ui, &state);
+                                            }
+                                            SettingsCategory::Voice => {
+                                                self.render_settings_voice(ui, &state);
+                                            }
+                                            SettingsCategory::Processing => {
+                                                self.render_settings_processing(ui, &state);
+                                            }
+                                            SettingsCategory::Encoder => {
+                                                self.render_settings_encoder(ui);
+                                            }
+                                            SettingsCategory::Statistics => {
+                                                self.render_settings_statistics(ui, &state);
+                                            }
+                                        }
                                     }
                                 }
-                                
-                                if let Some(settings) = self.settings_modal.pending_settings.clone() {
-                                    self.backend.send(Command::UpdateAudioSettings { settings });
-                                }
-                                if let Some(device_id) = self.settings_modal.pending_input_device.clone() {
-                                    let current = self.backend.state().audio.selected_input.clone();
-                                    if device_id != current {
-                                        self.backend.send(Command::SetInputDevice { device_id });
-                                    }
-                                }
-                                if let Some(device_id) = self.settings_modal.pending_output_device.clone() {
-                                    let current = self.backend.state().audio.selected_output.clone();
-                                    if device_id != current {
-                                        self.backend.send(Command::SetOutputDevice { device_id });
-                                    }
-                                }
-                                if let Some(mode) = self.settings_modal.pending_voice_mode.clone() {
-                                    let current = self.backend.state().audio.voice_mode.clone();
-                                    if mode != current {
-                                        self.backend.send(Command::SetVoiceMode { mode: mode.clone() });
-                                    }
-                                }
-                                
-                                // Apply pending TX pipeline
-                                if let Some(config) = self.settings_modal.pending_tx_pipeline.clone() {
-                                    self.backend.send(Command::UpdateTxPipeline { config });
-                                }
-                                
-                                // Save settings to disk
-                                self.save_settings();
-                            }
-                            self.settings_modal = SettingsModalState::default();
-                            self.show_settings = false;
-                        }
-                    },
-                );
+                            });
+                    });
             });
             // Don't auto-close on click outside - only close via Cancel/Close buttons
             let _ = modal;
