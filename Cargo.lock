@@ -1523,7 +1523,7 @@ dependencies = [
  "rand 0.8.5",
  "serde",
  "serde_json",
- "service-binding 2.1.0",
+ "service-binding",
  "sha2",
  "ssh-agent-lib",
  "ssh-key",
@@ -4565,15 +4565,6 @@ dependencies = [
 
 [[package]]
 name = "service-binding"
-version = "2.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e5580e177917150862f941023eb13ff219acc59daefa42b76fa747612723402c"
-dependencies = [
- "raunch",
-]
-
-[[package]]
-name = "service-binding"
 version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "25663b9d8b83193ef83183edb3fd01e5447adb3e5baa35466ff9a6cd2408d6e8"
@@ -4794,7 +4785,7 @@ dependencies = [
  "futures",
  "log",
  "secrecy",
- "service-binding 3.0.0",
+ "service-binding",
  "signature",
  "ssh-encoding",
  "ssh-key",

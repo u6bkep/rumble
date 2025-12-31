@@ -478,38 +478,98 @@ fn decrypt_key(
 // SSH Agent Client
 // =============================================================================
 
+/// Get the SSH agent socket/pipe path for the current platform.
+/// 
+/// On Unix, this reads the SSH_AUTH_SOCK environment variable.
+/// On Windows, this checks for SSH_AUTH_SOCK first, then falls back to the default
+/// OpenSSH for Windows named pipe.
+fn get_agent_path() -> anyhow::Result<String> {
+    // First try SSH_AUTH_SOCK (works on both platforms)
+    if let Ok(path) = std::env::var("SSH_AUTH_SOCK") {
+        return Ok(path);
+    }
+    
+    // On Windows, try the default OpenSSH pipe
+    #[cfg(windows)]
+    {
+        // OpenSSH for Windows uses this named pipe by default
+        let default_pipe = r"\\.\pipe\openssh-ssh-agent";
+        return Ok(default_pipe.to_string());
+    }
+    
+    #[cfg(not(windows))]
+    {
+        Err(anyhow::anyhow!("SSH_AUTH_SOCK not set - is ssh-agent running?"))
+    }
+}
+
 /// SSH agent client wrapper for Ed25519 key operations.
 /// 
-/// Uses ssh-agent-lib to communicate with the SSH agent over Unix socket.
+/// Uses ssh-agent-lib to communicate with the SSH agent over Unix socket (Unix)
+/// or named pipe (Windows).
 pub struct SshAgentClient {
-    client: ssh_agent_lib::client::Client<tokio::net::UnixStream>,
+    /// The underlying SSH agent session.
+    /// We use a boxed trait object to support both Unix and Windows stream types.
+    client: Box<dyn ssh_agent_lib::agent::Session + Send + Sync>,
 }
 
 impl SshAgentClient {
-    /// Connect to the SSH agent using the SSH_AUTH_SOCK environment variable.
+    /// Connect to the SSH agent.
+    /// 
+    /// On Unix, uses the SSH_AUTH_SOCK environment variable.
+    /// On Windows, uses SSH_AUTH_SOCK if set, otherwise falls back to the default
+    /// OpenSSH for Windows named pipe.
     pub async fn connect() -> anyhow::Result<Self> {
-        let socket_path = std::env::var("SSH_AUTH_SOCK")
-            .map_err(|_| anyhow::anyhow!("SSH_AUTH_SOCK not set - is ssh-agent running?"))?;
+        let agent_path = get_agent_path()?;
         
-        log::debug!("Connecting to SSH agent at: {}", socket_path);
+        log::debug!("Connecting to SSH agent at: {}", agent_path);
         
-        let stream = tokio::net::UnixStream::connect(&socket_path).await
-            .map_err(|e| anyhow::anyhow!("Failed to connect to SSH agent: {}", e))?;
+        // Parse the path into a service-binding Binding
+        let binding = Self::parse_agent_binding(&agent_path)?;
         
-        let client = ssh_agent_lib::client::Client::new(stream);
+        // Convert to Stream and connect
+        let stream: service_binding::Stream = binding.try_into()
+            .map_err(|e: std::io::Error| anyhow::anyhow!("Failed to connect to SSH agent: {}", e))?;
+        
+        let client = ssh_agent_lib::client::connect(stream)
+            .map_err(|e| anyhow::anyhow!("Failed to create SSH agent client: {}", e))?;
         
         log::info!("Connected to SSH agent");
         Ok(Self { client })
     }
     
+    /// Parse an agent path into a service-binding Binding.
+    fn parse_agent_binding(path: &str) -> anyhow::Result<service_binding::Binding> {
+        // Check if it's a Windows named pipe
+        if path.starts_with(r"\\") {
+            return Ok(service_binding::Binding::NamedPipe(path.into()));
+        }
+        
+        // Check if it's a npipe:// URL
+        if path.starts_with("npipe://") {
+            return path.parse()
+                .map_err(|e| anyhow::anyhow!("Failed to parse named pipe path: {:?}", e));
+        }
+        
+        // Otherwise treat it as a Unix socket path
+        #[cfg(unix)]
+        {
+            Ok(service_binding::Binding::FilePath(path.into()))
+        }
+        
+        #[cfg(not(unix))]
+        {
+            Err(anyhow::anyhow!("Unix socket paths not supported on Windows: {}", path))
+        }
+    }
+    
     /// Check if SSH agent is available.
     pub fn is_available() -> bool {
-        std::env::var("SSH_AUTH_SOCK").is_ok()
+        get_agent_path().is_ok()
     }
     
     /// List Ed25519 keys from the SSH agent.
     pub async fn list_ed25519_keys(&mut self) -> anyhow::Result<Vec<KeyInfo>> {
-        use ssh_agent_lib::agent::Session;
         use ssh_key::public::KeyData;
         
         let identities = self.client.request_identities().await
@@ -536,7 +596,6 @@ impl SshAgentClient {
     
     /// Sign data using a key identified by its fingerprint.
     pub async fn sign(&mut self, fingerprint: &str, data: &[u8]) -> anyhow::Result<[u8; 64]> {
-        use ssh_agent_lib::agent::Session;
         use ssh_agent_lib::proto::SignRequest;
         use ssh_key::public::KeyData;
         
@@ -588,7 +647,6 @@ impl SshAgentClient {
     
     /// Add a new Ed25519 key to the agent.
     pub async fn add_key(&mut self, signing_key: &SigningKey, comment: &str) -> anyhow::Result<()> {
-        use ssh_agent_lib::agent::Session;
         use ssh_agent_lib::proto::{AddIdentity, Credential};
         use ssh_key::private::{Ed25519Keypair, KeypairData};
         use ssh_key::public::Ed25519PublicKey;
