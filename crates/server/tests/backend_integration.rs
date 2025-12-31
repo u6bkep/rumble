@@ -549,6 +549,7 @@ impl TestClient {
             state_hash: Vec::new(),
             payload: Some(Payload::CreateRoom(proto::CreateRoom {
                 name: name.to_string(),
+                parent_id: None,
             })),
         };
         let frame = encode_frame(&env);
@@ -680,6 +681,15 @@ impl TestClient {
                         {
                             user.is_muted = usc.is_muted;
                             user.is_deafened = usc.is_deafened;
+                        }
+                    }
+                }
+                proto::state_update::Update::RoomMoved(rm) => {
+                    if let Some(rid) = rm.room_id.and_then(|r| uuid_from_room_id(&r)) {
+                        if let Some(room) = self.rooms.iter_mut().find(|r| {
+                            r.id.as_ref().and_then(uuid_from_room_id) == Some(rid)
+                        }) {
+                            room.parent_id = rm.new_parent_id;
                         }
                     }
                 }
@@ -1493,12 +1503,12 @@ async fn test_auth_success_with_valid_credentials() {
 }
 
 // =============================================================================
-// User Last Channel Persistence Tests
+// User Last Room Persistence Tests
 // =============================================================================
 
-/// Test that a registered user's last channel is saved when they join a room.
+/// Test that a registered user's last room is saved when they join a room.
 #[tokio::test]
-async fn test_registered_user_last_channel_persisted() {
+async fn test_registered_user_last_room_persisted() {
     let (port, server, _temp_dir) = start_server_with_persistence();
     tokio::time::sleep(Duration::from_millis(500)).await;
 
@@ -1508,7 +1518,7 @@ async fn test_registered_user_last_channel_persisted() {
     // First connection: connect and register the user
     let mut client = TestClient::connect_with_key(
         &format!("127.0.0.1:{}", port),
-        "channel-test-user",
+        "room-test-user",
         signing_key.clone(),
         None,
         &server.cert_path,
@@ -1521,13 +1531,13 @@ async fn test_registered_user_last_channel_persisted() {
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     // Create a room
-    client.create_room("Test Channel").await.unwrap();
+    client.create_room("Test Room").await.unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;
     client.process_messages(Duration::from_millis(300)).await.unwrap();
     
     // Find the created room
     let room_uuid = client.rooms.iter()
-        .find(|r| r.name == "Test Channel")
+        .find(|r| r.name == "Test Room")
         .and_then(|r| r.id.as_ref().and_then(uuid_from_room_id))
         .expect("should find created room");
 
@@ -1542,7 +1552,7 @@ async fn test_registered_user_last_channel_persisted() {
     // Second connection: reconnect with the same key and verify we're in the same room
     let client2 = TestClient::connect_with_key(
         &format!("127.0.0.1:{}", port),
-        "channel-test-user",
+        "room-test-user",
         signing_key,
         None,
         &server.cert_path,
@@ -1559,7 +1569,7 @@ async fn test_registered_user_last_channel_persisted() {
         .and_then(uuid_from_room_id)
         .expect("should have a current room");
     
-    assert_eq!(current_room_uuid, room_uuid, "registered user should be restored to last channel");
+    assert_eq!(current_room_uuid, room_uuid, "registered user should be restored to last room");
     
     client2.close();
 }
@@ -1628,9 +1638,9 @@ async fn test_unregistered_user_starts_in_root() {
     client2.close();
 }
 
-/// Test that if a user's last channel is deleted, they start in Root instead.
+/// Test that if a user's last room is deleted, they start in Root instead.
 #[tokio::test]
-async fn test_last_channel_deleted_falls_back_to_root() {
+async fn test_last_room_deleted_falls_back_to_root() {
     let (port, server, _temp_dir) = start_server_with_persistence();
     tokio::time::sleep(Duration::from_millis(500)).await;
 
@@ -1672,7 +1682,7 @@ async fn test_last_channel_deleted_falls_back_to_root() {
     client.close();
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    // Reconnect - should be in Root since the last channel was deleted
+    // Reconnect - should be in Root since the last room was deleted
     let client2 = TestClient::connect_with_key(
         &format!("127.0.0.1:{}", port),
         "fallback-test-user",
@@ -1691,33 +1701,33 @@ async fn test_last_channel_deleted_falls_back_to_root() {
         .and_then(uuid_from_room_id)
         .expect("should have a current room");
     
-    assert_eq!(current_room_uuid, api::ROOT_ROOM_UUID, "user should fall back to Root when last channel is deleted");
+    assert_eq!(current_room_uuid, api::ROOT_ROOM_UUID, "user should fall back to Root when last room is deleted");
     
     client2.close();
 }
 
-/// Test that persisted channels survive server restart.
+/// Test that persisted rooms survive server restart.
 #[tokio::test]
-async fn test_channels_persist_across_restart() {
+async fn test_rooms_persist_across_restart() {
     let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
     let port = next_test_port();
     
-    // Start server and create a channel
+    // Start server and create a room
     {
         let server = start_server_with_options(port, Some(temp_dir.path().to_str().unwrap()), None);
         tokio::time::sleep(Duration::from_millis(500)).await;
         
-        let mut client = TestClient::connect(&format!("127.0.0.1:{}", port), "channel-creator", &server.cert_path)
+        let mut client = TestClient::connect(&format!("127.0.0.1:{}", port), "room-creator", &server.cert_path)
             .await
             .expect("should connect");
         
-        client.create_room("Persistent Channel").await.unwrap();
+        client.create_room("Persistent Room").await.unwrap();
         client.process_messages(Duration::from_millis(500)).await.unwrap();
         
-        // Verify channel exists
+        // Verify room exists
         assert!(
-            client.rooms.iter().any(|r| r.name == "Persistent Channel"),
-            "channel should be created"
+            client.rooms.iter().any(|r| r.name == "Persistent Room"),
+            "room should be created"
         );
         
         client.close();
@@ -1732,14 +1742,14 @@ async fn test_channels_persist_across_restart() {
         let server = start_server_with_options(port2, Some(temp_dir.path().to_str().unwrap()), None);
         tokio::time::sleep(Duration::from_millis(500)).await;
         
-        let mut client = TestClient::connect(&format!("127.0.0.1:{}", port2), "channel-checker", &server.cert_path)
+        let mut client = TestClient::connect(&format!("127.0.0.1:{}", port2), "room-checker", &server.cert_path)
             .await
             .expect("should connect to restarted server");
         
-        // Channel should still exist
+        // Room should still exist
         assert!(
-            client.rooms.iter().any(|r| r.name == "Persistent Channel"),
-            "channel should persist across server restart"
+            client.rooms.iter().any(|r| r.name == "Persistent Room"),
+            "room should persist across server restart"
         );
         
         client.close();

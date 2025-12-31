@@ -244,6 +244,7 @@ fn test_backend_create_room() {
     // Create a new room
     handle.send(BackendCommand::CreateRoom {
         name: "Backend Test Room".to_string(),
+        parent_id: None,
     });
 
     // Wait for room to appear
@@ -273,6 +274,7 @@ fn test_backend_delete_room() {
     // Create a room to delete
     handle.send(BackendCommand::CreateRoom {
         name: "Room To Delete".to_string(),
+        parent_id: None,
     });
 
     wait_for(&handle, Duration::from_secs(2), |s| {
@@ -318,6 +320,7 @@ fn test_backend_rename_room() {
     // Create a room to rename
     handle.send(BackendCommand::CreateRoom {
         name: "Original Room Name".to_string(),
+        parent_id: None,
     });
 
     wait_for(&handle, Duration::from_secs(2), |s| {
@@ -501,6 +504,7 @@ fn test_backend_room_updates_broadcast() {
     // Backend 1 creates a room
     handle1.send(BackendCommand::CreateRoom {
         name: "Broadcast Room".to_string(),
+        parent_id: None,
     });
 
     // Both should see the new room
@@ -569,6 +573,7 @@ fn test_backend_join_room() {
     // Create a new room
     handle.send(BackendCommand::CreateRoom {
         name: "Room To Join".to_string(),
+        parent_id: None,
     });
 
     wait_for(&handle, Duration::from_secs(2), |s| {

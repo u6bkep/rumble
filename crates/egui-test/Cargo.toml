@@ -7,7 +7,7 @@ edition = "2024"
 eframe = "0.33.3"
 # egui = "0.33.2"
 egui_extras = { version = "0.33.3", features = ["image"] }
-egui_ltreeview = { version = "0.6.0", features = [] }
+egui_ltreeview = { git = "https://github.com/u6bkep/egui_ltreeview.git", branch = "main" }
 env_logger = { version = "0.11.8", features = ["auto-color", "humantime"] }
 uuid = { version = "1.18.1", features = ["v4"] }
 backend = { path = "../backend" }

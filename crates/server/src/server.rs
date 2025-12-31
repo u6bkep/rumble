@@ -82,23 +82,25 @@ impl Server {
         &self.state
     }
 
-    /// Load persisted channels into the server state.
-    async fn load_persisted_channels(&self) {
+    /// Load persisted rooms into the server state.
+    async fn load_persisted_rooms(&self) {
         if let Some(ref persist) = self.persistence {
-            let channels = persist.get_all_channels();
-            let count = channels.len();
-            for (uuid_bytes, channel) in channels {
+            let rooms = persist.get_all_rooms();
+            let count = rooms.len();
+            for (uuid_bytes, room) in rooms {
                 let uuid = uuid::Uuid::from_bytes(uuid_bytes);
                 // Skip the root room UUID (all zeros)
                 if uuid == api::ROOT_ROOM_UUID {
                     continue;
                 }
-                if self.state.add_room_with_uuid(uuid, channel.name.clone()).await {
-                    debug!("Loaded persisted channel: {} ({})", channel.name, uuid);
+                // Convert parent bytes to UUID if present
+                let parent = room.parent.map(uuid::Uuid::from_bytes);
+                if self.state.add_room_with_uuid_and_parent(uuid, room.name.clone(), parent).await {
+                    debug!("Loaded persisted room: {} ({})", room.name, uuid);
                 }
             }
             if count > 0 {
-                info!("Loaded {} persisted channel(s)", count);
+                info!("Loaded {} persisted room(s)", count);
             }
         }
     }
@@ -107,8 +109,8 @@ impl Server {
     ///
     /// This method will run forever unless the endpoint is closed externally.
     pub async fn run(&self) -> Result<()> {
-        // Load persisted channels before accepting connections
-        self.load_persisted_channels().await;
+        // Load persisted rooms before accepting connections
+        self.load_persisted_rooms().await;
         
         info!("server_listen_addr = {}", self.endpoint.local_addr()?);
 

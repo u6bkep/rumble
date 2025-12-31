@@ -3,12 +3,20 @@ use clap::Parser;
 use directories::ProjectDirs;
 use eframe::egui;
 use ed25519_dalek::SigningKey;
-use egui::{CollapsingHeader, Modal};
+use egui::Modal;
+use egui_ltreeview::{Action, TreeView, NodeBuilder};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 use uuid::Uuid;
+
+/// Node ID for the tree view - can be either a room or a user.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum TreeNodeId {
+    Room(Uuid),
+    User { room_id: Uuid, user_id: u64 },
+}
 
 mod key_manager;
 use key_manager::{FirstRunState, KeyManager, KeySource, KeyInfo, PendingAgentOp, SshAgentClient, connect_and_list_keys, generate_and_add_to_agent};
@@ -449,6 +457,16 @@ struct RenameModalState {
     room_name: String,
 }
 
+/// State for the move room confirmation modal
+#[derive(Default)]
+struct MoveRoomModalState {
+    open: bool,
+    room_id: Option<Uuid>,
+    room_name: String,
+    new_parent_id: Option<Uuid>,
+    new_parent_name: String,
+}
+
 /// Categories for the settings sidebar
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 enum SettingsCategory {
@@ -553,6 +571,9 @@ struct MyApp {
 
     // Rename modal state
     rename_modal: RenameModalState,
+
+    // Move room confirmation modal state
+    move_room_modal: MoveRoomModalState,
 
     // Settings modal state with pending changes
     settings_modal: SettingsModalState,
@@ -739,6 +760,7 @@ impl MyApp {
             backend,
             processor_registry,
             rename_modal: RenameModalState::default(),
+            move_room_modal: MoveRoomModalState::default(),
             settings_modal: SettingsModalState::default(),
             push_to_talk_active: false,
             egui_ctx: ctx,
@@ -2240,6 +2262,8 @@ impl eframe::App for MyApp {
                             "🎤 Push-to-Talk"
                         ).clicked() {
                             self.backend.send(Command::SetVoiceMode { mode: VoiceMode::PushToTalk });
+                            // Set voice mode directly before saving (async command hasn't processed yet)
+                            self.persistent_settings.voice_mode = PersistentVoiceMode::PushToTalk;
                             self.save_settings();
                         }
                         if ui.selectable_label(
@@ -2247,6 +2271,8 @@ impl eframe::App for MyApp {
                             "📡 Continuous"
                         ).clicked() {
                             self.backend.send(Command::SetVoiceMode { mode: VoiceMode::Continuous });
+                            // Set voice mode directly before saving (async command hasn't processed yet)
+                            self.persistent_settings.voice_mode = PersistentVoiceMode::Continuous;
                             self.save_settings();
                         }
                     });
@@ -2365,77 +2391,139 @@ impl eframe::App for MyApp {
                 ui.separator();
             }
             egui::ScrollArea::vertical().show(ui, |ui| {
-                for room in state.rooms.iter() {
-                    let room_uuid = room.id.as_ref().and_then(api::uuid_from_room_id);
-                    let is_current = state.my_room_id == room_uuid;
-                    let mut text = room.name.clone();
-                    if is_current {
-                        text.push_str("  (current)");
-                    }
-                    let resp = ui.selectable_label(is_current, text);
-                    if resp.clicked() {
-                        if let Some(uuid) = room_uuid {
-                            self.backend.send(Command::JoinRoom { room_id: uuid });
+                // Collect pending commands to execute after tree view
+                let mut pending_commands: Vec<Command> = Vec::new();
+                let mut pending_rename: Option<(Option<Uuid>, String)> = None;
+                
+                // Build set of rooms that have users in them or in any descendant
+                let mut rooms_with_users: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+                for &room_id in state.room_tree.nodes.keys() {
+                    if !state.users_in_room(room_id).is_empty() {
+                        rooms_with_users.insert(room_id);
+                        for ancestor in state.room_tree.ancestors(room_id) {
+                            rooms_with_users.insert(ancestor);
                         }
                     }
-                    resp.context_menu(|ui| {
-                        if ui.button("Join").clicked() {
-                            if let Some(uuid) = room_uuid {
-                                self.backend.send(Command::JoinRoom { room_id: uuid });
-                            }
-                            ui.close();
-                        }
-                        if ui.button("Rename...").clicked() {
-                            self.rename_modal = RenameModalState {
-                                open: true,
-                                room_uuid,
-                                room_name: room.name.clone(),
+                }
+                
+                let (_response, actions) = TreeView::<TreeNodeId>::new(egui::Id::new("room_tree"))
+                    .override_indent(Some(20.0))
+                    .show(ui, |builder| {
+                        // Recursive helper to render a room and its children
+                        fn render_room(
+                            room_id: Uuid,
+                            state: &backend::State,
+                            rooms_with_users: &std::collections::HashSet<Uuid>,
+                            pending_commands: &mut Vec<Command>,
+                            pending_rename: &mut Option<(Option<Uuid>, String)>,
+                            builder: &mut egui_ltreeview::TreeViewBuilder<TreeNodeId>,
+                        ) {
+                            let Some(tree_node) = state.room_tree.get(room_id) else { return };
+                            
+                            let is_current = state.my_room_id == Some(room_id);
+                            let is_root = room_id == api::ROOT_ROOM_UUID;
+                            let has_users_in_subtree = rooms_with_users.contains(&room_id);
+                            
+                            // Capture values for context menu closure
+                            let room_name = tree_node.name.clone();
+                            let parent_id = tree_node.parent_id;
+                            let my_room_id = state.my_room_id;
+                            
+                            let room_label = if is_current {
+                                format!("📁 {}  (current)", room_name)
+                            } else {
+                                format!("📁 {}", room_name)
                             };
-                            ui.close();
-                        }
-                        if ui.button("Add Room").clicked() {
-                            self.backend.send(Command::CreateRoom {
-                                name: "New Room".to_string(),
-                            });
-                            ui.close();
-                        }
-                        let is_root = room_uuid == Some(api::ROOT_ROOM_UUID);
-                        if !is_root && ui.button("Delete Room").clicked() {
-                            if let Some(uuid) = room_uuid {
-                                self.backend.send(Command::DeleteRoom { room_id: uuid });
+                            
+                            let room_node = NodeBuilder::dir(TreeNodeId::Room(room_id))
+                                .label(room_label)
+                                .default_open(has_users_in_subtree)
+                                .activatable(true)
+                                .context_menu(|ui| {
+                                    ui.set_min_width(200.0);
+                                    ui.label(format!("Room: {}", room_name));
+                                    ui.separator();
+                                    ui.label(format!("ID: {}", room_id));
+                                    if let Some(parent) = parent_id {
+                                        ui.label(format!("Parent: {}", parent));
+                                    } else {
+                                        ui.label("Parent: None (root)");
+                                    }
+                                    if let Some(my_room) = my_room_id {
+                                        ui.label(format!("Current Room: {}", my_room));
+                                    }
+                                    ui.separator();
+                                    
+                                    if ui.button("Join").clicked() {
+                                        pending_commands.push(Command::JoinRoom { room_id });
+                                        ui.close();
+                                    }
+                                    if ui.button("Rename...").clicked() {
+                                        *pending_rename = Some((Some(room_id), room_name.clone()));
+                                        ui.close();
+                                    }
+                                    if ui.button("Add Child Room").clicked() {
+                                        pending_commands.push(Command::CreateRoom {
+                                            name: "New Room".to_string(),
+                                            parent_id: Some(room_id),
+                                        });
+                                        ui.close();
+                                    }
+                                    if !is_root && ui.button("Delete Room").clicked() {
+                                        pending_commands.push(Command::DeleteRoom { room_id });
+                                        ui.close();
+                                    }
+                                });
+                            
+                            let is_open = builder.node(room_node);
+                            
+                            if is_open {
+                                // Render users in this room
+                                for user in state.users_in_room(room_id) {
+                                    render_user(room_id, user, state, pending_commands, builder);
+                                }
+                                
+                                // Recursively render child rooms
+                                for &child_id in &tree_node.children {
+                                    render_room(child_id, state, rooms_with_users, pending_commands, pending_rename, builder);
+                                }
                             }
-                            ui.close();
+                            
+                            builder.close_dir();
                         }
-                    });
-                    // Show users in this room
-                    CollapsingHeader::new("Users")
-                        .id_salt(room_uuid)
-                        .default_open(is_current)
-                        .show(ui, |ui| {
-                            if let Some(uuid) = room_uuid {
-                                for user in state.users_in_room(uuid) {
-                                    let user_id =
-                                        user.user_id.as_ref().map(|id| id.value).unwrap_or(0);
-                                    let is_self = state.my_user_id == Some(user_id);
-
-                                    // Check if user is talking
-                                    // For self, use is_transmitting from backend; for others, check talking_users
-                                    let is_talking = if is_self {
-                                        state.audio.is_transmitting
-                                    } else {
-                                        state.audio.talking_users.contains(&user_id)
-                                    };
-
-                                    // Determine mute/deafen status
-                                    // For self, use local audio state; for others, use user proto fields
-                                    let (user_muted, user_deafened) = if is_self {
-                                        (state.audio.self_muted, state.audio.self_deafened)
-                                    } else {
-                                        (user.is_muted, user.is_deafened)
-                                    };
-
+                        
+                        // Helper to render a user node
+                        fn render_user(
+                            room_id: Uuid,
+                            user: &api::proto::User,
+                            state: &backend::State,
+                            pending_commands: &mut Vec<Command>,
+                            builder: &mut egui_ltreeview::TreeViewBuilder<TreeNodeId>,
+                        ) {
+                            let user_id = user.user_id.as_ref().map(|id| id.value).unwrap_or(0);
+                            let is_self = state.my_user_id == Some(user_id);
+                            
+                            let is_talking = if is_self {
+                                state.audio.is_transmitting
+                            } else {
+                                state.audio.talking_users.contains(&user_id)
+                            };
+                            
+                            let (user_muted, user_deafened) = if is_self {
+                                (state.audio.self_muted, state.audio.self_deafened)
+                            } else {
+                                (user.is_muted, user.is_deafened)
+                            };
+                            
+                            let is_locally_muted = state.audio.muted_users.contains(&user_id);
+                            let username = user.username.clone();
+                            let self_muted = state.audio.self_muted;
+                            let self_deafened = state.audio.self_deafened;
+                            let my_room_id = state.my_room_id;
+                            
+                            let user_node = NodeBuilder::leaf(TreeNodeId::User { room_id, user_id })
+                                .label_ui(|ui| {
                                     ui.horizontal(|ui| {
-                                        // Microphone/talking indicator
                                         if is_talking {
                                             ui.colored_label(egui::Color32::GREEN, "🎤");
                                         } else if user_muted {
@@ -2444,133 +2532,152 @@ impl eframe::App for MyApp {
                                             ui.colored_label(egui::Color32::DARK_GRAY, "🎤");
                                         }
                                         
-                                        // Deafen indicator (only show if deafened)
                                         if user_deafened {
                                             ui.colored_label(egui::Color32::DARK_RED, "🔇");
                                         }
                                         
-                                        // Local mute indicator (we muted them locally)
-                                        let is_locally_muted = state.audio.muted_users.contains(&user_id);
                                         if is_locally_muted && !is_self {
                                             ui.colored_label(egui::Color32::YELLOW, "🔕");
                                         }
                                         
-                                        let resp = ui.label(&user.username);
-                                        
-                                        // Context menu for self user
-                                        if is_self {
-                                            resp.context_menu(|ui| {
-                                                ui.label(format!("User: {} (you)", user.username));
-                                                ui.separator();
-                                                
-                                                // Mute/unmute self
-                                                if state.audio.self_muted {
-                                                    if ui.button("🎤 Unmute").clicked() {
-                                                        self.backend.send(Command::SetMuted { muted: false });
-                                                        ui.close();
-                                                    }
-                                                } else {
-                                                    if ui.button("🔇 Mute").clicked() {
-                                                        self.backend.send(Command::SetMuted { muted: true });
-                                                        ui.close();
-                                                    }
-                                                }
-                                                
-                                                // Deafen/undeafen self
-                                                if state.audio.self_deafened {
-                                                    if ui.button("🔊 Undeafen").clicked() {
-                                                        self.backend.send(Command::SetDeafened { deafened: false });
-                                                        ui.close();
-                                                    }
-                                                } else {
-                                                    if ui.button("🔇 Deafen").clicked() {
-                                                        self.backend.send(Command::SetDeafened { deafened: true });
-                                                        ui.close();
-                                                    }
-                                                }
-                                                
-                                                ui.separator();
-                                                
-                                                // Registration
-                                                if ui.button("📝 Register").clicked() {
-                                                    self.backend.send(Command::RegisterUser { user_id });
-                                                    ui.close();
-                                                }
-                                                if ui.button("❌ Unregister").clicked() {
-                                                    self.backend.send(Command::UnregisterUser { user_id });
-                                                    ui.close();
-                                                }
-                                            });
-                                        }
-                                        
-                                        // Context menu for other users (not self)
-                                        if !is_self {
-                                            resp.context_menu(|ui| {
-                                                ui.label(format!("User: {}", user.username));
-                                                ui.separator();
-                                                
-                                                // Local mute toggle
-                                                if is_locally_muted {
-                                                    if ui.button("🔔 Unmute Locally").clicked() {
-                                                        self.backend.send(Command::UnmuteUser { user_id });
-                                                        ui.close();
-                                                    }
-                                                } else {
-                                                    if ui.button("🔕 Mute Locally").clicked() {
-                                                        self.backend.send(Command::MuteUser { user_id });
-                                                        ui.close();
-                                                    }
-                                                }
-                                                
-                                                ui.separator();
-                                                
-                                                // Volume adjustment
-                                                ui.label("Volume:");
-                                                let current_volume = state.audio.per_user_rx
-                                                    .get(&user_id)
-                                                    .map(|c| c.volume_db)
-                                                    .unwrap_or(0.0);
-                                                let mut volume = current_volume;
-                                                if ui.add(egui::Slider::new(&mut volume, -20.0..=12.0)
-                                                    .suffix(" dB")
-                                                    .text(""))
-                                                    .changed()
-                                                {
-                                                    self.backend.send(Command::SetUserVolume { 
-                                                        user_id, 
-                                                        volume_db: volume 
-                                                    });
-                                                }
-                                                
-                                                // Reset volume button
-                                                if current_volume != 0.0 {
-                                                    if ui.button("Reset Volume").clicked() {
-                                                        self.backend.send(Command::SetUserVolume { 
-                                                            user_id, 
-                                                            volume_db: 0.0 
-                                                        });
-                                                        ui.close();
-                                                    }
-                                                }
-                                                
-                                                ui.separator();
-                                                
-                                                // Registration
-                                                if ui.button("📝 Register").clicked() {
-                                                    self.backend.send(Command::RegisterUser { user_id });
-                                                    ui.close();
-                                                }
-                                                if ui.button("❌ Unregister").clicked() {
-                                                    self.backend.send(Command::UnregisterUser { user_id });
-                                                    ui.close();
-                                                }
-                                            });
-                                        }
+                                        ui.label(&username);
                                     });
+                                })
+                                .context_menu(|ui| {
+                                    ui.set_min_width(200.0);
+                                    
+                                    if is_self {
+                                        ui.label(format!("User: {} (you)", username));
+                                    } else {
+                                        ui.label(format!("User: {}", username));
+                                    }
+                                    ui.separator();
+                                    ui.label(format!("User ID: {}", user_id));
+                                    ui.label(format!("In Room: {}", room_id));
+                                    if let Some(my_room) = my_room_id {
+                                        ui.label(format!("Your Room: {}", my_room));
+                                    }
+                                    ui.separator();
+                                    
+                                    if is_self {
+                                        if self_muted {
+                                            if ui.button("🎤 Unmute").clicked() {
+                                                pending_commands.push(Command::SetMuted { muted: false });
+                                                ui.close();
+                                            }
+                                        } else {
+                                            if ui.button("🔇 Mute").clicked() {
+                                                pending_commands.push(Command::SetMuted { muted: true });
+                                                ui.close();
+                                            }
+                                        }
+                                        
+                                        if self_deafened {
+                                            if ui.button("🔊 Undeafen").clicked() {
+                                                pending_commands.push(Command::SetDeafened { deafened: false });
+                                                ui.close();
+                                            }
+                                        } else {
+                                            if ui.button("🔇 Deafen").clicked() {
+                                                pending_commands.push(Command::SetDeafened { deafened: true });
+                                                ui.close();
+                                            }
+                                        }
+                                        
+                                        ui.separator();
+                                        
+                                        if ui.button("📝 Register").clicked() {
+                                            pending_commands.push(Command::RegisterUser { user_id });
+                                            ui.close();
+                                        }
+                                        if ui.button("❌ Unregister").clicked() {
+                                            pending_commands.push(Command::UnregisterUser { user_id });
+                                            ui.close();
+                                        }
+                                    } else {
+                                        if is_locally_muted {
+                                            if ui.button("🔔 Unmute Locally").clicked() {
+                                                pending_commands.push(Command::UnmuteUser { user_id });
+                                                ui.close();
+                                            }
+                                        } else {
+                                            if ui.button("🔕 Mute Locally").clicked() {
+                                                pending_commands.push(Command::MuteUser { user_id });
+                                                ui.close();
+                                            }
+                                        }
+                                        
+                                        ui.separator();
+                                        
+                                        if ui.button("📝 Register").clicked() {
+                                            pending_commands.push(Command::RegisterUser { user_id });
+                                            ui.close();
+                                        }
+                                        if ui.button("❌ Unregister").clicked() {
+                                            pending_commands.push(Command::UnregisterUser { user_id });
+                                            ui.close();
+                                        }
+                                    }
+                                });
+                            
+                            builder.node(user_node);
+                        }
+                        
+                        // Render all root-level rooms
+                        for &root_id in &state.room_tree.roots {
+                            render_room(root_id, &state, &rooms_with_users, &mut pending_commands, &mut pending_rename, builder);
+                        }
+                    });
+                
+                // Handle double-click activation (join room) and drag-and-drop moves
+                for action in actions {
+                    match action {
+                        Action::Activate(activate) => {
+                            for node_id in activate.selected {
+                                if let TreeNodeId::Room(room_id) = node_id {
+                                    pending_commands.push(Command::JoinRoom { room_id });
                                 }
                             }
-                        });
-                    ui.separator();
+                        }
+                        Action::Move(drag_drop) => {
+                            // Only allow moving rooms (not users) onto rooms
+                            if let Some(TreeNodeId::Room(source_room_id)) = drag_drop.source.first().cloned() {
+                                if let TreeNodeId::Room(target_room_id) = drag_drop.target {
+                                    if source_room_id != target_room_id {
+                                        let source_name = state.room_tree.get(source_room_id)
+                                            .map(|n| n.name.clone())
+                                            .unwrap_or_else(|| "Unknown".to_string());
+                                        let target_name = state.room_tree.get(target_room_id)
+                                            .map(|n| n.name.clone())
+                                            .unwrap_or_else(|| "Unknown".to_string());
+                                        
+                                        self.move_room_modal = MoveRoomModalState {
+                                            open: true,
+                                            room_id: Some(source_room_id),
+                                            room_name: source_name,
+                                            new_parent_id: Some(target_room_id),
+                                            new_parent_name: target_name,
+                                        };
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                
+                // Execute pending commands
+                for cmd in pending_commands {
+                    self.backend.send(cmd);
+                }
+                
+                // Handle rename modal
+                if let Some((room_uuid, room_name)) = pending_rename {
+                    self.rename_modal = RenameModalState {
+                        open: true,
+                        room_uuid,
+                        room_name,
+                    };
                 }
             });
         });
@@ -2889,6 +2996,52 @@ impl eframe::App for MyApp {
             });
             if modal.should_close() {
                 self.rename_modal.open = false;
+            }
+        }
+
+        // Move room confirmation modal
+        if self.move_room_modal.open {
+            let modal = Modal::new(egui::Id::new("move_room_modal")).show(ctx, |ui| {
+                ui.set_width(350.0);
+                ui.heading("Move Room");
+                ui.add_space(8.0);
+                
+                ui.label(format!(
+                    "Move \"{}\" into \"{}\"?",
+                    self.move_room_modal.room_name,
+                    self.move_room_modal.new_parent_name
+                ));
+                
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new(
+                    "This will change the room's parent."
+                ).weak());
+                
+                ui.add_space(12.0);
+                ui.separator();
+                egui::Sides::new().show(
+                    ui,
+                    |_l| {},
+                    |ui| {
+                        if ui.button("Move").clicked() {
+                            if let (Some(room_id), Some(new_parent_id)) = 
+                                (self.move_room_modal.room_id, self.move_room_modal.new_parent_id) 
+                            {
+                                self.backend.send(Command::MoveRoom {
+                                    room_id,
+                                    new_parent_id,
+                                });
+                            }
+                            ui.close();
+                        }
+                        if ui.button("Cancel").clicked() {
+                            ui.close();
+                        }
+                    },
+                );
+            });
+            if modal.should_close() {
+                self.move_room_modal.open = false;
             }
         }
     }

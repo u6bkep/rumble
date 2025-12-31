@@ -33,9 +33,12 @@ message User {
 }
 
 // Room definition.
+// Rooms can be organized hierarchically using parent_id.
 message RoomInfo {
   RoomId id = 1;
   string name = 2;
+  // Parent room UUID (None/empty for root-level rooms).
+  optional RoomId parent_id = 3;
 }
 
 // Full state snapshot sent on initial sync and resync.
@@ -108,6 +111,7 @@ message Envelope {
     CreateRoom create_room = 20;
     DeleteRoom delete_room = 21;
     RenameRoom rename_room = 22;
+    MoveRoom move_room = 25;
     RequestStateSync request_state_sync = 23;
     SetUserStatus set_user_status = 24;
     
@@ -138,7 +142,9 @@ message JoinRoom {
 
 // Room management requests
 message CreateRoom { 
-  string name = 1; 
+  string name = 1;
+  // Parent room UUID (None/empty for root-level rooms).
+  optional RoomId parent_id = 2;
 }
 
 message DeleteRoom { 
@@ -148,6 +154,11 @@ message DeleteRoom {
 message RenameRoom { 
   RoomId room_id = 1; 
   string new_name = 2; 
+}
+
+message MoveRoom {
+  RoomId room_id = 1;
+  RoomId new_parent_id = 2;
 }
 
 // Request a full state resync from the server.
@@ -242,6 +253,8 @@ message StateUpdate {
     RoomDeleted room_deleted = 14;
     // A room was renamed
     RoomRenamed room_renamed = 15;
+    // A room was moved to a new parent
+    RoomMoved room_moved = 17;
     // A user's mute/deafen status changed
     UserStatusChanged user_status_changed = 16;
   }
@@ -280,6 +293,12 @@ message RoomDeleted {
 message RoomRenamed {
   RoomId room_id = 1;
   string new_name = 2;
+}
+
+// Incremental update: room moved to a new parent.
+message RoomMoved {
+  RoomId room_id = 1;
+  RoomId new_parent_id = 2;
 }
 
 // Incremental update: user's mute/deafen status changed.

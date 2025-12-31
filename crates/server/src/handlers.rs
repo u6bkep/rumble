@@ -85,7 +85,13 @@ pub async fn handle_envelope(
             if !sender.authenticated.load(Ordering::SeqCst) {
                 return Ok(());
             }
-            handle_rename_room(rr, sender, state).await?;
+            handle_rename_room(rr, sender, state, persistence).await?;
+        }
+        Some(Payload::MoveRoom(mr)) => {
+            if !sender.authenticated.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            handle_move_room(mr, sender, state, persistence).await?;
         }
         Some(Payload::RequestStateSync(rss)) => {
             if !sender.authenticated.load(Ordering::SeqCst) {
@@ -282,15 +288,15 @@ async fn handle_authenticate(
     // 9. Track session
     state.add_session(sender.user_id, pending.public_key);
     
-    // 10. Determine initial room (restore last channel if registered, otherwise Root)
+    // 10. Determine initial room (restore last room if registered, otherwise Root)
     let initial_room = if let Some(ref persist) = persistence {
         if let Some(registered) = persist.get_registered_user(&pending.public_key) {
-            if let Some(last_channel_bytes) = registered.last_channel {
-                let last_uuid = uuid::Uuid::from_bytes(last_channel_bytes);
+            if let Some(last_room_bytes) = registered.last_room {
+                let last_uuid = uuid::Uuid::from_bytes(last_room_bytes);
                 // Check if the room still exists
                 let rooms = state.get_rooms().await;
                 if rooms.iter().any(|r| r.id.as_ref().and_then(uuid_from_room_id) == Some(last_uuid)) {
-                    info!(user_id = sender.user_id, room = %last_uuid, "Restoring user to last channel");
+                    info!(user_id = sender.user_id, room = %last_uuid, "Restoring user to last room");
                     last_uuid
                 } else {
                     ROOT_ROOM_UUID
@@ -388,7 +394,7 @@ async fn handle_register_user(
     if let Err(e) = persist.register_user(&target_key, crate::persistence::RegisteredUser {
         username: username.clone(),
         roles: vec![],
-        last_channel: None,
+        last_room: None,
     }) {
         return send_command_result(&sender, "RegisterUser", false, &format!("Registration failed: {e}")).await;
     }
@@ -514,19 +520,19 @@ async fn handle_join_room(
         }
     };
     
-    let _old_room_uuid = state
-        .get_user_room(sender.user_id)
-        .await
-        .unwrap_or(ROOT_ROOM_UUID);
+    // let _old_room_uuid = state
+    //     .get_user_room(sender.user_id)
+    //     .await
+    //     .unwrap_or(ROOT_ROOM_UUID);
 
     state.set_user_room(sender.user_id, new_room_uuid).await;
 
-    // Save last channel for registered users
+    // Save last room for registered users
     if let Some(ref persist) = persistence {
         if let Some(public_key) = state.get_session_key(sender.user_id) {
             if persist.is_registered(&public_key) {
-                if let Err(e) = persist.update_user_last_channel(&public_key, Some(new_room_uuid.into_bytes())) {
-                    warn!("Failed to save user's last channel: {e}");
+                if let Err(e) = persist.update_user_last_room(&public_key, Some(new_room_uuid.into_bytes())) {
+                    warn!("Failed to save user's last room: {e}");
                 }
             }
         }
@@ -567,18 +573,23 @@ async fn handle_create_room(
 ) -> Result<()> {
     info!("CreateRoom: {}", cr.name);
     let room_name = cr.name.clone();
-    let room_uuid = state.create_room(cr.name.clone()).await;
+    
+    // Extract parent UUID if provided
+    let parent_uuid = cr.parent_id.as_ref().and_then(uuid_from_room_id);
+    
+    // Create the room with parent
+    let room_uuid = state.create_room_with_parent(cr.name.clone(), parent_uuid).await;
 
-    // Persist the new channel
+    // Persist the new room
     if let Some(ref persist) = persistence {
-        let channel = crate::persistence::PersistedChannel {
+        let room = crate::persistence::PersistedRoom {
             name: room_name.clone(),
-            parent: None,
+            parent: parent_uuid.map(|u| *u.as_bytes()),
             description: String::new(),
             permanent: true,
         };
-        if let Err(e) = persist.save_channel(&room_uuid.into_bytes(), &channel) {
-            warn!("Failed to persist channel: {e}");
+        if let Err(e) = persist.save_room(&room_uuid.into_bytes(), &room) {
+            warn!("Failed to persist room: {e}");
         }
     }
 
@@ -586,6 +597,7 @@ async fn handle_create_room(
     let room_info = proto::RoomInfo {
         id: Some(room_id_from_uuid(room_uuid)),
         name: cr.name,
+        parent_id: parent_uuid.map(room_id_from_uuid),
     };
     broadcast_state_update(
         &state,
@@ -634,8 +646,8 @@ async fn handle_delete_room(
 
     // Remove from persistence
     if let Some(ref persist) = persistence {
-        if let Err(e) = persist.delete_channel(&room_uuid.into_bytes()) {
-            warn!("Failed to remove channel from persistence: {e}");
+        if let Err(e) = persist.delete_room(&room_uuid.into_bytes()) {
+            warn!("Failed to remove room from persistence: {e}");
         }
     }
 
@@ -655,7 +667,12 @@ async fn handle_delete_room(
 }
 
 /// Handle rename room request.
-async fn handle_rename_room(rr: proto::RenameRoom, sender: Arc<ClientHandle>, state: Arc<ServerState>) -> Result<()> {
+async fn handle_rename_room(
+    rr: proto::RenameRoom,
+    sender: Arc<ClientHandle>,
+    state: Arc<ServerState>,
+    persistence: Option<Arc<Persistence>>,
+) -> Result<()> {
     let room_uuid = rr
         .room_id
         .as_ref()
@@ -678,6 +695,17 @@ async fn handle_rename_room(rr: proto::RenameRoom, sender: Arc<ClientHandle>, st
         return send_command_result(&sender, "RenameRoom", false, "Room not found").await;
     }
 
+    // Persist the room rename
+    if let Some(ref persist) = persistence {
+        let room_uuid_bytes = room_uuid.into_bytes();
+        if let Some(mut room) = persist.get_room(&room_uuid_bytes) {
+            room.name = new_name.clone();
+            if let Err(e) = persist.save_room(&room_uuid_bytes, &room) {
+                warn!("Failed to persist room rename: {e}");
+            }
+        }
+    }
+
     // Send incremental update to all clients
     broadcast_state_update(
         &state,
@@ -690,6 +718,72 @@ async fn handle_rename_room(rr: proto::RenameRoom, sender: Arc<ClientHandle>, st
     
     // Send confirmation to the requesting client
     send_command_result(&sender, "RenameRoom", true, &format!("Renamed '{}' to '{}'", old_name, new_name)).await?;
+    Ok(())
+}
+
+/// Handle move room request.
+async fn handle_move_room(
+    mr: proto::MoveRoom,
+    sender: Arc<ClientHandle>,
+    state: Arc<ServerState>,
+    persistence: Option<Arc<Persistence>>,
+) -> Result<()> {
+    let room_uuid = mr
+        .room_id
+        .as_ref()
+        .and_then(uuid_from_room_id)
+        .unwrap_or(ROOT_ROOM_UUID);
+    
+    let new_parent_uuid = mr
+        .new_parent_id
+        .as_ref()
+        .and_then(uuid_from_room_id)
+        .unwrap_or(ROOT_ROOM_UUID);
+    
+    // Get room name for the message
+    let room_name = state.get_rooms().await
+        .iter()
+        .find(|r| r.id.as_ref().and_then(uuid_from_room_id) == Some(room_uuid))
+        .map(|r| r.name.clone())
+        .unwrap_or_else(|| "room".to_string());
+    
+    let new_parent_name = state.get_rooms().await
+        .iter()
+        .find(|r| r.id.as_ref().and_then(uuid_from_room_id) == Some(new_parent_uuid))
+        .map(|r| r.name.clone())
+        .unwrap_or_else(|| "Root".to_string());
+    
+    info!("MoveRoom: {} -> parent {}", room_uuid, new_parent_uuid);
+
+    let moved = state.move_room(room_uuid, new_parent_uuid).await;
+    
+    if !moved {
+        return send_command_result(&sender, "MoveRoom", false, "Room not found").await;
+    }
+
+    // Persist the room move
+    if let Some(ref persist) = persistence {
+        let room_uuid_bytes = room_uuid.into_bytes();
+        if let Some(mut room) = persist.get_room(&room_uuid_bytes) {
+            room.parent = Some(new_parent_uuid.into_bytes());
+            if let Err(e) = persist.save_room(&room_uuid_bytes, &room) {
+                warn!("Failed to persist room move: {e}");
+            }
+        }
+    }
+
+    // Send incremental update to all clients
+    broadcast_state_update(
+        &state,
+        proto::state_update::Update::RoomMoved(proto::RoomMoved {
+            room_id: mr.room_id,
+            new_parent_id: mr.new_parent_id,
+        }),
+    )
+    .await?;
+    
+    // Send confirmation to the requesting client
+    send_command_result(&sender, "MoveRoom", true, &format!("Moved '{}' into '{}'", room_name, new_parent_name)).await?;
     Ok(())
 }
 

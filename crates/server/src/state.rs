@@ -118,6 +118,7 @@ impl StateData {
             rooms: vec![RoomInfo {
                 id: Some(root_room_id()),
                 name: "Root".to_string(),
+                parent_id: None,
             }],
             memberships: Vec::new(),
             user_statuses: Vec::new(),
@@ -333,6 +334,12 @@ impl ServerState {
     /// Add a room with a specific UUID (for loading from persistence).
     /// Returns false if a room with that UUID already exists.
     pub async fn add_room_with_uuid(&self, uuid: Uuid, name: String) -> bool {
+        self.add_room_with_uuid_and_parent(uuid, name, None).await
+    }
+
+    /// Add a room with a specific UUID and parent (for loading from persistence).
+    /// Returns false if a room with that UUID already exists.
+    pub async fn add_room_with_uuid_and_parent(&self, uuid: Uuid, name: String, parent: Option<Uuid>) -> bool {
         let mut data = self.state_data.write().await;
         // Check if room already exists
         let exists = data.rooms.iter().any(|r| {
@@ -344,17 +351,24 @@ impl ServerState {
         data.rooms.push(RoomInfo {
             id: Some(room_id_from_uuid(uuid)),
             name,
+            parent_id: parent.map(room_id_from_uuid),
         });
         true
     }
 
     /// Create a new room and return its UUID.
     pub async fn create_room(&self, name: String) -> Uuid {
+        self.create_room_with_parent(name, None).await
+    }
+
+    /// Create a new room with a parent and return its UUID.
+    pub async fn create_room_with_parent(&self, name: String, parent: Option<Uuid>) -> Uuid {
         let mut data = self.state_data.write().await;
         let new_uuid = Uuid::new_v4();
         data.rooms.push(RoomInfo {
             id: Some(room_id_from_uuid(new_uuid)),
             name,
+            parent_id: parent.map(room_id_from_uuid),
         });
         new_uuid
     }
@@ -392,6 +406,18 @@ impl ServerState {
         for r in data.rooms.iter_mut() {
             if uuid_from_room_id(r.id.as_ref().unwrap_or(&root_room_id())) == Some(room_uuid) {
                 r.name = new_name;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Move a room to a new parent. Returns true if the room was found and moved.
+    pub async fn move_room(&self, room_uuid: Uuid, new_parent_uuid: Uuid) -> bool {
+        let mut data = self.state_data.write().await;
+        for r in data.rooms.iter_mut() {
+            if uuid_from_room_id(r.id.as_ref().unwrap_or(&root_room_id())) == Some(room_uuid) {
+                r.parent_id = Some(room_id_from_uuid(new_parent_uuid));
                 return true;
             }
         }

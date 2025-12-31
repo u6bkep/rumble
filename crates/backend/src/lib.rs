@@ -78,7 +78,7 @@ pub use cert_verifier::{
 
 // State and command types
 pub mod events;
-pub use events::{AudioSettings, AudioState, AudioStats, ChatMessage, Command, ConnectionState, PendingCertificate, SigningCallback, State, VoiceMode, TransmissionMode};
+pub use events::{AudioSettings, AudioState, AudioStats, ChatMessage, Command, ConnectionState, PendingCertificate, RoomTree, RoomTreeNode, SigningCallback, State, VoiceMode, TransmissionMode};
 
 // Backend handle
 pub mod handle;

@@ -3,7 +3,7 @@
 //! This module provides persistent storage for:
 //! - Registered users (public_key → user data)
 //! - Known keys (keys that have connected before, bypass password)
-//! - Channels/rooms (uuid → channel data)
+//! - Rooms (uuid → room data)
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -17,20 +17,20 @@ pub struct RegisteredUser {
     pub username: String,
     /// User roles for future ACL support.
     pub roles: Vec<String>,
-    /// Last channel the user was in (UUID bytes).
-    pub last_channel: Option<[u8; 16]>,
+    /// Last room the user was in (UUID bytes).
+    pub last_room: Option<[u8; 16]>,
 }
 
-/// Channel/room data stored in the database.
+/// Room data stored in the database.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PersistedChannel {
-    /// The channel's display name.
+pub struct PersistedRoom {
+    /// The room's display name.
     pub name: String,
-    /// Parent channel UUID (None for root-level channels).
+    /// Parent room UUID (None for root-level rooms).
     pub parent: Option<[u8; 16]>,
-    /// Channel description.
+    /// Room description.
     pub description: String,
-    /// Whether this channel is permanent (survives server restart).
+    /// Whether this room is permanent (survives server restart).
     pub permanent: bool,
 }
 
@@ -41,8 +41,8 @@ pub struct Persistence {
     registered_users: sled::Tree,
     /// Tree for known keys: public_key (32 bytes) → empty value
     known_keys: sled::Tree,
-    /// Tree for channels: uuid (16 bytes) → PersistedChannel
-    channels: sled::Tree,
+    /// Tree for rooms: uuid (16 bytes) → PersistedRoom
+    rooms: sled::Tree,
 }
 
 impl Persistence {
@@ -51,13 +51,13 @@ impl Persistence {
         let db = sled::open(path)?;
         let registered_users = db.open_tree("registered_users")?;
         let known_keys = db.open_tree("known_keys")?;
-        let channels = db.open_tree("channels")?;
+        let rooms = db.open_tree("rooms")?;
         
         Ok(Self {
             db,
             registered_users,
             known_keys,
-            channels,
+            rooms,
         })
     }
     
@@ -66,13 +66,13 @@ impl Persistence {
         let db = sled::Config::new().temporary(true).open()?;
         let registered_users = db.open_tree("registered_users")?;
         let known_keys = db.open_tree("known_keys")?;
-        let channels = db.open_tree("channels")?;
+        let rooms = db.open_tree("rooms")?;
         
         Ok(Self {
             db,
             registered_users,
             known_keys,
-            channels,
+            rooms,
         })
     }
 
@@ -152,53 +152,53 @@ impl Persistence {
     }
 
     // =========================================================================
-    // Channel persistence
+    // Room persistence
     // =========================================================================
 
-    /// Get a channel by UUID.
-    pub fn get_channel(&self, uuid: &[u8; 16]) -> Option<PersistedChannel> {
-        self.channels
+    /// Get a room by UUID.
+    pub fn get_room(&self, uuid: &[u8; 16]) -> Option<PersistedRoom> {
+        self.rooms
             .get(uuid)
             .ok()
             .flatten()
             .and_then(|data| bincode::deserialize(&data).ok())
     }
 
-    /// Save a channel.
-    pub fn save_channel(&self, uuid: &[u8; 16], channel: &PersistedChannel) -> Result<()> {
-        let data = bincode::serialize(channel)?;
-        self.channels.insert(uuid, data)?;
+    /// Save a room.
+    pub fn save_room(&self, uuid: &[u8; 16], room: &PersistedRoom) -> Result<()> {
+        let data = bincode::serialize(room)?;
+        self.rooms.insert(uuid, data)?;
         Ok(())
     }
 
-    /// Delete a channel.
-    pub fn delete_channel(&self, uuid: &[u8; 16]) -> Result<()> {
-        self.channels.remove(uuid)?;
+    /// Delete a room.
+    pub fn delete_room(&self, uuid: &[u8; 16]) -> Result<()> {
+        self.rooms.remove(uuid)?;
         Ok(())
     }
 
-    /// Get all persisted channels.
-    pub fn get_all_channels(&self) -> Vec<([u8; 16], PersistedChannel)> {
-        self.channels
+    /// Get all persisted rooms.
+    pub fn get_all_rooms(&self) -> Vec<([u8; 16], PersistedRoom)> {
+        self.rooms
             .iter()
             .filter_map(|result| {
                 result.ok().and_then(|(key, value)| {
                     let uuid: [u8; 16] = key.as_ref().try_into().ok()?;
-                    let channel: PersistedChannel = bincode::deserialize(&value).ok()?;
-                    Some((uuid, channel))
+                    let room: PersistedRoom = bincode::deserialize(&value).ok()?;
+                    Some((uuid, room))
                 })
             })
             .collect()
     }
 
-    /// Update a registered user's last channel.
-    pub fn update_user_last_channel(
+    /// Update a registered user's last room.
+    pub fn update_user_last_room(
         &self,
         public_key: &[u8; 32],
-        channel_uuid: Option<[u8; 16]>,
+        room_uuid: Option<[u8; 16]>,
     ) -> Result<()> {
         if let Some(mut user) = self.get_registered_user(public_key) {
-            user.last_channel = channel_uuid;
+            user.last_room = room_uuid;
             self.register_user(public_key, user)?;
         }
         Ok(())
@@ -231,7 +231,7 @@ mod tests {
         let user = RegisteredUser {
             username: "alice".to_string(),
             roles: vec!["user".to_string()],
-            last_channel: None,
+            last_room: None,
         };
         persistence.register_user(&key, user.clone()).unwrap();
 
@@ -252,7 +252,7 @@ mod tests {
         let user = RegisteredUser {
             username: "alice".to_string(),
             roles: vec![],
-            last_channel: None,
+            last_room: None,
         };
         persistence.register_user(&key1, user).unwrap();
 
@@ -281,7 +281,7 @@ mod tests {
         let user = RegisteredUser {
             username: "alice".to_string(),
             roles: vec![],
-            last_channel: None,
+            last_room: None,
         };
         persistence.register_user(&key1, user).unwrap();
 
@@ -304,7 +304,7 @@ mod tests {
         let user = RegisteredUser {
             username: "alice".to_string(),
             roles: vec![],
-            last_channel: None,
+            last_room: None,
         };
         persistence.register_user(&registered_key, user).unwrap();
 
@@ -320,127 +320,127 @@ mod tests {
     }
 
     #[test]
-    fn test_channel_persistence() {
+    fn test_room_persistence() {
         let persistence = Persistence::in_memory().unwrap();
         let uuid = [3u8; 16];
 
-        // Initially no channel
-        assert!(persistence.get_channel(&uuid).is_none());
+        // Initially no room
+        assert!(persistence.get_room(&uuid).is_none());
 
-        // Save a channel
-        let channel = PersistedChannel {
+        // Save a room
+        let room = PersistedRoom {
             name: "General".to_string(),
             parent: None,
             description: "General discussion".to_string(),
             permanent: true,
         };
-        persistence.save_channel(&uuid, &channel).unwrap();
+        persistence.save_room(&uuid, &room).unwrap();
 
-        // Retrieve the channel
-        let retrieved = persistence.get_channel(&uuid).unwrap();
+        // Retrieve the room
+        let retrieved = persistence.get_room(&uuid).unwrap();
         assert_eq!(retrieved.name, "General");
         assert_eq!(retrieved.description, "General discussion");
         assert!(retrieved.permanent);
         assert!(retrieved.parent.is_none());
 
-        // Delete the channel
-        persistence.delete_channel(&uuid).unwrap();
-        assert!(persistence.get_channel(&uuid).is_none());
+        // Delete the room
+        persistence.delete_room(&uuid).unwrap();
+        assert!(persistence.get_room(&uuid).is_none());
     }
 
     #[test]
-    fn test_channel_with_parent() {
+    fn test_room_with_parent() {
         let persistence = Persistence::in_memory().unwrap();
         let parent_uuid = [4u8; 16];
         let child_uuid = [5u8; 16];
 
-        // Create parent channel
-        let parent = PersistedChannel {
+        // Create parent room
+        let parent = PersistedRoom {
             name: "Parent".to_string(),
             parent: None,
-            description: "Parent channel".to_string(),
+            description: "Parent room".to_string(),
             permanent: true,
         };
-        persistence.save_channel(&parent_uuid, &parent).unwrap();
+        persistence.save_room(&parent_uuid, &parent).unwrap();
 
-        // Create child channel with parent reference
-        let child = PersistedChannel {
+        // Create child room with parent reference
+        let child = PersistedRoom {
             name: "Child".to_string(),
             parent: Some(parent_uuid),
-            description: "Child channel".to_string(),
+            description: "Child room".to_string(),
             permanent: true,
         };
-        persistence.save_channel(&child_uuid, &child).unwrap();
+        persistence.save_room(&child_uuid, &child).unwrap();
 
         // Verify child has parent reference
-        let retrieved = persistence.get_channel(&child_uuid).unwrap();
+        let retrieved = persistence.get_room(&child_uuid).unwrap();
         assert_eq!(retrieved.parent, Some(parent_uuid));
     }
 
     #[test]
-    fn test_get_all_channels() {
+    fn test_get_all_rooms() {
         let persistence = Persistence::in_memory().unwrap();
 
         // Initially empty
-        assert!(persistence.get_all_channels().is_empty());
+        assert!(persistence.get_all_rooms().is_empty());
 
-        // Add some channels
+        // Add some rooms
         let uuid1 = [1u8; 16];
         let uuid2 = [2u8; 16];
 
-        persistence.save_channel(&uuid1, &PersistedChannel {
-            name: "Channel 1".to_string(),
+        persistence.save_room(&uuid1, &PersistedRoom {
+            name: "Room 1".to_string(),
             parent: None,
             description: String::new(),
             permanent: true,
         }).unwrap();
 
-        persistence.save_channel(&uuid2, &PersistedChannel {
-            name: "Channel 2".to_string(),
+        persistence.save_room(&uuid2, &PersistedRoom {
+            name: "Room 2".to_string(),
             parent: None,
             description: String::new(),
             permanent: false,
         }).unwrap();
 
-        let channels = persistence.get_all_channels();
-        assert_eq!(channels.len(), 2);
+        let rooms = persistence.get_all_rooms();
+        assert_eq!(rooms.len(), 2);
     }
 
     #[test]
-    fn test_update_user_last_channel() {
+    fn test_update_user_last_room() {
         let persistence = Persistence::in_memory().unwrap();
         let key = [6u8; 32];
-        let channel_uuid = [7u8; 16];
+        let room_uuid = [7u8; 16];
 
-        // Register user without last channel
+        // Register user without last room
         let user = RegisteredUser {
             username: "bob".to_string(),
             roles: vec![],
-            last_channel: None,
+            last_room: None,
         };
         persistence.register_user(&key, user).unwrap();
 
-        // Update last channel
-        persistence.update_user_last_channel(&key, Some(channel_uuid)).unwrap();
+        // Update last room
+        persistence.update_user_last_room(&key, Some(room_uuid)).unwrap();
 
-        // Verify last channel was updated
+        // Verify last room was updated
         let retrieved = persistence.get_registered_user(&key).unwrap();
-        assert_eq!(retrieved.last_channel, Some(channel_uuid));
+        assert_eq!(retrieved.last_room, Some(room_uuid));
 
-        // Clear last channel
-        persistence.update_user_last_channel(&key, None).unwrap();
+        // Clear last room
+        persistence.update_user_last_room(&key, None).unwrap();
         let retrieved = persistence.get_registered_user(&key).unwrap();
-        assert_eq!(retrieved.last_channel, None);
+        assert_eq!(retrieved.last_room, None);
     }
 
     #[test]
-    fn test_update_last_channel_unregistered_user() {
+    fn test_update_last_room_unregistered_user() {
         let persistence = Persistence::in_memory().unwrap();
         let key = [8u8; 32];
-        let channel_uuid = [9u8; 16];
+        let room_uuid = [9u8; 16];
 
-        // Try to update last channel for unregistered user - should not error
-        persistence.update_user_last_channel(&key, Some(channel_uuid)).unwrap();
+        // Try to update last room for unregistered user - should not error
+        persistence.update_user_last_room(&key, Some(room_uuid)).unwrap();
 
         // User should still not exist
         assert!(persistence.get_registered_user(&key).is_none());

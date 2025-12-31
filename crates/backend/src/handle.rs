@@ -135,6 +135,7 @@ impl BackendHandle {
                 input_level_db: None,
             },
             chat_messages: Vec::new(),
+            room_tree: Default::default(),
         };
 
         let state = Arc::new(RwLock::new(state));
@@ -365,6 +366,7 @@ async fn run_connection_task(
                                         .or(Some(ROOT_ROOM_UUID));
                                     s.rooms = rooms;
                                     s.users = users;
+                                    s.rebuild_room_tree();
                                 }
                                 repaint();
                                 
@@ -481,6 +483,7 @@ async fn run_connection_task(
                                             .or(Some(ROOT_ROOM_UUID));
                                         s.rooms = rooms;
                                         s.users = users;
+                                        s.rebuild_room_tree();
                                     }
                                     repaint();
                                     
@@ -546,6 +549,7 @@ async fn run_connection_task(
                             s.my_room_id = None;
                             s.rooms.clear();
                             s.users.clear();
+                            s.rebuild_room_tree();
                         }
                         repaint();
                     }
@@ -565,11 +569,14 @@ async fn run_connection_task(
                         }
                     }
                     
-                    Command::CreateRoom { name } => {
+                    Command::CreateRoom { name, parent_id } => {
                         if let Some(send) = &mut send_stream {
                             let env = proto::Envelope {
                                 state_hash: Vec::new(),
-                                payload: Some(Payload::CreateRoom(proto::CreateRoom { name })),
+                                payload: Some(Payload::CreateRoom(proto::CreateRoom { 
+                                    name,
+                                    parent_id: parent_id.map(room_id_from_uuid),
+                                })),
                             };
                             let frame = encode_frame(&env);
                             if let Err(e) = send.write_all(&frame).await {
@@ -605,6 +612,22 @@ async fn run_connection_task(
                             let frame = encode_frame(&env);
                             if let Err(e) = send.write_all(&frame).await {
                                 error!("Failed to send RenameRoom: {}", e);
+                            }
+                        }
+                    }
+                    
+                    Command::MoveRoom { room_id, new_parent_id } => {
+                        if let Some(send) = &mut send_stream {
+                            let env = proto::Envelope {
+                                state_hash: Vec::new(),
+                                payload: Some(Payload::MoveRoom(proto::MoveRoom {
+                                    room_id: Some(room_id_from_uuid(room_id)),
+                                    new_parent_id: Some(room_id_from_uuid(new_parent_id)),
+                                })),
+                            };
+                            let frame = encode_frame(&env);
+                            if let Err(e) = send.write_all(&frame).await {
+                                error!("Failed to send MoveRoom: {}", e);
                             }
                         }
                     }
@@ -988,6 +1011,7 @@ async fn run_receiver_task(
             s.my_room_id = None;
             s.rooms.clear();
             s.users.clear();
+            s.rebuild_room_tree();
         }
     }
     repaint();
@@ -1031,6 +1055,7 @@ fn handle_server_message(
                         let mut s = state.write().unwrap();
                         s.rooms = ss.rooms;
                         s.users = ss.users.clone();
+                        s.rebuild_room_tree();
                         
                         // Notify audio task about users in our room (for proactive decoder creation)
                         if let Some(my_room_id) = &s.my_room_id {
@@ -1094,6 +1119,7 @@ fn apply_state_update(
             proto::state_update::Update::RoomCreated(rc) => {
                 if let Some(room) = rc.room {
                     s.rooms.push(room);
+                    s.rebuild_room_tree();
                 }
             }
             proto::state_update::Update::RoomDeleted(rd) => {
@@ -1101,6 +1127,7 @@ fn apply_state_update(
                     s.rooms.retain(|r| {
                         r.id.as_ref().and_then(api::uuid_from_room_id) != Some(rid)
                     });
+                    s.rebuild_room_tree();
                 }
             }
             proto::state_update::Update::RoomRenamed(rr) => {
@@ -1110,6 +1137,17 @@ fn apply_state_update(
                     }) {
                         room.name = rr.new_name;
                     }
+                    s.rebuild_room_tree();
+                }
+            }
+            proto::state_update::Update::RoomMoved(rm) => {
+                if let Some(rid) = rm.room_id.and_then(|r| api::uuid_from_room_id(&r)) {
+                    if let Some(room) = s.rooms.iter_mut().find(|r| {
+                        r.id.as_ref().and_then(api::uuid_from_room_id) == Some(rid)
+                    }) {
+                        room.parent_id = rm.new_parent_id;
+                    }
+                    s.rebuild_room_tree();
                 }
             }
             proto::state_update::Update::UserJoined(uj) => {

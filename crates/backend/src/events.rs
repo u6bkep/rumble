@@ -12,6 +12,170 @@ use std::sync::Arc;
 use std::time::Instant;
 use uuid::Uuid;
 
+// =============================================================================
+// Room Tree
+// =============================================================================
+
+/// A node in the room tree hierarchy.
+#[derive(Debug, Clone)]
+pub struct RoomTreeNode {
+    /// The room UUID.
+    pub id: Uuid,
+    /// The room name.
+    pub name: String,
+    /// The parent room UUID (None for root rooms).
+    pub parent_id: Option<Uuid>,
+    /// UUIDs of child rooms, in sorted order by name.
+    pub children: Vec<Uuid>,
+}
+
+/// Hierarchical tree structure of rooms.
+/// 
+/// This is rebuilt whenever the room list changes. The UI can use this
+/// to efficiently render the room list as a tree without rebuilding
+/// the hierarchy on each frame.
+#[derive(Debug, Clone, Default)]
+pub struct RoomTree {
+    /// All nodes indexed by room UUID.
+    pub nodes: HashMap<Uuid, RoomTreeNode>,
+    /// Root room UUIDs (rooms with no parent), sorted by name.
+    pub roots: Vec<Uuid>,
+}
+
+impl RoomTree {
+    /// Create a new empty room tree.
+    pub fn new() -> Self {
+        Self::default()
+    }
+    
+    /// Rebuild the tree from a list of rooms.
+    pub fn rebuild(&mut self, rooms: &[RoomInfo]) {
+        self.nodes.clear();
+        self.roots.clear();
+        
+        // First pass: create all nodes
+        for room in rooms {
+            let Some(room_uuid) = room.id.as_ref().and_then(api::uuid_from_room_id) else {
+                continue;
+            };
+            let parent_uuid = room.parent_id.as_ref().and_then(api::uuid_from_room_id);
+            
+            self.nodes.insert(room_uuid, RoomTreeNode {
+                id: room_uuid,
+                name: room.name.clone(),
+                parent_id: parent_uuid,
+                children: Vec::new(),
+            });
+        }
+        
+        // Second pass: build parent-child relationships and collect roots
+        let uuids: Vec<Uuid> = self.nodes.keys().copied().collect();
+        for uuid in uuids {
+            let parent_id = self.nodes.get(&uuid).and_then(|n| n.parent_id);
+            
+            if let Some(parent_uuid) = parent_id {
+                // Add as child of parent (if parent exists)
+                if self.nodes.contains_key(&parent_uuid) {
+                    if let Some(parent) = self.nodes.get_mut(&parent_uuid) {
+                        parent.children.push(uuid);
+                    }
+                } else {
+                    // Parent doesn't exist, treat as root
+                    self.roots.push(uuid);
+                }
+            } else {
+                // No parent, this is a root
+                self.roots.push(uuid);
+            }
+        }
+        
+        // Sort roots by name
+        self.roots.sort_by(|a, b| {
+            let name_a = self.nodes.get(a).map(|n| n.name.as_str()).unwrap_or("");
+            let name_b = self.nodes.get(b).map(|n| n.name.as_str()).unwrap_or("");
+            name_a.cmp(name_b)
+        });
+        
+        // Sort children of each node by name
+        // First, collect the name for each UUID for sorting
+        let names: HashMap<Uuid, String> = self.nodes.iter()
+            .map(|(id, node)| (*id, node.name.clone()))
+            .collect();
+        
+        for node in self.nodes.values_mut() {
+            node.children.sort_by(|a, b| {
+                let name_a = names.get(a).map(|s| s.as_str()).unwrap_or("");
+                let name_b = names.get(b).map(|s| s.as_str()).unwrap_or("");
+                name_a.cmp(name_b)
+            });
+        }
+    }
+    
+    /// Get a node by UUID.
+    pub fn get(&self, uuid: Uuid) -> Option<&RoomTreeNode> {
+        self.nodes.get(&uuid)
+    }
+    
+    /// Get mutable reference to a node by UUID.
+    pub fn get_mut(&mut self, uuid: Uuid) -> Option<&mut RoomTreeNode> {
+        self.nodes.get_mut(&uuid)
+    }
+    
+    /// Check if the tree is empty.
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
+    
+    /// Get the number of rooms in the tree.
+    pub fn len(&self) -> usize {
+        self.nodes.len()
+    }
+    
+    /// Get children of a room.
+    pub fn children(&self, uuid: Uuid) -> &[Uuid] {
+        self.nodes.get(&uuid).map(|n| n.children.as_slice()).unwrap_or(&[])
+    }
+    
+    /// Check if a room has any children.
+    pub fn has_children(&self, uuid: Uuid) -> bool {
+        self.nodes.get(&uuid).map(|n| !n.children.is_empty()).unwrap_or(false)
+    }
+    
+    /// Iterate over all ancestors of a room, from parent to root.
+    pub fn ancestors(&self, uuid: Uuid) -> impl Iterator<Item = Uuid> + '_ {
+        AncestorIterator {
+            tree: self,
+            current: self.nodes.get(&uuid).and_then(|n| n.parent_id),
+        }
+    }
+    
+    /// Check if `ancestor` is an ancestor of `descendant`.
+    pub fn is_ancestor(&self, ancestor: Uuid, descendant: Uuid) -> bool {
+        self.ancestors(descendant).any(|id| id == ancestor)
+    }
+    
+    /// Get the depth of a room (0 for root rooms).
+    pub fn depth(&self, uuid: Uuid) -> usize {
+        self.ancestors(uuid).count()
+    }
+}
+
+/// Iterator over ancestors of a room.
+struct AncestorIterator<'a> {
+    tree: &'a RoomTree,
+    current: Option<Uuid>,
+}
+
+impl<'a> Iterator for AncestorIterator<'a> {
+    type Item = Uuid;
+    
+    fn next(&mut self) -> Option<Self::Item> {
+        let current = self.current?;
+        self.current = self.tree.nodes.get(&current).and_then(|n| n.parent_id);
+        Some(current)
+    }
+}
+
 /// Re-export ROOT_ROOM_UUID for convenience
 pub use api::ROOT_ROOM_UUID;
 
@@ -431,9 +595,19 @@ pub struct State {
     // Chat (recent messages, not persisted)
     /// Recent chat messages.
     pub chat_messages: Vec<ChatMessage>,
+    
+    // Room tree (derived from rooms)
+    /// Hierarchical tree structure of rooms, rebuilt when rooms change.
+    pub room_tree: RoomTree,
 }
 
 impl State {
+    /// Rebuild the room tree from the current rooms list.
+    /// Call this after modifying `self.rooms`.
+    pub fn rebuild_room_tree(&mut self) {
+        self.room_tree.rebuild(&self.rooms);
+    }
+    
     /// Get users in a specific room.
     pub fn users_in_room(&self, room_uuid: Uuid) -> Vec<&User> {
         self.users
@@ -503,12 +677,14 @@ pub enum Command {
     // Room/Chat
     /// Join a room by UUID.
     JoinRoom { room_id: Uuid },
-    /// Create a new room.
-    CreateRoom { name: String },
+    /// Create a new room, optionally under a parent room.
+    CreateRoom { name: String, parent_id: Option<Uuid> },
     /// Delete a room by UUID.
     DeleteRoom { room_id: Uuid },
     /// Rename a room.
     RenameRoom { room_id: Uuid, new_name: String },
+    /// Move a room to a new parent.
+    MoveRoom { room_id: Uuid, new_parent_id: Uuid },
     /// Send a chat message.
     SendChat { text: String },
     /// Add a local status message (not sent to server).
@@ -579,9 +755,10 @@ impl std::fmt::Debug for Command {
             Command::AcceptCertificate => write!(f, "AcceptCertificate"),
             Command::RejectCertificate => write!(f, "RejectCertificate"),
             Command::JoinRoom { room_id } => f.debug_struct("JoinRoom").field("room_id", room_id).finish(),
-            Command::CreateRoom { name } => f.debug_struct("CreateRoom").field("name", name).finish(),
+            Command::CreateRoom { name, parent_id } => f.debug_struct("CreateRoom").field("name", name).field("parent_id", parent_id).finish(),
             Command::DeleteRoom { room_id } => f.debug_struct("DeleteRoom").field("room_id", room_id).finish(),
             Command::RenameRoom { room_id, new_name } => f.debug_struct("RenameRoom").field("room_id", room_id).field("new_name", new_name).finish(),
+            Command::MoveRoom { room_id, new_parent_id } => f.debug_struct("MoveRoom").field("room_id", room_id).field("new_parent_id", new_parent_id).finish(),
             Command::SendChat { text } => f.debug_struct("SendChat").field("text", text).finish(),
             Command::LocalMessage { text } => f.debug_struct("LocalMessage").field("text", text).finish(),
             Command::SetInputDevice { device_id } => f.debug_struct("SetInputDevice").field("device_id", device_id).finish(),
@@ -628,10 +805,12 @@ mod tests {
                 RoomInfo {
                     id: Some(room_id_from_uuid(room1_uuid)),
                     name: "Root".to_string(),
+                    parent_id: None,
                 },
                 RoomInfo {
                     id: Some(room_id_from_uuid(room2_uuid)),
                     name: "Room2".to_string(),
+                    parent_id: None,
                 },
             ],
             users: vec![
@@ -659,6 +838,7 @@ mod tests {
             ],
             audio: AudioState::default(),
             chat_messages: vec![],
+            room_tree: RoomTree::default(),
         };
 
         let users_in_room1 = state.users_in_room(room1_uuid);
@@ -676,6 +856,7 @@ mod tests {
             rooms: vec![RoomInfo {
                 id: Some(room_id_from_uuid(room_uuid)),
                 name: "Root".to_string(),
+                parent_id: None,
             }],
             ..Default::default()
         };
@@ -685,5 +866,75 @@ mod tests {
         assert_eq!(room.unwrap().name, "Root");
 
         assert!(state.get_room(Uuid::new_v4()).is_none());
+    }
+
+    #[test]
+    fn test_room_tree_rebuild() {
+        let root_uuid = ROOT_ROOM_UUID;
+        let child1_uuid = Uuid::new_v4();
+        let child2_uuid = Uuid::new_v4();
+        let grandchild_uuid = Uuid::new_v4();
+
+        let rooms = vec![
+            RoomInfo {
+                id: Some(room_id_from_uuid(root_uuid)),
+                name: "Root".to_string(),
+                parent_id: None,
+            },
+            RoomInfo {
+                id: Some(room_id_from_uuid(child1_uuid)),
+                name: "Alpha Channel".to_string(),
+                parent_id: Some(room_id_from_uuid(root_uuid)),
+            },
+            RoomInfo {
+                id: Some(room_id_from_uuid(child2_uuid)),
+                name: "Beta Channel".to_string(),
+                parent_id: Some(room_id_from_uuid(root_uuid)),
+            },
+            RoomInfo {
+                id: Some(room_id_from_uuid(grandchild_uuid)),
+                name: "Private".to_string(),
+                parent_id: Some(room_id_from_uuid(child1_uuid)),
+            },
+        ];
+
+        let mut tree = RoomTree::new();
+        tree.rebuild(&rooms);
+
+        // Check basic structure
+        assert_eq!(tree.len(), 4);
+        assert_eq!(tree.roots.len(), 1);
+        assert_eq!(tree.roots[0], root_uuid);
+
+        // Check root has two children (sorted by name: Alpha, Beta)
+        let root_node = tree.get(root_uuid).unwrap();
+        assert_eq!(root_node.children.len(), 2);
+        assert_eq!(root_node.children[0], child1_uuid); // Alpha
+        assert_eq!(root_node.children[1], child2_uuid); // Beta
+
+        // Check child1 has grandchild
+        let child1_node = tree.get(child1_uuid).unwrap();
+        assert_eq!(child1_node.children.len(), 1);
+        assert_eq!(child1_node.children[0], grandchild_uuid);
+
+        // Check child2 has no children
+        let child2_node = tree.get(child2_uuid).unwrap();
+        assert!(child2_node.children.is_empty());
+
+        // Check ancestors
+        let ancestors: Vec<Uuid> = tree.ancestors(grandchild_uuid).collect();
+        assert_eq!(ancestors.len(), 2);
+        assert_eq!(ancestors[0], child1_uuid);
+        assert_eq!(ancestors[1], root_uuid);
+
+        // Check depth
+        assert_eq!(tree.depth(root_uuid), 0);
+        assert_eq!(tree.depth(child1_uuid), 1);
+        assert_eq!(tree.depth(grandchild_uuid), 2);
+
+        // Check is_ancestor
+        assert!(tree.is_ancestor(root_uuid, grandchild_uuid));
+        assert!(tree.is_ancestor(child1_uuid, grandchild_uuid));
+        assert!(!tree.is_ancestor(child2_uuid, grandchild_uuid));
     }
 }
