@@ -10,16 +10,20 @@
 //! - The voice path uses snapshots to avoid holding locks during relay
 //! - Client iteration is lock-free via DashMap
 
-use crate::state::{ClientHandle, ServerState, UserStatus, compute_server_state_hash};
+use crate::persistence::Persistence;
+use crate::state::{ClientHandle, PendingAuth, ServerState, UserStatus, compute_server_state_hash};
 use anyhow::Result;
 use api::{
-    ROOT_ROOM_UUID, encode_frame,
+    ROOT_ROOM_UUID, build_auth_payload, encode_frame,
     proto::{self, ServerState as ProtoServerState, VoiceDatagram, envelope::Payload},
     room_id_from_uuid, uuid_from_room_id,
 };
+use ed25519_dalek::{Signature, VerifyingKey};
 use prost::Message;
 use std::sync::Arc;
-use tracing::{debug, error, info};
+use std::sync::atomic::Ordering;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use tracing::{debug, error, info, warn};
 
 /// Handle a decoded envelope from a client.
 ///
@@ -30,6 +34,7 @@ use tracing::{debug, error, info};
 /// * `env` - The decoded envelope
 /// * `sender` - Handle to the client that sent this message
 /// * `state` - Shared server state
+/// * `persistence` - Optional persistence layer for registered users
 ///
 /// # Returns
 /// Ok(()) on success, Err on fatal errors that should close the connection.
@@ -37,69 +42,150 @@ pub async fn handle_envelope(
     env: proto::Envelope,
     sender: Arc<ClientHandle>,
     state: Arc<ServerState>,
+    persistence: Option<Arc<Persistence>>,
 ) -> Result<()> {
     match env.payload {
         Some(Payload::ClientHello(ch)) => {
-            handle_client_hello(ch, sender, state).await?;
+            handle_client_hello(ch, sender, state, persistence).await?;
+        }
+        Some(Payload::Authenticate(auth)) => {
+            handle_authenticate(auth, sender, state, persistence).await?;
         }
         Some(Payload::ChatMessage(msg)) => {
+            // Require authentication for chat
+            if !sender.authenticated.load(Ordering::SeqCst) {
+                warn!(user_id = sender.user_id, "unauthenticated client tried to send chat");
+                return Ok(());
+            }
             handle_chat_message(msg, sender, state).await?;
         }
         Some(Payload::JoinRoom(jr)) => {
-            handle_join_room(jr, sender, state).await?;
+            if !sender.authenticated.load(Ordering::SeqCst) {
+                warn!(user_id = sender.user_id, "unauthenticated client tried to join room");
+                return Ok(());
+            }
+            handle_join_room(jr, sender, state, persistence).await?;
         }
         Some(Payload::Disconnect(d)) => {
             handle_disconnect(d, sender).await?;
         }
         Some(Payload::CreateRoom(cr)) => {
-            handle_create_room(cr, state).await?;
+            if !sender.authenticated.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            handle_create_room(cr, sender, state, persistence).await?;
         }
         Some(Payload::DeleteRoom(dr)) => {
-            handle_delete_room(dr, state).await?;
+            if !sender.authenticated.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            handle_delete_room(dr, sender, state, persistence).await?;
         }
         Some(Payload::RenameRoom(rr)) => {
-            handle_rename_room(rr, state).await?;
+            if !sender.authenticated.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            handle_rename_room(rr, sender, state).await?;
         }
         Some(Payload::RequestStateSync(rss)) => {
+            if !sender.authenticated.load(Ordering::SeqCst) {
+                return Ok(());
+            }
             handle_request_state_sync(rss, sender, state).await?;
         }
         Some(Payload::SetUserStatus(sus)) => {
+            if !sender.authenticated.load(Ordering::SeqCst) {
+                return Ok(());
+            }
             handle_set_user_status(sus, sender, state).await?;
         }
+        Some(Payload::RegisterUser(ru)) => {
+            if !sender.authenticated.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            handle_register_user(ru, sender, state, persistence).await?;
+        }
+        Some(Payload::UnregisterUser(uu)) => {
+            if !sender.authenticated.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            handle_unregister_user(uu, sender, state, persistence).await?;
+        }
         // Server-to-client messages or empty - ignore
-        Some(Payload::ServerHello(_) | Payload::ServerEvent(_)) | None => {}
+        Some(Payload::ServerHello(_) | Payload::ServerEvent(_) | Payload::AuthFailed(_) | Payload::CommandResult(_)) | None => {}
     }
     Ok(())
 }
 
-/// Handle ClientHello - authenticate and send initial state.
+/// Handle ClientHello - begin authentication handshake.
 async fn handle_client_hello(
     ch: proto::ClientHello,
     sender: Arc<ClientHandle>,
     state: Arc<ServerState>,
+    persistence: Option<Arc<Persistence>>,
 ) -> Result<()> {
-    info!("ClientHello from {}", ch.client_name);
+    info!("ClientHello from {}", ch.username);
 
-    // Check password if required
-    if let Ok(required) = std::env::var("RUMBLE_SERVER_PASSWORD") {
-        if !required.is_empty() && ch.password != required {
-            error!("authentication failed for {}", ch.client_name);
-            let mut send = sender.send.lock().await;
-            send.reset(quinn::VarInt::from_u32(0)).ok();
-            return Ok(());
+    // 1. Validate public key length
+    if ch.public_key.len() != 32 {
+        return send_auth_failed(&sender, "Invalid public key length").await;
+    }
+    let public_key: [u8; 32] = ch.public_key.try_into().unwrap();
+    
+    // 2. Check registration constraints (if persistence is enabled)
+    if let Some(ref persist) = persistence {
+        // Check if username is taken by a DIFFERENT key
+        // Note: If this key is registered, they can provide any name - we'll override it later
+        // with their registered name. We only block if they're trying to use someone ELSE's
+        // registered name.
+        if persist.is_username_taken(&ch.username, &public_key) {
+            return send_auth_failed(&sender, "Username is registered to a different key").await;
         }
     }
+    
+    // 3. Check password for unknown keys
+    if let Some(ref persist) = persistence {
+        let is_known = persist.is_known_key(&public_key);
+        if !is_known {
+            if let Ok(required) = std::env::var("RUMBLE_SERVER_PASSWORD") {
+                if !required.is_empty() {
+                    match &ch.password {
+                        Some(pw) if pw == &required => { /* OK */ }
+                        _ => return send_auth_failed(&sender, "Password required for new users").await,
+                    }
+                }
+            }
+        }
+    } else {
+        // No persistence - check password for everyone if set
+        if let Ok(required) = std::env::var("RUMBLE_SERVER_PASSWORD") {
+            if !required.is_empty() {
+                match &ch.password {
+                    Some(pw) if pw == &required => { /* OK */ }
+                    _ => return send_auth_failed(&sender, "Password required").await,
+                }
+            }
+        }
+    }
+    
+    // 4. Generate nonce and store pending auth
+    let nonce: [u8; 32] = rand::random();
+    state.set_pending_auth(PendingAuth {
+        nonce,
+        user_id: sender.user_id,
+        public_key,
+        timestamp: Instant::now(),
+        username: ch.username.clone(),
+    });
+    
+    // 5. Store public key on client handle
+    *sender.public_key.write().await = Some(public_key);
 
-    // Set username (uses RwLock, only happens once)
-    sender.set_username(ch.client_name.clone()).await;
-
-    // Auto-join Root room
-    state.set_user_room(sender.user_id, ROOT_ROOM_UUID).await;
-
-    // Send ServerHello with assigned user_id
+    // 6. Send ServerHello with nonce
     let reply = proto::Envelope {
         state_hash: Vec::new(),
         payload: Some(Payload::ServerHello(proto::ServerHello {
+            nonce: nonce.to_vec(),
             server_name: "Rumble Server".to_string(),
             user_id: sender.user_id,
         })),
@@ -108,26 +194,129 @@ async fn handle_client_hello(
     debug!(
         bytes = frame.len(),
         user_id = sender.user_id,
-        "server: sending ServerHello frame with user_id"
+        "server: sending ServerHello frame with nonce"
     );
 
-    // Send using the new helper method
     if let Err(e) = sender.send_frame(&frame).await {
         error!("failed to send ServerHello: {e:?}");
         return Err(e.into());
     }
 
-    // Send initial ServerState
-    send_server_state_to_client(&sender, &state).await?;
+    Ok(())
+}
 
-    // Broadcast that this user joined
+/// Handle Authenticate - verify signature and complete handshake.
+async fn handle_authenticate(
+    auth: proto::Authenticate,
+    sender: Arc<ClientHandle>,
+    state: Arc<ServerState>,
+    persistence: Option<Arc<Persistence>>,
+) -> Result<()> {
+    // 1. Get pending auth state
+    let pending = match state.take_pending_auth(sender.user_id) {
+        Some(p) => p,
+        None => return send_auth_failed(&sender, "No pending authentication").await,
+    };
+    
+    // 2. Check timestamp (±5 minutes)
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let diff_ms = (now_ms - auth.timestamp_ms).abs();
+    if diff_ms > 5 * 60 * 1000 {
+        return send_auth_failed(&sender, "Timestamp out of range").await;
+    }
+    
+    // 3. Compute expected signature payload
+    let cert_hash = state.server_cert_hash();
+    let payload = build_auth_payload(
+        &pending.nonce,
+        auth.timestamp_ms,
+        &pending.public_key,
+        pending.user_id,
+        &cert_hash,
+    );
+    
+    // 4. Verify signature
+    let signature: [u8; 64] = match auth.signature.try_into() {
+        Ok(sig) => sig,
+        Err(_) => return send_auth_failed(&sender, "Invalid signature length").await,
+    };
+    
+    let verifying_key = match VerifyingKey::from_bytes(&pending.public_key) {
+        Ok(key) => key,
+        Err(_) => return send_auth_failed(&sender, "Invalid public key").await,
+    };
+    let sig = Signature::from_bytes(&signature);
+    
+    if verifying_key.verify_strict(&payload, &sig).is_err() {
+        return send_auth_failed(&sender, "Invalid signature").await;
+    }
+    
+    // 5. Authentication successful
+    sender.authenticated.store(true, Ordering::SeqCst);
+    
+    // 6. Mark key as known (if persistence enabled)
+    if let Some(ref persist) = persistence {
+        if let Err(e) = persist.add_known_key(&pending.public_key) {
+            warn!("Failed to mark key as known: {e}");
+        }
+    }
+    
+    // 7. Check for registered username (overrides client-provided)
+    let final_username = if let Some(ref persist) = persistence {
+        if let Some(registered) = persist.get_registered_user(&pending.public_key) {
+            registered.username
+        } else {
+            pending.username.clone()
+        }
+    } else {
+        pending.username.clone()
+    };
+    
+    // 8. Set username
+    sender.set_username(final_username.clone()).await;
+    info!(user_id = sender.user_id, username = %final_username, "Authentication successful");
+    
+    // 9. Track session
+    state.add_session(sender.user_id, pending.public_key);
+    
+    // 10. Determine initial room (restore last channel if registered, otherwise Root)
+    let initial_room = if let Some(ref persist) = persistence {
+        if let Some(registered) = persist.get_registered_user(&pending.public_key) {
+            if let Some(last_channel_bytes) = registered.last_channel {
+                let last_uuid = uuid::Uuid::from_bytes(last_channel_bytes);
+                // Check if the room still exists
+                let rooms = state.get_rooms().await;
+                if rooms.iter().any(|r| r.id.as_ref().and_then(uuid_from_room_id) == Some(last_uuid)) {
+                    info!(user_id = sender.user_id, room = %last_uuid, "Restoring user to last channel");
+                    last_uuid
+                } else {
+                    ROOT_ROOM_UUID
+                }
+            } else {
+                ROOT_ROOM_UUID
+            }
+        } else {
+            ROOT_ROOM_UUID
+        }
+    } else {
+        ROOT_ROOM_UUID
+    };
+    state.set_user_room(sender.user_id, initial_room).await;
+    
+    // 11. Send initial ServerState
+    send_server_state_to_client(&sender, &state).await?;
+    
+    // 12. Broadcast that this user joined
     broadcast_state_update(
         &state,
         proto::state_update::Update::UserJoined(proto::UserJoined {
             user: Some(proto::User {
                 user_id: Some(proto::UserId { value: sender.user_id }),
-                username: ch.client_name,
-                current_room: Some(room_id_from_uuid(ROOT_ROOM_UUID)),
+                username: final_username,
+                current_room: Some(room_id_from_uuid(initial_room)),
                 is_muted: false,
                 is_deafened: false,
             }),
@@ -135,6 +324,126 @@ async fn handle_client_hello(
     )
     .await?;
 
+    Ok(())
+}
+
+/// Send AuthFailed message to client.
+async fn send_auth_failed(sender: &ClientHandle, error: &str) -> Result<()> {
+    warn!(user_id = sender.user_id, error, "Authentication failed");
+    let reply = proto::Envelope {
+        state_hash: Vec::new(),
+        payload: Some(Payload::AuthFailed(proto::AuthFailed {
+            error: error.to_string(),
+        })),
+    };
+    let frame = encode_frame(&reply);
+    let _ = sender.send_frame(&frame).await;
+    // Finish the stream and wait for the peer to receive the data
+    {
+        let mut send = sender.send.lock().await;
+        let _ = send.finish();
+        // stopped() waits until the peer has consumed all data
+        let _ = send.stopped().await;
+    }
+    // Close the connection
+    sender.conn.close(quinn::VarInt::from_u32(1), b"auth failed");
+    Ok(())
+}
+
+/// Handle RegisterUser request.
+async fn handle_register_user(
+    req: proto::RegisterUser,
+    sender: Arc<ClientHandle>,
+    state: Arc<ServerState>,
+    persistence: Option<Arc<Persistence>>,
+) -> Result<()> {
+    let Some(persist) = persistence else {
+        return send_command_result(&sender, "RegisterUser", false, "Registration not enabled").await;
+    };
+    
+    // Extract user_id from the UserId message
+    let target_user_id = req.user_id.map(|u| u.value).unwrap_or(0);
+    
+    // Get the target user's public key from active sessions
+    let target_key = match state.get_session_key(target_user_id) {
+        Some(key) => key,
+        None => {
+            return send_command_result(&sender, "RegisterUser", false, "User not found").await;
+        }
+    };
+    
+    // Get the target user's current username
+    let target_client = match state.get_client(target_user_id) {
+        Some(c) => c,
+        None => return send_command_result(&sender, "RegisterUser", false, "User not found").await,
+    };
+    let username = target_client.get_username().await;
+    
+    // Check if already registered
+    if persist.get_registered_user(&target_key).is_some() {
+        return send_command_result(&sender, "RegisterUser", false, "User already registered").await;
+    }
+    
+    // Register
+    if let Err(e) = persist.register_user(&target_key, crate::persistence::RegisteredUser {
+        username: username.clone(),
+        roles: vec![],
+        last_channel: None,
+    }) {
+        return send_command_result(&sender, "RegisterUser", false, &format!("Registration failed: {e}")).await;
+    }
+    
+    send_command_result(&sender, "RegisterUser", true, &format!("Registered '{}' successfully", username)).await
+}
+
+/// Handle UnregisterUser request.
+async fn handle_unregister_user(
+    req: proto::UnregisterUser,
+    sender: Arc<ClientHandle>,
+    state: Arc<ServerState>,
+    persistence: Option<Arc<Persistence>>,
+) -> Result<()> {
+    let Some(persist) = persistence else {
+        return send_command_result(&sender, "UnregisterUser", false, "Registration not enabled").await;
+    };
+    
+    // Extract user_id from the UserId message
+    let target_user_id = req.user_id.map(|u| u.value).unwrap_or(0);
+    
+    // Get the target user's public key
+    let target_key = match state.get_session_key(target_user_id) {
+        Some(key) => key,
+        None => {
+            return send_command_result(&sender, "UnregisterUser", false, "User not found").await;
+        }
+    };
+    
+    // Get the username before unregistering
+    let username = match state.get_client(target_user_id) {
+        Some(c) => c.get_username().await,
+        None => "user".to_string(),
+    };
+    
+    // Unregister
+    if let Err(e) = persist.unregister_user(&target_key) {
+        return send_command_result(&sender, "UnregisterUser", false, &format!("Unregistration failed: {e}")).await;
+    }
+    
+    send_command_result(&sender, "UnregisterUser", true, &format!("Unregistered '{}' successfully", username)).await
+}
+
+/// Send CommandResult message to client.
+async fn send_command_result(sender: &ClientHandle, command: &str, success: bool, message: &str) -> Result<()> {
+    let reply = proto::Envelope {
+        state_hash: Vec::new(),
+        payload: Some(Payload::CommandResult(proto::CommandResult {
+            command: command.to_string(),
+            success,
+            message: message.to_string(),
+        })),
+    };
+    let frame = encode_frame(&reply);
+    let _ = sender.send_frame(&frame).await;
     Ok(())
 }
 
@@ -184,18 +493,44 @@ async fn handle_join_room(
     jr: proto::JoinRoom,
     sender: Arc<ClientHandle>,
     state: Arc<ServerState>,
+    persistence: Option<Arc<Persistence>>,
 ) -> Result<()> {
     let new_room_uuid = jr
         .room_id
         .as_ref()
         .and_then(uuid_from_room_id)
         .unwrap_or(ROOT_ROOM_UUID);
+    
+    // Check if room exists
+    let rooms = state.get_rooms().await;
+    let room = rooms.iter().find(|r| {
+        r.id.as_ref().and_then(uuid_from_room_id) == Some(new_room_uuid)
+    });
+    
+    let room_name = match room {
+        Some(r) => r.name.clone(),
+        None => {
+            return send_command_result(&sender, "JoinRoom", false, "Room not found").await;
+        }
+    };
+    
     let _old_room_uuid = state
         .get_user_room(sender.user_id)
         .await
         .unwrap_or(ROOT_ROOM_UUID);
 
     state.set_user_room(sender.user_id, new_room_uuid).await;
+
+    // Save last channel for registered users
+    if let Some(ref persist) = persistence {
+        if let Some(public_key) = state.get_session_key(sender.user_id) {
+            if persist.is_registered(&public_key) {
+                if let Err(e) = persist.update_user_last_channel(&public_key, Some(new_room_uuid.into_bytes())) {
+                    warn!("Failed to save user's last channel: {e}");
+                }
+            }
+        }
+    }
 
     // Send incremental update about user moving rooms (from_room is implicit)
     broadcast_state_update(
@@ -208,6 +543,9 @@ async fn handle_join_room(
         }),
     )
     .await?;
+    
+    // Send confirmation to the requesting client
+    send_command_result(&sender, "JoinRoom", true, &format!("Joined '{}'", room_name)).await?;
 
     Ok(())
 }
@@ -221,9 +559,28 @@ async fn handle_disconnect(d: proto::Disconnect, sender: Arc<ClientHandle>) -> R
 }
 
 /// Handle create room request.
-async fn handle_create_room(cr: proto::CreateRoom, state: Arc<ServerState>) -> Result<()> {
+async fn handle_create_room(
+    cr: proto::CreateRoom,
+    sender: Arc<ClientHandle>,
+    state: Arc<ServerState>,
+    persistence: Option<Arc<Persistence>>,
+) -> Result<()> {
     info!("CreateRoom: {}", cr.name);
+    let room_name = cr.name.clone();
     let room_uuid = state.create_room(cr.name.clone()).await;
+
+    // Persist the new channel
+    if let Some(ref persist) = persistence {
+        let channel = crate::persistence::PersistedChannel {
+            name: room_name.clone(),
+            parent: None,
+            description: String::new(),
+            permanent: true,
+        };
+        if let Err(e) = persist.save_channel(&room_uuid.into_bytes(), &channel) {
+            warn!("Failed to persist channel: {e}");
+        }
+    }
 
     // Send incremental update to all clients
     let room_info = proto::RoomInfo {
@@ -237,18 +594,50 @@ async fn handle_create_room(cr: proto::CreateRoom, state: Arc<ServerState>) -> R
         }),
     )
     .await?;
+    
+    // Send confirmation to the requesting client
+    send_command_result(&sender, "CreateRoom", true, &format!("Created room '{}'", room_name)).await?;
     Ok(())
 }
 
 /// Handle delete room request.
-async fn handle_delete_room(dr: proto::DeleteRoom, state: Arc<ServerState>) -> Result<()> {
+async fn handle_delete_room(
+    dr: proto::DeleteRoom,
+    sender: Arc<ClientHandle>,
+    state: Arc<ServerState>,
+    persistence: Option<Arc<Persistence>>,
+) -> Result<()> {
     let room_uuid = dr
         .room_id
         .as_ref()
         .and_then(uuid_from_room_id)
         .unwrap_or(ROOT_ROOM_UUID);
+    
+    // Cannot delete the root room
+    if room_uuid == ROOT_ROOM_UUID {
+        return send_command_result(&sender, "DeleteRoom", false, "Cannot delete the Root room").await;
+    }
+    
+    // Get room name before deleting
+    let room_name = state.get_rooms().await
+        .iter()
+        .find(|r| r.id.as_ref().and_then(uuid_from_room_id) == Some(room_uuid))
+        .map(|r| r.name.clone())
+        .unwrap_or_else(|| "room".to_string());
+    
     info!("DeleteRoom: {}", room_uuid);
-    state.delete_room(room_uuid).await;
+    let deleted = state.delete_room(room_uuid).await;
+    
+    if !deleted {
+        return send_command_result(&sender, "DeleteRoom", false, "Room not found").await;
+    }
+
+    // Remove from persistence
+    if let Some(ref persist) = persistence {
+        if let Err(e) = persist.delete_channel(&room_uuid.into_bytes()) {
+            warn!("Failed to remove channel from persistence: {e}");
+        }
+    }
 
     // Send incremental update to all clients
     broadcast_state_update(
@@ -259,19 +648,35 @@ async fn handle_delete_room(dr: proto::DeleteRoom, state: Arc<ServerState>) -> R
         }),
     )
     .await?;
+    
+    // Send confirmation to the requesting client
+    send_command_result(&sender, "DeleteRoom", true, &format!("Deleted room '{}'", room_name)).await?;
     Ok(())
 }
 
 /// Handle rename room request.
-async fn handle_rename_room(rr: proto::RenameRoom, state: Arc<ServerState>) -> Result<()> {
+async fn handle_rename_room(rr: proto::RenameRoom, sender: Arc<ClientHandle>, state: Arc<ServerState>) -> Result<()> {
     let room_uuid = rr
         .room_id
         .as_ref()
         .and_then(uuid_from_room_id)
         .unwrap_or(ROOT_ROOM_UUID);
+    
+    // Get old room name for the message
+    let old_name = state.get_rooms().await
+        .iter()
+        .find(|r| r.id.as_ref().and_then(uuid_from_room_id) == Some(room_uuid))
+        .map(|r| r.name.clone())
+        .unwrap_or_else(|| "room".to_string());
+    
     info!("RenameRoom: {} -> {}", room_uuid, rr.new_name);
+    let new_name = rr.new_name.clone();
 
-    state.rename_room(room_uuid, rr.new_name.clone()).await;
+    let renamed = state.rename_room(room_uuid, rr.new_name.clone()).await;
+    
+    if !renamed {
+        return send_command_result(&sender, "RenameRoom", false, "Room not found").await;
+    }
 
     // Send incremental update to all clients
     broadcast_state_update(
@@ -282,6 +687,9 @@ async fn handle_rename_room(rr: proto::RenameRoom, state: Arc<ServerState>) -> R
         }),
     )
     .await?;
+    
+    // Send confirmation to the requesting client
+    send_command_result(&sender, "RenameRoom", true, &format!("Renamed '{}' to '{}'", old_name, new_name)).await?;
     Ok(())
 }
 
@@ -463,19 +871,24 @@ pub async fn cleanup_client(client_handle: &Arc<ClientHandle>, state: &Arc<Serve
     state.remove_client_by_handle(client_handle);
     // Remove membership
     state.remove_user_membership(user_id).await;
+    // Remove session
+    state.remove_session(user_id);
 
     debug!(user_id, "server: cleaned up client");
 
-    // Send incremental update about user leaving
-    if let Err(e) = broadcast_state_update(
-        state,
-        proto::state_update::Update::UserLeft(proto::UserLeft {
-            user_id: Some(proto::UserId { value: user_id }),
-        }),
-    )
-    .await
-    {
-        error!("failed to broadcast state update after disconnect: {e:?}");
+    // Only broadcast if the client was authenticated
+    if client_handle.authenticated.load(Ordering::SeqCst) {
+        // Send incremental update about user leaving
+        if let Err(e) = broadcast_state_update(
+            state,
+            proto::state_update::Update::UserLeft(proto::UserLeft {
+                user_id: Some(proto::UserId { value: user_id }),
+            }),
+        )
+        .await
+        {
+            error!("failed to broadcast state update after disconnect: {e:?}");
+        }
     }
 }
 

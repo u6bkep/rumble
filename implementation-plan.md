@@ -142,9 +142,19 @@ Note: Voice Activity Detection (VAD) is not a voice mode but rather a pipeline p
 Commands are fire-and-forget. The UI sends a command, and the backend updates state asynchronously:
 
 ```rust
+/// Callback for signing authentication challenges.
+/// The UI provides this; it may use a local key or SSH agent.
+pub type SigningCallback = Box<dyn Fn(&[u8]) -> Result<[u8; 64], String> + Send + Sync>;
+
 pub enum Command {
-    // Connection
-    Connect { addr: String, name: String, password: Option<String> },
+    // Connection (signer is required; UI handles key storage/retrieval)
+    Connect { 
+        addr: String, 
+        name: String, 
+        public_key: [u8; 32],      // Ed25519 public key
+        signer: SigningCallback,   // Signs auth challenge, provided by UI
+        password: Option<String>,  // Server password (required for unknown keys)
+    },
     Disconnect,
     
     // Room/Chat
@@ -153,6 +163,10 @@ pub enum Command {
     DeleteRoom { room_id: Uuid },
     RenameRoom { room_id: Uuid, new_name: String },
     SendChat { text: String },
+    
+    // Registration
+    RegisterUser { user_id: u64 },
+    UnregisterUser { user_id: u64 },
     
     // Audio device configuration (always available)
     SetInputDevice { device_id: Option<String> },
@@ -275,13 +289,34 @@ Voice mode controls *when* transmission is triggered. Mute is a separate orthogo
 - When `self_muted = true`, never transmit regardless of voice mode
 - Can still receive and play audio from others (unless deafened)
 
-### Client Identity
+### Client Identity and Key Management
 
-- Each client is identified by a persistent client ID, implemented as a public/private keypair generated on first run and stored locally.
-- The public key is sent to the server for authentication; the private key never leaves the client.
-- The user-visible name is distinct from the client ID and can be changed by the user.
-- Client stores persistent data (keypair, config) in a standard XDG-compliant config directory.
-- future: client hello will include signed proof of possession of the private key and a copy of the public key.
+Clients are identified by Ed25519 keypairs. The backend accepts a private key as a mandatory input; key storage and retrieval is handled by a module in the UI code.
+
+**UI Key Manager Responsibilities:**
+
+On first run, the UI presents a setup dialog with three options:
+
+1. **Use existing key from SSH agent**: List available keys (fingerprint + comment, like `ssh-add -l`) and let user select one
+2. **Generate new key in SSH agent**: Create a new Ed25519 key and add it to the agent
+3. **Generate key stored by Rumble**: Create a key stored in the local config directory
+
+The UI configuration stores:
+- `key_source`: `"agent"` or `"local"`
+- `key_fingerprint`: SHA256 fingerprint of the public key (for agent key selection)
+- For local keys: the private key, optionally password-protected (user's choice)
+
+Client config is stored in the XDG-compliant config directory (`~/.config/rumble/` on Linux).
+
+**SSH Agent Integration:**
+- Use the `ssh-agent` protocol to list keys, sign data, and optionally add new keys
+- On connection, if using agent, find the key matching the stored fingerprint
+- If the key is not found in the agent, prompt user to unlock/add it or select a different key
+
+**Backend Interface:**
+- The backend's `Connect` command requires a signing callback
+- The signing callback is invoked to sign the authentication challenge
+- The backend never stores or persists keys; it only uses the callback for authentication
 
 ---
 
@@ -309,10 +344,29 @@ All reliable messages are wrapped in an `Envelope`:
 message Envelope {
   bytes state_hash = 1;
   oneof payload {
+    // Authentication
     ClientHello client_hello = 10;
     ServerHello server_hello = 11;
-    ChatMessage chat_message = 12;
-    // ... other message types
+    Authenticate authenticate = 12;
+    AuthFailed auth_failed = 13;
+    
+    // State sync
+    ServerState server_state = 20;
+    StateUpdate state_update = 21;
+    RequestStateSync request_state_sync = 22;
+    
+    // User actions
+    ChatMessage chat_message = 30;
+    JoinRoom join_room = 31;
+    CreateRoom create_room = 32;
+    DeleteRoom delete_room = 33;
+    RenameRoom rename_room = 34;
+    SetUserStatus set_user_status = 35;
+    
+    // Registration
+    RegisterUser register_user = 40;
+    UnregisterUser unregister_user = 41;
+    RegistrationResult registration_result = 42;
   }
 }
 ```
@@ -859,23 +913,142 @@ struct RemoteUserAudio {
 
 ---
 
-## Authentication, Identity, and ACLs
+## Authentication and Identity
 
-### Authentication
-- Simple global password for server authentication
-- Password configured per server instance
-- Clients present password + public key when connecting
+### Authentication Flow
 
-### Identity
-- Users identified by Ed25519 public keys (client IDs)
-- Username is display name, distinct from client ID
-- Default unauthenticated role for unknown keys
+The authentication handshake uses Ed25519 challenge-response:
+
+```
+Client                                Server
+   │                                     │
+   │─── ClientHello ────────────────────►│  username, public_key, [password]
+   │    (password required for unknown   │
+   │     keys, optional for known keys)  │
+   │                                     │
+   │                                     │  Server checks:
+   │                                     │  - If username taken by different key → reject
+   │                                     │  - If known key → password optional
+   │                                     │  - If unknown key → password required
+   │                                     │
+   │◄── ServerHello ─────────────────────│  nonce (32 bytes), server_name, user_id
+   │                                     │
+   │                                     │  Client signs: nonce || timestamp || public_key ||
+   │                                     │                user_id || server_name
+   │                                     │
+   │─── Authenticate ───────────────────►│  signature, timestamp
+   │                                     │
+   │                                     │  Server verifies:
+   │                                     │  - Signature valid for this session's nonce
+   │                                     │  - Timestamp within ±5 minutes of server time
+   │                                     │
+   │◄── AuthFailed ──────────────────────│  (if verification fails) error_message
+   │         OR                          │
+   │◄── ServerState ─────────────────────│  (if success) full state snapshot
+   │                                     │
+```
+
+**Message Details:**
+
+```protobuf
+message ClientHello {
+  string username = 1;
+  bytes public_key = 2;      // Ed25519 public key (32 bytes)
+  optional string password = 3;  // Server password (required for unknown keys)
+}
+
+message ServerHello {
+  bytes nonce = 1;           // Random 32-byte challenge
+  string server_name = 2;
+  uint64 user_id = 3;        // Assigned user ID for this session
+}
+
+message Authenticate {
+  bytes signature = 1;       // Ed25519 signature (64 bytes)
+  int64 timestamp_ms = 2;    // Unix timestamp in milliseconds
+}
+
+message AuthFailed {
+  string error = 1;          // Human-readable error message
+}
+```
+
+**Signature Payload:**
+The client signs the concatenation of (all fixed-length, 112 bytes total):
+- `nonce` (32 bytes)
+- `timestamp_ms` (8 bytes, big-endian)
+- `public_key` (32 bytes)
+- `user_id` (8 bytes, big-endian)
+- `server_cert_hash` (32 bytes, SHA256 of server's TLS certificate)
+
+The server certificate hash is derived from the existing QUIC/TLS connection, binding the signature to the specific server. Both client and server compute this from the connection's peer certificate.
+
+**Error Cases:**
+- "Username already taken" - username is registered to a different public key
+- "Password required" - unknown key attempted to connect without password
+- "Invalid password" - wrong server password
+- "Invalid signature" - signature verification failed
+- "Timestamp out of range" - timestamp not within ±5 minutes of server time
+
+### User Identity
+
+- Users are identified by their Ed25519 public key
+- `user_id` is a session-local identifier assigned by the server (not guaranteed unique across sessions)
+- Username is the display name; for registered users, the server's registered name is authoritative
+- The client receives the canonical username in the initial `ServerState` and should display that
+
+### User Registration
+
+Registration binds a username permanently to a public key. This provides:
+- Name reservation (no one else can use the registered username)
+- Persistent identity for ACLs (future)
+- The server remembers registered users across restarts
+
+**Registration Commands:**
+
+```protobuf
+message RegisterUser {
+  uint64 user_id = 1;  // User to register (allows admin to register others)
+}
+
+message UnregisterUser {
+  uint64 user_id = 1;  // User to unregister
+}
+
+message RegistrationResult {
+  bool success = 1;
+  optional string error = 2;
+}
+```
+
+**Current behavior (no ACLs):**
+- Any connected user can register any other connected user
+- Any connected user can unregister any user
+- Unregistered users can still connect and use the server with default permissions
+
+**Future behavior (with ACLs):**
+- Registration requires appropriate permissions (typically admin-only)
+- Registered users can have roles assigned for ACL purposes
+- Admins can change registered usernames via admin console
+
+### Server Persistence
+
+The server stores in its sled database:
+- **Registered users**: public_key → { username, roles (future) }, password bypass
+- **Known keys**: Set of public keys that have connected before (for last_room restore)
+- **Room data**: Room tree, ACLs (future)
+
+When a registered user connects:
+- Their registered username is used regardless of what they send in ClientHello
+- Their `last_room` is restored if the room still exists
+- Password is not required (known key)
 
 ### Access Control (Future)
+
 - All rooms have an ACL system
 - ACLs grant/deny permissions to users or roles
 - Rules inherit from parent rooms, can be overridden
-- Permissions include: join room, speak, send text, create rooms, move users, edit ACLs
+- Permissions include: join room, speak, send text, create rooms, move users, edit ACLs, register users
 
 ---
 
@@ -889,19 +1062,22 @@ struct RemoteUserAudio {
 5. State synchronization with hash verification
 
 ### Current Development
-1. **Audio Processing Pipeline**: Pluggable processor architecture for TX/RX
-2. **Voice Activity Detection (VAD)**: Pipeline processor for voice-gated transmission in Continuous mode
-3. **Per-user RX processing**: Volume control and optional processing per user, with the UI exposing a global rx pipeline that is internally implemented as applying the same pipeline to each user unless overridden.
+1. **Ed25519 Authentication**: Challenge-response auth with SSH agent integration
+2. **User Registration**: Name reservation and identity persistence
+3. **Audio Processing Pipeline**: Pluggable processor architecture for TX/RX
+4. **Voice Activity Detection (VAD)**: Pipeline processor for voice-gated transmission in Continuous mode
+5. **Per-user RX processing**: Volume control and optional processing per user
 
 ### Later Features
 1. User roles and ACLs for fine-grained permissions
-2. File transfers using BitTorrent with server as tracker
-3. Chat history snapshot sharing via torrent
-4. Mobile client support (Android, iOS, WASM)
-5. Server admin interface (CLI or web UI)
-6. Server plugins (RPC interface, scripting, loadable modules)
-7. Adaptive bitrate/quality based on network conditions
-8. Advanced audio processors (AGC, equalizer, limiter)
+2. Admin console (change usernames, manage registrations)
+3. File transfers using BitTorrent with server as tracker
+4. Chat history snapshot sharing via torrent
+5. Mobile client support (Android, iOS, WASM)
+6. Server admin interface (CLI or web UI)
+7. Server plugins (RPC interface, scripting, loadable modules)
+8. Adaptive bitrate/quality based on network conditions
+9. Advanced audio processors (AGC, equalizer, limiter)
 
 ---
 

@@ -4,6 +4,7 @@
 
 use crate::{
     handlers::{cleanup_client, handle_datagrams, handle_envelope},
+    persistence::Persistence,
     state::{ClientHandle, ServerState},
 };
 use anyhow::Result;
@@ -14,18 +15,20 @@ use api::{
 use bytes::BytesMut;
 use prost::Message;
 use quinn::{Endpoint, ServerConfig};
-use std::{net::Ipv6Addr, sync::Arc};
+use std::{net::SocketAddr, sync::Arc};
 use tracing::{debug, error, info};
 
 /// Configuration for the server.
 #[derive(Debug)]
 pub struct Config {
-    /// Port to listen on.
-    pub port: u16,
-    /// TLS certificate (DER format).
-    pub cert: rustls::pki_types::CertificateDer<'static>,
-    /// TLS private key (DER format).
+    /// Socket address to bind to (IPv4 or IPv6 with port).
+    pub bind: SocketAddr,
+    /// TLS certificate chain (PEM format, certbot-style).
+    pub certs: Vec<rustls::pki_types::CertificateDer<'static>>,
+    /// TLS private key (PEM format).
     pub key: rustls::pki_types::PrivateKeyDer<'static>,
+    /// Optional path for the persistence database.
+    pub data_dir: Option<String>,
 }
 
 /// The Rumble VOIP server.
@@ -35,14 +38,38 @@ pub struct Config {
 pub struct Server {
     endpoint: Endpoint,
     state: Arc<ServerState>,
+    persistence: Option<Arc<Persistence>>,
 }
 
 impl Server {
     /// Create a new server with the given configuration.
     pub fn new(config: Config) -> Result<Self> {
-        let endpoint = make_server_endpoint(config)?;
-        let state = Arc::new(ServerState::new());
-        Ok(Self { endpoint, state })
+        // Store first cert DER for hash computation (leaf certificate)
+        let cert_der = config.certs.first()
+            .map(|c| c.to_vec())
+            .unwrap_or_default();
+        
+        let endpoint = make_server_endpoint(&config)?;
+        let state = Arc::new(ServerState::with_cert(cert_der));
+        
+        // Initialize persistence if data_dir is provided
+        let persistence = if let Some(ref data_dir) = config.data_dir {
+            let db_path = format!("{}/rumble.db", data_dir);
+            match Persistence::open(&db_path) {
+                Ok(p) => {
+                    info!("Opened persistence database at {}", db_path);
+                    Some(Arc::new(p))
+                }
+                Err(e) => {
+                    error!("Failed to open persistence database: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        
+        Ok(Self { endpoint, state, persistence })
     }
 
     /// Get the local address the server is listening on.
@@ -55,10 +82,34 @@ impl Server {
         &self.state
     }
 
+    /// Load persisted channels into the server state.
+    async fn load_persisted_channels(&self) {
+        if let Some(ref persist) = self.persistence {
+            let channels = persist.get_all_channels();
+            let count = channels.len();
+            for (uuid_bytes, channel) in channels {
+                let uuid = uuid::Uuid::from_bytes(uuid_bytes);
+                // Skip the root room UUID (all zeros)
+                if uuid == api::ROOT_ROOM_UUID {
+                    continue;
+                }
+                if self.state.add_room_with_uuid(uuid, channel.name.clone()).await {
+                    debug!("Loaded persisted channel: {} ({})", channel.name, uuid);
+                }
+            }
+            if count > 0 {
+                info!("Loaded {} persisted channel(s)", count);
+            }
+        }
+    }
+
     /// Run the server, accepting connections until the endpoint is closed.
     ///
     /// This method will run forever unless the endpoint is closed externally.
     pub async fn run(&self) -> Result<()> {
+        // Load persisted channels before accepting connections
+        self.load_persisted_channels().await;
+        
         info!("server_listen_addr = {}", self.endpoint.local_addr()?);
 
         while let Some(connecting) = self.endpoint.accept().await {
@@ -66,8 +117,9 @@ impl Server {
                 Ok(new_conn) => {
                     info!("new connection from {}", new_conn.remote_address());
                     let st = self.state.clone();
+                    let persist = self.persistence.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = handle_connection(new_conn, st).await {
+                        if let Err(e) = handle_connection(new_conn, st, persist).await {
                             error!("connection error: {e:?}");
                         }
                     });
@@ -90,13 +142,13 @@ impl Server {
 }
 
 /// Create a QUIC server endpoint with the given configuration.
-fn make_server_endpoint(config: Config) -> Result<Endpoint> {
+fn make_server_endpoint(config: &Config) -> Result<Endpoint> {
     let mut rustls_config = rustls::ServerConfig::builder_with_provider(
         rustls::crypto::aws_lc_rs::default_provider().into(),
     )
     .with_protocol_versions(&[&rustls::version::TLS13])?
     .with_no_client_auth()
-    .with_single_cert(vec![config.cert], config.key)?;
+    .with_single_cert(config.certs.clone(), config.key.clone_key())?;
     rustls_config.alpn_protocols = vec![b"rumble".to_vec()];
 
     let mut server_config = ServerConfig::with_crypto(Arc::new(
@@ -110,8 +162,7 @@ fn make_server_endpoint(config: Config) -> Result<Endpoint> {
     transport_config.datagram_receive_buffer_size(Some(65536));
     server_config.transport_config(Arc::new(transport_config));
 
-    let addr = (Ipv6Addr::UNSPECIFIED, config.port).into();
-    let endpoint = Endpoint::server(server_config, addr)?;
+    let endpoint = Endpoint::server(server_config, config.bind)?;
     Ok(endpoint)
 }
 
@@ -123,7 +174,11 @@ fn make_server_endpoint(config: Config) -> Result<Endpoint> {
 /// 3. Accept bidirectional streams
 /// 4. Process messages on each stream
 /// 5. Clean up on disconnect
-pub async fn handle_connection(conn: quinn::Connection, state: Arc<ServerState>) -> Result<()> {
+pub async fn handle_connection(
+    conn: quinn::Connection,
+    state: Arc<ServerState>,
+    persistence: Option<Arc<Persistence>>,
+) -> Result<()> {
     // Assign user_id at connection level - this is the authoritative identity.
     // This is lock-free (AtomicU64).
     let user_id = state.allocate_user_id();
@@ -160,6 +215,7 @@ pub async fn handle_connection(conn: quinn::Connection, state: Arc<ServerState>)
                 connection_clients.push(client_handle.clone());
 
                 let mut buf = BytesMut::new();
+                let persist = persistence.clone();
 
                 // Read loop - handle errors gracefully
                 loop {
@@ -185,6 +241,7 @@ pub async fn handle_connection(conn: quinn::Connection, state: Arc<ServerState>)
                                             env,
                                             client_handle.clone(),
                                             state.clone(),
+                                            persist.clone(),
                                         )
                                         .await
                                         {

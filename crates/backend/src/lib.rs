@@ -68,9 +68,17 @@ pub use bounded_voice::{
 pub mod audio_task;
 pub use audio_task::{AudioCommand, AudioTaskConfig, AudioTaskHandle, spawn_audio_task};
 
+// Certificate verification for self-signed cert handling
+pub mod cert_verifier;
+pub use cert_verifier::{
+    CapturedCert, InteractiveCertVerifier, ServerCertInfo, 
+    compute_sha256_fingerprint, is_cert_verification_error, 
+    new_captured_cert, peek_captured_cert, take_captured_cert,
+};
+
 // State and command types
 pub mod events;
-pub use events::{AudioSettings, AudioState, AudioStats, ChatMessage, Command, ConnectionState, State, VoiceMode, TransmissionMode};
+pub use events::{AudioSettings, AudioState, AudioStats, ChatMessage, Command, ConnectionState, PendingCertificate, SigningCallback, State, VoiceMode, TransmissionMode};
 
 // Backend handle
 pub mod handle;
@@ -101,10 +109,15 @@ pub use api::ROOT_ROOM_UUID;
 /// Configuration for the backend client.
 #[derive(Clone, Debug, Default)]
 pub struct ConnectConfig {
-    /// Additional certificate paths (DER format) to trust for server verification.
+    /// Additional certificate paths (DER or PEM format) to trust for server verification.
     /// These are added to the system root certificates (webpki_roots).
-    /// Use this to add self-signed or development certificates.
+    /// Use this to add self-signed or development certificates from files.
     pub additional_certs: Vec<PathBuf>,
+    
+    /// Certificates that have been accepted by the user during this session.
+    /// These are DER-encoded certificate bytes that will be added to the trust store.
+    /// This is typically populated when the user accepts a self-signed certificate prompt.
+    pub accepted_certs: Vec<Vec<u8>>,
 }
 
 impl ConnectConfig {
@@ -113,7 +126,7 @@ impl ConnectConfig {
         Self::default()
     }
 
-    /// Add an additional certificate path to trust (DER format).
+    /// Add an additional certificate path to trust (DER or PEM format).
     pub fn with_cert(mut self, path: impl Into<PathBuf>) -> Self {
         self.additional_certs.push(path.into());
         self

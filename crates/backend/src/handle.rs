@@ -41,11 +41,15 @@
 use crate::{
     audio::AudioSystem,
     audio_task::{spawn_audio_task, AudioCommand, AudioTaskConfig, AudioTaskHandle},
-    events::{AudioState, Command, ConnectionState, State, VoiceMode},
+    cert_verifier::{
+        is_cert_verification_error, new_captured_cert, take_captured_cert, 
+        CapturedCert, InteractiveCertVerifier,
+    },
+    events::{AudioState, Command, ConnectionState, PendingCertificate, SigningCallback, State, VoiceMode},
     ConnectConfig,
 };
 use api::{
-    encode_frame,
+    build_auth_payload, compute_cert_hash, encode_frame,
     proto::{self, envelope::Payload},
     room_id_from_uuid, try_decode_frame, ROOT_ROOM_UUID,
 };
@@ -56,6 +60,7 @@ use std::{
     collections::HashSet,
     net::ToSocketAddrs,
     sync::{Arc, RwLock},
+    time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -328,7 +333,7 @@ async fn run_connection_task(
                     return;
                 };
                 match cmd {
-                    Command::Connect { addr, name, password } => {
+                    Command::Connect { addr, name, public_key, signer, password } => {
                         client_name = name.clone();
                         
                         // Update state to Connecting
@@ -338,8 +343,11 @@ async fn run_connection_task(
                         }
                         repaint();
 
-                        // Attempt connection
-                        match connect_to_server(&addr, &name, password.as_deref(), &config).await {
+                        // Create a captured cert holder for the verifier to store self-signed certs
+                        let captured_cert = new_captured_cert();
+
+                        // Attempt connection with Ed25519 auth
+                        match connect_to_server(&addr, &name, &public_key, &signer, password.as_deref(), &config, captured_cert.clone()).await {
                             Ok((conn, send, recv, recv_buf, user_id, rooms, users)) => {
                                 // Update state to Connected
                                 {
@@ -349,7 +357,12 @@ async fn run_connection_task(
                                         user_id,
                                     };
                                     s.my_user_id = Some(user_id);
-                                    s.my_room_id = Some(ROOT_ROOM_UUID);
+                                    // Find our user in the users list and get their current room
+                                    s.my_room_id = users.iter()
+                                        .find(|u| u.user_id.as_ref().map(|id| id.value) == Some(user_id))
+                                        .and_then(|u| u.current_room.as_ref())
+                                        .and_then(api::uuid_from_room_id)
+                                        .or(Some(ROOT_ROOM_UUID));
                                     s.rooms = rooms;
                                     s.users = users;
                                 }
@@ -373,14 +386,149 @@ async fn run_connection_task(
                                 });
                             }
                             Err(e) => {
-                                error!("Connection failed: {}", e);
-                                {
-                                    let mut s = state.write().unwrap();
-                                    s.connection = ConnectionState::ConnectionLost { error: e.to_string() };
+                                // Check if the verifier captured a self-signed certificate
+                                if let Some(cert_info) = take_captured_cert(&captured_cert) {
+                                    info!("Self-signed certificate detected, prompting user for acceptance");
+                                    let pending = PendingCertificate {
+                                        certificate_der: cert_info.certificate_der,
+                                        fingerprint: cert_info.fingerprint,
+                                        server_name: cert_info.server_name,
+                                        server_addr: addr.clone(),
+                                        username: name.clone(),
+                                        password: password.clone(),
+                                        public_key,
+                                        signer: signer.clone(),
+                                    };
+                                    {
+                                        let mut s = state.write().unwrap();
+                                        s.connection = ConnectionState::CertificatePending { cert_info: pending };
+                                    }
+                                    repaint();
+                                } else if is_cert_verification_error(&e) {
+                                    // Cert verification error but we didn't capture the cert - shouldn't happen
+                                    // but log and treat as connection failure
+                                    error!("Certificate verification error but no cert captured: {}", e);
+                                    {
+                                        let mut s = state.write().unwrap();
+                                        s.connection = ConnectionState::ConnectionLost { 
+                                            error: format!("Certificate error: {}", e) 
+                                        };
+                                    }
+                                    repaint();
+                                } else {
+                                    error!("Connection failed: {}", e);
+                                    {
+                                        let mut s = state.write().unwrap();
+                                        s.connection = ConnectionState::ConnectionLost { error: e.to_string() };
+                                    }
+                                    repaint();
                                 }
-                                repaint();
                             }
                         }
+                    }
+                    
+                    Command::AcceptCertificate => {
+                        // Get the pending certificate info from state
+                        let pending_info = {
+                            let s = state.read().unwrap();
+                            if let ConnectionState::CertificatePending { cert_info } = &s.connection {
+                                Some(cert_info.clone())
+                            } else {
+                                None
+                            }
+                        };
+                        
+                        if let Some(pending) = pending_info {
+                            info!("User accepted certificate for {}", pending.server_name);
+                            
+                            // Update state to Connecting
+                            {
+                                let mut s = state.write().unwrap();
+                                s.connection = ConnectionState::Connecting { server_addr: pending.server_addr.clone() };
+                            }
+                            repaint();
+                            
+                            // Create a new config with the certificate added
+                            let mut new_config = config.clone();
+                            new_config.accepted_certs.push(pending.certificate_der.clone());
+                            
+                            // Create a new captured cert holder (shouldn't capture again since cert is now trusted)
+                            let captured_cert = new_captured_cert();
+                            
+                            // Retry connection with the certificate trusted
+                            match connect_to_server(
+                                &pending.server_addr,
+                                &pending.username,
+                                &pending.public_key,
+                                &pending.signer,
+                                pending.password.as_deref(),
+                                &new_config,
+                                captured_cert,
+                            ).await {
+                                Ok((conn, send, recv, recv_buf, user_id, rooms, users)) => {
+                                    // Success! Update state
+                                    {
+                                        let mut s = state.write().unwrap();
+                                        s.connection = ConnectionState::Connected {
+                                            server_name: "Rumble Server".to_string(),
+                                            user_id,
+                                        };
+                                        s.my_user_id = Some(user_id);
+                                        s.my_room_id = users.iter()
+                                            .find(|u| u.user_id.as_ref().map(|id| id.value) == Some(user_id))
+                                            .and_then(|u| u.current_room.as_ref())
+                                            .and_then(api::uuid_from_room_id)
+                                            .or(Some(ROOT_ROOM_UUID));
+                                        s.rooms = rooms;
+                                        s.users = users;
+                                    }
+                                    repaint();
+                                    
+                                    // Notify audio task
+                                    audio_task.send(AudioCommand::ConnectionEstablished {
+                                        connection: conn.clone(),
+                                        my_user_id: user_id,
+                                    });
+                                    
+                                    connection = Some(conn.clone());
+                                    send_stream = Some(send);
+                                    client_name = pending.username;
+                                    
+                                    // Spawn receiver task
+                                    let state_clone = state.clone();
+                                    let repaint_clone = repaint.clone();
+                                    let audio_task_clone = audio_task.clone();
+                                    tokio::spawn(async move {
+                                        run_receiver_task(conn, recv, recv_buf, state_clone, repaint_clone, audio_task_clone).await;
+                                    });
+                                }
+                                Err(e) => {
+                                    error!("Connection failed after accepting certificate: {}", e);
+                                    {
+                                        let mut s = state.write().unwrap();
+                                        s.connection = ConnectionState::ConnectionLost { error: e.to_string() };
+                                    }
+                                    repaint();
+                                }
+                            }
+                        } else {
+                            warn!("AcceptCertificate received but no certificate pending");
+                        }
+                    }
+                    
+                    Command::RejectCertificate => {
+                        // Simply go back to disconnected state
+                        {
+                            let s = state.read().unwrap();
+                            if let ConnectionState::CertificatePending { cert_info } = &s.connection {
+                                info!("User rejected certificate for {}", cert_info.server_name);
+                            }
+                        }
+                        {
+                            let mut s = state.write().unwrap();
+                            s.connection = ConnectionState::Disconnected;
+                        }
+                        repaint();
                     }
                     
                     Command::Disconnect => {
@@ -553,18 +701,51 @@ async fn run_connection_task(
                     | Command::SetUserVolume { .. } => {
                         debug!("Audio command received in connection task - should be routed to audio task");
                     }
+                    
+                    Command::RegisterUser { user_id } => {
+                        if let Some(send) = &mut send_stream {
+                            let env = proto::Envelope {
+                                state_hash: Vec::new(),
+                                payload: Some(Payload::RegisterUser(proto::RegisterUser {
+                                    user_id: Some(proto::UserId { value: user_id }),
+                                })),
+                            };
+                            let frame = encode_frame(&env);
+                            if let Err(e) = send.write_all(&frame).await {
+                                error!("Failed to send RegisterUser: {}", e);
+                            }
+                        }
+                    }
+                    
+                    Command::UnregisterUser { user_id } => {
+                        if let Some(send) = &mut send_stream {
+                            let env = proto::Envelope {
+                                state_hash: Vec::new(),
+                                payload: Some(Payload::UnregisterUser(proto::UnregisterUser {
+                                    user_id: Some(proto::UserId { value: user_id }),
+                                })),
+                            };
+                            let frame = encode_frame(&env);
+                            if let Err(e) = send.write_all(&frame).await {
+                                error!("Failed to send UnregisterUser: {}", e);
+                            }
+                        }
+                    }
                 }
             }
         }
     }
 }
 
-/// Connect to a server and perform handshake.
+/// Connect to a server and perform handshake with Ed25519 authentication.
 async fn connect_to_server(
     addr: &str,
     client_name: &str,
+    public_key: &[u8; 32],
+    signer: &SigningCallback,
     password: Option<&str>,
     config: &ConnectConfig,
+    captured_cert: CapturedCert,
 ) -> anyhow::Result<(
     quinn::Connection,
     quinn::SendStream,
@@ -602,7 +783,7 @@ async fn connect_to_server(
         .next()
         .ok_or_else(|| anyhow::anyhow!("No addresses found for hostname"))?;
 
-    let endpoint = make_client_endpoint(socket_addr, config)?;
+    let endpoint = make_client_endpoint(socket_addr, config, captured_cert)?;
 
     let conn = endpoint.connect(socket_addr, "localhost")?.await?;
     info!(remote = %conn.remote_address(), "Connected to server");
@@ -610,56 +791,85 @@ async fn connect_to_server(
     let (mut send, mut recv) = conn.open_bi().await?;
     info!("Opened bi stream");
 
-    // Send ClientHello
+    // Step 1: Send ClientHello with public key
     let hello = proto::Envelope {
         state_hash: Vec::new(),
         payload: Some(Payload::ClientHello(proto::ClientHello {
-            client_name: client_name.to_string(),
-            password: password.unwrap_or("").to_string(),
+            username: client_name.to_string(),
+            public_key: public_key.to_vec(),
+            password: password.map(|s| s.to_string()),
         })),
     };
     let frame = encode_frame(&hello);
     send.write_all(&frame).await?;
+    debug!("Sent ClientHello");
 
-    // Also send JoinRoom for Root room
-    let join_env = proto::Envelope {
+    // Step 2: Wait for ServerHello with nonce
+    let mut buf = BytesMut::new();
+    let (nonce, user_id) = wait_for_server_hello(&mut recv, &mut buf).await?;
+    info!(user_id, "Received ServerHello with nonce");
+    
+    // Step 3: Compute server certificate hash
+    let server_cert_hash = compute_server_cert_hash(&conn);
+    
+    // Step 4: Compute signature payload
+    let timestamp_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    
+    let payload = build_auth_payload(
+        &nonce,
+        timestamp_ms,
+        public_key,
+        user_id,
+        &server_cert_hash,
+    );
+    
+    // Step 5: Sign the payload
+    let signature = signer(&payload)
+        .map_err(|e| anyhow::anyhow!("Signing failed: {}", e))?;
+    
+    // Step 6: Send Authenticate
+    let auth = proto::Envelope {
         state_hash: Vec::new(),
-        payload: Some(Payload::JoinRoom(proto::JoinRoom {
-            room_id: Some(room_id_from_uuid(ROOT_ROOM_UUID)),
+        payload: Some(Payload::Authenticate(proto::Authenticate {
+            signature: signature.to_vec(),
+            timestamp_ms,
         })),
     };
-    let join_frame = encode_frame(&join_env);
-    send.write_all(&join_frame).await?;
+    let frame = encode_frame(&auth);
+    send.write_all(&frame).await?;
+    debug!("Sent Authenticate");
+    
+    // Step 7: Wait for ServerState or AuthFailed
+    let (rooms, users) = wait_for_auth_result(&mut recv, &mut buf).await?;
 
-    // Wait for ServerHello and initial state
-    let mut buf = BytesMut::new();
-    let mut user_id = 0u64;
-    #[allow(unused_assignments)]
-    let mut rooms: Vec<proto::RoomInfo> = Vec::new();
-    #[allow(unused_assignments)]
-    let mut users: Vec<proto::User> = Vec::new();
+    Ok((conn, send, recv, buf, user_id, rooms, users))
+}
 
-    'wait: loop {
+/// Wait for ServerHello message and extract nonce and user_id.
+async fn wait_for_server_hello(
+    recv: &mut quinn::RecvStream,
+    buf: &mut BytesMut,
+) -> anyhow::Result<([u8; 32], u64)> {
+    loop {
         let mut chunk = [0u8; 4096];
         match recv.read(&mut chunk).await? {
             Some(n) => {
                 buf.extend_from_slice(&chunk[..n]);
-                while let Some(frame) = try_decode_frame(&mut buf) {
+                while let Some(frame) = try_decode_frame(buf) {
                     if let Ok(env) = proto::Envelope::decode(&*frame) {
                         match env.payload {
                             Some(Payload::ServerHello(sh)) => {
-                                info!(server_name = %sh.server_name, user_id = sh.user_id, "Received ServerHello");
-                                user_id = sh.user_id;
-                            }
-                            Some(Payload::ServerEvent(se)) => {
-                                if let Some(proto::server_event::Kind::ServerState(ss)) = se.kind {
-                                    rooms = ss.rooms;
-                                    users = ss.users;
-                                    // Once we have both ServerHello and initial state, we're done
-                                    if user_id != 0 {
-                                        break 'wait;
-                                    }
+                                if sh.nonce.len() != 32 {
+                                    return Err(anyhow::anyhow!("Invalid nonce length in ServerHello"));
                                 }
+                                let nonce: [u8; 32] = sh.nonce.try_into().unwrap();
+                                return Ok((nonce, sh.user_id));
+                            }
+                            Some(Payload::AuthFailed(af)) => {
+                                return Err(anyhow::anyhow!("Authentication failed: {}", af.error));
                             }
                             _ => {}
                         }
@@ -671,8 +881,54 @@ async fn connect_to_server(
             }
         }
     }
+}
 
-    Ok((conn, send, recv, buf, user_id, rooms, users))
+/// Wait for authentication result (ServerState or AuthFailed).
+async fn wait_for_auth_result(
+    recv: &mut quinn::RecvStream,
+    buf: &mut BytesMut,
+) -> anyhow::Result<(Vec<proto::RoomInfo>, Vec<proto::User>)> {
+    loop {
+        let mut chunk = [0u8; 4096];
+        match recv.read(&mut chunk).await? {
+            Some(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                while let Some(frame) = try_decode_frame(buf) {
+                    if let Ok(env) = proto::Envelope::decode(&*frame) {
+                        match env.payload {
+                            Some(Payload::AuthFailed(af)) => {
+                                return Err(anyhow::anyhow!("Authentication failed: {}", af.error));
+                            }
+                            Some(Payload::ServerEvent(se)) => {
+                                if let Some(proto::server_event::Kind::ServerState(ss)) = se.kind {
+                                    return Ok((ss.rooms, ss.users));
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            None => {
+                return Err(anyhow::anyhow!("Server closed connection during authentication"));
+            }
+        }
+    }
+}
+
+/// Compute the SHA256 hash of the server's TLS certificate from the connection.
+fn compute_server_cert_hash(conn: &quinn::Connection) -> [u8; 32] {
+    // Get peer certificates from the connection
+    if let Some(peer_identity) = conn.peer_identity() {
+        if let Some(certs) = peer_identity.downcast_ref::<Vec<rustls::pki_types::CertificateDer<'_>>>() {
+            if let Some(cert) = certs.first() {
+                return compute_cert_hash(cert.as_ref());
+            }
+        }
+    }
+    // Fallback: return zeros (should not happen with proper TLS)
+    warn!("Could not get server certificate for hash computation");
+    [0u8; 32]
 }
 
 /// Background task that receives reliable messages from the server.
@@ -737,6 +993,23 @@ async fn run_receiver_task(
     repaint();
 }
 
+/// Add a local status message to the chat.
+fn add_local_message(state: &Arc<RwLock<State>>, text: String, repaint: &Arc<dyn Fn() + Send + Sync>) {
+    let mut s = state.write().unwrap();
+    s.chat_messages.push(crate::events::ChatMessage {
+        sender: String::new(),
+        text,
+        timestamp: std::time::SystemTime::now(),
+        is_local: true,
+    });
+    // Keep only recent messages
+    if s.chat_messages.len() > 100 {
+        s.chat_messages.remove(0);
+    }
+    drop(s);
+    repaint();
+}
+
 /// Handle an incoming server message and update state accordingly.
 fn handle_server_message(
     env: proto::Envelope,
@@ -744,59 +1017,67 @@ fn handle_server_message(
     repaint: &Arc<dyn Fn() + Send + Sync>,
     audio_task: &AudioTaskHandle,
 ) {
-    if let Some(Payload::ServerEvent(se)) = env.payload {
-        if let Some(kind) = se.kind {
-            match kind {
-                proto::server_event::Kind::ServerState(ss) => {
-                    // Full state replacement
-                    let mut s = state.write().unwrap();
-                    s.rooms = ss.rooms;
-                    s.users = ss.users.clone();
-                    
-                    // Notify audio task about users in our room (for proactive decoder creation)
-                    if let Some(my_room_id) = &s.my_room_id {
-                        let my_user_id = s.my_user_id;
-                        let user_ids_in_room: Vec<u64> = ss.users.iter()
-                            .filter_map(|u| {
-                                let user_id = u.user_id.as_ref().map(|id| id.value)?;
-                                let user_room = u.current_room.as_ref().and_then(api::uuid_from_room_id)?;
-                                if user_room == *my_room_id && Some(user_id) != my_user_id {
-                                    Some(user_id)
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect();
-                        drop(s);
-                        audio_task.send(AudioCommand::RoomChanged { user_ids_in_room });
-                    } else {
-                        drop(s);
+    match env.payload {
+        Some(Payload::CommandResult(cr)) => {
+            // Display command results as local chat messages
+            let prefix = if cr.success { "✓" } else { "✗" };
+            add_local_message(state, format!("{} {}", prefix, cr.message), repaint);
+        }
+        Some(Payload::ServerEvent(se)) => {
+            if let Some(kind) = se.kind {
+                match kind {
+                    proto::server_event::Kind::ServerState(ss) => {
+                        // Full state replacement
+                        let mut s = state.write().unwrap();
+                        s.rooms = ss.rooms;
+                        s.users = ss.users.clone();
+                        
+                        // Notify audio task about users in our room (for proactive decoder creation)
+                        if let Some(my_room_id) = &s.my_room_id {
+                            let my_user_id = s.my_user_id;
+                            let user_ids_in_room: Vec<u64> = ss.users.iter()
+                                .filter_map(|u| {
+                                    let user_id = u.user_id.as_ref().map(|id| id.value)?;
+                                    let user_room = u.current_room.as_ref().and_then(api::uuid_from_room_id)?;
+                                    if user_room == *my_room_id && Some(user_id) != my_user_id {
+                                        Some(user_id)
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect();
+                            drop(s);
+                            audio_task.send(AudioCommand::RoomChanged { user_ids_in_room });
+                        } else {
+                            drop(s);
+                        }
+                        repaint();
                     }
-                    repaint();
-                }
-                proto::server_event::Kind::StateUpdate(su) => {
-                    apply_state_update(su, state, repaint, audio_task);
-                }
-                proto::server_event::Kind::ChatBroadcast(cb) => {
-                    let mut s = state.write().unwrap();
-                    s.chat_messages.push(crate::events::ChatMessage {
-                        sender: cb.sender,
-                        text: cb.text,
-                        timestamp: std::time::SystemTime::now(),
-                        is_local: false,
-                    });
-                    // Keep only recent messages
-                    if s.chat_messages.len() > 100 {
-                        s.chat_messages.remove(0);
+                    proto::server_event::Kind::StateUpdate(su) => {
+                        apply_state_update(su, state, repaint, audio_task);
                     }
-                    drop(s);
-                    repaint();
-                }
-                proto::server_event::Kind::KeepAlive(_) => {
-                    // Ignore keep-alive for now
+                    proto::server_event::Kind::ChatBroadcast(cb) => {
+                        let mut s = state.write().unwrap();
+                        s.chat_messages.push(crate::events::ChatMessage {
+                            sender: cb.sender,
+                            text: cb.text,
+                            timestamp: std::time::SystemTime::now(),
+                            is_local: false,
+                        });
+                        // Keep only recent messages
+                        if s.chat_messages.len() > 100 {
+                            s.chat_messages.remove(0);
+                        }
+                        drop(s);
+                        repaint();
+                    }
+                    proto::server_event::Kind::KeepAlive(_) => {
+                        // Ignore keep-alive for now
+                    }
                 }
             }
         }
+        _ => {}
     }
 }
 
@@ -959,8 +1240,19 @@ fn apply_state_update(
     }
 }
 
-/// Create a QUIC client endpoint.
-fn make_client_endpoint(remote_addr: std::net::SocketAddr, config: &ConnectConfig) -> anyhow::Result<Endpoint> {
+/// Create a QUIC client endpoint with custom certificate verification.
+///
+/// This endpoint uses an interactive certificate verifier that:
+/// 1. Accepts certificates from standard webpki roots
+/// 2. Accepts certificates from configured additional_certs paths
+/// 3. Accepts certificates from the accepted_certs list (user-accepted)
+/// 4. For other self-signed certs, stores the cert in `captured_cert` and returns an error
+///    that allows the UI to prompt the user for acceptance
+fn make_client_endpoint(
+    remote_addr: std::net::SocketAddr, 
+    config: &ConnectConfig,
+    captured_cert: CapturedCert,
+) -> anyhow::Result<Endpoint> {
     // Bind to the same address family as the remote address
     let bind_addr: std::net::SocketAddr = if remote_addr.is_ipv6() {
         "[::]:0".parse().unwrap()
@@ -973,26 +1265,58 @@ fn make_client_endpoint(remote_addr: std::net::SocketAddr, config: &ConnectConfi
     let mut root_store = rustls::RootCertStore::empty();
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
-    // Load additional configured certificates
+    // Load additional configured certificates from files (supports both PEM and DER formats)
     for cert_path in &config.additional_certs {
         match std::fs::read(cert_path) {
             Ok(cert_bytes) => {
-                let cert = rustls::pki_types::CertificateDer::from(cert_bytes);
-                let _ = root_store.add(cert);
-                info!("Loaded additional cert from {:?}", cert_path);
+                // Try to detect if it's PEM format (starts with "-----BEGIN")
+                if cert_bytes.starts_with(b"-----BEGIN") {
+                    // Parse as PEM - may contain multiple certificates
+                    let mut reader = std::io::BufReader::new(cert_bytes.as_slice());
+                    let certs: Vec<rustls::pki_types::CertificateDer<'static>> = 
+                        rustls_pemfile::certs(&mut reader)
+                            .filter_map(|r| r.ok())
+                            .collect();
+                    for cert in certs {
+                        let _ = root_store.add(cert);
+                    }
+                    info!("Loaded PEM certificate(s) from {:?}", cert_path);
+                } else {
+                    // Assume DER format
+                    let cert = rustls::pki_types::CertificateDer::from(cert_bytes);
+                    let _ = root_store.add(cert);
+                    info!("Loaded DER certificate from {:?}", cert_path);
+                }
             }
             Err(e) => {
                 error!("Failed to load cert from {:?}: {}", cert_path, e);
             }
         }
     }
+    
+    // Add user-accepted certificates (from interactive prompts)
+    for cert_der in &config.accepted_certs {
+        let cert = rustls::pki_types::CertificateDer::from(cert_der.clone());
+        if let Err(e) = root_store.add(cert) {
+            warn!("Failed to add accepted certificate to root store: {:?}", e);
+        } else {
+            debug!("Added user-accepted certificate to trust store");
+        }
+    }
 
-    let mut client_cfg = rustls::ClientConfig::builder_with_provider(
-        rustls::crypto::aws_lc_rs::default_provider().into(),
-    )
-    .with_protocol_versions(&[&rustls::version::TLS13])?
-    .with_root_certificates(root_store)
-    .with_no_client_auth();
+    // Create the crypto provider
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    
+    // Create the custom interactive verifier with the shared captured cert storage
+    let verifier = Arc::new(InteractiveCertVerifier::new(root_store, provider.clone(), captured_cert));
+
+    // Build client config with the custom verifier using dangerous() API
+    let mut client_cfg = rustls::ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth();
+    
     client_cfg.alpn_protocols = vec![b"rumble".to_vec()];
     let rustls_config = Arc::new(client_cfg);
     let crypto = QuicClientConfig::try_from(rustls_config)?;

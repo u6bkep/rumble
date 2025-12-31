@@ -13,6 +13,9 @@ prost-types = "0.14"
 bytes = "1"
 blake3 = "1"
 uuid = { version = "1.19.0", features = ["v4"] }
+sha2 = "0.10"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
 
 [build-dependencies]
 prost-build = "0.14"

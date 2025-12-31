@@ -5,6 +5,7 @@
 
 use std::{
     io::{BufRead, BufReader},
+    path::PathBuf,
     process::{Child, Command, Stdio},
     sync::{
         atomic::{AtomicBool, AtomicU16, Ordering},
@@ -13,14 +14,21 @@ use std::{
     time::Duration,
 };
 
-use backend::{BackendHandle, Command as BackendCommand, ConnectConfig, ConnectionState};
+use backend::{BackendHandle, Command as BackendCommand, ConnectConfig, ConnectionState, SigningCallback};
+use ed25519_dalek::SigningKey;
+use rand::rngs::OsRng;
+use tempfile::TempDir;
 
-/// Guard that kills the server process on drop.
-struct ChildGuard(Option<Child>);
+/// Guard that kills the server process on drop and cleans up temp dirs.
+struct ServerGuard {
+    child: Option<Child>,
+    _temp_dir: TempDir,
+    pub cert_path: PathBuf,
+}
 
-impl Drop for ChildGuard {
+impl Drop for ServerGuard {
     fn drop(&mut self) {
-        if let Some(mut c) = self.0.take() {
+        if let Some(mut c) = self.child.take() {
             let _ = c.kill();
             let _ = c.wait();
         }
@@ -35,10 +43,21 @@ fn next_test_port() -> u16 {
 }
 
 /// Start a server instance on the given port and return the guard.
-fn start_server(port: u16) -> ChildGuard {
+/// Creates a unique temp directory for this server's certs and data.
+fn start_server(port: u16) -> ServerGuard {
+    // Create a unique temp directory for this test's server
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let cert_dir = temp_dir.path().join("certs");
+    let data_dir = temp_dir.path().join("data");
+    std::fs::create_dir_all(&cert_dir).expect("failed to create cert dir");
+    std::fs::create_dir_all(&data_dir).expect("failed to create data dir");
+
     let mut child = Command::new(env!("CARGO_BIN_EXE_server"))
         .env("RUST_LOG", "debug")
+        .env("RUMBLE_NO_CONFIG", "1")
         .env("RUMBLE_PORT", port.to_string())
+        .env("RUMBLE_CERT_DIR", cert_dir.to_str().unwrap())
+        .env("RUMBLE_DATA_DIR", data_dir.to_str().unwrap())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -64,18 +83,40 @@ fn start_server(port: u16) -> ChildGuard {
         });
     }
 
-    ChildGuard(Some(child))
+    // Wait for certs to be generated
+    let cert_path = cert_dir.join("fullchain.pem");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !cert_path.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    ServerGuard {
+        child: Some(child),
+        _temp_dir: temp_dir,
+        cert_path,
+    }
 }
 
-/// Helper to create a BackendHandle with the dev certificate and a repaint counter.
-fn create_backend_with_repaint() -> (BackendHandle, Arc<AtomicBool>) {
+/// Helper to create a BackendHandle with the specified certificate and a repaint counter.
+fn create_backend_with_repaint_and_cert(cert_path: &std::path::Path) -> (BackendHandle, Arc<AtomicBool>) {
     let repaint_called = Arc::new(AtomicBool::new(false));
     let repaint_called_clone = repaint_called.clone();
 
-    let config = ConnectConfig::new().with_cert("dev-certs/server-cert.der");
+    let config = ConnectConfig::new().with_cert(cert_path);
 
     let handle =
         BackendHandle::with_config(move || repaint_called_clone.store(true, Ordering::SeqCst), config);
+
+    (handle, repaint_called)
+}
+
+/// Helper to create a BackendHandle without any certificate (for tests that don't connect).
+fn create_backend_without_cert() -> (BackendHandle, Arc<AtomicBool>) {
+    let repaint_called = Arc::new(AtomicBool::new(false));
+    let repaint_called_clone = repaint_called.clone();
+
+    let handle =
+        BackendHandle::with_config(move || repaint_called_clone.store(true, Ordering::SeqCst), ConnectConfig::new());
 
     (handle, repaint_called)
 }
@@ -99,13 +140,41 @@ where
 // Tests
 // =============================================================================
 
+/// Create Ed25519 signing credentials for a test client.
+fn create_test_credentials() -> ([u8; 32], SigningCallback) {
+    let signing_key = SigningKey::generate(&mut OsRng);
+    let public_key = signing_key.verifying_key().to_bytes();
+    let key_bytes = signing_key.to_bytes();
+    
+    let signer: SigningCallback = Arc::new(move |payload: &[u8]| {
+        use ed25519_dalek::Signer;
+        let key = SigningKey::from_bytes(&key_bytes);
+        let signature = key.sign(payload);
+        Ok(signature.to_bytes())
+    });
+    
+    (public_key, signer)
+}
+
+/// Helper to send a connect command with test credentials.
+fn send_connect(handle: &BackendHandle, addr: String, name: String, password: Option<String>) {
+    let (public_key, signer) = create_test_credentials();
+    handle.send(BackendCommand::Connect {
+        addr,
+        name,
+        public_key,
+        signer,
+        password,
+    });
+}
+
 #[test]
 fn test_backend_connects_to_server() {
     let port = next_test_port();
-    let _server = start_server(port);
+    let server = start_server(port);
     std::thread::sleep(Duration::from_millis(500));
 
-    let (handle, _repaint) = create_backend_with_repaint();
+    let (handle, _repaint) = create_backend_with_repaint_and_cert(&server.cert_path);
 
     // Initially disconnected
     assert!(matches!(
@@ -114,11 +183,7 @@ fn test_backend_connects_to_server() {
     ));
 
     // Send connect command
-    handle.send(BackendCommand::Connect {
-        addr: format!("127.0.0.1:{}", port),
-        name: "backend-test".to_string(),
-        password: None,
-    });
+    send_connect(&handle, format!("127.0.0.1:{}", port), "backend-test".to_string(), None);
 
     // Wait for connection
     let connected = wait_for(&handle, Duration::from_secs(5), |s| s.connection.is_connected());
@@ -139,17 +204,13 @@ fn test_backend_connects_to_server() {
 #[test]
 fn test_backend_disconnect() {
     let port = next_test_port();
-    let _server = start_server(port);
+    let server = start_server(port);
     std::thread::sleep(Duration::from_millis(500));
 
-    let (handle, _repaint) = create_backend_with_repaint();
+    let (handle, _repaint) = create_backend_with_repaint_and_cert(&server.cert_path);
 
     // Connect
-    handle.send(BackendCommand::Connect {
-        addr: format!("127.0.0.1:{}", port),
-        name: "disconnect-test".to_string(),
-        password: None,
-    });
+    send_connect(&handle, format!("127.0.0.1:{}", port), "disconnect-test".to_string(), None);
 
     wait_for(&handle, Duration::from_secs(5), |s| s.connection.is_connected());
     assert!(handle.is_connected());
@@ -169,16 +230,12 @@ fn test_backend_disconnect() {
 #[test]
 fn test_backend_create_room() {
     let port = next_test_port();
-    let _server = start_server(port);
+    let server = start_server(port);
     std::thread::sleep(Duration::from_millis(500));
 
-    let (handle, _repaint) = create_backend_with_repaint();
+    let (handle, _repaint) = create_backend_with_repaint_and_cert(&server.cert_path);
 
-    handle.send(BackendCommand::Connect {
-        addr: format!("127.0.0.1:{}", port),
-        name: "room-creator".to_string(),
-        password: None,
-    });
+    send_connect(&handle, format!("127.0.0.1:{}", port), "room-creator".to_string(), None);
 
     wait_for(&handle, Duration::from_secs(5), |s| s.connection.is_connected());
 
@@ -204,16 +261,12 @@ fn test_backend_create_room() {
 #[test]
 fn test_backend_delete_room() {
     let port = next_test_port();
-    let _server = start_server(port);
+    let server = start_server(port);
     std::thread::sleep(Duration::from_millis(500));
 
-    let (handle, _repaint) = create_backend_with_repaint();
+    let (handle, _repaint) = create_backend_with_repaint_and_cert(&server.cert_path);
 
-    handle.send(BackendCommand::Connect {
-        addr: format!("127.0.0.1:{}", port),
-        name: "room-deleter".to_string(),
-        password: None,
-    });
+    send_connect(&handle, format!("127.0.0.1:{}", port), "room-deleter".to_string(), None);
 
     wait_for(&handle, Duration::from_secs(5), |s| s.connection.is_connected());
 
@@ -253,16 +306,12 @@ fn test_backend_delete_room() {
 #[test]
 fn test_backend_rename_room() {
     let port = next_test_port();
-    let _server = start_server(port);
+    let server = start_server(port);
     std::thread::sleep(Duration::from_millis(500));
 
-    let (handle, _repaint) = create_backend_with_repaint();
+    let (handle, _repaint) = create_backend_with_repaint_and_cert(&server.cert_path);
 
-    handle.send(BackendCommand::Connect {
-        addr: format!("127.0.0.1:{}", port),
-        name: "room-renamer".to_string(),
-        password: None,
-    });
+    send_connect(&handle, format!("127.0.0.1:{}", port), "room-renamer".to_string(), None);
 
     wait_for(&handle, Duration::from_secs(5), |s| s.connection.is_connected());
 
@@ -304,16 +353,12 @@ fn test_backend_rename_room() {
 #[test]
 fn test_backend_user_appears_in_state() {
     let port = next_test_port();
-    let _server = start_server(port);
+    let server = start_server(port);
     std::thread::sleep(Duration::from_millis(500));
 
-    let (handle, _repaint) = create_backend_with_repaint();
+    let (handle, _repaint) = create_backend_with_repaint_and_cert(&server.cert_path);
 
-    handle.send(BackendCommand::Connect {
-        addr: format!("127.0.0.1:{}", port),
-        name: "visible-user".to_string(),
-        password: None,
-    });
+    send_connect(&handle, format!("127.0.0.1:{}", port), "visible-user".to_string(), None);
 
     wait_for(&handle, Duration::from_secs(5), |s| s.connection.is_connected());
 
@@ -333,28 +378,20 @@ fn test_backend_user_appears_in_state() {
 #[test]
 fn test_two_backends_see_each_other() {
     let port = next_test_port();
-    let _server = start_server(port);
+    let server = start_server(port);
     std::thread::sleep(Duration::from_millis(500));
 
-    let (handle1, _repaint1) = create_backend_with_repaint();
-    let (handle2, _repaint2) = create_backend_with_repaint();
+    let (handle1, _repaint1) = create_backend_with_repaint_and_cert(&server.cert_path);
+    let (handle2, _repaint2) = create_backend_with_repaint_and_cert(&server.cert_path);
 
     // Connect first backend
-    handle1.send(BackendCommand::Connect {
-        addr: format!("127.0.0.1:{}", port),
-        name: "first-backend".to_string(),
-        password: None,
-    });
+    send_connect(&handle1, format!("127.0.0.1:{}", port), "first-backend".to_string(), None);
 
     wait_for(&handle1, Duration::from_secs(5), |s| s.connection.is_connected());
     let user1_id = handle1.state().my_user_id.expect("user 1 should have ID");
 
     // Connect second backend
-    handle2.send(BackendCommand::Connect {
-        addr: format!("127.0.0.1:{}", port),
-        name: "second-backend".to_string(),
-        password: None,
-    });
+    send_connect(&handle2, format!("127.0.0.1:{}", port), "second-backend".to_string(), None);
 
     wait_for(&handle2, Duration::from_secs(5), |s| s.connection.is_connected());
     let user2_id = handle2.state().my_user_id.expect("user 2 should have ID");
@@ -384,17 +421,13 @@ fn test_two_backends_see_each_other() {
 #[test]
 fn test_no_duplicate_users_when_second_client_connects() {
     let port = next_test_port();
-    let _server = start_server(port);
+    let server = start_server(port);
     std::thread::sleep(Duration::from_millis(500));
 
-    let (handle1, _repaint1) = create_backend_with_repaint();
+    let (handle1, _repaint1) = create_backend_with_repaint_and_cert(&server.cert_path);
 
     // Connect first backend
-    handle1.send(BackendCommand::Connect {
-        addr: format!("127.0.0.1:{}", port),
-        name: "first-client".to_string(),
-        password: None,
-    });
+    send_connect(&handle1, format!("127.0.0.1:{}", port), "first-client".to_string(), None);
 
     wait_for(&handle1, Duration::from_secs(5), |s| s.connection.is_connected());
     let user1_id = handle1.state().my_user_id.expect("user 1 should have ID");
@@ -409,12 +442,8 @@ fn test_no_duplicate_users_when_second_client_connects() {
     assert_eq!(user1_count_before, 1, "User 1 should appear exactly once before second client connects");
 
     // Connect second backend
-    let (handle2, _repaint2) = create_backend_with_repaint();
-    handle2.send(BackendCommand::Connect {
-        addr: format!("127.0.0.1:{}", port),
-        name: "second-client".to_string(),
-        password: None,
-    });
+    let (handle2, _repaint2) = create_backend_with_repaint_and_cert(&server.cert_path);
+    send_connect(&handle2, format!("127.0.0.1:{}", port), "second-client".to_string(), None);
 
     wait_for(&handle2, Duration::from_secs(5), |s| s.connection.is_connected());
     let user2_id = handle2.state().my_user_id.expect("user 2 should have ID");
@@ -456,23 +485,15 @@ fn test_no_duplicate_users_when_second_client_connects() {
 #[test]
 fn test_backend_room_updates_broadcast() {
     let port = next_test_port();
-    let _server = start_server(port);
+    let server = start_server(port);
     std::thread::sleep(Duration::from_millis(500));
 
-    let (handle1, _repaint1) = create_backend_with_repaint();
-    let (handle2, _repaint2) = create_backend_with_repaint();
+    let (handle1, _repaint1) = create_backend_with_repaint_and_cert(&server.cert_path);
+    let (handle2, _repaint2) = create_backend_with_repaint_and_cert(&server.cert_path);
 
     // Connect both backends
-    handle1.send(BackendCommand::Connect {
-        addr: format!("127.0.0.1:{}", port),
-        name: "broadcaster".to_string(),
-        password: None,
-    });
-    handle2.send(BackendCommand::Connect {
-        addr: format!("127.0.0.1:{}", port),
-        name: "listener".to_string(),
-        password: None,
-    });
+    send_connect(&handle1, format!("127.0.0.1:{}", port), "broadcaster".to_string(), None);
+    send_connect(&handle2, format!("127.0.0.1:{}", port), "listener".to_string(), None);
 
     wait_for(&handle1, Duration::from_secs(5), |s| s.connection.is_connected());
     wait_for(&handle2, Duration::from_secs(5), |s| s.connection.is_connected());
@@ -497,27 +518,19 @@ fn test_backend_room_updates_broadcast() {
 #[test]
 fn test_backend_disconnect_removes_user() {
     let port = next_test_port();
-    let _server = start_server(port);
+    let server = start_server(port);
     std::thread::sleep(Duration::from_millis(500));
 
-    let (handle1, _repaint1) = create_backend_with_repaint();
-    let (handle2, _repaint2) = create_backend_with_repaint();
+    let (handle1, _repaint1) = create_backend_with_repaint_and_cert(&server.cert_path);
+    let (handle2, _repaint2) = create_backend_with_repaint_and_cert(&server.cert_path);
 
     // Connect both backends
-    handle1.send(BackendCommand::Connect {
-        addr: format!("127.0.0.1:{}", port),
-        name: "will-disconnect".to_string(),
-        password: None,
-    });
+    send_connect(&handle1, format!("127.0.0.1:{}", port), "will-disconnect".to_string(), None);
 
     wait_for(&handle1, Duration::from_secs(5), |s| s.connection.is_connected());
     let user1_id = handle1.state().my_user_id.expect("user 1 should have ID");
 
-    handle2.send(BackendCommand::Connect {
-        addr: format!("127.0.0.1:{}", port),
-        name: "observer".to_string(),
-        password: None,
-    });
+    send_connect(&handle2, format!("127.0.0.1:{}", port), "observer".to_string(), None);
 
     wait_for(&handle2, Duration::from_secs(5), |s| s.connection.is_connected());
 
@@ -544,16 +557,12 @@ fn test_backend_disconnect_removes_user() {
 #[test]
 fn test_backend_join_room() {
     let port = next_test_port();
-    let _server = start_server(port);
+    let server = start_server(port);
     std::thread::sleep(Duration::from_millis(500));
 
-    let (handle, _repaint) = create_backend_with_repaint();
+    let (handle, _repaint) = create_backend_with_repaint_and_cert(&server.cert_path);
 
-    handle.send(BackendCommand::Connect {
-        addr: format!("127.0.0.1:{}", port),
-        name: "room-joiner".to_string(),
-        password: None,
-    });
+    send_connect(&handle, format!("127.0.0.1:{}", port), "room-joiner".to_string(), None);
 
     wait_for(&handle, Duration::from_secs(5), |s| s.connection.is_connected());
 
@@ -601,18 +610,14 @@ fn test_backend_connection_lost_on_server_shutdown() {
     let mut server_guard = start_server(port);
     std::thread::sleep(Duration::from_millis(500));
 
-    let (handle, _repaint) = create_backend_with_repaint();
+    let (handle, _repaint) = create_backend_with_repaint_and_cert(&server_guard.cert_path);
 
-    handle.send(BackendCommand::Connect {
-        addr: format!("127.0.0.1:{}", port),
-        name: "connection-test".to_string(),
-        password: None,
-    });
+    send_connect(&handle, format!("127.0.0.1:{}", port), "connection-test".to_string(), None);
 
     wait_for(&handle, Duration::from_secs(5), |s| s.connection.is_connected());
 
     // Kill the server
-    if let Some(mut c) = server_guard.0.take() {
+    if let Some(mut c) = server_guard.child.take() {
         let _ = c.kill();
         let _ = c.wait();
     }
@@ -631,19 +636,15 @@ fn test_backend_connection_lost_on_server_shutdown() {
 #[test]
 fn test_backend_repaint_callback_called() {
     let port = next_test_port();
-    let _server = start_server(port);
+    let server = start_server(port);
     std::thread::sleep(Duration::from_millis(500));
 
-    let (handle, repaint_called) = create_backend_with_repaint();
+    let (handle, repaint_called) = create_backend_with_repaint_and_cert(&server.cert_path);
 
     // Reset repaint flag
     repaint_called.store(false, Ordering::SeqCst);
 
-    handle.send(BackendCommand::Connect {
-        addr: format!("127.0.0.1:{}", port),
-        name: "repaint-test".to_string(),
-        password: None,
-    });
+    send_connect(&handle, format!("127.0.0.1:{}", port), "repaint-test".to_string(), None);
 
     // Wait for connection and check repaint was called
     wait_for(&handle, Duration::from_secs(5), |s| s.connection.is_connected());
@@ -659,10 +660,10 @@ fn test_backend_repaint_callback_called() {
 #[test]
 fn test_transmission_mode_defaults_to_ptt() {
     let port = next_test_port();
-    let _server = start_server(port);
+    let server = start_server(port);
     std::thread::sleep(Duration::from_millis(500));
 
-    let (handle, _repaint) = create_backend_with_repaint();
+    let (handle, _repaint) = create_backend_with_repaint_and_cert(&server.cert_path);
 
     let state = handle.state();
     assert!(
@@ -677,17 +678,13 @@ fn test_transmission_mode_defaults_to_ptt() {
 #[test]
 fn test_set_transmission_mode_updates_state() {
     let port = next_test_port();
-    let _server = start_server(port);
+    let server = start_server(port);
     std::thread::sleep(Duration::from_millis(500));
 
-    let (handle, _repaint) = create_backend_with_repaint();
+    let (handle, _repaint) = create_backend_with_repaint_and_cert(&server.cert_path);
 
     // Connect first
-    handle.send(BackendCommand::Connect {
-        addr: format!("127.0.0.1:{}", port),
-        name: "mode-test".to_string(),
-        password: None,
-    });
+    send_connect(&handle, format!("127.0.0.1:{}", port), "mode-test".to_string(), None);
 
     wait_for(&handle, Duration::from_secs(5), |s| s.connection.is_connected());
 
@@ -736,16 +733,12 @@ fn test_set_transmission_mode_updates_state() {
 #[test]
 fn test_ptt_start_stop_transmit() {
     let port = next_test_port();
-    let _server = start_server(port);
+    let server = start_server(port);
     std::thread::sleep(Duration::from_millis(500));
 
-    let (handle, _repaint) = create_backend_with_repaint();
+    let (handle, _repaint) = create_backend_with_repaint_and_cert(&server.cert_path);
 
-    handle.send(BackendCommand::Connect {
-        addr: format!("127.0.0.1:{}", port),
-        name: "ptt-test".to_string(),
-        password: None,
-    });
+    send_connect(&handle, format!("127.0.0.1:{}", port), "ptt-test".to_string(), None);
 
     wait_for(&handle, Duration::from_secs(5), |s| s.connection.is_connected());
 
@@ -765,16 +758,12 @@ fn test_ptt_start_stop_transmit() {
 #[test]
 fn test_ptt_in_continuous_mode_ignored() {
     let port = next_test_port();
-    let _server = start_server(port);
+    let server = start_server(port);
     std::thread::sleep(Duration::from_millis(500));
 
-    let (handle, _repaint) = create_backend_with_repaint();
+    let (handle, _repaint) = create_backend_with_repaint_and_cert(&server.cert_path);
 
-    handle.send(BackendCommand::Connect {
-        addr: format!("127.0.0.1:{}", port),
-        name: "ptt-continuous-test".to_string(),
-        password: None,
-    });
+    send_connect(&handle, format!("127.0.0.1:{}", port), "ptt-continuous-test".to_string(), None);
 
     wait_for(&handle, Duration::from_secs(5), |s| s.connection.is_connected());
 
@@ -803,16 +792,12 @@ fn test_switch_from_continuous_to_ptt_while_ptt_held() {
     // This test verifies the fix for the bug where switching from Continuous to PTT
     // while holding the PTT key would stop transmission incorrectly.
     let port = next_test_port();
-    let _server = start_server(port);
+    let server = start_server(port);
     std::thread::sleep(Duration::from_millis(500));
 
-    let (handle, _repaint) = create_backend_with_repaint();
+    let (handle, _repaint) = create_backend_with_repaint_and_cert(&server.cert_path);
 
-    handle.send(BackendCommand::Connect {
-        addr: format!("127.0.0.1:{}", port),
-        name: "mode-switch-test".to_string(),
-        password: None,
-    });
+    send_connect(&handle, format!("127.0.0.1:{}", port), "mode-switch-test".to_string(), None);
 
     wait_for(&handle, Duration::from_secs(5), |s| s.connection.is_connected());
 
@@ -848,16 +833,12 @@ fn test_switch_from_continuous_to_ptt_while_ptt_held() {
 #[test]
 fn test_switch_from_ptt_to_continuous_continues_transmission() {
     let port = next_test_port();
-    let _server = start_server(port);
+    let server = start_server(port);
     std::thread::sleep(Duration::from_millis(500));
 
-    let (handle, _repaint) = create_backend_with_repaint();
+    let (handle, _repaint) = create_backend_with_repaint_and_cert(&server.cert_path);
 
-    handle.send(BackendCommand::Connect {
-        addr: format!("127.0.0.1:{}", port),
-        name: "ptt-to-continuous-test".to_string(),
-        password: None,
-    });
+    send_connect(&handle, format!("127.0.0.1:{}", port), "ptt-to-continuous-test".to_string(), None);
 
     wait_for(&handle, Duration::from_secs(5), |s| s.connection.is_connected());
 
@@ -888,10 +869,10 @@ fn test_switch_from_ptt_to_continuous_continues_transmission() {
 #[test]
 fn test_continuous_mode_starts_on_connect() {
     let port = next_test_port();
-    let _server = start_server(port);
+    let server = start_server(port);
     std::thread::sleep(Duration::from_millis(500));
 
-    let (handle, _repaint) = create_backend_with_repaint();
+    let (handle, _repaint) = create_backend_with_repaint_and_cert(&server.cert_path);
 
     // Set continuous mode BEFORE connecting
     handle.send(BackendCommand::SetVoiceMode {
@@ -901,11 +882,7 @@ fn test_continuous_mode_starts_on_connect() {
     std::thread::sleep(Duration::from_millis(100));
 
     // Connect
-    handle.send(BackendCommand::Connect {
-        addr: format!("127.0.0.1:{}", port),
-        name: "continuous-on-connect-test".to_string(),
-        password: None,
-    });
+    send_connect(&handle, format!("127.0.0.1:{}", port), "continuous-on-connect-test".to_string(), None);
 
     wait_for(&handle, Duration::from_secs(5), |s| s.connection.is_connected());
 
@@ -917,16 +894,12 @@ fn test_continuous_mode_starts_on_connect() {
 #[test]
 fn test_muted_does_not_transmit() {
     let port = next_test_port();
-    let _server = start_server(port);
+    let server = start_server(port);
     std::thread::sleep(Duration::from_millis(500));
 
-    let (handle, _repaint) = create_backend_with_repaint();
+    let (handle, _repaint) = create_backend_with_repaint_and_cert(&server.cert_path);
 
-    handle.send(BackendCommand::Connect {
-        addr: format!("127.0.0.1:{}", port),
-        name: "muted-test".to_string(),
-        password: None,
-    });
+    send_connect(&handle, format!("127.0.0.1:{}", port), "muted-test".to_string(), None);
 
     wait_for(&handle, Duration::from_secs(5), |s| s.connection.is_connected());
 
@@ -946,16 +919,12 @@ fn test_muted_does_not_transmit() {
 #[test]
 fn test_mute_stops_continuous_transmission() {
     let port = next_test_port();
-    let _server = start_server(port);
+    let server = start_server(port);
     std::thread::sleep(Duration::from_millis(500));
 
-    let (handle, _repaint) = create_backend_with_repaint();
+    let (handle, _repaint) = create_backend_with_repaint_and_cert(&server.cert_path);
 
-    handle.send(BackendCommand::Connect {
-        addr: format!("127.0.0.1:{}", port),
-        name: "continuous-to-muted-test".to_string(),
-        password: None,
-    });
+    send_connect(&handle, format!("127.0.0.1:{}", port), "continuous-to-muted-test".to_string(), None);
 
     wait_for(&handle, Duration::from_secs(5), |s| s.connection.is_connected());
 
@@ -976,16 +945,12 @@ fn test_mute_stops_continuous_transmission() {
 #[test]
 fn test_disconnect_clears_transmission_state() {
     let port = next_test_port();
-    let _server = start_server(port);
+    let server = start_server(port);
     std::thread::sleep(Duration::from_millis(500));
 
-    let (handle, _repaint) = create_backend_with_repaint();
+    let (handle, _repaint) = create_backend_with_repaint_and_cert(&server.cert_path);
 
-    handle.send(BackendCommand::Connect {
-        addr: format!("127.0.0.1:{}", port),
-        name: "disconnect-transmission-test".to_string(),
-        password: None,
-    });
+    send_connect(&handle, format!("127.0.0.1:{}", port), "disconnect-transmission-test".to_string(), None);
 
     wait_for(&handle, Duration::from_secs(5), |s| s.connection.is_connected());
 
@@ -1011,10 +976,10 @@ fn test_disconnect_clears_transmission_state() {
 #[test]
 fn test_continuous_mode_resumes_on_reconnect() {
     let port = next_test_port();
-    let _server = start_server(port);
+    let server = start_server(port);
     std::thread::sleep(Duration::from_millis(500));
 
-    let (handle, _repaint) = create_backend_with_repaint();
+    let (handle, _repaint) = create_backend_with_repaint_and_cert(&server.cert_path);
 
     // Set continuous mode
     handle.send(BackendCommand::SetVoiceMode {
@@ -1022,11 +987,7 @@ fn test_continuous_mode_resumes_on_reconnect() {
     });
 
     // Connect
-    handle.send(BackendCommand::Connect {
-        addr: format!("127.0.0.1:{}", port),
-        name: "reconnect-continuous-test".to_string(),
-        password: None,
-    });
+    send_connect(&handle, format!("127.0.0.1:{}", port), "reconnect-continuous-test".to_string(), None);
 
     wait_for(&handle, Duration::from_secs(5), |s| s.connection.is_connected());
     wait_for(&handle, Duration::from_secs(2), |s| s.audio.is_transmitting);
@@ -1046,11 +1007,7 @@ fn test_continuous_mode_resumes_on_reconnect() {
     );
 
     // Reconnect
-    handle.send(BackendCommand::Connect {
-        addr: format!("127.0.0.1:{}", port),
-        name: "reconnect-continuous-test".to_string(),
-        password: None,
-    });
+    send_connect(&handle, format!("127.0.0.1:{}", port), "reconnect-continuous-test".to_string(), None);
 
     wait_for(&handle, Duration::from_secs(5), |s| s.connection.is_connected());
 
@@ -1063,16 +1020,12 @@ fn test_continuous_mode_resumes_on_reconnect() {
 fn test_ptt_not_transmitting_after_disconnect() {
     // Verifies that PTT state is reset on disconnect
     let port = next_test_port();
-    let _server = start_server(port);
+    let server = start_server(port);
     std::thread::sleep(Duration::from_millis(500));
 
-    let (handle, _repaint) = create_backend_with_repaint();
+    let (handle, _repaint) = create_backend_with_repaint_and_cert(&server.cert_path);
 
-    handle.send(BackendCommand::Connect {
-        addr: format!("127.0.0.1:{}", port),
-        name: "ptt-disconnect-test".to_string(),
-        password: None,
-    });
+    send_connect(&handle, format!("127.0.0.1:{}", port), "ptt-disconnect-test".to_string(), None);
 
     wait_for(&handle, Duration::from_secs(5), |s| s.connection.is_connected());
 
@@ -1092,11 +1045,7 @@ fn test_ptt_not_transmitting_after_disconnect() {
     assert!(!handle.state().audio.is_transmitting, "Should not be transmitting after disconnect");
 
     // Reconnect
-    handle.send(BackendCommand::Connect {
-        addr: format!("127.0.0.1:{}", port),
-        name: "ptt-disconnect-test".to_string(),
-        password: None,
-    });
+    send_connect(&handle, format!("127.0.0.1:{}", port), "ptt-disconnect-test".to_string(), None);
 
     wait_for(&handle, Duration::from_secs(5), |s| s.connection.is_connected());
 
@@ -1112,7 +1061,7 @@ fn test_ptt_not_transmitting_after_disconnect() {
 #[test]
 fn test_audio_devices_available_before_connect() {
     // Audio devices should be enumerable before connecting
-    let (handle, _repaint) = create_backend_with_repaint();
+    let (handle, _repaint) = create_backend_without_cert();
 
     let state = handle.state();
     
@@ -1124,7 +1073,7 @@ fn test_audio_devices_available_before_connect() {
 
 #[test]
 fn test_refresh_audio_devices() {
-    let (handle, _repaint) = create_backend_with_repaint();
+    let (handle, _repaint) = create_backend_without_cert();
 
     // Refresh devices should not panic or fail
     handle.send(BackendCommand::RefreshAudioDevices);
@@ -1137,7 +1086,7 @@ fn test_refresh_audio_devices() {
 
 #[test]
 fn test_set_input_device() {
-    let (handle, _repaint) = create_backend_with_repaint();
+    let (handle, _repaint) = create_backend_without_cert();
 
     // Setting a device (even invalid) should update state
     handle.send(BackendCommand::SetInputDevice {
@@ -1153,7 +1102,7 @@ fn test_set_input_device() {
 
 #[test]
 fn test_set_output_device() {
-    let (handle, _repaint) = create_backend_with_repaint();
+    let (handle, _repaint) = create_backend_without_cert();
 
     handle.send(BackendCommand::SetOutputDevice {
         device_id: Some("test-output-device".to_string()),

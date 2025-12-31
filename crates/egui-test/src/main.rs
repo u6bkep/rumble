@@ -2,11 +2,16 @@ use backend::{AudioSettings, BackendHandle, Command, ConnectionState, ConnectCon
 use clap::Parser;
 use directories::ProjectDirs;
 use eframe::egui;
+use ed25519_dalek::SigningKey;
 use egui::{CollapsingHeader, Modal};
+use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 use uuid::Uuid;
+
+mod key_manager;
+use key_manager::{FirstRunState, KeyManager, KeySource, KeyInfo, PendingAgentOp, SshAgentClient, connect_and_list_keys, generate_and_add_to_agent};
 
 /// Rumble - A voice chat client
 #[derive(Parser, Debug, Clone)]
@@ -171,6 +176,13 @@ pub struct PersistentSettings {
     pub custom_cert_path: Option<String>,
     pub client_name: String,
     
+    // Accepted server certificates (stored as hex-encoded fingerprints and DER bytes)
+    /// List of accepted certificates: (fingerprint_hex, der_bytes_base64)
+    pub accepted_certificates: Vec<AcceptedCertificate>,
+    
+    // Identity (Ed25519 private key as hex string, 64 hex chars = 32 bytes)
+    pub identity_private_key_hex: Option<String>,
+    
     // Autoconnect
     pub autoconnect_on_launch: bool,
     
@@ -189,6 +201,17 @@ pub struct PersistentSettings {
     pub chat_timestamp_format: TimestampFormat,
 }
 
+/// A certificate that was accepted by the user.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AcceptedCertificate {
+    /// Server address/name this certificate was accepted for.
+    pub server_name: String,
+    /// SHA256 fingerprint as hex string.
+    pub fingerprint_hex: String,
+    /// DER-encoded certificate as base64 string.
+    pub certificate_der_base64: String,
+}
+
 impl Default for PersistentSettings {
     fn default() -> Self {
         Self {
@@ -197,6 +220,8 @@ impl Default for PersistentSettings {
             trust_dev_cert: true,
             custom_cert_path: None,
             client_name: format!("user-{}", Uuid::new_v4().simple()),
+            accepted_certificates: Vec::new(),
+            identity_private_key_hex: None, // Will be generated on first use
             autoconnect_on_launch: false,
             audio: PersistentAudioSettings::default(),
             voice_mode: PersistentVoiceMode::PushToTalk,
@@ -295,7 +320,7 @@ impl From<PersistentVoiceMode> for VoiceMode {
 
 impl PersistentSettings {
     /// Get the config directory path.
-    fn config_dir() -> Option<PathBuf> {
+    pub fn config_dir() -> Option<PathBuf> {
         ProjectDirs::from("com", "rumble", "Rumble").map(|dirs| dirs.config_dir().to_path_buf())
     }
 
@@ -352,6 +377,47 @@ impl PersistentSettings {
 
         log::info!("Saved settings to {}", path.display());
         Ok(())
+    }
+    
+    /// Get or generate the Ed25519 signing key.
+    /// If no key is stored, generates a new one and stores it in hex format.
+    pub fn get_or_generate_signing_key(&mut self) -> SigningKey {
+        if let Some(ref hex_key) = self.identity_private_key_hex {
+            if let Some(key) = Self::parse_signing_key(hex_key) {
+                return key;
+            }
+            log::warn!("Invalid stored signing key, generating new one");
+        }
+        
+        // Generate a new key
+        let key = SigningKey::generate(&mut OsRng);
+        let bytes = key.to_bytes();
+        self.identity_private_key_hex = Some(hex::encode(bytes));
+        log::info!("Generated new Ed25519 identity key");
+        key
+    }
+    
+    /// Parse a signing key from hex string.
+    fn parse_signing_key(hex_key: &str) -> Option<SigningKey> {
+        let bytes = hex::decode(hex_key).ok()?;
+        if bytes.len() != 32 {
+            return None;
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&bytes);
+        Some(SigningKey::from_bytes(&arr))
+    }
+    
+    /// Get the public key bytes (32 bytes) if a signing key exists.
+    pub fn public_key_bytes(&self) -> Option<[u8; 32]> {
+        self.identity_private_key_hex.as_ref().and_then(|hex| {
+            Self::parse_signing_key(hex).map(|key| key.verifying_key().to_bytes())
+        })
+    }
+    
+    /// Get the public key as hex string for display.
+    pub fn public_key_hex(&self) -> Option<String> {
+        self.public_key_bytes().map(hex::encode)
     }
 }
 
@@ -459,6 +525,21 @@ struct MyApp {
     chat_input: String,
     client_name: String,
     
+    // Key manager for Ed25519 identity
+    key_manager: KeyManager,
+    
+    // First-run setup state (shown if no key is configured)
+    first_run_state: FirstRunState,
+    
+    // Cached signing key (from key manager after setup/unlock)
+    signing_key: Option<SigningKey>,
+    
+    // Pending async operation for SSH agent
+    pending_agent_op: Option<PendingAgentOp>,
+    
+    // Tokio runtime for async operations (SSH agent)
+    tokio_runtime: tokio::runtime::Runtime,
+    
     // Persistent settings
     persistent_settings: PersistentSettings,
     /// Whether to autoconnect on launch
@@ -498,6 +579,36 @@ impl MyApp {
         // Load persistent settings
         let mut persistent_settings = PersistentSettings::load();
         
+        // Get config directory for key manager
+        let config_dir = PersistentSettings::config_dir()
+            .unwrap_or_else(|| PathBuf::from("."));
+        
+        // Create key manager and check for migration from old format
+        let mut key_manager = KeyManager::new(config_dir);
+        
+        // Migration: If we have an old-style key in persistent_settings but no new key config,
+        // migrate it to the new key_manager format
+        if key_manager.needs_setup() {
+            if let Some(ref hex_key) = persistent_settings.identity_private_key_hex {
+                if let Some(signing_key) = key_manager::parse_signing_key(hex_key) {
+                    log::info!("Migrating existing identity key to new format");
+                    if let Err(e) = key_manager.import_signing_key(signing_key) {
+                        log::error!("Failed to migrate key: {}", e);
+                    }
+                }
+            }
+        }
+        
+        // Determine first-run state
+        let first_run_state = if key_manager.needs_setup() {
+            FirstRunState::SelectMethod
+        } else {
+            FirstRunState::NotNeeded
+        };
+        
+        // Get the cached signing key if available
+        let signing_key = key_manager.signing_key().cloned();
+        
         // CLI args override persistent settings
         let server_address = args.server.clone().unwrap_or_else(|| persistent_settings.server_address.clone());
         let server_password = args.password.clone().unwrap_or_else(|| persistent_settings.server_password.clone());
@@ -522,6 +633,22 @@ impl MyApp {
         }
         if let Ok(cert_path) = std::env::var("RUMBLE_SERVER_CERT_PATH") {
             config = config.with_cert(cert_path);
+        }
+        
+        // Load previously accepted certificates from persistent settings
+        {
+            use base64::Engine;
+            for accepted in &persistent_settings.accepted_certificates {
+                match base64::engine::general_purpose::STANDARD.decode(&accepted.certificate_der_base64) {
+                    Ok(der_bytes) => {
+                        log::info!("Loading accepted certificate for {}", accepted.server_name);
+                        config.accepted_certs.push(der_bytes);
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to decode accepted certificate for {}: {}", accepted.server_name, e);
+                    }
+                }
+            }
         }
 
         // Create backend handle with repaint callback
@@ -579,7 +706,21 @@ impl MyApp {
         persistent_settings.trust_dev_cert = trust_dev_cert;
         
         let autoconnect_on_launch = persistent_settings.autoconnect_on_launch;
+        
+        // Save settings
+        if let Err(e) = persistent_settings.save() {
+            log::warn!("Failed to save settings: {}", e);
+        }
 
+        let needs_first_run = !matches!(first_run_state, FirstRunState::NotNeeded);
+        
+        // Create a Tokio runtime for async operations (SSH agent)
+        let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("Failed to create Tokio runtime");
+        
         let mut app = Self {
             show_connect: false,
             show_settings: false,
@@ -588,6 +729,11 @@ impl MyApp {
             trust_dev_cert,
             chat_input: String::new(),
             client_name,
+            key_manager,
+            first_run_state,
+            signing_key,
+            pending_agent_op: None,
+            tokio_runtime,
             persistent_settings,
             autoconnect_on_launch,
             backend,
@@ -598,15 +744,17 @@ impl MyApp {
             egui_ctx: ctx,
         };
 
-        // If server was specified on command line, connect immediately
+        // If server was specified on command line, connect immediately (unless first run)
         // Otherwise, check autoconnect setting
-        if args.server.is_some() {
-            app.connect();
-        } else if autoconnect_on_launch && !app.connect_address.is_empty() {
-            app.backend.send(Command::LocalMessage {
-                text: "Auto-connecting...".to_string(),
-            });
-            app.connect();
+        if !needs_first_run {
+            if args.server.is_some() {
+                app.connect();
+            } else if autoconnect_on_launch && !app.connect_address.is_empty() {
+                app.backend.send(Command::LocalMessage {
+                    text: "Auto-connecting...".to_string(),
+                });
+                app.connect();
+            }
         }
 
         app
@@ -614,6 +762,34 @@ impl MyApp {
 
     /// Connect to the server using current settings.
     fn connect(&mut self) {
+        // Check if we have a key configured and can create a signer
+        let public_key = match self.key_manager.public_key_bytes() {
+            Some(key) => key,
+            None => {
+                self.backend.send(Command::LocalMessage {
+                    text: "Cannot connect: No identity key configured. Please complete first-run setup.".to_string(),
+                });
+                return;
+            }
+        };
+        
+        let signer = match self.key_manager.create_signer() {
+            Some(s) => s,
+            None => {
+                // Check if key needs unlocking
+                if self.key_manager.needs_unlock() {
+                    self.backend.send(Command::LocalMessage {
+                        text: "Cannot connect: Key is encrypted. Please unlock it in settings.".to_string(),
+                    });
+                } else {
+                    self.backend.send(Command::LocalMessage {
+                        text: "Cannot connect: Failed to create signer for key.".to_string(),
+                    });
+                }
+                return;
+            }
+        };
+        
         let addr = if self.connect_address.trim().is_empty() {
             "127.0.0.1:5000".to_string()
         } else {
@@ -632,6 +808,8 @@ impl MyApp {
         self.backend.send(Command::Connect {
             addr,
             name,
+            public_key,
+            signer,
             password,
         });
     }
@@ -802,6 +980,49 @@ impl MyApp {
         {
             self.settings_modal.pending_autoconnect = Some(pending_autoconnect);
             self.settings_modal.dirty = true;
+        }
+        
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(8.0);
+        
+        // Identity section
+        ui.heading("Identity");
+        ui.add_space(4.0);
+        
+        if let Some(public_key_hex) = self.key_manager.public_key_hex() {
+            ui.horizontal(|ui| {
+                ui.label("Public Key:");
+                // Show truncated key with copy button
+                let short_key = format!("{}...{}", &public_key_hex[..8], &public_key_hex[56..]);
+                ui.code(&short_key);
+                if ui.small_button("📋").on_hover_text("Copy full public key").clicked() {
+                    ui.ctx().copy_text(public_key_hex.clone());
+                }
+            });
+            
+            // Show key source
+            if let Some(config) = self.key_manager.config() {
+                let source_desc = match &config.source {
+                    KeySource::LocalPlaintext { .. } => "Local (unencrypted)",
+                    KeySource::LocalEncrypted { .. } => "Local (password protected)",
+                    KeySource::SshAgent { comment, .. } => &format!("SSH Agent ({})", comment),
+                };
+                ui.horizontal(|ui| {
+                    ui.label("Storage:");
+                    ui.label(source_desc);
+                });
+            }
+            
+            ui.add_space(8.0);
+            if ui.button("🔑 Generate New Identity...").on_hover_text("Generate a new identity key (will replace the current one)").clicked() {
+                self.first_run_state = FirstRunState::SelectMethod;
+            }
+        } else {
+            ui.colored_label(egui::Color32::YELLOW, "⚠ No identity key configured");
+            if ui.button("🔑 Configure Identity...").clicked() {
+                self.first_run_state = FirstRunState::SelectMethod;
+            }
         }
     }
     
@@ -1346,6 +1567,422 @@ impl MyApp {
                 });
         });
     }
+    
+    /// Render the first-run setup dialog for key configuration.
+    /// Returns true if setup is complete and the dialog should close.
+    fn render_first_run_dialog(&mut self, ctx: &egui::Context) {
+        // Don't show if not in first-run mode
+        if matches!(self.first_run_state, FirstRunState::NotNeeded | FirstRunState::Complete) {
+            return;
+        }
+        
+        // Track what action to take after the UI is rendered
+        // This avoids borrow checker issues with closures
+        let mut next_state: Option<FirstRunState> = None;
+        let mut generate_key_password: Option<Option<String>> = None;
+        let mut select_agent_key: Option<KeyInfo> = None;
+        let mut generate_agent_key_comment: Option<String> = None;
+        
+        let modal = Modal::new(egui::Id::new("first_run_modal")).show(ctx, |ui| {
+            ui.set_min_width(400.0);
+            
+            // Clone the state to avoid borrowing issues
+            let state = self.first_run_state.clone();
+            
+            match state {
+                FirstRunState::SelectMethod => {
+                    ui.heading("Welcome to Rumble! 🎤");
+                    ui.add_space(8.0);
+                    
+                    ui.label("Rumble uses Ed25519 cryptographic keys for secure authentication.");
+                    ui.label("This key is your identity and will be used to identify you on servers.");
+                    
+                    ui.add_space(16.0);
+                    ui.separator();
+                    ui.add_space(16.0);
+                    
+                    ui.heading("Choose how to store your key:");
+                    ui.add_space(12.0);
+                    
+                    // Option 1: Generate local key (simple)
+                    ui.group(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.strong("🔑 Generate Local Key");
+                            ui.label("(Recommended for most users)");
+                        });
+                        ui.label("A new key will be generated and stored on this computer.");
+                        ui.label("You can optionally protect it with a password.");
+                        ui.add_space(8.0);
+                        if ui.button("Generate Local Key →").clicked() {
+                            next_state = Some(FirstRunState::GenerateLocal {
+                                password: String::new(),
+                                password_confirm: String::new(),
+                                error: None,
+                            });
+                        }
+                    });
+                    
+                    ui.add_space(8.0);
+                    
+                    // Option 2: SSH Agent (advanced)
+                    ui.group(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.strong("🔐 Use SSH Agent");
+                            ui.label("(Advanced)");
+                        });
+                        ui.label("Use a key stored in your SSH agent for better security.");
+                        ui.label("Requires ssh-agent to be running with Ed25519 keys.");
+                        
+                        // Check if SSH agent is available
+                        let agent_available = SshAgentClient::is_available();
+                        
+                        ui.add_space(8.0);
+                        if !agent_available {
+                            ui.colored_label(egui::Color32::YELLOW, "⚠ SSH_AUTH_SOCK not set - ssh-agent not available");
+                        }
+                        
+                        ui.add_enabled_ui(agent_available, |ui| {
+                            if ui.button("Connect to SSH Agent →").clicked() {
+                                next_state = Some(FirstRunState::ConnectingAgent);
+                            }
+                        });
+                    });
+                }
+                
+                FirstRunState::GenerateLocal { password, password_confirm, error } => {
+                    ui.heading("Generate Local Key");
+                    ui.add_space(8.0);
+                    
+                    ui.label("Your key will be stored locally. Optionally add a password for extra security.");
+                    ui.label("If you set a password, you'll need to enter it each time you start Rumble.");
+                    
+                    ui.add_space(16.0);
+                    
+                    // Clone values for editing
+                    let mut pw = password.clone();
+                    let mut pw_confirm = password_confirm.clone();
+                    
+                    ui.horizontal(|ui| {
+                        ui.label("Password (optional):");
+                        ui.add(egui::TextEdit::singleline(&mut pw).password(true));
+                    });
+                    
+                    ui.horizontal(|ui| {
+                        ui.label("Confirm password:");
+                        ui.add(egui::TextEdit::singleline(&mut pw_confirm).password(true));
+                    });
+                    
+                    // If text changed, update the state
+                    if pw != password || pw_confirm != password_confirm {
+                        next_state = Some(FirstRunState::GenerateLocal {
+                            password: pw.clone(),
+                            password_confirm: pw_confirm.clone(),
+                            error: error.clone(),
+                        });
+                    }
+                    
+                    if let Some(err) = &error {
+                        ui.add_space(8.0);
+                        ui.colored_label(egui::Color32::RED, err);
+                    }
+                    
+                    // Show password mismatch warning
+                    if !pw.is_empty() && !pw_confirm.is_empty() && pw != pw_confirm {
+                        ui.add_space(4.0);
+                        ui.colored_label(egui::Color32::YELLOW, "⚠ Passwords don't match");
+                    }
+                    
+                    ui.add_space(16.0);
+                    ui.separator();
+                    ui.add_space(8.0);
+                    
+                    ui.horizontal(|ui| {
+                        if ui.button("← Back").clicked() {
+                            next_state = Some(FirstRunState::SelectMethod);
+                        }
+                        
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let can_generate = pw.is_empty() || pw == pw_confirm;
+                            
+                            if ui.add_enabled(can_generate, egui::Button::new("Generate Key ✓"))
+                                .on_disabled_hover_text("Passwords don't match")
+                                .clicked()
+                            {
+                                // Signal that we should generate a key
+                                let password_opt = if pw.is_empty() { None } else { Some(pw.clone()) };
+                                generate_key_password = Some(password_opt);
+                            }
+                        });
+                    });
+                }
+                
+                FirstRunState::ConnectingAgent => {
+                    ui.heading("Connecting to SSH Agent...");
+                    ui.add_space(16.0);
+                    ui.spinner();
+                    ui.label("Fetching Ed25519 keys from ssh-agent...");
+                    
+                    ui.add_space(16.0);
+                    if ui.button("← Cancel").clicked() {
+                        next_state = Some(FirstRunState::SelectMethod);
+                    }
+                }
+                
+                FirstRunState::SelectAgentKey { keys, selected, error } => {
+                    ui.heading("Select Key from SSH Agent");
+                    ui.add_space(8.0);
+                    
+                    let mut new_selected = selected;
+                    
+                    if keys.is_empty() {
+                        ui.label("No Ed25519 keys found in the SSH agent.");
+                        ui.label("You can generate a new key to add to the agent.");
+                    } else {
+                        ui.label("Select an existing key or generate a new one:");
+                        ui.add_space(8.0);
+                        
+                        for (i, key) in keys.iter().enumerate() {
+                            let text = format!("{} ({})", key.comment, key.fingerprint);
+                            if ui.selectable_label(new_selected == Some(i), text).clicked() {
+                                new_selected = Some(i);
+                            }
+                        }
+                    }
+                    
+                    // Update selection if changed
+                    if new_selected != selected {
+                        next_state = Some(FirstRunState::SelectAgentKey {
+                            keys: keys.clone(),
+                            selected: new_selected,
+                            error: error.clone(),
+                        });
+                    }
+                    
+                    if let Some(err) = &error {
+                        ui.add_space(8.0);
+                        ui.colored_label(egui::Color32::RED, err);
+                    }
+                    
+                    ui.add_space(16.0);
+                    ui.separator();
+                    ui.add_space(8.0);
+                    
+                    ui.horizontal(|ui| {
+                        if ui.button("← Back").clicked() {
+                            next_state = Some(FirstRunState::SelectMethod);
+                        }
+                        
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let can_select = new_selected.is_some();
+                            if ui.add_enabled(can_select, egui::Button::new("Use Selected Key")).clicked() {
+                                // Signal to save the selected key
+                                if let Some(idx) = new_selected {
+                                    if let Some(key) = keys.get(idx) {
+                                        select_agent_key = Some(key.clone());
+                                    }
+                                }
+                            }
+                            
+                            if ui.button("Generate New Key").clicked() {
+                                next_state = Some(FirstRunState::GenerateAgentKey {
+                                    comment: "rumble-identity".to_string(),
+                                });
+                            }
+                        });
+                    });
+                }
+                
+                FirstRunState::GenerateAgentKey { comment } => {
+                    ui.heading("Generate Key for SSH Agent");
+                    ui.add_space(8.0);
+                    
+                    ui.label("A new Ed25519 key will be generated and added to your SSH agent.");
+                    
+                    ui.add_space(8.0);
+                    
+                    let mut c = comment.clone();
+                    ui.horizontal(|ui| {
+                        ui.label("Key comment:");
+                        ui.text_edit_singleline(&mut c);
+                    });
+                    
+                    if c != comment {
+                        next_state = Some(FirstRunState::GenerateAgentKey { comment: c.clone() });
+                    }
+                    
+                    ui.add_space(16.0);
+                    ui.separator();
+                    ui.add_space(8.0);
+                    
+                    ui.horizontal(|ui| {
+                        if ui.button("← Back").clicked() {
+                            // Go back to agent to re-list keys
+                            next_state = Some(FirstRunState::ConnectingAgent);
+                        }
+                        
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let generating = self.pending_agent_op.is_some();
+                            if generating {
+                                ui.spinner();
+                                ui.label("Generating...");
+                            } else if ui.button("Generate and Add to Agent").clicked() {
+                                // Signal to generate and add key to agent
+                                generate_agent_key_comment = Some(c.clone());
+                            }
+                        });
+                    });
+                }
+                
+                FirstRunState::Error { message } => {
+                    ui.heading("⚠ Error");
+                    ui.add_space(8.0);
+                    
+                    ui.colored_label(egui::Color32::RED, &message);
+                    
+                    ui.add_space(16.0);
+                    
+                    if ui.button("← Back to Start").clicked() {
+                        next_state = Some(FirstRunState::SelectMethod);
+                    }
+                }
+                
+                FirstRunState::NotNeeded | FirstRunState::Complete => {
+                    // Should not be shown, but handle gracefully
+                    ui.close();
+                }
+            }
+        });
+        
+        // Apply state changes after the UI is done
+        if let Some(new_state) = next_state {
+            // If transitioning to ConnectingAgent, start the async operation
+            if matches!(new_state, FirstRunState::ConnectingAgent) && self.pending_agent_op.is_none() {
+                let handle = self.tokio_runtime.spawn(connect_and_list_keys());
+                self.pending_agent_op = Some(PendingAgentOp::Connect(handle));
+            }
+            self.first_run_state = new_state;
+        }
+        
+        // Poll pending async operation
+        if let Some(pending_op) = &mut self.pending_agent_op {
+            match pending_op {
+                PendingAgentOp::Connect(handle) => {
+                    if handle.is_finished() {
+                        // Take the handle and get the result
+                        if let Some(PendingAgentOp::Connect(handle)) = self.pending_agent_op.take() {
+                            match self.tokio_runtime.block_on(handle) {
+                                Ok(Ok(keys)) => {
+                                    self.first_run_state = FirstRunState::SelectAgentKey {
+                                        keys,
+                                        selected: None,
+                                        error: None,
+                                    };
+                                }
+                                Ok(Err(e)) => {
+                                    self.first_run_state = FirstRunState::Error {
+                                        message: format!("Failed to connect to SSH agent: {}", e),
+                                    };
+                                }
+                                Err(e) => {
+                                    self.first_run_state = FirstRunState::Error {
+                                        message: format!("Agent operation panicked: {}", e),
+                                    };
+                                }
+                            }
+                        }
+                    }
+                }
+                PendingAgentOp::AddKey(handle) => {
+                    if handle.is_finished() {
+                        if let Some(PendingAgentOp::AddKey(handle)) = self.pending_agent_op.take() {
+                            match self.tokio_runtime.block_on(handle) {
+                                Ok(Ok(key_info)) => {
+                                    // Save the key config
+                                    if let Err(e) = self.key_manager.select_agent_key(&key_info) {
+                                        self.first_run_state = FirstRunState::Error {
+                                            message: format!("Failed to save key config: {}", e),
+                                        };
+                                    } else {
+                                        self.first_run_state = FirstRunState::Complete;
+                                        self.backend.send(Command::LocalMessage {
+                                            text: format!("Added new key to SSH agent: {}", key_info.fingerprint),
+                                        });
+                                    }
+                                }
+                                Ok(Err(e)) => {
+                                    self.first_run_state = FirstRunState::Error {
+                                        message: format!("Failed to add key to agent: {}", e),
+                                    };
+                                }
+                                Err(e) => {
+                                    self.first_run_state = FirstRunState::Error {
+                                        message: format!("Agent operation panicked: {}", e),
+                                    };
+                                }
+                            }
+                        }
+                    }
+                }
+                PendingAgentOp::Sign(_) => {
+                    // Sign operations are handled elsewhere
+                }
+            }
+        }
+        
+        // Handle key generation if requested
+        if let Some(password_opt) = generate_key_password {
+            let password_str = password_opt.as_deref();
+            match self.key_manager.generate_local_key(password_str) {
+                Ok(key_info) => {
+                    // Get the signing key
+                    self.signing_key = self.key_manager.signing_key().cloned();
+                    self.first_run_state = FirstRunState::Complete;
+                    
+                    self.backend.send(Command::LocalMessage {
+                        text: format!("Identity key generated: {}", key_info.fingerprint),
+                    });
+                }
+                Err(e) => {
+                    self.first_run_state = FirstRunState::GenerateLocal {
+                        password: password_opt.clone().unwrap_or_default(),
+                        password_confirm: password_opt.unwrap_or_default(),
+                        error: Some(format!("Failed to generate key: {}", e)),
+                    };
+                }
+            }
+        }
+        
+        // Handle selecting an agent key
+        if let Some(key_info) = select_agent_key {
+            match self.key_manager.select_agent_key(&key_info) {
+                Ok(()) => {
+                    // Agent keys don't have a signing_key cached locally
+                    self.signing_key = None;
+                    self.first_run_state = FirstRunState::Complete;
+                    
+                    self.backend.send(Command::LocalMessage {
+                        text: format!("Using SSH agent key: {} ({})", key_info.comment, key_info.fingerprint),
+                    });
+                }
+                Err(e) => {
+                    self.first_run_state = FirstRunState::Error {
+                        message: format!("Failed to save key config: {}", e),
+                    };
+                }
+            }
+        }
+        
+        // Handle generating and adding a key to the agent
+        if let Some(comment) = generate_agent_key_comment {
+            if self.pending_agent_op.is_none() {
+                let handle = self.tokio_runtime.spawn(generate_and_add_to_agent(comment));
+                self.pending_agent_op = Some(PendingAgentOp::AddKey(handle));
+            }
+        }
+        
+        // Don't allow closing via escape/click outside during first run
+        let _ = modal;
+    }
 }
 
 /// Render a single schema field and return true if it was modified.
@@ -1551,6 +2188,9 @@ impl eframe::App for MyApp {
                                 egui::Color32::RED,
                                 format!("● Connection Lost: {}", error),
                             );
+                        }
+                        ConnectionState::CertificatePending { .. } => {
+                            ui.colored_label(egui::Color32::YELLOW, "⚠ Certificate Verification");
                         }
                         ConnectionState::Disconnected => {
                             ui.colored_label(egui::Color32::GRAY, "○ Disconnected");
@@ -1817,6 +2457,52 @@ impl eframe::App for MyApp {
                                         
                                         let resp = ui.label(&user.username);
                                         
+                                        // Context menu for self user
+                                        if is_self {
+                                            resp.context_menu(|ui| {
+                                                ui.label(format!("User: {} (you)", user.username));
+                                                ui.separator();
+                                                
+                                                // Mute/unmute self
+                                                if state.audio.self_muted {
+                                                    if ui.button("🎤 Unmute").clicked() {
+                                                        self.backend.send(Command::SetMuted { muted: false });
+                                                        ui.close();
+                                                    }
+                                                } else {
+                                                    if ui.button("🔇 Mute").clicked() {
+                                                        self.backend.send(Command::SetMuted { muted: true });
+                                                        ui.close();
+                                                    }
+                                                }
+                                                
+                                                // Deafen/undeafen self
+                                                if state.audio.self_deafened {
+                                                    if ui.button("🔊 Undeafen").clicked() {
+                                                        self.backend.send(Command::SetDeafened { deafened: false });
+                                                        ui.close();
+                                                    }
+                                                } else {
+                                                    if ui.button("🔇 Deafen").clicked() {
+                                                        self.backend.send(Command::SetDeafened { deafened: true });
+                                                        ui.close();
+                                                    }
+                                                }
+                                                
+                                                ui.separator();
+                                                
+                                                // Registration
+                                                if ui.button("📝 Register").clicked() {
+                                                    self.backend.send(Command::RegisterUser { user_id });
+                                                    ui.close();
+                                                }
+                                                if ui.button("❌ Unregister").clicked() {
+                                                    self.backend.send(Command::UnregisterUser { user_id });
+                                                    ui.close();
+                                                }
+                                            });
+                                        }
+                                        
                                         // Context menu for other users (not self)
                                         if !is_self {
                                             resp.context_menu(|ui| {
@@ -1866,6 +2552,18 @@ impl eframe::App for MyApp {
                                                         ui.close();
                                                     }
                                                 }
+                                                
+                                                ui.separator();
+                                                
+                                                // Registration
+                                                if ui.button("📝 Register").clicked() {
+                                                    self.backend.send(Command::RegisterUser { user_id });
+                                                    ui.close();
+                                                }
+                                                if ui.button("❌ Unregister").clicked() {
+                                                    self.backend.send(Command::UnregisterUser { user_id });
+                                                    ui.close();
+                                                }
                                             });
                                         }
                                     });
@@ -1876,6 +2574,93 @@ impl eframe::App for MyApp {
                 }
             });
         });
+
+        // First-run setup modal (shown if no identity key is configured)
+        self.render_first_run_dialog(ctx);
+
+        // Certificate acceptance modal (shown when server presents untrusted cert)
+        if let ConnectionState::CertificatePending { cert_info } = &state.connection {
+            let fingerprint = cert_info.fingerprint_hex();
+            let server_name = cert_info.server_name.clone();
+            let server_addr = cert_info.server_addr.clone();
+            let certificate_der = cert_info.certificate_der.clone();
+            
+            Modal::new(egui::Id::new("cert_modal")).show(ctx, |ui| {
+                ui.set_width(450.0);
+                ui.heading("⚠ Untrusted Certificate");
+                
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new(
+                    "The server presented a certificate that is not trusted."
+                ).color(egui::Color32::YELLOW));
+                
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.label("Server:");
+                    ui.label(egui::RichText::new(&server_addr).strong());
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Certificate for:");
+                    ui.label(egui::RichText::new(&server_name).strong());
+                });
+                
+                ui.add_space(8.0);
+                ui.label("Certificate Fingerprint (SHA256):");
+                ui.add(egui::TextEdit::multiline(&mut fingerprint.as_str())
+                    .font(egui::TextStyle::Monospace)
+                    .desired_width(f32::INFINITY)
+                    .desired_rows(2)
+                    .interactive(false));
+                
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new(
+                    "If you expected to connect to a server with a self-signed certificate, \
+                     verify the fingerprint matches what the server administrator provided."
+                ).weak());
+                
+                ui.add_space(8.0);
+                ui.separator();
+                
+                egui::Sides::new().show(
+                    ui,
+                    |ui| {
+                        ui.label(egui::RichText::new("⚠ Only accept if you trust this server").weak());
+                    },
+                    |ui| {
+                        if ui.button("Accept Certificate").clicked() {
+                            // Save the certificate to persistent settings
+                            use base64::Engine;
+                            let accepted_cert = AcceptedCertificate {
+                                server_name: server_name.clone(),
+                                fingerprint_hex: fingerprint.clone(),
+                                certificate_der_base64: base64::engine::general_purpose::STANDARD.encode(&certificate_der),
+                            };
+                            
+                            // Add to persistent settings if not already present
+                            if !self.persistent_settings.accepted_certificates.iter()
+                                .any(|c| c.fingerprint_hex == fingerprint)
+                            {
+                                self.persistent_settings.accepted_certificates.push(accepted_cert);
+                                if let Err(e) = self.persistent_settings.save() {
+                                    log::error!("Failed to save accepted certificate: {}", e);
+                                }
+                            }
+                            
+                            self.backend.send(Command::AcceptCertificate);
+                            self.backend.send(Command::LocalMessage {
+                                text: format!("Accepted certificate for {} (saved for future connections)", server_name),
+                            });
+                        }
+                        if ui.button("Reject").clicked() {
+                            self.backend.send(Command::RejectCertificate);
+                            self.backend.send(Command::LocalMessage {
+                                text: format!("Rejected certificate for {}", server_name),
+                            });
+                        }
+                    },
+                );
+            });
+        }
 
         // Connect modal
         if self.show_connect {

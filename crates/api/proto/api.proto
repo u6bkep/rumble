@@ -94,8 +94,13 @@ message VoiceDatagram {
 message Envelope {
   bytes state_hash = 1; // BLAKE3 hash over canonical protobuf serialization
   oneof payload {
+    // Authentication (10-19)
     ClientHello client_hello = 10;
     ServerHello server_hello = 11;
+    Authenticate authenticate = 15;
+    AuthFailed auth_failed = 17;
+    
+    // Chat and status
     ChatMessage chat_message = 12;
     Disconnect disconnect = 13;
     ServerEvent server_event = 14;
@@ -105,6 +110,13 @@ message Envelope {
     RenameRoom rename_room = 22;
     RequestStateSync request_state_sync = 23;
     SetUserStatus set_user_status = 24;
+    
+    // Registration (40-49)
+    RegisterUser register_user = 40;
+    UnregisterUser unregister_user = 41;
+    
+    // General command result (50)
+    CommandResult command_result = 50;
   }
 }
 
@@ -114,9 +126,9 @@ message Envelope {
 
 // Sent by client immediately after connecting and opening the control stream.
 message ClientHello {
-  string client_name = 1;
-  // Optional authentication password; if server requires one, must match.
-  string password = 2;
+  string username = 1;
+  bytes public_key = 2;       // Ed25519 public key (32 bytes)
+  optional string password = 3; // Server password (required for unknown keys)
 }
 
 // Request to join a room.
@@ -164,10 +176,20 @@ message Disconnect {
 
 // Initial response from server after ClientHello.
 message ServerHello {
-  string server_name = 1;
-  // The user_id assigned to this client by the server.
-  // This is determined by the server based on the connection, not claimed by the client.
-  uint64 user_id = 2;
+  bytes nonce = 1;            // Random 32-byte challenge
+  string server_name = 2;
+  uint64 user_id = 3;         // Assigned user ID for this session
+}
+
+// Sent by client to prove key ownership.
+message Authenticate {
+  bytes signature = 1;        // Ed25519 signature (64 bytes)
+  int64 timestamp_ms = 2;     // Unix timestamp in milliseconds
+}
+
+// Sent by server on authentication failure.
+message AuthFailed {
+  string error = 1;           // Human-readable error message
 }
 
 // Events pushed from server to clients.
@@ -276,4 +298,35 @@ message UserStatusChanged {
 message SetUserStatus {
   bool is_muted = 1;
   bool is_deafened = 2;
+}
+
+// =============================================================================
+// Registration Messages
+// =============================================================================
+
+// Register a user (binds username to public key permanently).
+message RegisterUser {
+  UserId user_id = 1;         // User to register (allows admin to register others)
+}
+
+// Unregister a user (unbinds username from public key).
+message UnregisterUser {
+  UserId user_id = 1;
+}
+
+// =============================================================================
+// Command Result (General Response)
+// =============================================================================
+
+// Result of a command that can succeed or fail.
+// Sent by the server in response to commands like CreateRoom, DeleteRoom,
+// RegisterUser, etc. The command field indicates which command this is
+// a response to.
+message CommandResult {
+  // The command this is a response to (e.g., "RegisterUser", "CreateRoom")
+  string command = 1;
+  // Whether the command succeeded
+  bool success = 2;
+  // Human-readable message (success confirmation or error description)
+  string message = 3;
 }

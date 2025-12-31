@@ -8,11 +8,25 @@ use crate::audio::AudioDeviceInfo;
 use api::proto::{RoomInfo, User};
 use pipeline::{PipelineConfig, UserRxConfig};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Instant;
 use uuid::Uuid;
 
 /// Re-export ROOT_ROOM_UUID for convenience
 pub use api::ROOT_ROOM_UUID;
+
+// =============================================================================
+// Authentication Types
+// =============================================================================
+
+/// Callback for signing authentication challenges.
+/// 
+/// The UI provides this callback. It may:
+/// - Sign using a local Ed25519 private key
+/// - Sign using the SSH agent
+/// 
+/// Takes the payload to sign, returns the 64-byte signature or an error.
+pub type SigningCallback = Arc<dyn Fn(&[u8]) -> Result<[u8; 64], String> + Send + Sync>;
 
 // =============================================================================
 // Audio Settings (Configurable)
@@ -150,6 +164,76 @@ impl AudioStats {
 // Connection State
 // =============================================================================
 
+/// Information about a pending certificate for user confirmation.
+#[derive(Clone)]
+pub struct PendingCertificate {
+    /// The DER-encoded certificate data.
+    pub certificate_der: Vec<u8>,
+    /// SHA256 fingerprint of the certificate.
+    pub fingerprint: [u8; 32],
+    /// The server name/address.
+    pub server_name: String,
+    /// The server address we were trying to connect to.
+    pub server_addr: String,
+    /// Username for retry.
+    pub username: String,
+    /// Password for retry (if any).
+    pub password: Option<String>,
+    /// Public key for retry.
+    pub public_key: [u8; 32],
+    /// Signer callback for retry.
+    pub signer: SigningCallback,
+}
+
+// Implement Debug manually since SigningCallback doesn't implement Debug
+impl std::fmt::Debug for PendingCertificate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingCertificate")
+            .field("fingerprint", &self.fingerprint_short())
+            .field("server_name", &self.server_name)
+            .field("server_addr", &self.server_addr)
+            .field("username", &self.username)
+            .field("password", &self.password.is_some())
+            .field("public_key", &format!("{:02x?}...", &self.public_key[..4]))
+            .finish()
+    }
+}
+
+impl PendingCertificate {
+    /// Get a hex-encoded fingerprint string for display.
+    pub fn fingerprint_hex(&self) -> String {
+        self.fingerprint
+            .iter()
+            .map(|b| format!("{:02X}", b))
+            .collect::<Vec<_>>()
+            .chunks(2)
+            .map(|c| c.join(""))
+            .collect::<Vec<_>>()
+            .join(":")
+    }
+
+    /// Get a shortened fingerprint for compact display.
+    pub fn fingerprint_short(&self) -> String {
+        self.fingerprint
+            .iter()
+            .take(8)
+            .map(|b| format!("{:02X}", b))
+            .collect::<Vec<_>>()
+            .join(":")
+    }
+}
+
+// Implement PartialEq manually since SigningCallback doesn't implement it
+impl PartialEq for PendingCertificate {
+    fn eq(&self, other: &Self) -> bool {
+        self.fingerprint == other.fingerprint
+            && self.server_name == other.server_name
+            && self.server_addr == other.server_addr
+    }
+}
+
+impl Eq for PendingCertificate {}
+
 /// Connection lifecycle state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionState {
@@ -161,6 +245,11 @@ pub enum ConnectionState {
     Connected { server_name: String, user_id: u64 },
     /// Connection was unexpectedly lost.
     ConnectionLost { error: String },
+    /// Server presented a self-signed/untrusted certificate that needs user confirmation.
+    CertificatePending {
+        /// Information about the certificate awaiting confirmation.
+        cert_info: PendingCertificate,
+    },
 }
 
 impl Default for ConnectionState {
@@ -392,17 +481,24 @@ impl State {
 ///
 /// Commands are fire-and-forget. The UI sends a command, and the backend
 /// updates state asynchronously.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum Command {
     // Connection
-    /// Connect to a server.
+    /// Connect to a server with Ed25519 authentication.
     Connect {
         addr: String,
         name: String,
-        password: Option<String>,
+        public_key: [u8; 32],      // Ed25519 public key
+        signer: SigningCallback,   // Signs auth challenge
+        password: Option<String>,  // Server password (for unknown keys)
     },
     /// Disconnect from the current server.
     Disconnect,
+    /// Accept the pending self-signed certificate and retry connection.
+    /// The certificate will be added to the trusted store.
+    AcceptCertificate,
+    /// Reject the pending certificate and cancel the connection attempt.
+    RejectCertificate,
 
     // Room/Chat
     /// Join a room by UUID.
@@ -459,6 +555,56 @@ pub enum Command {
     ClearUserRxOverride { user_id: u64 },
     /// Set per-user volume (convenience command, updates UserRxConfig).
     SetUserVolume { user_id: u64, volume_db: f32 },
+    
+    // Registration
+    /// Register a user (binds their username to their public key).
+    RegisterUser { user_id: u64 },
+    /// Unregister a user.
+    UnregisterUser { user_id: u64 },
+}
+
+// Implement Debug manually since SigningCallback doesn't implement Debug
+impl std::fmt::Debug for Command {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Command::Connect { addr, name, public_key, password, .. } => {
+                f.debug_struct("Connect")
+                    .field("addr", addr)
+                    .field("name", name)
+                    .field("public_key", &format!("{:02x?}...", &public_key[..4]))
+                    .field("password", &password.is_some())
+                    .finish()
+            }
+            Command::Disconnect => write!(f, "Disconnect"),
+            Command::AcceptCertificate => write!(f, "AcceptCertificate"),
+            Command::RejectCertificate => write!(f, "RejectCertificate"),
+            Command::JoinRoom { room_id } => f.debug_struct("JoinRoom").field("room_id", room_id).finish(),
+            Command::CreateRoom { name } => f.debug_struct("CreateRoom").field("name", name).finish(),
+            Command::DeleteRoom { room_id } => f.debug_struct("DeleteRoom").field("room_id", room_id).finish(),
+            Command::RenameRoom { room_id, new_name } => f.debug_struct("RenameRoom").field("room_id", room_id).field("new_name", new_name).finish(),
+            Command::SendChat { text } => f.debug_struct("SendChat").field("text", text).finish(),
+            Command::LocalMessage { text } => f.debug_struct("LocalMessage").field("text", text).finish(),
+            Command::SetInputDevice { device_id } => f.debug_struct("SetInputDevice").field("device_id", device_id).finish(),
+            Command::SetOutputDevice { device_id } => f.debug_struct("SetOutputDevice").field("device_id", device_id).finish(),
+            Command::RefreshAudioDevices => write!(f, "RefreshAudioDevices"),
+            Command::SetVoiceMode { mode } => f.debug_struct("SetVoiceMode").field("mode", mode).finish(),
+            Command::SetMuted { muted } => f.debug_struct("SetMuted").field("muted", muted).finish(),
+            Command::SetDeafened { deafened } => f.debug_struct("SetDeafened").field("deafened", deafened).finish(),
+            Command::MuteUser { user_id } => f.debug_struct("MuteUser").field("user_id", user_id).finish(),
+            Command::UnmuteUser { user_id } => f.debug_struct("UnmuteUser").field("user_id", user_id).finish(),
+            Command::StartTransmit => write!(f, "StartTransmit"),
+            Command::StopTransmit => write!(f, "StopTransmit"),
+            Command::UpdateAudioSettings { settings } => f.debug_struct("UpdateAudioSettings").field("settings", settings).finish(),
+            Command::ResetAudioStats => write!(f, "ResetAudioStats"),
+            Command::UpdateTxPipeline { .. } => write!(f, "UpdateTxPipeline {{ .. }}"),
+            Command::UpdateRxPipelineDefaults { .. } => write!(f, "UpdateRxPipelineDefaults {{ .. }}"),
+            Command::UpdateUserRxConfig { user_id, .. } => f.debug_struct("UpdateUserRxConfig").field("user_id", user_id).finish(),
+            Command::ClearUserRxOverride { user_id } => f.debug_struct("ClearUserRxOverride").field("user_id", user_id).finish(),
+            Command::SetUserVolume { user_id, volume_db } => f.debug_struct("SetUserVolume").field("user_id", user_id).field("volume_db", volume_db).finish(),
+            Command::RegisterUser { user_id } => f.debug_struct("RegisterUser").field("user_id", user_id).finish(),
+            Command::UnregisterUser { user_id } => f.debug_struct("UnregisterUser").field("user_id", user_id).finish(),
+        }
+    }
 }
 
 #[cfg(test)]

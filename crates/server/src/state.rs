@@ -30,6 +30,9 @@ use std::sync::{
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
+use std::sync::atomic::AtomicBool;
+use std::time::Instant;
+
 /// Handle to a connected client's control stream.
 ///
 /// This represents a single client connection and provides access to:
@@ -37,6 +40,7 @@ use uuid::Uuid;
 /// - Their username (immutable after set)
 /// - Their server-assigned user_id
 /// - Their QUIC connection for datagram sending
+/// - Their Ed25519 public key (set after authentication)
 #[derive(Debug)]
 pub struct ClientHandle {
     /// Send stream for the client's control channel.
@@ -49,6 +53,10 @@ pub struct ClientHandle {
     pub user_id: u64,
     /// The underlying QUIC connection (for datagrams).
     pub conn: Connection,
+    /// The client's Ed25519 public key (set after authentication).
+    pub public_key: RwLock<Option<[u8; 32]>>,
+    /// Whether authentication is complete.
+    pub authenticated: AtomicBool,
 }
 
 impl ClientHandle {
@@ -59,6 +67,8 @@ impl ClientHandle {
             username: RwLock::new(String::new()),
             user_id,
             conn,
+            public_key: RwLock::new(None),
+            authenticated: AtomicBool::new(false),
         }
     }
 
@@ -122,12 +132,29 @@ pub fn compute_server_state_hash(server_state: &api::proto::ServerState) -> Vec<
     api::compute_server_state_hash(server_state)
 }
 
+/// Pending authentication state for a client.
+#[derive(Debug)]
+pub struct PendingAuth {
+    /// Random challenge nonce (32 bytes).
+    pub nonce: [u8; 32],
+    /// Assigned user ID for this session.
+    pub user_id: u64,
+    /// Client's Ed25519 public key.
+    pub public_key: [u8; 32],
+    /// Timestamp when the auth started (for timeout).
+    pub timestamp: Instant,
+    /// Username claimed by the client.
+    pub username: String,
+}
+
 /// The server's shared state.
 ///
 /// This contains all mutable server state including:
 /// - Connected clients (DashMap for concurrent access)
 /// - Room definitions and user memberships (consolidated under one RwLock)
 /// - Atomic user ID counter
+/// - Persistence layer for registered users and known keys
+/// - Pending authentication state
 ///
 /// # Thread Safety
 ///
@@ -142,6 +169,12 @@ pub struct ServerState {
     state_data: RwLock<StateData>,
     /// Counter for assigning unique user IDs.
     next_user_id: AtomicU64,
+    /// Pending authentication state: user_id → PendingAuth.
+    pending_auth: DashMap<u64, PendingAuth>,
+    /// Active sessions: user_id → public_key (for looking up identity).
+    sessions: DashMap<u64, [u8; 32]>,
+    /// Server's TLS certificate DER bytes (for computing cert hash).
+    server_cert_der: Vec<u8>,
 }
 
 impl ServerState {
@@ -151,7 +184,52 @@ impl ServerState {
             clients: DashMap::new(),
             state_data: RwLock::new(StateData::new()),
             next_user_id: AtomicU64::new(1),
+            pending_auth: DashMap::new(),
+            sessions: DashMap::new(),
+            server_cert_der: Vec::new(),
         }
+    }
+    
+    /// Create a new server state with the given server certificate.
+    pub fn with_cert(cert_der: Vec<u8>) -> Self {
+        Self {
+            clients: DashMap::new(),
+            state_data: RwLock::new(StateData::new()),
+            next_user_id: AtomicU64::new(1),
+            pending_auth: DashMap::new(),
+            sessions: DashMap::new(),
+            server_cert_der: cert_der,
+        }
+    }
+    
+    /// Get the server's certificate hash.
+    pub fn server_cert_hash(&self) -> [u8; 32] {
+        api::compute_cert_hash(&self.server_cert_der)
+    }
+    
+    /// Store pending authentication state.
+    pub fn set_pending_auth(&self, pending: PendingAuth) {
+        self.pending_auth.insert(pending.user_id, pending);
+    }
+    
+    /// Get and remove pending authentication state.
+    pub fn take_pending_auth(&self, user_id: u64) -> Option<PendingAuth> {
+        self.pending_auth.remove(&user_id).map(|(_, v)| v)
+    }
+    
+    /// Track an active session (user_id → public_key).
+    pub fn add_session(&self, user_id: u64, public_key: [u8; 32]) {
+        self.sessions.insert(user_id, public_key);
+    }
+    
+    /// Remove an active session.
+    pub fn remove_session(&self, user_id: u64) {
+        self.sessions.remove(&user_id);
+    }
+    
+    /// Get the public key for an active session.
+    pub fn get_session_key(&self, user_id: u64) -> Option<[u8; 32]> {
+        self.sessions.get(&user_id).map(|r| *r.value())
     }
 
     /// Allocate the next user ID (lock-free).
@@ -250,6 +328,24 @@ impl ServerState {
             .filter(|(_, rid)| *rid == room_uuid)
             .map(|(uid, _)| *uid)
             .collect()
+    }
+
+    /// Add a room with a specific UUID (for loading from persistence).
+    /// Returns false if a room with that UUID already exists.
+    pub async fn add_room_with_uuid(&self, uuid: Uuid, name: String) -> bool {
+        let mut data = self.state_data.write().await;
+        // Check if room already exists
+        let exists = data.rooms.iter().any(|r| {
+            r.id.as_ref().and_then(uuid_from_room_id) == Some(uuid)
+        });
+        if exists {
+            return false;
+        }
+        data.rooms.push(RoomInfo {
+            id: Some(room_id_from_uuid(uuid)),
+            name,
+        });
+        true
     }
 
     /// Create a new room and return its UUID.
@@ -408,6 +504,32 @@ mod tests {
         let rooms = state.get_rooms().await;
         assert_eq!(rooms.len(), 2);
         assert!(rooms.iter().any(|r| r.name == "Test Room"));
+    }
+
+    /// Test adding a room with a specific UUID (for loading from persistence).
+    #[tokio::test]
+    async fn test_add_room_with_uuid() {
+        let state = ServerState::new();
+        let specific_uuid = Uuid::new_v4();
+
+        // Add room with specific UUID
+        let added = state.add_room_with_uuid(specific_uuid, "Persisted Room".to_string()).await;
+        assert!(added);
+
+        // Verify the room exists with the correct UUID
+        let rooms = state.get_rooms().await;
+        assert_eq!(rooms.len(), 2);
+        
+        let room = rooms.iter().find(|r| r.name == "Persisted Room").unwrap();
+        assert_eq!(uuid_from_room_id(room.id.as_ref().unwrap()), Some(specific_uuid));
+
+        // Try to add a room with the same UUID - should fail
+        let added_again = state.add_room_with_uuid(specific_uuid, "Duplicate".to_string()).await;
+        assert!(!added_again);
+        
+        // Room count should still be 2
+        let rooms = state.get_rooms().await;
+        assert_eq!(rooms.len(), 2);
     }
 
     /// Test room deletion moves users to Root.
