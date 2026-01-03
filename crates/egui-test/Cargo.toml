@@ -28,4 +28,5 @@ anyhow = "1.0"
 ssh-agent-lib = "0.5"
 ssh-key = { version = "0.6", features = ["ed25519"] }
 service-binding = "3.0"
+rfd = "0.15"
 base64 = "0.22"

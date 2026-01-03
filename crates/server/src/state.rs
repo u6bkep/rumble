@@ -33,6 +33,9 @@ use uuid::Uuid;
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
+use crate::relay::RelayTokenManager;
+use crate::tracker::Tracker;
+
 /// Handle to a connected client's control stream.
 ///
 /// This represents a single client connection and provides access to:
@@ -48,27 +51,34 @@ pub struct ClientHandle {
     pub send: Mutex<quinn::SendStream>,
     /// The client's display name (set once from ClientHello, then immutable).
     /// Use `set_username` and `get_username` for access.
-    username: RwLock<String>,
+    username: Arc<RwLock<String>>,
     /// Server-assigned user ID (immutable after creation).
     pub user_id: u64,
     /// The underlying QUIC connection (for datagrams).
     pub conn: Connection,
     /// The client's Ed25519 public key (set after authentication).
-    pub public_key: RwLock<Option<[u8; 32]>>,
+    pub public_key: Arc<RwLock<Option<[u8; 32]>>>,
     /// Whether authentication is complete.
-    pub authenticated: AtomicBool,
+    pub authenticated: Arc<AtomicBool>,
 }
 
 impl ClientHandle {
     /// Create a new client handle.
-    pub fn new(send: quinn::SendStream, user_id: u64, conn: Connection) -> Self {
+    pub fn new(
+        send: quinn::SendStream,
+        user_id: u64,
+        conn: Connection,
+        username: Arc<RwLock<String>>,
+        public_key: Arc<RwLock<Option<[u8; 32]>>>,
+        authenticated: Arc<AtomicBool>,
+    ) -> Self {
         Self {
             send: Mutex::new(send),
-            username: RwLock::new(String::new()),
+            username,
             user_id,
             conn,
-            public_key: RwLock::new(None),
-            authenticated: AtomicBool::new(false),
+            public_key,
+            authenticated,
         }
     }
 
@@ -87,6 +97,7 @@ impl ClientHandle {
     /// Returns an error if the write fails.
     pub async fn send_frame(&self, frame: &[u8]) -> Result<(), quinn::WriteError> {
         let mut send = self.send.lock().await;
+        tracing::info!("Sending frame of size {} to user {}", frame.len(), self.user_id);
         send.write_all(frame).await
     }
 }
@@ -176,11 +187,19 @@ pub struct ServerState {
     sessions: DashMap<u64, [u8; 32]>,
     /// Server's TLS certificate DER bytes (for computing cert hash).
     server_cert_der: Vec<u8>,
+    /// BitTorrent tracker.
+    pub tracker: Arc<Tracker>,
+    /// Relay token manager for NAT traversal.
+    pub relay_tokens: Arc<RelayTokenManager>,
+    /// Relay service port (set after relay service starts).
+    relay_port: std::sync::atomic::AtomicU16,
 }
 
 impl ServerState {
     /// Create a new server state with the default Root room.
     pub fn new() -> Self {
+        let tracker = Arc::new(Tracker::new());
+        tracker.spawn_cleanup_task();
         Self {
             clients: DashMap::new(),
             state_data: RwLock::new(StateData::new()),
@@ -188,11 +207,16 @@ impl ServerState {
             pending_auth: DashMap::new(),
             sessions: DashMap::new(),
             server_cert_der: Vec::new(),
+            tracker,
+            relay_tokens: Arc::new(RelayTokenManager::new()),
+            relay_port: std::sync::atomic::AtomicU16::new(0),
         }
     }
-    
+
     /// Create a new server state with the given server certificate.
     pub fn with_cert(cert_der: Vec<u8>) -> Self {
+        let tracker = Arc::new(Tracker::new());
+        tracker.spawn_cleanup_task();
         Self {
             clients: DashMap::new(),
             state_data: RwLock::new(StateData::new()),
@@ -200,7 +224,20 @@ impl ServerState {
             pending_auth: DashMap::new(),
             sessions: DashMap::new(),
             server_cert_der: cert_der,
+            tracker,
+            relay_tokens: Arc::new(RelayTokenManager::new()),
+            relay_port: std::sync::atomic::AtomicU16::new(0),
         }
+    }
+
+    /// Set the relay port (called after relay service starts).
+    pub fn set_relay_port(&self, port: u16) {
+        self.relay_port.store(port, Ordering::SeqCst);
+    }
+
+    /// Get the relay port.
+    pub fn relay_port(&self) -> u16 {
+        self.relay_port.load(Ordering::SeqCst)
     }
     
     /// Get the server's certificate hash.

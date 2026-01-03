@@ -1,4 +1,4 @@
-use backend::{AudioSettings, BackendHandle, Command, ConnectionState, ConnectConfig, PipelineConfig, ProcessorRegistry, VoiceMode, register_builtin_processors, build_default_tx_pipeline, merge_with_default_tx_pipeline};
+use backend::{AudioSettings, BackendHandle, Command, ConnectionState, ConnectConfig, FileMessage, PipelineConfig, ProcessorRegistry, TransferState, VoiceMode, register_builtin_processors, build_default_tx_pipeline, merge_with_default_tx_pipeline};
 use clap::Parser;
 use directories::ProjectDirs;
 use eframe::egui;
@@ -173,6 +173,48 @@ fn days_to_ymd(days: u64) -> (i32, u32, u32) {
     (y as i32, m, d)
 }
 
+/// Format a byte size as a human-readable string (KB, MB, GB).
+fn format_size(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    const GB: u64 = 1024 * MB;
+
+    if bytes >= GB {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
+/// Get an icon for a file based on its MIME type.
+fn get_file_icon(mime: &str) -> &'static str {
+    if mime.starts_with("image/") {
+        "🖼"
+    } else if mime.starts_with("audio/") {
+        "🎵"
+    } else if mime.starts_with("video/") {
+        "🎬"
+    } else if mime.starts_with("text/") {
+        "📝"
+    } else if mime == "application/pdf" {
+        "📕"
+    } else if mime.contains("zip") || mime.contains("tar") || mime.contains("rar") || mime.contains("7z") {
+        "📦"
+    } else if mime.contains("word") || mime.contains("document") {
+        "📄"
+    } else if mime.contains("excel") || mime.contains("spreadsheet") {
+        "📊"
+    } else if mime.contains("powerpoint") || mime.contains("presentation") {
+        "📽"
+    } else {
+        "📁"
+    }
+}
+
 /// Persistent settings saved to disk.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -207,6 +249,47 @@ pub struct PersistentSettings {
     // Chat settings
     pub show_chat_timestamps: bool,
     pub chat_timestamp_format: TimestampFormat,
+
+    // File transfer settings
+    pub file_transfer: FileTransferSettings,
+}
+
+/// File transfer settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FileTransferSettings {
+    /// Auto-download files from trusted sources.
+    pub auto_download_enabled: bool,
+    /// Maximum file size to auto-download (in bytes). 0 = disabled.
+    pub auto_download_max_size: u64,
+    /// MIME type patterns for auto-download (e.g., "image/*", "audio/*").
+    pub auto_download_mime_patterns: Vec<String>,
+    /// Download speed limit in bytes/sec. 0 = unlimited.
+    pub download_speed_limit: u64,
+    /// Upload speed limit in bytes/sec. 0 = unlimited.
+    pub upload_speed_limit: u64,
+    /// Continue seeding after download completes.
+    pub seed_after_download: bool,
+    /// Clean up downloaded files on application exit.
+    pub cleanup_on_exit: bool,
+}
+
+impl Default for FileTransferSettings {
+    fn default() -> Self {
+        Self {
+            auto_download_enabled: false,
+            auto_download_max_size: 10 * 1024 * 1024, // 10 MB
+            auto_download_mime_patterns: vec![
+                "image/*".to_string(),
+                "audio/*".to_string(),
+                "text/*".to_string(),
+            ],
+            download_speed_limit: 0, // Unlimited
+            upload_speed_limit: 0,   // Unlimited
+            seed_after_download: true,
+            cleanup_on_exit: false,
+        }
+    }
 }
 
 /// A certificate that was accepted by the user.
@@ -237,6 +320,7 @@ impl Default for PersistentSettings {
             output_device_id: None,
             show_chat_timestamps: false,
             chat_timestamp_format: TimestampFormat::default(),
+            file_transfer: FileTransferSettings::default(),
         }
     }
 }
@@ -467,6 +551,13 @@ struct MoveRoomModalState {
     new_parent_name: String,
 }
 
+/// State for the download file modal
+#[derive(Default)]
+struct DownloadModalState {
+    open: bool,
+    magnet_link: String,
+}
+
 /// Categories for the settings sidebar
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 enum SettingsCategory {
@@ -477,6 +568,7 @@ enum SettingsCategory {
     Processing,
     Encoder,
     Chat,
+    FileTransfer,
     Statistics,
 }
 
@@ -489,10 +581,11 @@ impl SettingsCategory {
             SettingsCategory::Processing,
             SettingsCategory::Encoder,
             SettingsCategory::Chat,
+            SettingsCategory::FileTransfer,
             SettingsCategory::Statistics,
         ]
     }
-    
+
     fn label(&self) -> &'static str {
         match self {
             SettingsCategory::Connection => "🔗 Connection",
@@ -501,6 +594,7 @@ impl SettingsCategory {
             SettingsCategory::Processing => "⚙ Processing",
             SettingsCategory::Encoder => "📦 Encoder",
             SettingsCategory::Chat => "💬 Chat",
+            SettingsCategory::FileTransfer => "📂 File Transfer",
             SettingsCategory::Statistics => "📊 Statistics",
         }
     }
@@ -537,6 +631,7 @@ struct MyApp {
     // UI state
     show_connect: bool,
     show_settings: bool,
+    show_transfers: bool,
     connect_address: String,
     connect_password: String,
     trust_dev_cert: bool,
@@ -574,6 +669,9 @@ struct MyApp {
 
     // Move room confirmation modal state
     move_room_modal: MoveRoomModalState,
+
+    // Download file modal state
+    download_modal: DownloadModalState,
 
     // Settings modal state with pending changes
     settings_modal: SettingsModalState,
@@ -745,6 +843,7 @@ impl MyApp {
         let mut app = Self {
             show_connect: false,
             show_settings: false,
+            show_transfers: false,
             connect_address: server_address,
             connect_password: server_password,
             trust_dev_cert,
@@ -761,6 +860,7 @@ impl MyApp {
             processor_registry,
             rename_modal: RenameModalState::default(),
             move_room_modal: MoveRoomModalState::default(),
+            download_modal: DownloadModalState::default(),
             settings_modal: SettingsModalState::default(),
             push_to_talk_active: false,
             egui_ctx: ctx,
@@ -1548,7 +1648,7 @@ impl MyApp {
     fn render_settings_chat(&mut self, ui: &mut egui::Ui) {
         ui.heading("Chat Settings");
         ui.add_space(8.0);
-        
+
         // Show timestamps toggle
         let show_timestamps = self.settings_modal.pending_show_timestamps
             .unwrap_or(self.persistent_settings.show_chat_timestamps);
@@ -1560,20 +1660,20 @@ impl MyApp {
             self.settings_modal.pending_show_timestamps = Some(pending_show);
             self.settings_modal.dirty = true;
         }
-        
+
         ui.add_space(8.0);
-        
+
         // Timestamp format dropdown (only enabled when timestamps are shown)
         ui.add_enabled_ui(pending_show, |ui| {
             ui.label("Timestamp format:");
             let current_format = self.settings_modal.pending_timestamp_format
                 .unwrap_or(self.persistent_settings.chat_timestamp_format);
-            
+
             // Ensure pending_timestamp_format is set so we can mutate it
             if self.settings_modal.pending_timestamp_format.is_none() {
                 self.settings_modal.pending_timestamp_format = Some(current_format);
             }
-            
+
             egui::ComboBox::from_id_salt("timestamp_format")
                 .selected_text(current_format.label())
                 .show_ui(ui, |ui| {
@@ -1589,7 +1689,140 @@ impl MyApp {
                 });
         });
     }
-    
+
+    fn render_settings_file_transfer(&mut self, ui: &mut egui::Ui) {
+        ui.heading("File Transfer Settings");
+        ui.add_space(8.0);
+
+        // Auto-download section
+        ui.strong("Auto-Download");
+        ui.add_space(4.0);
+
+        let mut auto_download = self.persistent_settings.file_transfer.auto_download_enabled;
+        if ui.checkbox(&mut auto_download, "Enable auto-download")
+            .on_hover_text("Automatically download files matching the rules below")
+            .changed()
+        {
+            self.persistent_settings.file_transfer.auto_download_enabled = auto_download;
+            self.settings_modal.dirty = true;
+        }
+
+        ui.add_enabled_ui(auto_download, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Max file size:");
+                let mut max_size_mb = self.persistent_settings.file_transfer.auto_download_max_size / (1024 * 1024);
+                if ui.add(egui::DragValue::new(&mut max_size_mb)
+                    .range(1..=1000)
+                    .suffix(" MB"))
+                    .changed()
+                {
+                    self.persistent_settings.file_transfer.auto_download_max_size = max_size_mb * 1024 * 1024;
+                    self.settings_modal.dirty = true;
+                }
+            });
+
+            ui.add_space(4.0);
+            ui.label("Auto-download file types:");
+            let patterns = &mut self.persistent_settings.file_transfer.auto_download_mime_patterns;
+
+            // Display current patterns
+            let mut pattern_to_remove: Option<usize> = None;
+            for (i, pattern) in patterns.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.label(format!("  - {}", pattern));
+                    if ui.small_button("✕").clicked() {
+                        pattern_to_remove = Some(i);
+                    }
+                });
+            }
+            if let Some(i) = pattern_to_remove {
+                patterns.remove(i);
+                self.settings_modal.dirty = true;
+            }
+
+            // Add new pattern
+            ui.horizontal(|ui| {
+                ui.label("Add:");
+                for pattern in ["image/*", "audio/*", "video/*", "text/*", "application/pdf"] {
+                    if !patterns.contains(&pattern.to_string()) {
+                        if ui.small_button(pattern).clicked() {
+                            patterns.push(pattern.to_string());
+                            self.settings_modal.dirty = true;
+                        }
+                    }
+                }
+            });
+        });
+
+        ui.add_space(16.0);
+        ui.separator();
+        ui.add_space(8.0);
+
+        // Bandwidth limits section
+        ui.strong("Bandwidth Limits");
+        ui.add_space(4.0);
+
+        ui.horizontal(|ui| {
+            ui.label("Download limit:");
+            let mut dl_limit_kbps = self.persistent_settings.file_transfer.download_speed_limit / 1024;
+            if ui.add(egui::DragValue::new(&mut dl_limit_kbps)
+                .range(0..=100000)
+                .suffix(" KB/s"))
+                .on_hover_text("0 = unlimited")
+                .changed()
+            {
+                self.persistent_settings.file_transfer.download_speed_limit = dl_limit_kbps * 1024;
+                self.settings_modal.dirty = true;
+            }
+            if dl_limit_kbps == 0 {
+                ui.label("(unlimited)");
+            }
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("Upload limit:");
+            let mut ul_limit_kbps = self.persistent_settings.file_transfer.upload_speed_limit / 1024;
+            if ui.add(egui::DragValue::new(&mut ul_limit_kbps)
+                .range(0..=100000)
+                .suffix(" KB/s"))
+                .on_hover_text("0 = unlimited")
+                .changed()
+            {
+                self.persistent_settings.file_transfer.upload_speed_limit = ul_limit_kbps * 1024;
+                self.settings_modal.dirty = true;
+            }
+            if ul_limit_kbps == 0 {
+                ui.label("(unlimited)");
+            }
+        });
+
+        ui.add_space(16.0);
+        ui.separator();
+        ui.add_space(8.0);
+
+        // Seeding behavior
+        ui.strong("Seeding Behavior");
+        ui.add_space(4.0);
+
+        let mut seed_after = self.persistent_settings.file_transfer.seed_after_download;
+        if ui.checkbox(&mut seed_after, "Continue seeding after download")
+            .on_hover_text("Keep sharing files with others after download completes")
+            .changed()
+        {
+            self.persistent_settings.file_transfer.seed_after_download = seed_after;
+            self.settings_modal.dirty = true;
+        }
+
+        let mut cleanup = self.persistent_settings.file_transfer.cleanup_on_exit;
+        if ui.checkbox(&mut cleanup, "Clean up downloaded files on exit")
+            .on_hover_text("Delete downloaded files when the application closes")
+            .changed()
+        {
+            self.persistent_settings.file_transfer.cleanup_on_exit = cleanup;
+            self.settings_modal.dirty = true;
+        }
+    }
+
     /// Render the first-run setup dialog for key configuration.
     /// Returns true if setup is complete and the dialog should close.
     fn render_first_run_dialog(&mut self, ctx: &egui::Context) {
@@ -2149,6 +2382,122 @@ impl eframe::App for MyApp {
             self.stop_transmit();
         }
 
+        // Download Modal
+        if self.download_modal.open {
+            egui::Modal::new(egui::Id::new("download_modal")).show(ctx, |ui| {
+                ui.heading("Download File");
+                ui.add_space(8.0);
+                ui.label("Enter Magnet Link:");
+                ui.text_edit_singleline(&mut self.download_modal.magnet_link);
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        self.download_modal.open = false;
+                    }
+                    if ui.button("Download").clicked() {
+                        if !self.download_modal.magnet_link.is_empty() {
+                            self.backend.send(Command::DownloadFile {
+                                magnet: self.download_modal.magnet_link.clone(),
+                            });
+                            self.download_modal.open = false;
+                            self.show_transfers = true;
+                        }
+                    }
+                });
+            });
+        }
+
+        // Transfers Window
+        if self.show_transfers {
+            egui::Window::new("File Transfers")
+                .open(&mut self.show_transfers)
+                .default_width(400.0)
+                .show(ctx, |ui| {
+                    if state.file_transfers.is_empty() {
+                        ui.label("No active transfers.");
+                    } else {
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            for transfer in &state.file_transfers {
+                                ui.group(|ui| {
+                                    // Status icon and name
+                                    let (icon, status_text, color) = match transfer.state {
+                                        TransferState::Pending => ("⏳", "Pending", egui::Color32::GRAY),
+                                        TransferState::Checking => ("🔍", "Checking", egui::Color32::YELLOW),
+                                        TransferState::Downloading => ("↓", "Downloading", egui::Color32::GREEN),
+                                        TransferState::Seeding => ("↑", "Seeding", egui::Color32::LIGHT_BLUE),
+                                        TransferState::Paused => ("⏸", "Paused", egui::Color32::GRAY),
+                                        TransferState::Completed => ("✓", "Complete", egui::Color32::GREEN),
+                                        TransferState::Error => ("✗", "Error", egui::Color32::RED),
+                                    };
+
+                                    ui.horizontal(|ui| {
+                                        ui.colored_label(color, icon);
+                                        ui.strong(&transfer.name);
+                                    });
+
+                                    // Size info
+                                    let size_str = format_size(transfer.size);
+                                    ui.horizontal(|ui| {
+                                        ui.label(format!("{} · {}", size_str, status_text));
+                                        if transfer.peers > 0 {
+                                            ui.label(format!("· {} peers", transfer.peers));
+                                        }
+                                    });
+
+                                    // Progress bar (show for downloading/checking)
+                                    if matches!(transfer.state, TransferState::Downloading | TransferState::Checking) {
+                                        ui.add(egui::ProgressBar::new(transfer.progress)
+                                            .show_percentage()
+                                            .animate(true));
+
+                                        // Speed info
+                                        if transfer.download_speed > 0 || transfer.upload_speed > 0 {
+                                            ui.horizontal(|ui| {
+                                                if transfer.download_speed > 0 {
+                                                    ui.label(format!("↓ {}/s", format_size(transfer.download_speed)));
+                                                }
+                                                if transfer.upload_speed > 0 {
+                                                    ui.label(format!("↑ {}/s", format_size(transfer.upload_speed)));
+                                                }
+                                            });
+                                        }
+                                    }
+
+                                    // Seeding stats
+                                    if matches!(transfer.state, TransferState::Seeding) {
+                                        ui.horizontal(|ui| {
+                                            if transfer.upload_speed > 0 {
+                                                ui.label(format!("↑ {}/s", format_size(transfer.upload_speed)));
+                                            } else {
+                                                ui.label("Seeding...");
+                                            }
+                                        });
+                                    }
+
+                                    // Error message
+                                    if let Some(err) = &transfer.error {
+                                        ui.colored_label(egui::Color32::RED, format!("Error: {}", err));
+                                    }
+
+                                    // Actions
+                                    ui.horizontal(|ui| {
+                                        // Show magnet link copy for seeding transfers
+                                        if matches!(transfer.state, TransferState::Seeding | TransferState::Completed) {
+                                            if let Some(magnet) = &transfer.magnet {
+                                                if ui.button("📋 Copy Magnet").clicked() {
+                                                    ui.ctx().copy_text(magnet.clone());
+                                                }
+                                            }
+                                        }
+                                    });
+                                });
+                                ui.add_space(4.0);
+                            }
+                        });
+                    }
+                });
+        }
+
         // Top menu
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
@@ -2189,6 +2538,25 @@ impl eframe::App for MyApp {
                             dirty: false,
                         };
                         self.show_settings = true;
+                        ui.close();
+                    }
+                });
+
+                ui.menu_button("File Transfer", |ui| {
+                    if ui.button("Share File...").clicked() {
+                        if let Some(path) = rfd::FileDialog::new().pick_file() {
+                            self.backend.send(Command::ShareFile { path });
+                            self.show_transfers = true;
+                        }
+                        ui.close();
+                    }
+                    if ui.button("Download File...").clicked() {
+                        self.download_modal.open = true;
+                        self.download_modal.magnet_link.clear();
+                        ui.close();
+                    }
+                    if ui.button("Show Transfers").clicked() {
+                        self.show_transfers = true;
                         ui.close();
                     }
                 });
@@ -2316,30 +2684,78 @@ impl eframe::App for MyApp {
                         strip.cell(|ui| {
                             ui.heading("Text Chat");
                             ui.separator();
+                            // Collect file downloads to trigger (can't trigger inside loop due to borrow)
+                            let mut download_magnet: Option<String> = None;
+
                             egui::ScrollArea::vertical()
                                 .auto_shrink([false; 2])
                                 .stick_to_bottom(true)
                                 .show(ui, |ui| {
                                     let show_timestamps = self.persistent_settings.show_chat_timestamps;
                                     let timestamp_format = self.persistent_settings.chat_timestamp_format;
-                                    
+
                                     for msg in &state.chat_messages {
                                         let timestamp_prefix = if show_timestamps {
                                             format!("[{}] ", timestamp_format.format(msg.timestamp))
                                         } else {
                                             String::new()
                                         };
-                                        
+
                                         if msg.is_local {
                                             // Local status messages in gray italics
                                             let text = format!("{}{}", timestamp_prefix, msg.text);
                                             ui.label(egui::RichText::new(text).italics().color(egui::Color32::GRAY));
+                                        } else if let Some(file_msg) = FileMessage::parse(&msg.text) {
+                                            // File message - render as file widget
+                                            ui.group(|ui| {
+                                                ui.horizontal(|ui| {
+                                                    // File icon based on mime type
+                                                    let icon = get_file_icon(&file_msg.file.mime);
+                                                    ui.label(egui::RichText::new(icon).size(24.0));
+
+                                                    ui.vertical(|ui| {
+                                                        // Sender and timestamp
+                                                        ui.horizontal(|ui| {
+                                                            ui.label(egui::RichText::new(&msg.sender).strong());
+                                                            if !timestamp_prefix.is_empty() {
+                                                                ui.label(egui::RichText::new(&timestamp_prefix).small().color(egui::Color32::GRAY));
+                                                            }
+                                                        });
+
+                                                        // File name
+                                                        ui.label(&file_msg.file.name);
+
+                                                        // Size and mime type
+                                                        ui.label(egui::RichText::new(format!(
+                                                            "{} · {}",
+                                                            format_size(file_msg.file.size),
+                                                            &file_msg.file.mime
+                                                        )).small().color(egui::Color32::GRAY));
+                                                    });
+                                                });
+
+                                                // Download button
+                                                ui.horizontal(|ui| {
+                                                    if ui.button("⬇ Download").clicked() {
+                                                        download_magnet = Some(file_msg.magnet_link());
+                                                    }
+                                                    if ui.button("📋 Copy Magnet").clicked() {
+                                                        ui.ctx().copy_text(file_msg.magnet_link());
+                                                    }
+                                                });
+                                            });
                                         } else {
-                                            // Chat messages from other users
+                                            // Regular chat message
                                             ui.label(format!("{}{}: {}", timestamp_prefix, msg.sender, msg.text));
                                         }
                                     }
                                 });
+
+                            // Handle file download trigger
+                            if let Some(magnet) = download_magnet {
+                                self.backend.send(Command::DownloadFile { magnet });
+                                self.show_transfers = true;
+                            }
                         });
                         strip.cell(|ui| {
                             ui.add_space(2.0);
@@ -2950,6 +3366,9 @@ impl eframe::App for MyApp {
                                             }
                                             SettingsCategory::Chat => {
                                                 self.render_settings_chat(ui);
+                                            }
+                                            SettingsCategory::FileTransfer => {
+                                                self.render_settings_file_transfer(ui);
                                             }
                                             SettingsCategory::Statistics => {
                                                 self.render_settings_statistics(ui, &state);

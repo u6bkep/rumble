@@ -118,9 +118,13 @@ message Envelope {
     // Registration (40-49)
     RegisterUser register_user = 40;
     UnregisterUser unregister_user = 41;
-    
-    // General command result (50)
-    CommandResult command_result = 50;
+    CommandResult command_result = 42;
+
+    // Tracker (50-59)
+    TrackerAnnounce tracker_announce = 50;
+    TrackerAnnounceResponse tracker_announce_response = 51;
+    TrackerScrape tracker_scrape = 52;
+    TrackerScrapeResponse tracker_scrape_response = 53;
   }
 }
 
@@ -172,8 +176,10 @@ message RequestStateSync {
 
 // Chat message sent from client to server.
 message ChatMessage {
-  string sender = 1;
-  string text = 2;
+  bytes id = 1;           // 16-byte UUID
+  int64 timestamp_ms = 2; // Unix timestamp milliseconds
+  string sender = 3;
+  string text = 4;        // EasyMark or JSON for file messages
 }
 
 // Graceful disconnect notification.
@@ -218,8 +224,10 @@ message ServerEvent {
 
 // Broadcast of a chat message to all connected clients in the same room.
 message ChatBroadcast {
-  string sender = 1;
-  string text = 2;
+  bytes id = 1;           // 16-byte UUID
+  int64 timestamp_ms = 2; // Unix timestamp milliseconds
+  string sender = 3;
+  string text = 4;
 }
 
 // Empty keep-alive message with optional timestamp.
@@ -348,4 +356,66 @@ message CommandResult {
   bool success = 2;
   // Human-readable message (success confirmation or error description)
   string message = 3;
+}
+
+// =============================================================================
+// Tracker Messages
+// =============================================================================
+
+message TrackerAnnounce {
+  bytes info_hash = 1;    // 20 bytes
+  bytes peer_id = 2;      // 20 bytes
+  uint64 user_id = 3;     // Rumble user ID
+  uint32 port = 4;
+  uint64 uploaded = 5;
+  uint64 downloaded = 6;
+  uint64 left = 7;
+
+  enum Event {
+    NONE = 0;
+    COMPLETED = 1;
+    STARTED = 2;
+    STOPPED = 3;
+  }
+  Event event = 8;
+  uint32 numwant = 9;
+  uint32 request_id = 10;
+  bool needs_relay = 11;  // Client requests relay mode
+}
+
+message TrackerAnnounceResponse {
+  uint32 interval = 1;
+  uint32 min_interval = 2;
+  uint32 complete = 3;
+  uint32 incomplete = 4;
+  repeated PeerInfo peers = 5;
+  uint32 request_id = 6;
+  optional RelayInfo relay = 7;  // Relay assignment if requested
+}
+
+message PeerInfo {
+  bytes peer_id = 1;
+  uint64 user_id = 2;     // Rumble user ID for display
+  string ip = 3;
+  uint32 port = 4;
+  bool supports_relay = 5; // Peer can receive via relay
+}
+
+message RelayInfo {
+  string relay_token = 1;  // Token to authenticate relay requests
+  uint32 relay_port = 2;   // Server relay port
+}
+
+message TrackerScrape {
+  repeated bytes info_hashes = 1;
+}
+
+message TrackerScrapeResponse {
+  map<string, ScrapeStats> files = 1; // Key is info_hash (bytes as string/bytes)
+}
+
+message ScrapeStats {
+  uint32 complete = 1;
+  uint32 downloaded = 2;
+  uint32 incomplete = 3;
 }

@@ -5,6 +5,7 @@
 use crate::{
     handlers::{cleanup_client, handle_datagrams, handle_envelope},
     persistence::Persistence,
+    relay::{RelayConfig, RelayService},
     state::{ClientHandle, ServerState},
 };
 use anyhow::Result;
@@ -15,7 +16,8 @@ use api::{
 use bytes::BytesMut;
 use prost::Message;
 use quinn::{Endpoint, ServerConfig};
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, sync::Arc, sync::atomic::AtomicBool};
+use tokio::sync::RwLock;
 use tracing::{debug, error, info};
 
 /// Configuration for the server.
@@ -29,6 +31,8 @@ pub struct Config {
     pub key: rustls::pki_types::PrivateKeyDer<'static>,
     /// Optional path for the persistence database.
     pub data_dir: Option<String>,
+    /// Relay service configuration. If None, relay service is disabled.
+    pub relay: Option<RelayConfig>,
 }
 
 /// The Rumble VOIP server.
@@ -39,6 +43,8 @@ pub struct Server {
     endpoint: Endpoint,
     state: Arc<ServerState>,
     persistence: Option<Arc<Persistence>>,
+    relay_service: Option<Arc<RelayService>>,
+    relay_bind: Option<SocketAddr>,
 }
 
 impl Server {
@@ -48,10 +54,10 @@ impl Server {
         let cert_der = config.certs.first()
             .map(|c| c.to_vec())
             .unwrap_or_default();
-        
+
         let endpoint = make_server_endpoint(&config)?;
         let state = Arc::new(ServerState::with_cert(cert_der));
-        
+
         // Initialize persistence if data_dir is provided
         let persistence = if let Some(ref data_dir) = config.data_dir {
             let db_path = format!("{}/rumble.db", data_dir);
@@ -68,8 +74,18 @@ impl Server {
         } else {
             None
         };
-        
-        Ok(Self { endpoint, state, persistence })
+
+        // Initialize relay service if configured
+        let (relay_service, relay_bind) = if let Some(relay_config) = config.relay {
+            let relay_port = relay_config.port;
+            let relay = RelayService::new(relay_config, state.relay_tokens.clone());
+            let bind_addr = SocketAddr::new(config.bind.ip(), relay_port);
+            (Some(Arc::new(relay)), Some(bind_addr))
+        } else {
+            (None, None)
+        };
+
+        Ok(Self { endpoint, state, persistence, relay_service, relay_bind })
     }
 
     /// Get the local address the server is listening on.
@@ -111,7 +127,23 @@ impl Server {
     pub async fn run(&self) -> Result<()> {
         // Load persisted rooms before accepting connections
         self.load_persisted_rooms().await;
-        
+
+        // Start relay service if configured
+        if let (Some(relay), Some(bind_addr)) = (&self.relay_service, &self.relay_bind) {
+            let relay = relay.clone();
+            let bind = *bind_addr;
+            tokio::spawn(async move {
+                if let Err(e) = relay.run(bind).await {
+                    error!("Relay service error: {e}");
+                }
+            });
+            // Give the relay service time to bind and store the port
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let port = self.relay_service.as_ref().unwrap().port().await;
+            self.state.set_relay_port(port);
+            info!("Relay service started on port {}", port);
+        }
+
         info!("server_listen_addr = {}", self.endpoint.local_addr()?);
 
         while let Some(connecting) = self.endpoint.accept().await {
@@ -190,9 +222,6 @@ pub async fn handle_connection(
         "assigned user_id for connection"
     );
 
-    // Track all client handles for this connection so we can clean up when connection closes.
-    let mut connection_clients: Vec<Arc<ClientHandle>> = Vec::new();
-
     // Spawn a task to handle incoming datagrams for voice relay.
     let conn_for_datagrams = conn.clone();
     let state_for_datagrams = state.clone();
@@ -200,101 +229,106 @@ pub async fn handle_connection(
         handle_datagrams(conn_for_datagrams, state_for_datagrams, user_id).await;
     });
 
+    // Shared state for all streams on this connection
+    let username = Arc::new(RwLock::new(String::new()));
+    let public_key = Arc::new(RwLock::new(None));
+    let authenticated = Arc::new(AtomicBool::new(false));
+
     loop {
         match conn.accept_bi().await {
             Ok((send_stream, mut recv)) => {
                 info!("new bi stream opened");
 
                 // Create client handle using the new constructor
-                let client_handle = Arc::new(ClientHandle::new(send_stream, user_id, conn.clone()));
+                let client_handle = Arc::new(ClientHandle::new(
+                    send_stream, 
+                    user_id, 
+                    conn.clone(),
+                    username.clone(),
+                    public_key.clone(),
+                    authenticated.clone()
+                ));
 
                 // Register client (lock-free DashMap insert)
                 state.register_client(client_handle.clone());
                 let client_count = state.client_count();
                 debug!(total_clients = client_count, "server: client registered");
 
-                // Track this client for connection-level cleanup.
-                connection_clients.push(client_handle.clone());
+                let persistence = persistence.clone();
+                let state = state.clone();
+                
+                tokio::spawn(async move {
+                    let mut buf = BytesMut::new();
+                    
+                    // Read loop - handle errors gracefully
+                    loop {
+                        let mut chunk = [0u8; 1024];
+                        let read_result = tokio::time::timeout(
+                            std::time::Duration::from_secs(30),
+                            recv.read(&mut chunk),
+                        )
+                        .await;
 
-                let mut buf = BytesMut::new();
-                let persist = persistence.clone();
-
-                // Read loop - handle errors gracefully
-                loop {
-                    let mut chunk = [0u8; 1024];
-                    let read_result = tokio::time::timeout(
-                        std::time::Duration::from_secs(30),
-                        recv.read(&mut chunk),
-                    )
-                    .await;
-
-                    match read_result {
-                        Ok(Ok(Some(n))) => {
-                            debug!(bytes = n, "server: received bytes on stream");
-                            buf.extend_from_slice(&chunk[..n]);
-                            while let Some(frame) = try_decode_frame(&mut buf) {
-                                match Envelope::decode(&*frame) {
-                                    Ok(env) => {
-                                        debug!(
-                                            frame_len = frame.len(),
-                                            "server: decoded envelope frame"
-                                        );
-                                        if let Err(e) = handle_envelope(
-                                            env,
-                                            client_handle.clone(),
-                                            state.clone(),
-                                            persist.clone(),
-                                        )
-                                        .await
-                                        {
-                                            error!("handle_envelope error: {e:?}");
+                        match read_result {
+                            Ok(Ok(Some(n))) => {
+                                info!(bytes = n, "server: received bytes on stream");
+                                buf.extend_from_slice(&chunk[..n]);
+                                while let Some(frame) = try_decode_frame(&mut buf) {
+                                    match Envelope::decode(&*frame) {
+                                        Ok(env) => {
+                                            info!(
+                                                frame_len = frame.len(),
+                                                "server: decoded envelope frame"
+                                            );
+                                            if let Err(e) = handle_envelope(
+                                                env,
+                                                client_handle.clone(),
+                                                state.clone(),
+                                                persistence.clone(),
+                                            )
+                                            .await
+                                            {
+                                                error!("handle_envelope error: {e:?}");
+                                            }
                                         }
+                                        Err(e) => error!("failed to decode envelope: {e:?}"),
                                     }
-                                    Err(e) => error!("failed to decode envelope: {e:?}"),
+                                }
+                            }
+                            Ok(Ok(None)) => {
+                                info!("stream closed by peer");
+                                break;
+                            }
+                            Ok(Err(e)) => {
+                                info!("stream read error (likely disconnect): {e:?}");
+                                break;
+                            }
+                            Err(_) => {
+                                // Read timeout - check if connection is still alive
+                                info!("read timeout, checking connection health");
+                                let env = proto::Envelope {
+                                    state_hash: Vec::new(),
+                                    payload: None,
+                                };
+                                let frame = api::encode_frame(&env);
+                                // Use the send_frame helper method
+                                if client_handle.send_frame(&frame).await.is_err() {
+                                    info!("connection dead after read timeout");
+                                    break;
                                 }
                             }
                         }
-                        Ok(Ok(None)) => {
-                            info!("stream closed by peer");
-                            break;
-                        }
-                        Ok(Err(e)) => {
-                            info!("stream read error (likely disconnect): {e:?}");
-                            break;
-                        }
-                        Err(_) => {
-                            // Read timeout - check if connection is still alive
-                            info!("read timeout, checking connection health");
-                            let env = proto::Envelope {
-                                state_hash: Vec::new(),
-                                payload: None,
-                            };
-                            let frame = api::encode_frame(&env);
-                            // Use the send_frame helper method
-                            if client_handle.send_frame(&frame).await.is_err() {
-                                info!("connection dead after read timeout");
-                                break;
-                            }
-                        }
                     }
-                }
 
-                // Stream closed - clean up this client
-                cleanup_client(&client_handle, &state).await;
-
-                // Remove from connection tracking
-                connection_clients.retain(|h| !Arc::ptr_eq(h, &client_handle));
+                    // Stream closed - clean up this client
+                    cleanup_client(&client_handle, &state).await;
+                });
             }
             Err(e) => {
                 info!("connection closed: {e:?}");
                 break;
             }
         }
-    }
-
-    // Connection-level cleanup: clean up any remaining clients from this connection.
-    for client_handle in connection_clients {
-        cleanup_client(&client_handle, &state).await;
     }
 
     Ok(())

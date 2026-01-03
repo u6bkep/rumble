@@ -136,6 +136,7 @@ impl BackendHandle {
             },
             chat_messages: Vec::new(),
             room_tree: Default::default(),
+            file_transfers: Vec::new(),
         };
 
         let state = Arc::new(RwLock::new(state));
@@ -321,9 +322,85 @@ async fn run_connection_task(
     let mut connection: Option<quinn::Connection> = None;
     let mut send_stream: Option<quinn::SendStream> = None;
     let mut client_name = String::new();
+    let mut torrent_manager: Option<Arc<crate::torrent::TorrentManager>> = None;
+    let mut transfer_update_interval = tokio::time::interval(std::time::Duration::from_millis(500));
 
     loop {
         tokio::select! {
+            _ = transfer_update_interval.tick() => {
+                if let Some(tm) = &torrent_manager {
+                    let transfers = tm.session().with_torrents(|iter| {
+                        let mut transfers = Vec::new();
+                        for (_id, handle) in iter {
+                            let stats = handle.stats();
+                            let name = handle.name().unwrap_or_else(|| "Unknown".to_string());
+                            let progress = if stats.total_bytes > 0 {
+                                stats.progress_bytes as f32 / stats.total_bytes as f32
+                            } else {
+                                0.0
+                            };
+
+                            // Map librqbit state to our TransferState
+                            let state = match stats.state {
+                                librqbit::TorrentStatsState::Initializing => crate::events::TransferState::Checking,
+                                librqbit::TorrentStatsState::Paused => crate::events::TransferState::Paused,
+                                librqbit::TorrentStatsState::Error => crate::events::TransferState::Error,
+                                librqbit::TorrentStatsState::Live => {
+                                    if stats.finished {
+                                        crate::events::TransferState::Seeding
+                                    } else {
+                                        crate::events::TransferState::Downloading
+                                    }
+                                }
+                            };
+
+                            let info_hash = handle.info_hash();
+                            let magnet = format!("magnet:?xt=urn:btih:{}", hex::encode(info_hash.0));
+
+                            // Extract speed and peer info from live stats
+                            let (download_speed, upload_speed, peers) = stats.live.as_ref()
+                                .map(|l| {
+                                    let dl = l.download_speed.as_bytes();
+                                    let ul = l.upload_speed.as_bytes();
+                                    let peer_stats = &l.snapshot.peer_stats;
+                                    let peer_count = peer_stats.live + peer_stats.queued + peer_stats.connecting;
+                                    (dl, ul, peer_count)
+                                })
+                                .unwrap_or((0, 0, 0));
+
+                            // Get error message if in error state
+                            let error = if matches!(state, crate::events::TransferState::Error) {
+                                stats.error.clone()
+                            } else {
+                                None
+                            };
+
+                            transfers.push(crate::events::FileTransferState {
+                                infohash: info_hash.0,
+                                name,
+                                size: stats.total_bytes,
+                                mime: None, // TODO: detect from filename extension
+                                progress,
+                                download_speed,
+                                upload_speed,
+                                peers,
+                                seeders: Vec::new(), // TODO: populate from tracker responses
+                                state,
+                                error,
+                                magnet: Some(magnet),
+                                local_path: None, // Output folder is not easily accessible
+                            });
+                        }
+                        transfers
+                    });
+
+                    {
+                        let mut s = state.write().unwrap();
+                        s.file_transfers = transfers;
+                    }
+                    repaint();
+                }
+            }
             cmd = command_rx.recv() => {
                 let Some(cmd) = cmd else {
                     // Channel closed, handle is dropped, exit task
@@ -379,12 +456,25 @@ async fn run_connection_task(
                                 connection = Some(conn.clone());
                                 send_stream = Some(send);
                                 
+                                // Initialize TorrentManager
+                                let temp_dir = config.download_dir.clone()
+                                    .unwrap_or_else(|| std::env::temp_dir().join("rumble_downloads"));
+                                match crate::torrent::TorrentManager::new(conn.clone(), temp_dir).await {
+                                    Ok(tm) => {
+                                        torrent_manager = Some(Arc::new(tm));
+                                    }
+                                    Err(e) => {
+                                        error!("Failed to initialize TorrentManager: {}", e);
+                                    }
+                                }
+
                                 // Spawn receiver task for reliable messages
                                 let state_clone = state.clone();
                                 let repaint_clone = repaint.clone();
                                 let audio_task_clone = audio_task.clone();
+                                let torrent_manager_clone = torrent_manager.clone();
                                 tokio::spawn(async move {
-                                    run_receiver_task(conn, recv, recv_buf, state_clone, repaint_clone, audio_task_clone).await;
+                                    run_receiver_task(conn, recv, recv_buf, state_clone, repaint_clone, audio_task_clone, torrent_manager_clone).await;
                                 });
                             }
                             Err(e) => {
@@ -497,12 +587,25 @@ async fn run_connection_task(
                                     send_stream = Some(send);
                                     client_name = pending.username;
                                     
+                                    // Initialize TorrentManager
+                                    let temp_dir = new_config.download_dir.clone()
+                                        .unwrap_or_else(|| std::env::temp_dir().join("rumble_downloads"));
+                                    match crate::torrent::TorrentManager::new(conn.clone(), temp_dir).await {
+                                        Ok(tm) => {
+                                            torrent_manager = Some(Arc::new(tm));
+                                        }
+                                        Err(e) => {
+                                            error!("Failed to initialize TorrentManager: {}", e);
+                                        }
+                                    }
+
                                     // Spawn receiver task
                                     let state_clone = state.clone();
                                     let repaint_clone = repaint.clone();
                                     let audio_task_clone = audio_task.clone();
+                                    let torrent_manager_clone = torrent_manager.clone();
                                     tokio::spawn(async move {
-                                        run_receiver_task(conn, recv, recv_buf, state_clone, repaint_clone, audio_task_clone).await;
+                                        run_receiver_task(conn, recv, recv_buf, state_clone, repaint_clone, audio_task_clone, torrent_manager_clone).await;
                                     });
                                 }
                                 Err(e) => {
@@ -542,6 +645,7 @@ async fn run_connection_task(
                             conn.close(quinn::VarInt::from_u32(0), b"disconnect");
                         }
                         send_stream = None;
+                        torrent_manager = None;
                         {
                             let mut s = state.write().unwrap();
                             s.connection = ConnectionState::Disconnected;
@@ -634,9 +738,16 @@ async fn run_connection_task(
                     
                     Command::SendChat { text } => {
                         if let Some(send) = &mut send_stream {
+                            let message_id = uuid::Uuid::new_v4().into_bytes().to_vec();
+                            let timestamp_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_millis() as i64;
                             let env = proto::Envelope {
                                 state_hash: Vec::new(),
                                 payload: Some(Payload::ChatMessage(proto::ChatMessage {
+                                    id: message_id,
+                                    timestamp_ms,
                                     sender: client_name.clone(),
                                     text,
                                 })),
@@ -651,6 +762,7 @@ async fn run_connection_task(
                     Command::LocalMessage { text } => {
                         let mut s = state.write().unwrap();
                         s.chat_messages.push(crate::events::ChatMessage {
+                            id: uuid::Uuid::new_v4().into_bytes(),
                             sender: String::new(),
                             text,
                             timestamp: std::time::SystemTime::now(),
@@ -752,6 +864,112 @@ async fn run_connection_task(
                             if let Err(e) = send.write_all(&frame).await {
                                 error!("Failed to send UnregisterUser: {}", e);
                             }
+                        }
+                    }
+
+                    Command::ShareFile { path } => {
+                        if let (Some(tm), Some(send)) = (&torrent_manager, &mut send_stream) {
+                            let tm = tm.clone();
+                            let path = path.clone();
+                            let state = state.clone();
+                            let repaint = repaint.clone();
+                            let client = client_name.clone();
+
+                            // Share file and get info
+                            match tm.share_file(path).await {
+                                Ok(file_info) => {
+                                    info!("Shared file: {} ({})", file_info.name, file_info.magnet);
+
+                                    // Create file message JSON
+                                    let file_message = crate::events::FileMessage::new(
+                                        file_info.name.clone(),
+                                        file_info.size,
+                                        file_info.mime.clone(),
+                                        file_info.infohash.clone(),
+                                    );
+                                    let text = file_message.to_json();
+                                    let message_id = uuid::Uuid::new_v4().into_bytes().to_vec();
+                                    let timestamp_ms = SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap()
+                                        .as_millis() as i64;
+
+                                    // Send to server as chat message
+                                    let env = proto::Envelope {
+                                        state_hash: Vec::new(),
+                                        payload: Some(Payload::ChatMessage(proto::ChatMessage {
+                                            id: message_id.clone(),
+                                            timestamp_ms,
+                                            sender: client.clone(),
+                                            text: text.clone(),
+                                        })),
+                                    };
+                                    let frame = encode_frame(&env);
+                                    if let Err(e) = send.write_all(&frame).await {
+                                        error!("Failed to send file share message: {}", e);
+                                    }
+
+                                    // Add local confirmation
+                                    let mut s = state.write().unwrap();
+                                    s.chat_messages.push(crate::events::ChatMessage {
+                                        id: uuid::Uuid::new_v4().into_bytes(),
+                                        sender: "System".to_string(),
+                                        text: format!("Sharing {} ({} bytes)", file_info.name, file_info.size),
+                                        timestamp: SystemTime::now(),
+                                        is_local: true,
+                                    });
+                                    repaint();
+                                }
+                                Err(e) => {
+                                    error!("Failed to share file: {}", e);
+                                    let mut s = state.write().unwrap();
+                                    s.chat_messages.push(crate::events::ChatMessage {
+                                        id: uuid::Uuid::new_v4().into_bytes(),
+                                        sender: "System".to_string(),
+                                        text: format!("Failed to share file: {}", e),
+                                        timestamp: SystemTime::now(),
+                                        is_local: true,
+                                    });
+                                    repaint();
+                                }
+                            }
+                        }
+                    }
+
+                    Command::DownloadFile { magnet } => {
+                        if let Some(tm) = &torrent_manager {
+                            let tm = tm.clone();
+                            let magnet = magnet.clone();
+                            let state = state.clone();
+                            let repaint = repaint.clone();
+                            tokio::spawn(async move {
+                                match tm.download_file(magnet).await {
+                                    Ok(_) => {
+                                        info!("Started download");
+                                        let mut s = state.write().unwrap();
+                                        s.chat_messages.push(crate::events::ChatMessage {
+                                            id: uuid::Uuid::new_v4().into_bytes(),
+                                            sender: "System".to_string(),
+                                            text: "Started download".to_string(),
+                                            timestamp: SystemTime::now(),
+                                            is_local: true,
+                                        });
+                                        repaint();
+                                    }
+                                    Err(e) => {
+                                        error!("Failed to download file: {}", e);
+                                        let mut s = state.write().unwrap();
+                                        s.chat_messages.push(crate::events::ChatMessage {
+                                            id: uuid::Uuid::new_v4().into_bytes(),
+                                            sender: "System".to_string(),
+                                            text: format!("Failed to download file: {}", e),
+                                            timestamp: SystemTime::now(),
+                                            is_local: true,
+                                        });
+                                        repaint();
+                                    }
+                                }
+                            });
                         }
                     }
                 }
@@ -968,6 +1186,7 @@ async fn run_receiver_task(
     state: Arc<RwLock<State>>,
     repaint: Arc<dyn Fn() + Send + Sync>,
     audio_task: AudioTaskHandle,
+    torrent_manager: Option<Arc<crate::torrent::TorrentManager>>,
 ) {
     loop {
         let mut chunk = [0u8; 4096];
@@ -976,7 +1195,7 @@ async fn run_receiver_task(
                 buf.extend_from_slice(&chunk[..n]);
                 while let Some(frame) = try_decode_frame(&mut buf) {
                     if let Ok(env) = proto::Envelope::decode(&*frame) {
-                        handle_server_message(env, &state, &repaint, &audio_task);
+                        handle_server_message(env, &state, &repaint, &audio_task, &torrent_manager);
                     }
                 }
             }
@@ -1021,6 +1240,7 @@ async fn run_receiver_task(
 fn add_local_message(state: &Arc<RwLock<State>>, text: String, repaint: &Arc<dyn Fn() + Send + Sync>) {
     let mut s = state.write().unwrap();
     s.chat_messages.push(crate::events::ChatMessage {
+        id: uuid::Uuid::new_v4().into_bytes(),
         sender: String::new(),
         text,
         timestamp: std::time::SystemTime::now(),
@@ -1040,8 +1260,13 @@ fn handle_server_message(
     state: &Arc<RwLock<State>>,
     repaint: &Arc<dyn Fn() + Send + Sync>,
     audio_task: &AudioTaskHandle,
+    _torrent_manager: &Option<Arc<crate::torrent::TorrentManager>>,
 ) {
     match env.payload {
+        Some(Payload::TrackerAnnounceResponse(_)) => {
+            // TrackerAnnounceResponse is handled inline in the announce loop
+            // This branch handles any stray responses (shouldn't happen)
+        }
         Some(Payload::CommandResult(cr)) => {
             // Display command results as local chat messages
             let prefix = if cr.success { "✓" } else { "✗" };
@@ -1082,11 +1307,22 @@ fn handle_server_message(
                         apply_state_update(su, state, repaint, audio_task);
                     }
                     proto::server_event::Kind::ChatBroadcast(cb) => {
+                        // Extract message ID or generate a fallback
+                        let id: [u8; 16] = cb.id.try_into().unwrap_or_else(|_| uuid::Uuid::new_v4().into_bytes());
+
+                        // Convert timestamp_ms to SystemTime, fall back to now
+                        let timestamp = if cb.timestamp_ms > 0 {
+                            std::time::UNIX_EPOCH + std::time::Duration::from_millis(cb.timestamp_ms as u64)
+                        } else {
+                            std::time::SystemTime::now()
+                        };
+
                         let mut s = state.write().unwrap();
                         s.chat_messages.push(crate::events::ChatMessage {
+                            id,
                             sender: cb.sender,
                             text: cb.text,
-                            timestamp: std::time::SystemTime::now(),
+                            timestamp,
                             is_local: false,
                         });
                         // Keep only recent messages

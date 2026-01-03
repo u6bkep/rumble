@@ -53,11 +53,14 @@
 pub mod config;
 pub mod handlers;
 pub mod persistence;
+pub mod relay;
 pub mod server;
 pub mod state;
+pub mod tracker;
 
 // Re-export main types for convenience
 pub use config::{ServerConfig, load_pem_certificates, generate_self_signed_cert};
 pub use persistence::{Persistence, PersistedRoom, RegisteredUser};
+pub use relay::{RelayConfig, RelayService, RelayTokenManager};
 pub use server::{Config, Server};
 pub use state::{ClientHandle, ServerState, StateData};

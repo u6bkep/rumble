@@ -78,11 +78,13 @@ pub use cert_verifier::{
 
 // State and command types
 pub mod events;
-pub use events::{AudioSettings, AudioState, AudioStats, ChatMessage, Command, ConnectionState, PendingCertificate, RoomTree, RoomTreeNode, SigningCallback, State, VoiceMode, TransmissionMode};
+pub use events::{AudioSettings, AudioState, AudioStats, ChatMessage, Command, ConnectionState, FileInfo, FileMessage, FileTransferState, PendingCertificate, RoomTree, RoomTreeNode, SigningCallback, State, TransferState, TransmissionMode, VoiceMode};
 
 // Backend handle
 pub mod handle;
 pub use handle::BackendHandle;
+
+pub mod torrent;
 
 // Audio processing pipeline - processors
 pub mod processors;
@@ -118,6 +120,10 @@ pub struct ConnectConfig {
     /// These are DER-encoded certificate bytes that will be added to the trust store.
     /// This is typically populated when the user accepts a self-signed certificate prompt.
     pub accepted_certs: Vec<Vec<u8>>,
+
+    /// Directory to store downloaded files.
+    /// If None, defaults to system temp dir + "rumble_downloads".
+    pub download_dir: Option<PathBuf>,
 }
 
 impl ConnectConfig {
@@ -129,6 +135,12 @@ impl ConnectConfig {
     /// Add an additional certificate path to trust (DER or PEM format).
     pub fn with_cert(mut self, path: impl Into<PathBuf>) -> Self {
         self.additional_certs.push(path.into());
+        self
+    }
+
+    /// Set the download directory.
+    pub fn with_download_dir(mut self, path: impl Into<PathBuf>) -> Self {
+        self.download_dir = Some(path.into());
         self
     }
 }

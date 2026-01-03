@@ -117,9 +117,135 @@ pub async fn handle_envelope(
             }
             handle_unregister_user(uu, sender, state, persistence).await?;
         }
+        Some(Payload::TrackerAnnounce(ta)) => {
+            if !sender.authenticated.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            handle_tracker_announce(ta, sender, state).await?;
+        }
+        Some(Payload::TrackerScrape(ts)) => {
+            if !sender.authenticated.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            handle_tracker_scrape(ts, sender, state).await?;
+        }
         // Server-to-client messages or empty - ignore
         Some(Payload::ServerHello(_) | Payload::ServerEvent(_) | Payload::AuthFailed(_) | Payload::CommandResult(_)) | None => {}
+        _ => {
+            warn!("Received unknown or unhandled message type");
+        }
     }
+    Ok(())
+}
+
+async fn handle_tracker_announce(
+    msg: proto::TrackerAnnounce,
+    sender: Arc<ClientHandle>,
+    state: Arc<ServerState>,
+) -> Result<()> {
+    let info_hash: [u8; 20] = msg.info_hash.clone().try_into().unwrap_or([0; 20]);
+    let peer_id: [u8; 20] = msg.peer_id.clone().try_into().unwrap_or([0; 20]);
+
+    // Use the authenticated user ID from the sender, not from the message
+    // This prevents spoofing
+    let user_id = sender.user_id;
+
+    info!("Received TrackerAnnounce from user={} info_hash={} needs_relay={}",
+          user_id, hex::encode(&info_hash), msg.needs_relay);
+
+    // Use the client's IP address from the connection
+    let ip = sender.conn.remote_address().ip();
+
+    let event = proto::tracker_announce::Event::try_from(msg.event).ok();
+
+    let (complete, incomplete, peers) = state.tracker.announce(
+        info_hash,
+        peer_id,
+        user_id,
+        ip,
+        msg.port as u16,
+        msg.uploaded,
+        msg.downloaded,
+        msg.left,
+        event,
+        msg.needs_relay,
+    ).await;
+
+    // Generate relay info if client requested relay mode and relay is enabled
+    let relay = if msg.needs_relay {
+        let relay_port = state.relay_port();
+        if relay_port > 0 {
+            let token = state.relay_tokens.generate_token(user_id);
+            Some(proto::RelayInfo {
+                relay_token: hex::encode(token),
+                relay_port: relay_port as u32,
+            })
+        } else {
+            debug!("Client requested relay but relay service is not enabled");
+            None
+        }
+    } else {
+        None
+    };
+
+    let response = proto::TrackerAnnounceResponse {
+        interval: 1800,
+        min_interval: 60,
+        complete,
+        incomplete,
+        peers: peers.into_iter().map(|p| proto::PeerInfo {
+            peer_id: p.peer_id.to_vec(),
+            user_id: p.user_id,
+            ip: p.ip.to_string(),
+            port: p.port as u32,
+            supports_relay: p.needs_relay,
+        }).collect(),
+        request_id: msg.request_id,
+        relay,
+    };
+
+    let envelope = proto::Envelope {
+        state_hash: Vec::new(),
+        payload: Some(Payload::TrackerAnnounceResponse(response)),
+    };
+
+    let frame = api::encode_frame(&envelope);
+    sender.send_frame(&frame).await?;
+    Ok(())
+}
+
+async fn handle_tracker_scrape(
+    msg: proto::TrackerScrape,
+    sender: Arc<ClientHandle>,
+    state: Arc<ServerState>,
+) -> Result<()> {
+    let info_hashes: Vec<[u8; 20]> = msg.info_hashes.iter()
+        .filter_map(|h| h.clone().try_into().ok())
+        .collect();
+
+    let stats = state.tracker.scrape(info_hashes).await;
+
+    let mut files = std::collections::HashMap::new();
+    for (hash, (complete, downloaded, incomplete)) in stats {
+        let hash_hex = hex::encode(hash);
+        files.insert(hash_hex, proto::ScrapeStats {
+            complete,
+            downloaded,
+            incomplete,
+        });
+    }
+
+    let response = proto::TrackerScrapeResponse {
+        files,
+    };
+
+    let envelope = proto::Envelope {
+        state_hash: Vec::new(),
+        payload: Some(Payload::TrackerScrapeResponse(response)),
+    };
+
+    let frame = api::encode_frame(&envelope);
+    sender.send_frame(&frame).await?;
     Ok(())
 }
 
@@ -466,11 +592,29 @@ async fn handle_chat_message(
         .await
         .unwrap_or(ROOT_ROOM_UUID);
 
+    // Use provided message ID and timestamp, or generate new ones if not provided
+    let message_id = if msg.id.len() == 16 {
+        msg.id
+    } else {
+        uuid::Uuid::new_v4().into_bytes().to_vec()
+    };
+
+    let timestamp_ms = if msg.timestamp_ms > 0 {
+        msg.timestamp_ms
+    } else {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+    };
+
     let broadcast = proto::Envelope {
         state_hash: Vec::new(),
         payload: Some(Payload::ServerEvent(proto::ServerEvent {
             kind: Some(proto::server_event::Kind::ChatBroadcast(
                 proto::ChatBroadcast {
+                    id: message_id,
+                    timestamp_ms,
                     sender: msg.sender,
                     text: msg.text,
                 },

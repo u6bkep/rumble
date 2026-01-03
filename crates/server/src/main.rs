@@ -12,7 +12,7 @@
 //! Run with `--help` for available options.
 
 use anyhow::Result;
-use server::{Config, Server, ServerConfig};
+use server::{Config, RelayConfig, Server, ServerConfig};
 use tracing::info;
 
 #[tokio::main]
@@ -38,11 +38,17 @@ async fn main() -> Result<()> {
 
     // Build server config
     let data_dir = server_config.data_dir().ok().map(|p| p.to_string_lossy().to_string());
+
+    // Enable relay service with default configuration
+    // Port 0 means OS will assign an available port
+    let relay = Some(RelayConfig::default());
+
     let config = Config {
         bind: server_config.bind,
         certs,
         key,
         data_dir,
+        relay,
     };
 
     let server = Server::new(config)?;

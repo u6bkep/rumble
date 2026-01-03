@@ -556,12 +556,191 @@ impl AudioState {
 /// A chat message.
 #[derive(Debug, Clone)]
 pub struct ChatMessage {
+    /// Unique message ID (16-byte UUID).
+    pub id: [u8; 16],
     pub sender: String,
     pub text: String,
     /// Wall-clock time when the message was received/created.
     pub timestamp: std::time::SystemTime,
     /// True if this is a local status message (not from the server).
     pub is_local: bool,
+}
+
+// =============================================================================
+// File Message (for file sharing in chat)
+// =============================================================================
+
+/// A file share message embedded in chat.
+///
+/// File messages are sent as JSON-encoded text in chat messages.
+/// The client detects file messages by parsing the text as JSON
+/// and validating against the file message schema.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct FileMessage {
+    /// Message type marker (always "file").
+    #[serde(rename = "type")]
+    pub msg_type: String,
+    /// File information.
+    pub file: FileInfo,
+}
+
+/// File information for a shared file.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct FileInfo {
+    /// Original filename.
+    pub name: String,
+    /// File size in bytes.
+    pub size: u64,
+    /// MIME type (e.g., "image/jpeg").
+    pub mime: String,
+    /// 40-character hex-encoded SHA-1 infohash.
+    pub infohash: String,
+}
+
+impl FileMessage {
+    /// Schema URL for file messages.
+    pub const SCHEMA: &'static str = "https://rumble.example/schemas/file-message-v1.json";
+
+    /// Create a new file message.
+    pub fn new(name: String, size: u64, mime: String, infohash: String) -> Self {
+        Self {
+            msg_type: "file".to_string(),
+            file: FileInfo {
+                name,
+                size,
+                mime,
+                infohash,
+            },
+        }
+    }
+
+    /// Try to parse a chat message text as a file message.
+    ///
+    /// Returns Some(FileMessage) if the text is valid JSON that matches
+    /// the file message schema with no extraneous fields.
+    pub fn parse(text: &str) -> Option<Self> {
+        // Attempt JSON parse
+        let value: serde_json::Value = serde_json::from_str(text).ok()?;
+
+        // Check it's an object
+        let obj = value.as_object()?;
+
+        // Validate against the schema:
+        // - Must have "type": "file"
+        // - Must have "file" object with exactly: name, size, mime, infohash
+        // - May optionally have "$schema" field
+        // - No other fields allowed (prevents false positives on user-pasted JSON)
+
+        // Check type field
+        if obj.get("type")?.as_str()? != "file" {
+            return None;
+        }
+
+        // Check file object exists
+        let file_obj = obj.get("file")?.as_object()?;
+
+        // Validate file object has exactly the required fields
+        let required_fields = ["name", "size", "mime", "infohash"];
+        for field in &required_fields {
+            if !file_obj.contains_key(*field) {
+                return None;
+            }
+        }
+
+        // Check for extraneous fields in file object
+        for key in file_obj.keys() {
+            if !required_fields.contains(&key.as_str()) {
+                return None;
+            }
+        }
+
+        // Check for extraneous fields in root object
+        for key in obj.keys() {
+            if !["type", "file", "$schema"].contains(&key.as_str()) {
+                return None;
+            }
+        }
+
+        // Now we can safely deserialize
+        serde_json::from_value(value).ok()
+    }
+
+    /// Generate the magnet link for this file.
+    pub fn magnet_link(&self) -> String {
+        format!("magnet:?xt=urn:btih:{}", self.file.infohash)
+    }
+
+    /// Serialize to JSON for sending as a chat message.
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
+}
+
+// =============================================================================
+// File Transfer State
+// =============================================================================
+
+/// State of a file transfer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TransferState {
+    /// In queue, not started.
+    #[default]
+    Pending,
+    /// Verifying existing data.
+    Checking,
+    /// Actively downloading.
+    Downloading,
+    /// Actively seeding (upload only).
+    Seeding,
+    /// Paused by user.
+    Paused,
+    /// Download completed, not seeding.
+    Completed,
+    /// Transfer failed with error.
+    Error,
+}
+
+impl TransferState {
+    /// Check if this state represents an active transfer.
+    pub fn is_active(&self) -> bool {
+        matches!(self, TransferState::Checking | TransferState::Downloading | TransferState::Seeding)
+    }
+
+    /// Check if the transfer is complete (downloaded or seeding).
+    pub fn is_finished(&self) -> bool {
+        matches!(self, TransferState::Seeding | TransferState::Completed)
+    }
+}
+
+/// Information about a file transfer.
+#[derive(Debug, Clone)]
+pub struct FileTransferState {
+    /// Infohash (20 bytes).
+    pub infohash: [u8; 20],
+    /// Original filename.
+    pub name: String,
+    /// File size in bytes.
+    pub size: u64,
+    /// MIME type (if known).
+    pub mime: Option<String>,
+    /// Progress (0.0 to 1.0).
+    pub progress: f32,
+    /// Download speed in bytes/sec.
+    pub download_speed: u64,
+    /// Upload speed in bytes/sec.
+    pub upload_speed: u64,
+    /// Number of connected peers.
+    pub peers: u32,
+    /// User IDs of known seeders (from tracker).
+    pub seeders: Vec<u64>,
+    /// Current state.
+    pub state: TransferState,
+    /// Error message (if state is Error).
+    pub error: Option<String>,
+    /// Magnet link for sharing.
+    pub magnet: Option<String>,
+    /// Local file path (if available).
+    pub local_path: Option<std::path::PathBuf>,
 }
 
 // =============================================================================
@@ -595,6 +774,9 @@ pub struct State {
     // Chat (recent messages, not persisted)
     /// Recent chat messages.
     pub chat_messages: Vec<ChatMessage>,
+
+    // File Transfers
+    pub file_transfers: Vec<FileTransferState>,
     
     // Room tree (derived from rooms)
     /// Hierarchical tree structure of rooms, rebuilt when rooms change.
@@ -737,6 +919,10 @@ pub enum Command {
     RegisterUser { user_id: u64 },
     /// Unregister a user.
     UnregisterUser { user_id: u64 },
+
+    // File Sharing
+    ShareFile { path: std::path::PathBuf },
+    DownloadFile { magnet: String },
 }
 
 // Implement Debug manually since SigningCallback doesn't implement Debug
@@ -780,6 +966,8 @@ impl std::fmt::Debug for Command {
             Command::SetUserVolume { user_id, volume_db } => f.debug_struct("SetUserVolume").field("user_id", user_id).field("volume_db", volume_db).finish(),
             Command::RegisterUser { user_id } => f.debug_struct("RegisterUser").field("user_id", user_id).finish(),
             Command::UnregisterUser { user_id } => f.debug_struct("UnregisterUser").field("user_id", user_id).finish(),
+            Command::ShareFile { path } => f.debug_struct("ShareFile").field("path", path).finish(),
+            Command::DownloadFile { magnet } => f.debug_struct("DownloadFile").field("magnet", magnet).finish(),
         }
     }
 }
@@ -838,6 +1026,7 @@ mod tests {
             ],
             audio: AudioState::default(),
             chat_messages: vec![],
+            file_transfers: vec![],
             room_tree: RoomTree::default(),
         };
 
