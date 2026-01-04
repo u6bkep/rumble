@@ -254,8 +254,7 @@ Files with identical content have identical infohash (SHA-1 of torrent info dict
 ┌─────────────────────────────────────┐
 │ 📄 presentation.pdf                 │
 │ 2.4 MB · application/pdf            │
-│ Seeders: Alice, Bob                 │
-│ [Download] [Save As...]             │
+│ [Download] [Copy Magnet]            │
 └─────────────────────────────────────┘
 ```
 
@@ -269,18 +268,32 @@ Files with identical content have identical infohash (SHA-1 of torrent info dict
 └─────────────────────────────────────┘
 ```
 
-#### After Download (Known Media)
+#### After Download
+```
+┌─────────────────────────────────────┐
+│ 📄 presentation.pdf                 │
+│ 2.4 MB · application/pdf            │
+│ Downloaded ✓                        │
+│ [Open] [Save As...] [Repost]        │
+└─────────────────────────────────────┘
+```
+
+#### After Download (Image)
 ```
 ┌─────────────────────────────────────┐
 │ ┌─────────────────────────────────┐ │
 │ │                                 │ │
-│ │        [Rendered Image]         │ │
+│ │        [Image Preview]          │ │
 │ │                                 │ │
 │ └─────────────────────────────────┘ │
-│ photo.jpg · 1.2 MB                  │
-│ [Save As...] [Open]                 │
+│ photo.jpg · 1.2 MB · Downloaded ✓   │
+│ [Open] [Save As...] [Repost]        │
 └─────────────────────────────────────┘
 ```
+
+- **Open**: Opens the file with the system default application
+- **Save As**: Copies the file to a user-selected location
+- **Repost**: Re-sends the file share message so new users in chat can download
 
 #### Unavailable
 ```
@@ -314,6 +327,23 @@ Transfers
 ```
 
 ### Settings
+
+#### Download Directory
+
+```
+Download Directory
+─────────────────────────────────────────
+Location: [~/Downloads/rumble     ] [Browse]
+─────────────────────────────────────────
+```
+
+Command-line override: `--download-dir <path>`
+
+When downloading a file that already exists at the destination:
+1. The torrent client adds the existing file to the session
+2. Verification runs to check piece integrity
+3. Only missing/corrupt pieces are downloaded
+4. If fully verified, download completes immediately
 
 #### Auto-Download Rules
 
@@ -429,22 +459,26 @@ Unauthenticated users use configurable default ACL set.
 - [x] Fix announce loop lifecycle (stop on disconnect/complete)
 - [x] Clean up swarms when all seeders disconnect
 
-### Phase 2: Client Features (5/7 Complete)
+### Phase 2: Client Features ✅
 - [x] File message rendering in chat (file widget with icon, name, size, download button)
 - [x] Transfers menu UI (enhanced with state icons, speed display, peer count)
 - [x] Auto-download settings (FileTransfer settings category with MIME patterns)
 - [x] Bandwidth limit settings (download/upload speed limits in settings)
-- [ ] Pause/resume/cancel controls (requires librqbit API)
-- [ ] "Save As" for completed downloads
+- [x] Pause/resume/cancel controls (using librqbit Session.pause/unpause/delete API)
+- [x] "Save As" for completed downloads (async file picker with copy to destination)
 - [x] Seed file cleanup on exit (configurable setting added)
+- [x] Downloaded file card with Open/Save As/Repost buttons (replaces Download button when file is available)
+- [x] Open file with system default application
+- [x] Progress bar in chat file card during download (with Pause/Cancel buttons)
+- [x] Inline image preview for downloaded images (up to 300x200px thumbnail)
 
 ### Phase 3: NAT Traversal ✅
 - [x] Implement relay service on server
 - [x] Client relay mode detection and request
 - [x] Relay authentication and rate limiting
 
-### Phase 4: Polish
-- [ ] Inline media preview (images, audio, video)
-- [ ] Progress notifications
-- [ ] Drag-and-drop file sharing
-- [ ] Paste image from clipboard
+### Phase 4: Polish (3/4 Complete)
+- [x] Inline media preview (images displayed inline when downloaded)
+- [ ] Progress notifications (toast system)
+- [x] Drag-and-drop file sharing (visual drop indicator when dragging files)
+- [x] Paste image from clipboard (Ctrl+V to paste and share clipboard images)

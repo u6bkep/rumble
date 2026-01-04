@@ -17,6 +17,14 @@ cargo fmt                      # Format code
 RUST_LOG=debug cargo run -p egui-test  # Run with debug logging
 ```
 
+## Building egui-test (debugging tip)
+
+When fixing build issues, run:
+```bash
+cargo build -p egui-test
+```
+and address the **first** error shown (later errors are often cascading).
+
 ## Crate Architecture
 
 ```
@@ -78,6 +86,7 @@ Server sends incremental `StateUpdate` messages with BLAKE3 hash. Client verifie
 - **Serialization**: Protocol Buffers (prost) - see `crates/api/proto/api.proto`
 - **Audio Format**: Opus at 48kHz, 20ms frames (960 samples)
 - **Authentication**: Ed25519 signatures with optional SSH agent support
+- **File Sharing**: BitTorrent
 
 ## Formatting
 
@@ -91,3 +100,11 @@ Located in `vendor/`:
 - `egui_ltreeview` - Tree view widget for room hierarchy
 - `rqbit` - BitTorrent client (for file sharing feature)
 - `torrust-tracker` - BitTorrent tracker
+
+## Audio: Opus decoder lifetime (important)
+
+Each remote peer must have a **long-lived Opus decoder instance** that persists across talk spurts.
+It should only be dropped when the peer leaves the room/session (or after a very long TTL GC fallback).
+Re-initializing decoders per received packet/talkspurt will cause:
+- `backend::codec: codec: decoder initialized` spam
+- audible crackle/pop at start of speech (decoder state reset)
