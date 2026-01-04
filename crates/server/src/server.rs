@@ -16,7 +16,10 @@ use api::{
 use bytes::BytesMut;
 use prost::Message;
 use quinn::{Endpoint, ServerConfig};
-use std::{net::SocketAddr, sync::Arc, sync::atomic::AtomicBool};
+use std::{
+    net::SocketAddr,
+    sync::{Arc, atomic::AtomicBool},
+};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info};
 
@@ -51,9 +54,7 @@ impl Server {
     /// Create a new server with the given configuration.
     pub fn new(config: Config) -> Result<Self> {
         // Store first cert DER for hash computation (leaf certificate)
-        let cert_der = config.certs.first()
-            .map(|c| c.to_vec())
-            .unwrap_or_default();
+        let cert_der = config.certs.first().map(|c| c.to_vec()).unwrap_or_default();
 
         let endpoint = make_server_endpoint(&config)?;
         let state = Arc::new(ServerState::with_cert(cert_der));
@@ -85,7 +86,13 @@ impl Server {
             (None, None)
         };
 
-        Ok(Self { endpoint, state, persistence, relay_service, relay_bind })
+        Ok(Self {
+            endpoint,
+            state,
+            persistence,
+            relay_service,
+            relay_bind,
+        })
     }
 
     /// Get the local address the server is listening on.
@@ -111,7 +118,11 @@ impl Server {
                 }
                 // Convert parent bytes to UUID if present
                 let parent = room.parent.map(uuid::Uuid::from_bytes);
-                if self.state.add_room_with_uuid_and_parent(uuid, room.name.clone(), parent).await {
+                if self
+                    .state
+                    .add_room_with_uuid_and_parent(uuid, room.name.clone(), parent)
+                    .await
+                {
                     debug!("Loaded persisted room: {} ({})", room.name, uuid);
                 }
             }
@@ -170,24 +181,22 @@ impl Server {
 
     /// Close the server endpoint, causing `run()` to return.
     pub fn close(&self) {
-        self.endpoint
-            .close(quinn::VarInt::from_u32(0), b"server shutdown");
+        self.endpoint.close(quinn::VarInt::from_u32(0), b"server shutdown");
     }
 }
 
 /// Create a QUIC server endpoint with the given configuration.
 fn make_server_endpoint(config: &Config) -> Result<Endpoint> {
-    let mut rustls_config = rustls::ServerConfig::builder_with_provider(
-        rustls::crypto::aws_lc_rs::default_provider().into(),
-    )
-    .with_protocol_versions(&[&rustls::version::TLS13])?
-    .with_no_client_auth()
-    .with_single_cert(config.certs.clone(), config.key.clone_key())?;
+    let mut rustls_config =
+        rustls::ServerConfig::builder_with_provider(rustls::crypto::aws_lc_rs::default_provider().into())
+            .with_protocol_versions(&[&rustls::version::TLS13])?
+            .with_no_client_auth()
+            .with_single_cert(config.certs.clone(), config.key.clone_key())?;
     rustls_config.alpn_protocols = vec![b"rumble".to_vec()];
 
-    let mut server_config = ServerConfig::with_crypto(Arc::new(
-        quinn::crypto::rustls::QuicServerConfig::try_from(Arc::new(rustls_config))?,
-    ));
+    let mut server_config = ServerConfig::with_crypto(Arc::new(quinn::crypto::rustls::QuicServerConfig::try_from(
+        Arc::new(rustls_config),
+    )?));
 
     // Configure transport for faster disconnect detection
     let mut transport_config = quinn::TransportConfig::default();
@@ -252,7 +261,7 @@ pub async fn handle_connection(
                         conn.clone(),
                         username.clone(),
                         public_key.clone(),
-                        authenticated.clone()
+                        authenticated.clone(),
                     ));
 
                     // Register client (lock-free DashMap insert)
@@ -272,7 +281,7 @@ pub async fn handle_connection(
                         conn.clone(),
                         username.clone(),
                         public_key.clone(),
-                        authenticated.clone()
+                        authenticated.clone(),
                     ))
                 };
 
@@ -286,11 +295,8 @@ pub async fn handle_connection(
                     // Read loop - handle errors gracefully
                     loop {
                         let mut chunk = [0u8; 1024];
-                        let read_result = tokio::time::timeout(
-                            std::time::Duration::from_secs(30),
-                            recv.read(&mut chunk),
-                        )
-                        .await;
+                        let read_result =
+                            tokio::time::timeout(std::time::Duration::from_secs(30), recv.read(&mut chunk)).await;
 
                         match read_result {
                             Ok(Ok(Some(n))) => {
@@ -299,10 +305,7 @@ pub async fn handle_connection(
                                 while let Some(frame) = try_decode_frame(&mut buf) {
                                     match Envelope::decode(&*frame) {
                                         Ok(env) => {
-                                            info!(
-                                                frame_len = frame.len(),
-                                                "server: decoded envelope frame"
-                                            );
+                                            info!(frame_len = frame.len(), "server: decoded envelope frame");
                                             if let Err(e) = handle_envelope(
                                                 env,
                                                 handle.clone(),

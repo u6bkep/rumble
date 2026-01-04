@@ -20,13 +20,19 @@
 //! Default: 1 MB/s per user, 10 MB/s global.
 
 use dashmap::DashMap;
-use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::RwLock;
+use std::{
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
+};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+    sync::RwLock,
+};
 use tracing::{debug, error, info, warn};
 
 /// Relay handshake role bytes
@@ -258,11 +264,7 @@ impl RelayService {
         }
     }
 
-    async fn handle_connection(
-        &self,
-        mut stream: TcpStream,
-        peer_addr: SocketAddr,
-    ) -> anyhow::Result<()> {
+    async fn handle_connection(&self, mut stream: TcpStream, peer_addr: SocketAddr) -> anyhow::Result<()> {
         // Set TCP nodelay for lower latency
         stream.set_nodelay(true)?;
 
@@ -283,12 +285,8 @@ impl RelayService {
         };
 
         match role {
-            ROLE_ACCEPTOR => {
-                self.handle_acceptor(stream, token, user_id, peer_addr).await
-            }
-            ROLE_DIALER => {
-                self.handle_dialer(stream, token, user_id, peer_addr).await
-            }
+            ROLE_ACCEPTOR => self.handle_acceptor(stream, token, user_id, peer_addr).await,
+            ROLE_DIALER => self.handle_dialer(stream, token, user_id, peer_addr).await,
             _ => {
                 warn!("Invalid role byte {} from {}", role, peer_addr);
                 Ok(())
@@ -356,12 +354,7 @@ impl RelayService {
 
         // Bridge the two streams
         let result = self
-            .bridge_streams(
-                dialer_stream,
-                acceptor.stream,
-                dialer_limit,
-                acceptor_limit,
-            )
+            .bridge_streams(dialer_stream, acceptor.stream, dialer_limit, acceptor_limit)
             .await;
 
         self.active_sessions.fetch_sub(1, Ordering::SeqCst);

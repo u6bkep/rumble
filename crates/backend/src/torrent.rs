@@ -1,23 +1,27 @@
-use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::{
+    net::{IpAddr, SocketAddr},
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use librqbit::{
-    AddTorrent, AddTorrentOptions, ManagedTorrent, ManagedTorrentState, Session,
-    SessionOptions, ListenerOptions, api::TorrentIdOrHash,
+    AddTorrent, AddTorrentOptions, ListenerOptions, ManagedTorrent, ManagedTorrentState, Session, SessionOptions,
+    api::TorrentIdOrHash,
 };
 use quinn::Connection;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
-use tokio::sync::RwLock;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpStream,
+    sync::RwLock,
+};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use api::proto;
-use api::{encode_frame, try_decode_frame};
-use api::proto::envelope::Payload;
+use api::{encode_frame, proto, proto::envelope::Payload, try_decode_frame};
 use prost::Message;
 
 /// Relay handshake role bytes
@@ -128,7 +132,8 @@ impl SharedFileInfo {
             "7z" => "application/x-7z-compressed",
             // Default
             _ => "application/octet-stream",
-        }.to_string()
+        }
+        .to_string()
     }
 }
 
@@ -170,9 +175,12 @@ impl TorrentManager {
                 }),
                 ..Default::default()
             },
-        ).await?;
+        )
+        .await?;
 
-        let port = session.announce_port().ok_or(anyhow::anyhow!("Failed to get announce port"))?;
+        let port = session
+            .announce_port()
+            .ok_or(anyhow::anyhow!("Failed to get announce port"))?;
 
         Ok(Self {
             session,
@@ -209,7 +217,8 @@ impl TorrentManager {
         // Get file metadata
         let metadata = tokio::fs::metadata(&path).await?;
         let file_size = metadata.len();
-        let file_name = path.file_name()
+        let file_name = path
+            .file_name()
             .ok_or(anyhow::anyhow!("Invalid file path"))?
             .to_string_lossy()
             .into_owned();
@@ -223,21 +232,25 @@ impl TorrentManager {
 
         let torrent_result = librqbit::create_torrent(&path, opts).await?;
 
-        let output_folder = path.parent()
+        let output_folder = path
+            .parent()
             .ok_or(anyhow::anyhow!("Invalid path"))?
             .to_string_lossy()
             .into_owned();
 
         // Add to session
-        let handle = self.session.add_torrent(
-            AddTorrent::from_bytes(torrent_result.as_bytes()?),
-            Some(AddTorrentOptions {
-                paused: false,
-                output_folder: Some(output_folder),
-                overwrite: true,
-                ..Default::default()
-            })
-        ).await?;
+        let handle = self
+            .session
+            .add_torrent(
+                AddTorrent::from_bytes(torrent_result.as_bytes()?),
+                Some(AddTorrentOptions {
+                    paused: false,
+                    output_folder: Some(output_folder),
+                    overwrite: true,
+                    ..Default::default()
+                }),
+            )
+            .await?;
 
         let managed_torrent = handle.into_handle().ok_or(anyhow::anyhow!("Failed to get handle"))?;
         let info_hash = managed_torrent.info_hash();
@@ -259,17 +272,31 @@ impl TorrentManager {
 
     pub async fn download_file(&self, magnet: String) -> anyhow::Result<()> {
         // Parse magnet to get infohash
-        let info_hash_hex = magnet.split("xt=urn:btih:").nth(1)
+        let info_hash_hex = magnet
+            .split("xt=urn:btih:")
+            .nth(1)
             .ok_or(anyhow::anyhow!("Invalid magnet link"))?
-            .split('&').next().unwrap();
+            .split('&')
+            .next()
+            .unwrap();
         let info_hash_bytes = hex::decode(info_hash_hex)?;
-        let info_hash: [u8; 20] = info_hash_bytes.try_into().map_err(|_| anyhow::anyhow!("Invalid infohash length"))?;
+        let info_hash: [u8; 20] = info_hash_bytes
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("Invalid infohash length"))?;
 
         // Use the manager's peer_id for consistency
         let peer_id = self.peer_id;
 
         // Get initial peers from server
-        let peers = match self.announce_to_server(info_hash, peer_id, self.listen_port, proto::tracker_announce::Event::Started as i32).await {
+        let peers = match self
+            .announce_to_server(
+                info_hash,
+                peer_id,
+                self.listen_port,
+                proto::tracker_announce::Event::Started as i32,
+            )
+            .await
+        {
             Ok(p) => p,
             Err(e) => {
                 warn!("Failed to resolve peers from server: {}", e);
@@ -278,24 +305,33 @@ impl TorrentManager {
         };
 
         // Add to session
-        let handle = self.session.add_torrent(
-            AddTorrent::from_url(magnet),
-            Some(AddTorrentOptions {
-                paused: false,
-                initial_peers: Some(peers),
-                ..Default::default()
-            })
-        ).await?;
-        
+        let handle = self
+            .session
+            .add_torrent(
+                AddTorrent::from_url(magnet),
+                Some(AddTorrentOptions {
+                    paused: false,
+                    initial_peers: Some(peers),
+                    ..Default::default()
+                }),
+            )
+            .await?;
+
         let managed_torrent = handle.into_handle().ok_or(anyhow::anyhow!("Failed to get handle"))?;
-        
+
         // Spawn announce loop
         self.spawn_announce_loop(managed_torrent.clone());
-        
+
         Ok(())
     }
 
-    async fn announce_to_server(&self, info_hash: [u8; 20], peer_id: [u8; 20], port: u16, event: i32) -> anyhow::Result<Vec<SocketAddr>> {
+    async fn announce_to_server(
+        &self,
+        info_hash: [u8; 20],
+        peer_id: [u8; 20],
+        port: u16,
+        event: i32,
+    ) -> anyhow::Result<Vec<SocketAddr>> {
         let request_id = rand::random::<u32>();
         let needs_relay = self.needs_relay();
 
@@ -564,7 +600,10 @@ impl TorrentManager {
                     }
                     Err(e) => {
                         // Connection closed - stop the announce loop
-                        error!("Failed to open stream for TrackerAnnounce: {} - stopping announce loop", e);
+                        error!(
+                            "Failed to open stream for TrackerAnnounce: {} - stopping announce loop",
+                            e
+                        );
                         break;
                     }
                 }
@@ -597,10 +636,14 @@ impl TorrentManager {
     /// Pause a torrent by infohash (hex-encoded).
     pub async fn pause_transfer(&self, infohash: &str) -> anyhow::Result<()> {
         let hash_bytes = hex::decode(infohash)?;
-        let hash: [u8; 20] = hash_bytes.try_into().map_err(|_| anyhow::anyhow!("Invalid infohash length"))?;
+        let hash: [u8; 20] = hash_bytes
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("Invalid infohash length"))?;
         let id = librqbit::dht::Id20::new(hash);
 
-        let handle = self.session.get(TorrentIdOrHash::Hash(id))
+        let handle = self
+            .session
+            .get(TorrentIdOrHash::Hash(id))
             .ok_or_else(|| anyhow::anyhow!("Transfer not found"))?;
 
         self.session.pause(&handle).await?;
@@ -611,10 +654,14 @@ impl TorrentManager {
     /// Resume a paused torrent by infohash (hex-encoded).
     pub async fn resume_transfer(&self, infohash: &str) -> anyhow::Result<()> {
         let hash_bytes = hex::decode(infohash)?;
-        let hash: [u8; 20] = hash_bytes.try_into().map_err(|_| anyhow::anyhow!("Invalid infohash length"))?;
+        let hash: [u8; 20] = hash_bytes
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("Invalid infohash length"))?;
         let id = librqbit::dht::Id20::new(hash);
 
-        let handle = self.session.get(TorrentIdOrHash::Hash(id))
+        let handle = self
+            .session
+            .get(TorrentIdOrHash::Hash(id))
             .ok_or_else(|| anyhow::anyhow!("Transfer not found"))?;
 
         self.session.unpause(&handle).await?;
@@ -625,7 +672,9 @@ impl TorrentManager {
     /// Cancel and remove a torrent by infohash (hex-encoded).
     pub async fn cancel_transfer(&self, infohash: &str, delete_files: bool) -> anyhow::Result<()> {
         let hash_bytes = hex::decode(infohash)?;
-        let hash: [u8; 20] = hash_bytes.try_into().map_err(|_| anyhow::anyhow!("Invalid infohash length"))?;
+        let hash: [u8; 20] = hash_bytes
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("Invalid infohash length"))?;
         let id = librqbit::dht::Id20::new(hash);
 
         self.session.delete(TorrentIdOrHash::Hash(id), delete_files).await?;
@@ -636,10 +685,14 @@ impl TorrentManager {
     /// Get the local file path for a completed torrent.
     pub fn get_file_path(&self, infohash: &str) -> anyhow::Result<std::path::PathBuf> {
         let hash_bytes = hex::decode(infohash)?;
-        let hash: [u8; 20] = hash_bytes.try_into().map_err(|_| anyhow::anyhow!("Invalid infohash length"))?;
+        let hash: [u8; 20] = hash_bytes
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("Invalid infohash length"))?;
         let id = librqbit::dht::Id20::new(hash);
 
-        let handle = self.session.get(TorrentIdOrHash::Hash(id))
+        let handle = self
+            .session
+            .get(TorrentIdOrHash::Hash(id))
             .ok_or_else(|| anyhow::anyhow!("Transfer not found"))?;
 
         // Get the file name from the torrent metadata

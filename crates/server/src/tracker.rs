@@ -1,8 +1,10 @@
 use rand::seq::SliceRandom;
-use std::collections::HashMap;
-use std::net::IpAddr;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::{
+    collections::HashMap,
+    net::IpAddr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tokio::sync::RwLock;
 use tracing::{debug, info};
 
@@ -12,14 +14,14 @@ pub type PeerId = [u8; 20];
 #[derive(Debug, Clone)]
 pub struct Peer {
     pub peer_id: PeerId,
-    pub user_id: u64,        // Rumble user ID
+    pub user_id: u64, // Rumble user ID
     pub ip: IpAddr,
     pub port: u16,
     pub uploaded: u64,
     pub downloaded: u64,
     pub left: u64,
     pub last_seen: Instant,
-    pub needs_relay: bool,   // Client requested relay mode
+    pub needs_relay: bool, // Client requested relay mode
 }
 
 impl Peer {
@@ -47,9 +49,8 @@ impl Swarm {
     /// Returns true if the swarm is now empty.
     pub fn prune(&mut self, timeout: Duration) -> bool {
         let now = Instant::now();
-        self.peers.retain(|_, peer| {
-            now.duration_since(peer.last_seen) < timeout
-        });
+        self.peers
+            .retain(|_, peer| now.duration_since(peer.last_seen) < timeout);
         // Re-calculate completed count
         self.completed = self.peers.values().filter(|p| p.left == 0).count() as u32;
         self.peers.is_empty()
@@ -129,7 +130,11 @@ impl Tracker {
         match event {
             Some(Event::Stopped) => {
                 swarm.peers.remove(&peer_id);
-                info!("Peer stopped: {} for infohash {}", hex::encode(peer_id), hex::encode(info_hash));
+                info!(
+                    "Peer stopped: {} for infohash {}",
+                    hex::encode(peer_id),
+                    hex::encode(info_hash)
+                );
             }
             _ => {
                 let peer = Peer {

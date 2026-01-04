@@ -30,11 +30,9 @@ use std::sync::{
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
-use std::sync::atomic::AtomicBool;
-use std::time::Instant;
+use std::{sync::atomic::AtomicBool, time::Instant};
 
-use crate::relay::RelayTokenManager;
-use crate::tracker::Tracker;
+use crate::{relay::RelayTokenManager, tracker::Tracker};
 
 /// Handle to a connected client's control stream.
 ///
@@ -239,32 +237,32 @@ impl ServerState {
     pub fn relay_port(&self) -> u16 {
         self.relay_port.load(Ordering::SeqCst)
     }
-    
+
     /// Get the server's certificate hash.
     pub fn server_cert_hash(&self) -> [u8; 32] {
         api::compute_cert_hash(&self.server_cert_der)
     }
-    
+
     /// Store pending authentication state.
     pub fn set_pending_auth(&self, pending: PendingAuth) {
         self.pending_auth.insert(pending.user_id, pending);
     }
-    
+
     /// Get and remove pending authentication state.
     pub fn take_pending_auth(&self, user_id: u64) -> Option<PendingAuth> {
         self.pending_auth.remove(&user_id).map(|(_, v)| v)
     }
-    
+
     /// Track an active session (user_id → public_key).
     pub fn add_session(&self, user_id: u64, public_key: [u8; 32]) {
         self.sessions.insert(user_id, public_key);
     }
-    
+
     /// Remove an active session.
     pub fn remove_session(&self, user_id: u64) {
         self.sessions.remove(&user_id);
     }
-    
+
     /// Get the public key for an active session.
     pub fn get_session_key(&self, user_id: u64) -> Option<[u8; 32]> {
         self.sessions.get(&user_id).map(|r| *r.value())
@@ -379,9 +377,10 @@ impl ServerState {
     pub async fn add_room_with_uuid_and_parent(&self, uuid: Uuid, name: String, parent: Option<Uuid>) -> bool {
         let mut data = self.state_data.write().await;
         // Check if room already exists
-        let exists = data.rooms.iter().any(|r| {
-            r.id.as_ref().and_then(uuid_from_room_id) == Some(uuid)
-        });
+        let exists = data
+            .rooms
+            .iter()
+            .any(|r| r.id.as_ref().and_then(uuid_from_room_id) == Some(uuid));
         if exists {
             return false;
         }
@@ -420,9 +419,8 @@ impl ServerState {
 
         let mut data = self.state_data.write().await;
         let before_len = data.rooms.len();
-        data.rooms.retain(|r| {
-            uuid_from_room_id(r.id.as_ref().unwrap_or(&root_room_id())) != Some(room_uuid)
-        });
+        data.rooms
+            .retain(|r| uuid_from_room_id(r.id.as_ref().unwrap_or(&root_room_id())) != Some(room_uuid));
         let deleted = data.rooms.len() < before_len;
 
         if deleted {
@@ -576,20 +574,22 @@ mod tests {
         let specific_uuid = Uuid::new_v4();
 
         // Add room with specific UUID
-        let added = state.add_room_with_uuid(specific_uuid, "Persisted Room".to_string()).await;
+        let added = state
+            .add_room_with_uuid(specific_uuid, "Persisted Room".to_string())
+            .await;
         assert!(added);
 
         // Verify the room exists with the correct UUID
         let rooms = state.get_rooms().await;
         assert_eq!(rooms.len(), 2);
-        
+
         let room = rooms.iter().find(|r| r.name == "Persisted Room").unwrap();
         assert_eq!(uuid_from_room_id(room.id.as_ref().unwrap()), Some(specific_uuid));
 
         // Try to add a room with the same UUID - should fail
         let added_again = state.add_room_with_uuid(specific_uuid, "Duplicate".to_string()).await;
         assert!(!added_again);
-        
+
         // Room count should still be 2
         let rooms = state.get_rooms().await;
         assert_eq!(rooms.len(), 2);

@@ -13,7 +13,7 @@ cargo build                    # Build all crates
 cargo run --bin server         # Run the server
 cargo run -p egui-test         # Run the GUI client
 cargo test                     # Run all tests
-cargo fmt                      # Format code
+cargo +nightly fmt             # Format code
 RUST_LOG=debug cargo run -p egui-test  # Run with debug logging
 ```
 

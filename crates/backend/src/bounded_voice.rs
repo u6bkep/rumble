@@ -153,9 +153,7 @@ impl<T> BoundedVoiceReceiver<T> {
 /// The channel will hold at most `config.max_frames` frames. When full,
 /// `try_send` will drop new frames (returning false) rather than blocking
 /// or growing the buffer.
-pub fn bounded_voice_channel<T>(
-    config: VoiceChannelConfig,
-) -> (BoundedVoiceSender<T>, BoundedVoiceReceiver<T>) {
+pub fn bounded_voice_channel<T>(config: VoiceChannelConfig) -> (BoundedVoiceSender<T>, BoundedVoiceReceiver<T>) {
     let (tx, rx) = tokio::sync::mpsc::channel(config.max_frames);
     let dropped_count = Arc::new(AtomicUsize::new(0));
     let total_sent = Arc::new(AtomicUsize::new(0));

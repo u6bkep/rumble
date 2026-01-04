@@ -13,13 +13,14 @@ use std::{
 
 use anyhow::Result;
 use api::{
-    build_auth_payload, compute_cert_hash, encode_frame, try_decode_frame, room_id_from_uuid, uuid_from_room_id,
-    proto::{self, envelope::Payload, Envelope, RoomInfo, User},
+    build_auth_payload, compute_cert_hash, encode_frame,
+    proto::{self, Envelope, RoomInfo, User, envelope::Payload},
+    room_id_from_uuid, try_decode_frame, uuid_from_room_id,
 };
 use bytes::BytesMut;
-use ed25519_dalek::{SigningKey, Signer};
+use ed25519_dalek::{Signer, SigningKey};
 use prost::Message;
-use quinn::{crypto::rustls::QuicClientConfig, Endpoint};
+use quinn::{Endpoint, crypto::rustls::QuicClientConfig};
 use rand::rngs::OsRng;
 use rustls_pemfile;
 use std::sync::Arc;
@@ -73,11 +74,11 @@ fn start_server_with_options(port: u16, data_dir_override: Option<&str>, passwor
         .env("RUMBLE_DATA_DIR", data_dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    
+
     if let Some(pw) = password {
         cmd.env("RUMBLE_SERVER_PASSWORD", pw);
     }
-    
+
     let mut child = cmd.spawn().expect("failed to start server binary");
 
     // Pipe server stdout/stderr to test output.
@@ -127,14 +128,12 @@ fn start_server_with_persistence() -> (u16, ServerGuard, tempfile::TempDir) {
 /// Load certificate(s) from a file, supporting both PEM and DER formats.
 fn load_cert_file(cert_path: &std::path::Path) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
     let cert_bytes = std::fs::read(cert_path)?;
-    
+
     if cert_bytes.starts_with(b"-----BEGIN") {
         // PEM format
         let mut reader = std::io::BufReader::new(cert_bytes.as_slice());
-        let certs: Vec<rustls::pki_types::CertificateDer<'static>> = 
-            rustls_pemfile::certs(&mut reader)
-                .filter_map(|r| r.ok())
-                .collect();
+        let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+            rustls_pemfile::certs(&mut reader).filter_map(|r| r.ok()).collect();
         if certs.is_empty() {
             anyhow::bail!("No certificates found in PEM file");
         }
@@ -159,7 +158,13 @@ struct RawConnection {
 
 impl RawConnection {
     /// Create a connection and send ClientHello, but don't send Authenticate yet.
-    async fn connect_no_auth(addr: &str, name: &str, public_key: &[u8; 32], password: Option<&str>, cert_path: &std::path::Path) -> Result<Self> {
+    async fn connect_no_auth(
+        addr: &str,
+        name: &str,
+        public_key: &[u8; 32],
+        password: Option<&str>,
+        cert_path: &std::path::Path,
+    ) -> Result<Self> {
         let certs = load_cert_file(cert_path)?;
         let cert_der = certs[0].to_vec(); // Keep first cert for hash
 
@@ -168,19 +173,16 @@ impl RawConnection {
             roots.add(cert)?;
         }
 
-        let rustls_config = rustls::ClientConfig::builder_with_provider(
-            rustls::crypto::aws_lc_rs::default_provider().into(),
-        )
-        .with_protocol_versions(&[&rustls::version::TLS13])?
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+        let rustls_config =
+            rustls::ClientConfig::builder_with_provider(rustls::crypto::aws_lc_rs::default_provider().into())
+                .with_protocol_versions(&[&rustls::version::TLS13])?
+                .with_root_certificates(roots)
+                .with_no_client_auth();
 
         let mut rustls_config = rustls_config;
         rustls_config.alpn_protocols = vec![b"rumble".to_vec()];
 
-        let client_config = quinn::ClientConfig::new(Arc::new(
-            QuicClientConfig::try_from(Arc::new(rustls_config))?,
-        ));
+        let client_config = quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(Arc::new(rustls_config))?));
 
         let mut endpoint = Endpoint::client("0.0.0.0:0".parse()?)?;
         endpoint.set_default_client_config(client_config);
@@ -338,25 +340,37 @@ impl TestClient {
         let signing_key = SigningKey::generate(&mut OsRng);
         Self::connect_with_key(addr, name, signing_key, None, cert_path).await
     }
-    
+
     /// Connect with a specific signing key (for testing with existing identity).
-    async fn connect_with_key(addr: &str, name: &str, signing_key: SigningKey, password: Option<&str>, cert_path: &std::path::Path) -> Result<Self> {
+    async fn connect_with_key(
+        addr: &str,
+        name: &str,
+        signing_key: SigningKey,
+        password: Option<&str>,
+        cert_path: &std::path::Path,
+    ) -> Result<Self> {
         match Self::try_connect_with_key(addr, name, signing_key, password, cert_path).await? {
             ConnectResult::Success(client) => Ok(client),
             ConnectResult::AuthFailed(error) => Err(anyhow::anyhow!("Authentication failed: {}", error)),
         }
     }
-    
+
     /// Attempt to connect, returning either success or auth failure reason.
     async fn try_connect(addr: &str, name: &str, cert_path: &std::path::Path) -> Result<ConnectResult> {
         let signing_key = SigningKey::generate(&mut OsRng);
         Self::try_connect_with_key(addr, name, signing_key, None, cert_path).await
     }
-    
+
     /// Attempt to connect with a specific key, returning either success or auth failure reason.
-    async fn try_connect_with_key(addr: &str, name: &str, signing_key: SigningKey, password: Option<&str>, cert_path: &std::path::Path) -> Result<ConnectResult> {
+    async fn try_connect_with_key(
+        addr: &str,
+        name: &str,
+        signing_key: SigningKey,
+        password: Option<&str>,
+        cert_path: &std::path::Path,
+    ) -> Result<ConnectResult> {
         let public_key = signing_key.verifying_key().to_bytes();
-        
+
         // Load certificate(s)
         let certs = load_cert_file(cert_path)?;
         let cert_der = certs[0].to_vec(); // Keep first cert for hash
@@ -367,19 +381,16 @@ impl TestClient {
             roots.add(cert)?;
         }
 
-        let rustls_config = rustls::ClientConfig::builder_with_provider(
-            rustls::crypto::aws_lc_rs::default_provider().into(),
-        )
-        .with_protocol_versions(&[&rustls::version::TLS13])?
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+        let rustls_config =
+            rustls::ClientConfig::builder_with_provider(rustls::crypto::aws_lc_rs::default_provider().into())
+                .with_protocol_versions(&[&rustls::version::TLS13])?
+                .with_root_certificates(roots)
+                .with_no_client_auth();
 
         let mut rustls_config = rustls_config;
         rustls_config.alpn_protocols = vec![b"rumble".to_vec()];
 
-        let client_config = quinn::ClientConfig::new(Arc::new(
-            QuicClientConfig::try_from(Arc::new(rustls_config))?,
-        ));
+        let client_config = quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(Arc::new(rustls_config))?));
 
         // Create endpoint
         let mut endpoint = Endpoint::client("0.0.0.0:0".parse()?)?;
@@ -436,8 +447,7 @@ impl TestClient {
 
         while (!got_hello || !got_state) && std::time::Instant::now() < deadline {
             let mut chunk = [0u8; 4096];
-            match tokio::time::timeout(Duration::from_millis(100), self.recv.read(&mut chunk)).await
-            {
+            match tokio::time::timeout(Duration::from_millis(100), self.recv.read(&mut chunk)).await {
                 Ok(Ok(Some(n))) => {
                     self.buf.extend_from_slice(&chunk[..n]);
                     while let Some(frame) = try_decode_frame(&mut self.buf) {
@@ -451,16 +461,14 @@ impl TestClient {
                                         nonce = Some(n);
                                     }
                                     got_hello = true;
-                                    
+
                                     // Send Authenticate message
                                     if let Some(n) = nonce {
                                         self.send_authenticate(n, cert_der).await?;
                                     }
                                 }
                                 Some(Payload::ServerEvent(se)) => {
-                                    if let Some(proto::server_event::Kind::ServerState(ss)) =
-                                        se.kind
-                                    {
+                                    if let Some(proto::server_event::Kind::ServerState(ss)) = se.kind {
                                         self.rooms = ss.rooms;
                                         self.users = ss.users;
                                         got_state = true;
@@ -503,21 +511,12 @@ impl TestClient {
     async fn send_authenticate(&mut self, nonce: [u8; 32], cert_der: &[u8]) -> Result<()> {
         let public_key = self.signing_key.verifying_key().to_bytes();
         let server_cert_hash = compute_cert_hash(cert_der);
-        let timestamp_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64;
-        
-        let payload = build_auth_payload(
-            &nonce,
-            timestamp_ms,
-            &public_key,
-            self.user_id,
-            &server_cert_hash,
-        );
-        
+        let timestamp_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
+
+        let payload = build_auth_payload(&nonce, timestamp_ms, &public_key, self.user_id, &server_cert_hash);
+
         let signature = self.signing_key.sign(&payload);
-        
+
         let env = Envelope {
             state_hash: Vec::new(),
             payload: Some(Payload::Authenticate(proto::Authenticate {
@@ -590,8 +589,7 @@ impl TestClient {
 
         while std::time::Instant::now() < deadline {
             let mut chunk = [0u8; 4096];
-            match tokio::time::timeout(Duration::from_millis(50), self.recv.read(&mut chunk)).await
-            {
+            match tokio::time::timeout(Duration::from_millis(50), self.recv.read(&mut chunk)).await {
                 Ok(Ok(Some(n))) => {
                     self.buf.extend_from_slice(&chunk[..n]);
                     while let Some(frame) = try_decode_frame(&mut self.buf) {
@@ -636,16 +634,17 @@ impl TestClient {
                 }
                 proto::state_update::Update::RoomDeleted(rd) => {
                     if let Some(rid) = rd.room_id.and_then(|r| uuid_from_room_id(&r)) {
-                        self.rooms.retain(|r| {
-                            r.id.as_ref().and_then(uuid_from_room_id) != Some(rid)
-                        });
+                        self.rooms
+                            .retain(|r| r.id.as_ref().and_then(uuid_from_room_id) != Some(rid));
                     }
                 }
                 proto::state_update::Update::RoomRenamed(rr) => {
                     if let Some(rid) = rr.room_id.and_then(|r| uuid_from_room_id(&r)) {
-                        if let Some(room) = self.rooms.iter_mut().find(|r| {
-                            r.id.as_ref().and_then(uuid_from_room_id) == Some(rid)
-                        }) {
+                        if let Some(room) = self
+                            .rooms
+                            .iter_mut()
+                            .find(|r| r.id.as_ref().and_then(uuid_from_room_id) == Some(rid))
+                        {
                             room.name = rr.new_name;
                         }
                     }
@@ -686,9 +685,11 @@ impl TestClient {
                 }
                 proto::state_update::Update::RoomMoved(rm) => {
                     if let Some(rid) = rm.room_id.and_then(|r| uuid_from_room_id(&r)) {
-                        if let Some(room) = self.rooms.iter_mut().find(|r| {
-                            r.id.as_ref().and_then(uuid_from_room_id) == Some(rid)
-                        }) {
+                        if let Some(room) = self
+                            .rooms
+                            .iter_mut()
+                            .find(|r| r.id.as_ref().and_then(uuid_from_room_id) == Some(rid))
+                        {
                             room.parent_id = rm.new_parent_id;
                         }
                     }
@@ -729,8 +730,7 @@ impl TestClient {
 
         while std::time::Instant::now() < deadline {
             let mut chunk = [0u8; 4096];
-            match tokio::time::timeout(Duration::from_millis(50), self.recv.read(&mut chunk)).await
-            {
+            match tokio::time::timeout(Duration::from_millis(50), self.recv.read(&mut chunk)).await {
                 Ok(Ok(Some(n))) => {
                     self.buf.extend_from_slice(&chunk[..n]);
                     while let Some(frame) = try_decode_frame(&mut self.buf) {
@@ -873,16 +873,9 @@ async fn test_create_room() {
         .expect("create room should succeed");
 
     // Process messages to get the update
-    client
-        .process_messages(Duration::from_millis(500))
-        .await
-        .unwrap();
+    client.process_messages(Duration::from_millis(500)).await.unwrap();
 
-    assert_eq!(
-        client.rooms().len(),
-        initial_count + 1,
-        "should have one more room"
-    );
+    assert_eq!(client.rooms().len(), initial_count + 1, "should have one more room");
     assert!(
         client.rooms().iter().any(|r| r.name == "Test Room"),
         "should have the new room"
@@ -901,10 +894,7 @@ async fn test_delete_room() {
 
     // Create a room to delete
     client.create_room("Room To Delete").await.unwrap();
-    client
-        .process_messages(Duration::from_millis(500))
-        .await
-        .unwrap();
+    client.process_messages(Duration::from_millis(500)).await.unwrap();
 
     let room_uuid = client
         .rooms()
@@ -918,16 +908,9 @@ async fn test_delete_room() {
 
     // Delete the room
     client.delete_room(room_uuid).await.unwrap();
-    client
-        .process_messages(Duration::from_millis(500))
-        .await
-        .unwrap();
+    client.process_messages(Duration::from_millis(500)).await.unwrap();
 
-    assert_eq!(
-        client.rooms().len(),
-        count_before - 1,
-        "should have one less room"
-    );
+    assert_eq!(client.rooms().len(), count_before - 1, "should have one less room");
     assert!(
         !client.rooms().iter().any(|r| r.name == "Room To Delete"),
         "deleted room should be gone"
@@ -946,10 +929,7 @@ async fn test_rename_room() {
 
     // Create a room to rename
     client.create_room("Original Name").await.unwrap();
-    client
-        .process_messages(Duration::from_millis(500))
-        .await
-        .unwrap();
+    client.process_messages(Duration::from_millis(500)).await.unwrap();
 
     let room_uuid = client
         .rooms()
@@ -961,10 +941,7 @@ async fn test_rename_room() {
 
     // Rename the room
     client.rename_room(room_uuid, "New Name").await.unwrap();
-    client
-        .process_messages(Duration::from_millis(500))
-        .await
-        .unwrap();
+    client.process_messages(Duration::from_millis(500)).await.unwrap();
 
     assert!(
         client.rooms().iter().any(|r| r.name == "New Name"),
@@ -989,8 +966,7 @@ async fn test_user_appears_in_users_list() {
     // Check that our user is in the users list
     assert!(
         client.users().iter().any(|u| {
-            u.user_id.as_ref().map(|id| id.value) == Some(client.user_id())
-                && u.username == "visible-user"
+            u.user_id.as_ref().map(|id| id.value) == Some(client.user_id()) && u.username == "visible-user"
         }),
         "should see ourselves in users list"
     );
@@ -1012,9 +988,10 @@ async fn test_second_client_sees_first_client() {
 
     // Client 2 should see client 1 in the users list
     assert!(
-        client2.users().iter().any(|u| {
-            u.user_id.as_ref().map(|id| id.value) == Some(client1.user_id())
-        }),
+        client2
+            .users()
+            .iter()
+            .any(|u| { u.user_id.as_ref().map(|id| id.value) == Some(client1.user_id()) }),
         "client 2 should see client 1 in users list"
     );
 
@@ -1041,14 +1018,8 @@ async fn test_room_updates_broadcast_to_all_clients() {
     client1.create_room("Shared Room").await.unwrap();
 
     // Both clients process messages
-    client1
-        .process_messages(Duration::from_millis(500))
-        .await
-        .unwrap();
-    client2
-        .process_messages(Duration::from_millis(500))
-        .await
-        .unwrap();
+    client1.process_messages(Duration::from_millis(500)).await.unwrap();
+    client2.process_messages(Duration::from_millis(500)).await.unwrap();
 
     // Both should see the new room
     assert!(
@@ -1093,10 +1064,7 @@ async fn test_client_disconnect_removes_user() {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Client 2 processes messages to get the UserLeft update
-    client2
-        .process_messages(Duration::from_millis(500))
-        .await
-        .unwrap();
+    client2.process_messages(Duration::from_millis(500)).await.unwrap();
 
     // Client 1 should no longer be in the users list
     assert!(
@@ -1146,7 +1114,10 @@ async fn test_registered_user_can_reconnect_with_same_key() {
 
     client.register_user(client.user_id()).await.unwrap();
     let result = client.wait_for_command_result(Duration::from_secs(2)).await.unwrap();
-    assert!(result.is_some() && result.unwrap().success, "registration should succeed");
+    assert!(
+        result.is_some() && result.unwrap().success,
+        "registration should succeed"
+    );
 
     client.close();
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1180,7 +1151,10 @@ async fn test_registered_user_name_overridden_by_server() {
 
     client.register_user(client.user_id()).await.unwrap();
     let result = client.wait_for_command_result(Duration::from_secs(2)).await.unwrap();
-    assert!(result.is_some() && result.unwrap().success, "registration should succeed");
+    assert!(
+        result.is_some() && result.unwrap().success,
+        "registration should succeed"
+    );
 
     client.close();
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1198,13 +1172,14 @@ async fn test_registered_user_name_overridden_by_server() {
     .expect("connection should succeed");
 
     // Find our user in the users list
-    let our_user = client2.users().iter().find(|u| {
-        u.user_id.as_ref().map(|id| id.value) == Some(client2.user_id())
-    });
+    let our_user = client2
+        .users()
+        .iter()
+        .find(|u| u.user_id.as_ref().map(|id| id.value) == Some(client2.user_id()));
 
     assert!(our_user.is_some(), "should find ourselves in users list");
     let our_user = our_user.unwrap();
-    
+
     // The server should have overridden the name with the registered name
     assert_eq!(
         our_user.username, "registered-name",
@@ -1226,7 +1201,10 @@ async fn test_different_key_cannot_use_registered_username() {
 
     client.register_user(client.user_id()).await.unwrap();
     let result = client.wait_for_command_result(Duration::from_secs(2)).await.unwrap();
-    assert!(result.is_some() && result.unwrap().success, "registration should succeed");
+    assert!(
+        result.is_some() && result.unwrap().success,
+        "registration should succeed"
+    );
 
     client.close();
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1263,12 +1241,18 @@ async fn test_unregister_allows_username_reuse() {
     // Register
     client.register_user(client.user_id()).await.unwrap();
     let result = client.wait_for_command_result(Duration::from_secs(2)).await.unwrap();
-    assert!(result.is_some() && result.unwrap().success, "registration should succeed");
+    assert!(
+        result.is_some() && result.unwrap().success,
+        "registration should succeed"
+    );
 
     // Unregister
     client.unregister_user(client.user_id()).await.unwrap();
     let result = client.wait_for_command_result(Duration::from_secs(2)).await.unwrap();
-    assert!(result.is_some() && result.unwrap().success, "unregistration should succeed");
+    assert!(
+        result.is_some() && result.unwrap().success,
+        "unregistration should succeed"
+    );
 
     client.close();
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1314,10 +1298,7 @@ async fn test_auth_failure_invalid_signature() {
 
     // Send garbage signature
     let bad_signature = vec![0u8; 64];
-    let timestamp_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64;
+    let timestamp_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
 
     raw.send_authenticate(&bad_signature, timestamp_ms).await.unwrap();
 
@@ -1359,29 +1340,24 @@ async fn test_auth_failure_timestamp_out_of_range() {
 
     let nonce = raw.nonce.unwrap();
     let server_cert_hash = compute_cert_hash(&raw.cert_der);
-    
-    // Use a timestamp from 10 minutes ago (server allows ±5 minutes)
-    let old_timestamp_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64 - 10 * 60 * 1000;
 
-    let payload = build_auth_payload(
-        &nonce,
-        old_timestamp_ms,
-        &public_key,
-        raw.user_id,
-        &server_cert_hash,
-    );
+    // Use a timestamp from 10 minutes ago (server allows ±5 minutes)
+    let old_timestamp_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64 - 10 * 60 * 1000;
+
+    let payload = build_auth_payload(&nonce, old_timestamp_ms, &public_key, raw.user_id, &server_cert_hash);
 
     let signature = signing_key.sign(&payload);
-    raw.send_authenticate(&signature.to_bytes(), old_timestamp_ms).await.unwrap();
+    raw.send_authenticate(&signature.to_bytes(), old_timestamp_ms)
+        .await
+        .unwrap();
 
     let result = raw.wait_for_auth_result(Duration::from_secs(2)).await.unwrap();
     match result {
         AuthResult::Failed(error) => {
             assert!(
-                error.to_lowercase().contains("timestamp") || error.to_lowercase().contains("time") || error.to_lowercase().contains("expired"),
+                error.to_lowercase().contains("timestamp")
+                    || error.to_lowercase().contains("time")
+                    || error.to_lowercase().contains("expired"),
                 "error should mention timestamp issue: {}",
                 error
             );
@@ -1415,23 +1391,16 @@ async fn test_auth_failure_wrong_user_id_in_signature() {
 
     let nonce = raw.nonce.unwrap();
     let server_cert_hash = compute_cert_hash(&raw.cert_der);
-    let timestamp_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64;
+    let timestamp_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
 
     // Sign with WRONG user_id (we use 999999 instead of the actual assigned user_id)
     let wrong_user_id = 999999u64;
-    let payload = build_auth_payload(
-        &nonce,
-        timestamp_ms,
-        &public_key,
-        wrong_user_id,
-        &server_cert_hash,
-    );
+    let payload = build_auth_payload(&nonce, timestamp_ms, &public_key, wrong_user_id, &server_cert_hash);
 
     let signature = signing_key.sign(&payload);
-    raw.send_authenticate(&signature.to_bytes(), timestamp_ms).await.unwrap();
+    raw.send_authenticate(&signature.to_bytes(), timestamp_ms)
+        .await
+        .unwrap();
 
     let result = raw.wait_for_auth_result(Duration::from_secs(2)).await.unwrap();
     match result {
@@ -1472,22 +1441,15 @@ async fn test_auth_success_with_valid_credentials() {
 
     let nonce = raw.nonce.unwrap();
     let server_cert_hash = compute_cert_hash(&raw.cert_der);
-    let timestamp_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64;
+    let timestamp_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
 
     // Create valid signature
-    let payload = build_auth_payload(
-        &nonce,
-        timestamp_ms,
-        &public_key,
-        raw.user_id,
-        &server_cert_hash,
-    );
+    let payload = build_auth_payload(&nonce, timestamp_ms, &public_key, raw.user_id, &server_cert_hash);
 
     let signature = signing_key.sign(&payload);
-    raw.send_authenticate(&signature.to_bytes(), timestamp_ms).await.unwrap();
+    raw.send_authenticate(&signature.to_bytes(), timestamp_ms)
+        .await
+        .unwrap();
 
     let result = raw.wait_for_auth_result(Duration::from_secs(2)).await.unwrap();
     match result {
@@ -1514,7 +1476,7 @@ async fn test_registered_user_last_room_persisted() {
 
     // Create a client with a specific signing key
     let signing_key = SigningKey::generate(&mut OsRng);
-    
+
     // First connection: connect and register the user
     let mut client = TestClient::connect_with_key(
         &format!("127.0.0.1:{}", port),
@@ -1534,9 +1496,11 @@ async fn test_registered_user_last_room_persisted() {
     client.create_room("Test Room").await.unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;
     client.process_messages(Duration::from_millis(300)).await.unwrap();
-    
+
     // Find the created room
-    let room_uuid = client.rooms.iter()
+    let room_uuid = client
+        .rooms
+        .iter()
         .find(|r| r.name == "Test Room")
         .and_then(|r| r.id.as_ref().and_then(uuid_from_room_id))
         .expect("should find created room");
@@ -1544,7 +1508,7 @@ async fn test_registered_user_last_room_persisted() {
     // Join the room
     client.join_room(room_uuid).await.unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;
-    
+
     // Disconnect
     client.close();
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -1561,16 +1525,23 @@ async fn test_registered_user_last_room_persisted() {
     .expect("should reconnect");
 
     // Check that we're in the correct room
-    let my_user = client2.users.iter()
+    let my_user = client2
+        .users
+        .iter()
         .find(|u| u.user_id.as_ref().map(|id| id.value) == Some(client2.user_id))
         .expect("should find self in user list");
-    
-    let current_room_uuid = my_user.current_room.as_ref()
+
+    let current_room_uuid = my_user
+        .current_room
+        .as_ref()
         .and_then(uuid_from_room_id)
         .expect("should have a current room");
-    
-    assert_eq!(current_room_uuid, room_uuid, "registered user should be restored to last room");
-    
+
+    assert_eq!(
+        current_room_uuid, room_uuid,
+        "registered user should be restored to last room"
+    );
+
     client2.close();
 }
 
@@ -1582,7 +1553,7 @@ async fn test_unregistered_user_starts_in_root() {
 
     // Create a client with a specific signing key (but don't register)
     let signing_key = SigningKey::generate(&mut OsRng);
-    
+
     // First connection: connect, create and join a room, but don't register
     let mut client = TestClient::connect_with_key(
         &format!("127.0.0.1:{}", port),
@@ -1598,9 +1569,11 @@ async fn test_unregistered_user_starts_in_root() {
     client.create_room("Unregistered Test Room").await.unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;
     client.process_messages(Duration::from_millis(300)).await.unwrap();
-    
+
     // Find the created room
-    let room_uuid = client.rooms.iter()
+    let room_uuid = client
+        .rooms
+        .iter()
         .find(|r| r.name == "Unregistered Test Room")
         .and_then(|r| r.id.as_ref().and_then(uuid_from_room_id))
         .expect("should find created room");
@@ -1608,7 +1581,7 @@ async fn test_unregistered_user_starts_in_root() {
     // Join the room (without registering)
     client.join_room(room_uuid).await.unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;
-    
+
     // Disconnect
     client.close();
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -1625,16 +1598,24 @@ async fn test_unregistered_user_starts_in_root() {
     .expect("should reconnect");
 
     // Check that we're in the Root room
-    let my_user = client2.users.iter()
+    let my_user = client2
+        .users
+        .iter()
         .find(|u| u.user_id.as_ref().map(|id| id.value) == Some(client2.user_id))
         .expect("should find self in user list");
-    
-    let current_room_uuid = my_user.current_room.as_ref()
+
+    let current_room_uuid = my_user
+        .current_room
+        .as_ref()
         .and_then(uuid_from_room_id)
         .expect("should have a current room");
-    
-    assert_eq!(current_room_uuid, api::ROOT_ROOM_UUID, "unregistered user should start in Root room");
-    
+
+    assert_eq!(
+        current_room_uuid,
+        api::ROOT_ROOM_UUID,
+        "unregistered user should start in Root room"
+    );
+
     client2.close();
 }
 
@@ -1646,7 +1627,7 @@ async fn test_last_room_deleted_falls_back_to_root() {
 
     // Create a registered user and join a room
     let signing_key = SigningKey::generate(&mut OsRng);
-    
+
     let mut client = TestClient::connect_with_key(
         &format!("127.0.0.1:{}", port),
         "fallback-test-user",
@@ -1665,19 +1646,21 @@ async fn test_last_room_deleted_falls_back_to_root() {
     client.create_room("Will Be Deleted").await.unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;
     client.process_messages(Duration::from_millis(300)).await.unwrap();
-    
-    let room_uuid = client.rooms.iter()
+
+    let room_uuid = client
+        .rooms
+        .iter()
         .find(|r| r.name == "Will Be Deleted")
         .and_then(|r| r.id.as_ref().and_then(uuid_from_room_id))
         .expect("should find created room");
 
     client.join_room(room_uuid).await.unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;
-    
+
     // Now delete the room while still connected
     client.delete_room(room_uuid).await.unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;
-    
+
     // Disconnect
     client.close();
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -1693,16 +1676,24 @@ async fn test_last_room_deleted_falls_back_to_root() {
     .await
     .expect("should reconnect");
 
-    let my_user = client2.users.iter()
+    let my_user = client2
+        .users
+        .iter()
         .find(|u| u.user_id.as_ref().map(|id| id.value) == Some(client2.user_id))
         .expect("should find self in user list");
-    
-    let current_room_uuid = my_user.current_room.as_ref()
+
+    let current_room_uuid = my_user
+        .current_room
+        .as_ref()
         .and_then(uuid_from_room_id)
         .expect("should have a current room");
-    
-    assert_eq!(current_room_uuid, api::ROOT_ROOM_UUID, "user should fall back to Root when last room is deleted");
-    
+
+    assert_eq!(
+        current_room_uuid,
+        api::ROOT_ROOM_UUID,
+        "user should fall back to Root when last room is deleted"
+    );
+
     client2.close();
 }
 
@@ -1711,47 +1702,47 @@ async fn test_last_room_deleted_falls_back_to_root() {
 async fn test_rooms_persist_across_restart() {
     let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
     let port = next_test_port();
-    
+
     // Start server and create a room
     {
         let server = start_server_with_options(port, Some(temp_dir.path().to_str().unwrap()), None);
         tokio::time::sleep(Duration::from_millis(500)).await;
-        
+
         let mut client = TestClient::connect(&format!("127.0.0.1:{}", port), "room-creator", &server.cert_path)
             .await
             .expect("should connect");
-        
+
         client.create_room("Persistent Room").await.unwrap();
         client.process_messages(Duration::from_millis(500)).await.unwrap();
-        
+
         // Verify room exists
         assert!(
             client.rooms.iter().any(|r| r.name == "Persistent Room"),
             "room should be created"
         );
-        
+
         client.close();
         // Server drops here
     }
-    
+
     tokio::time::sleep(Duration::from_millis(500)).await;
-    
+
     // Restart server on a different port (to avoid port conflicts)
     let port2 = next_test_port();
     {
         let server = start_server_with_options(port2, Some(temp_dir.path().to_str().unwrap()), None);
         tokio::time::sleep(Duration::from_millis(500)).await;
-        
+
         let mut client = TestClient::connect(&format!("127.0.0.1:{}", port2), "room-checker", &server.cert_path)
             .await
             .expect("should connect to restarted server");
-        
+
         // Room should still exist
         assert!(
             client.rooms.iter().any(|r| r.name == "Persistent Room"),
             "room should persist across server restart"
         );
-        
+
         client.close();
     }
 }

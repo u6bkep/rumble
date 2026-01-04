@@ -16,10 +16,12 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde::{Deserialize, Serialize};
-use std::fs;
-use std::io::BufReader;
-use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::{
+    fs,
+    io::BufReader,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+};
 use tracing::{info, warn};
 
 /// Default configuration file content with comments.
@@ -215,28 +217,19 @@ impl ServerConfig {
 
         // Merge: CLI args > env vars > file config > defaults
         // Check environment variables for overrides
-        let env_bind = std::env::var("RUMBLE_BIND").ok()
+        let env_bind = std::env::var("RUMBLE_BIND")
+            .ok()
             .or_else(|| std::env::var("RUMBLE_PORT").ok().map(|p| format!("[::]:{}", p)));
         let env_log_level = std::env::var("RUMBLE_LOG_LEVEL").ok();
         let env_data_dir = std::env::var("RUMBLE_DATA_DIR").ok().map(PathBuf::from);
         let env_cert_dir = std::env::var("RUMBLE_CERT_DIR").ok().map(PathBuf::from);
         let env_domain = std::env::var("RUMBLE_DOMAIN").ok();
 
-        let bind_str = args.bind
-            .or(env_bind)
-            .unwrap_or(file_config.bind);
-        let log_level = args.log_level
-            .or(env_log_level)
-            .unwrap_or(file_config.log_level);
-        let data_dir = args.data_dir
-            .or(env_data_dir)
-            .unwrap_or(file_config.data_dir);
-        let cert_dir = args.cert_dir
-            .or(env_cert_dir)
-            .unwrap_or(file_config.cert_dir);
-        let domain = args.domain
-            .or(env_domain)
-            .unwrap_or(file_config.domain);
+        let bind_str = args.bind.or(env_bind).unwrap_or(file_config.bind);
+        let log_level = args.log_level.or(env_log_level).unwrap_or(file_config.log_level);
+        let data_dir = args.data_dir.or(env_data_dir).unwrap_or(file_config.data_dir);
+        let cert_dir = args.cert_dir.or(env_cert_dir).unwrap_or(file_config.cert_dir);
+        let domain = args.domain.or(env_domain).unwrap_or(file_config.domain);
 
         // Parse bind address
         let bind = parse_bind_address(&bind_str)?;
@@ -283,7 +276,10 @@ impl ServerConfig {
             info!("Loading certificates from {}", cert_dir.display());
             load_pem_certificates(&fullchain_path, &privkey_path)
         } else {
-            warn!("Certificates not found in {}, generating self-signed dev cert", cert_dir.display());
+            warn!(
+                "Certificates not found in {}, generating self-signed dev cert",
+                cert_dir.display()
+            );
             generate_self_signed_cert(&cert_dir, &self.domain)
         }
     }
@@ -309,7 +305,8 @@ fn parse_bind_address(s: &str) -> Result<SocketAddr> {
         s.to_string()
     };
 
-    with_port.parse()
+    with_port
+        .parse()
         .with_context(|| format!("Invalid bind address: {}", s))
 }
 
@@ -338,13 +335,17 @@ pub fn load_pem_certificates(
     if certs.is_empty() {
         anyhow::bail!("No certificates found in {}", fullchain_path.display());
     }
-    info!("Loaded {} certificate(s) from {}", certs.len(), fullchain_path.display());
+    info!(
+        "Loaded {} certificate(s) from {}",
+        certs.len(),
+        fullchain_path.display()
+    );
 
     // Load private key
-    let key_file = fs::File::open(privkey_path)
-        .with_context(|| format!("Failed to open key file: {}", privkey_path.display()))?;
+    let key_file =
+        fs::File::open(privkey_path).with_context(|| format!("Failed to open key file: {}", privkey_path.display()))?;
     let mut key_reader = BufReader::new(key_file);
-    
+
     let key = rustls_pemfile::private_key(&mut key_reader)
         .with_context(|| format!("Failed to parse key file: {}", privkey_path.display()))?
         .ok_or_else(|| anyhow::anyhow!("No private key found in {}", privkey_path.display()))?;
@@ -360,14 +361,14 @@ pub fn generate_self_signed_cert(
     domain: &str,
 ) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
     fs::create_dir_all(cert_dir)?;
-    
+
     let fullchain_path = cert_dir.join("fullchain.pem");
     let privkey_path = cert_dir.join("privkey.pem");
 
     // Generate self-signed certificate
     let subject_alt_names = vec![domain.to_string()];
-    let ck = rcgen::generate_simple_self_signed(subject_alt_names)
-        .context("Failed to generate self-signed certificate")?;
+    let ck =
+        rcgen::generate_simple_self_signed(subject_alt_names).context("Failed to generate self-signed certificate")?;
 
     // Write PEM files (certbot-style)
     let cert_pem = ck.cert.pem();
@@ -378,7 +379,11 @@ pub fn generate_self_signed_cert(
     fs::write(&privkey_path, &key_pem)
         .with_context(|| format!("Failed to write private key: {}", privkey_path.display()))?;
 
-    info!("Generated self-signed certificate for '{}' in {}", domain, cert_dir.display());
+    info!(
+        "Generated self-signed certificate for '{}' in {}",
+        domain,
+        cert_dir.display()
+    );
 
     // Parse the generated PEM files
     load_pem_certificates(&fullchain_path, &privkey_path)

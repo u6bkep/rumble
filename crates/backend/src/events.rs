@@ -7,9 +7,11 @@
 use crate::audio::AudioDeviceInfo;
 use api::proto::{RoomInfo, User};
 use pipeline::{PipelineConfig, UserRxConfig};
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-use std::time::Instant;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Instant,
+};
 use uuid::Uuid;
 
 // =============================================================================
@@ -30,7 +32,7 @@ pub struct RoomTreeNode {
 }
 
 /// Hierarchical tree structure of rooms.
-/// 
+///
 /// This is rebuilt whenever the room list changes. The UI can use this
 /// to efficiently render the room list as a tree without rebuilding
 /// the hierarchy on each frame.
@@ -47,32 +49,35 @@ impl RoomTree {
     pub fn new() -> Self {
         Self::default()
     }
-    
+
     /// Rebuild the tree from a list of rooms.
     pub fn rebuild(&mut self, rooms: &[RoomInfo]) {
         self.nodes.clear();
         self.roots.clear();
-        
+
         // First pass: create all nodes
         for room in rooms {
             let Some(room_uuid) = room.id.as_ref().and_then(api::uuid_from_room_id) else {
                 continue;
             };
             let parent_uuid = room.parent_id.as_ref().and_then(api::uuid_from_room_id);
-            
-            self.nodes.insert(room_uuid, RoomTreeNode {
-                id: room_uuid,
-                name: room.name.clone(),
-                parent_id: parent_uuid,
-                children: Vec::new(),
-            });
+
+            self.nodes.insert(
+                room_uuid,
+                RoomTreeNode {
+                    id: room_uuid,
+                    name: room.name.clone(),
+                    parent_id: parent_uuid,
+                    children: Vec::new(),
+                },
+            );
         }
-        
+
         // Second pass: build parent-child relationships and collect roots
         let uuids: Vec<Uuid> = self.nodes.keys().copied().collect();
         for uuid in uuids {
             let parent_id = self.nodes.get(&uuid).and_then(|n| n.parent_id);
-            
+
             if let Some(parent_uuid) = parent_id {
                 // Add as child of parent (if parent exists)
                 if self.nodes.contains_key(&parent_uuid) {
@@ -88,20 +93,18 @@ impl RoomTree {
                 self.roots.push(uuid);
             }
         }
-        
+
         // Sort roots by name
         self.roots.sort_by(|a, b| {
             let name_a = self.nodes.get(a).map(|n| n.name.as_str()).unwrap_or("");
             let name_b = self.nodes.get(b).map(|n| n.name.as_str()).unwrap_or("");
             name_a.cmp(name_b)
         });
-        
+
         // Sort children of each node by name
         // First, collect the name for each UUID for sorting
-        let names: HashMap<Uuid, String> = self.nodes.iter()
-            .map(|(id, node)| (*id, node.name.clone()))
-            .collect();
-        
+        let names: HashMap<Uuid, String> = self.nodes.iter().map(|(id, node)| (*id, node.name.clone())).collect();
+
         for node in self.nodes.values_mut() {
             node.children.sort_by(|a, b| {
                 let name_a = names.get(a).map(|s| s.as_str()).unwrap_or("");
@@ -110,37 +113,37 @@ impl RoomTree {
             });
         }
     }
-    
+
     /// Get a node by UUID.
     pub fn get(&self, uuid: Uuid) -> Option<&RoomTreeNode> {
         self.nodes.get(&uuid)
     }
-    
+
     /// Get mutable reference to a node by UUID.
     pub fn get_mut(&mut self, uuid: Uuid) -> Option<&mut RoomTreeNode> {
         self.nodes.get_mut(&uuid)
     }
-    
+
     /// Check if the tree is empty.
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
     }
-    
+
     /// Get the number of rooms in the tree.
     pub fn len(&self) -> usize {
         self.nodes.len()
     }
-    
+
     /// Get children of a room.
     pub fn children(&self, uuid: Uuid) -> &[Uuid] {
         self.nodes.get(&uuid).map(|n| n.children.as_slice()).unwrap_or(&[])
     }
-    
+
     /// Check if a room has any children.
     pub fn has_children(&self, uuid: Uuid) -> bool {
         self.nodes.get(&uuid).map(|n| !n.children.is_empty()).unwrap_or(false)
     }
-    
+
     /// Iterate over all ancestors of a room, from parent to root.
     pub fn ancestors(&self, uuid: Uuid) -> impl Iterator<Item = Uuid> + '_ {
         AncestorIterator {
@@ -148,12 +151,12 @@ impl RoomTree {
             current: self.nodes.get(&uuid).and_then(|n| n.parent_id),
         }
     }
-    
+
     /// Check if `ancestor` is an ancestor of `descendant`.
     pub fn is_ancestor(&self, ancestor: Uuid, descendant: Uuid) -> bool {
         self.ancestors(descendant).any(|id| id == ancestor)
     }
-    
+
     /// Get the depth of a room (0 for root rooms).
     pub fn depth(&self, uuid: Uuid) -> usize {
         self.ancestors(uuid).count()
@@ -168,7 +171,7 @@ struct AncestorIterator<'a> {
 
 impl<'a> Iterator for AncestorIterator<'a> {
     type Item = Uuid;
-    
+
     fn next(&mut self) -> Option<Self::Item> {
         let current = self.current?;
         self.current = self.tree.nodes.get(&current).and_then(|n| n.parent_id);
@@ -184,11 +187,11 @@ pub use api::ROOT_ROOM_UUID;
 // =============================================================================
 
 /// Callback for signing authentication challenges.
-/// 
+///
 /// The UI provides this callback. It may:
 /// - Sign using a local Ed25519 private key
 /// - Sign using the SSH agent
-/// 
+///
 /// Takes the payload to sign, returns the 64-byte signature or an error.
 pub type SigningCallback = Arc<dyn Fn(&[u8]) -> Result<[u8; 64], String> + Send + Sync>;
 
@@ -199,7 +202,7 @@ pub type SigningCallback = Arc<dyn Fn(&[u8]) -> Result<[u8; 64], String> + Send 
 /// Configurable audio pipeline settings.
 ///
 /// These settings can be changed at runtime via the `UpdateAudioSettings` command.
-/// 
+///
 /// Note: Audio processing (denoise, VAD, etc.) is configured via the TX pipeline,
 /// not via these settings.
 #[derive(Debug, Clone, PartialEq)]
@@ -208,20 +211,20 @@ pub struct AudioSettings {
     /// Common values: 24000 (low), 32000 (medium), 64000 (high), 96000 (very high).
     /// Range: 6000 - 510000.
     pub bitrate: i32,
-    
+
     /// Opus encoder complexity (0-10).
     /// Higher values = better quality but more CPU usage.
     /// Recommended: 5 for mobile, 10 for desktop.
     pub encoder_complexity: i32,
-    
+
     /// Number of packets to buffer before starting playback.
     /// Higher values = more latency but smoother playback under jitter.
     /// At 20ms per frame: 2 packets = 40ms, 3 packets = 60ms, 5 packets = 100ms.
     pub jitter_buffer_delay_packets: u32,
-    
+
     /// Enable Forward Error Correction for packet loss recovery.
     pub fec_enabled: bool,
-    
+
     /// Expected packet loss percentage (0-100) for FEC tuning.
     /// Higher values add more redundancy at the cost of bitrate.
     pub packet_loss_percent: i32,
@@ -245,7 +248,7 @@ impl AudioSettings {
     pub const BITRATE_MEDIUM: i32 = 32000;
     pub const BITRATE_HIGH: i32 = 64000;
     pub const BITRATE_VERY_HIGH: i32 = 96000;
-    
+
     /// Get a human-readable description of the current bitrate.
     pub fn bitrate_label(&self) -> &'static str {
         match self.bitrate {
@@ -268,37 +271,37 @@ impl AudioSettings {
 pub struct AudioStats {
     /// Number of voice packets sent.
     pub packets_sent: u64,
-    
+
     /// Number of voice packets received.
     pub packets_received: u64,
-    
+
     /// Number of packets lost (detected via sequence gaps).
     pub packets_lost: u64,
-    
+
     /// Number of packets recovered via FEC.
     pub packets_recovered_fec: u64,
-    
+
     /// Number of frames concealed via PLC (packet loss concealment).
     pub frames_concealed: u64,
-    
+
     /// Total bytes of Opus data sent.
     pub bytes_sent: u64,
-    
+
     /// Total bytes of Opus data received.
     pub bytes_received: u64,
-    
+
     /// Average encoded frame size in bytes (rolling average).
     pub avg_frame_size_bytes: f32,
-    
+
     /// Estimated actual bitrate in bits per second (rolling average).
     pub actual_bitrate_bps: f32,
-    
+
     /// Current playback buffer level in packets (for jitter buffer monitoring).
     pub playback_buffer_packets: u32,
-    
+
     /// Number of buffer underruns (playback starvation events).
     pub buffer_underruns: u64,
-    
+
     /// Timestamp of last stats update.
     pub last_update: Option<Instant>,
 }
@@ -313,7 +316,7 @@ impl AudioStats {
             (self.packets_lost as f32 / total as f32) * 100.0
         }
     }
-    
+
     /// Calculate FEC recovery percentage (of lost packets).
     pub fn fec_recovery_percent(&self) -> f32 {
         if self.packets_lost == 0 {
@@ -447,10 +450,10 @@ impl ConnectionState {
 // =============================================================================
 
 /// Voice activation mode (how transmission is triggered).
-/// 
+///
 /// Note: This is separate from mute state. A user can be in Continuous mode
 /// but still muted - mute is an orthogonal toggle.
-/// 
+///
 /// Note: Voice Activity Detection (VAD) is not a voice mode but a pipeline
 /// processor. To achieve "voice activated" transmission, use Continuous mode
 /// with the VAD processor enabled in the TX pipeline.
@@ -466,7 +469,7 @@ pub enum VoiceMode {
 
 impl VoiceMode {
     /// Check if this mode requires the audio pipeline to run continuously.
-    /// 
+    ///
     /// In PTT mode, the pipeline only runs when PTT is pressed.
     /// In Continuous mode, it runs continuously.
     pub fn requires_continuous_capture(&self) -> bool {
@@ -508,7 +511,7 @@ pub struct AudioState {
     pub settings: AudioSettings,
     /// Runtime audio statistics.
     pub stats: AudioStats,
-    
+
     // Pipeline configuration
     /// TX (transmit) pipeline configuration.
     pub tx_pipeline: PipelineConfig,
@@ -516,7 +519,7 @@ pub struct AudioState {
     pub rx_pipeline_defaults: PipelineConfig,
     /// Per-user RX configuration overrides.
     pub per_user_rx: HashMap<u64, UserRxConfig>,
-    
+
     /// Current audio input level in dB (from TX pipeline, for UI metering).
     pub input_level_db: Option<f32>,
 }
@@ -703,7 +706,10 @@ pub enum TransferState {
 impl TransferState {
     /// Check if this state represents an active transfer.
     pub fn is_active(&self) -> bool {
-        matches!(self, TransferState::Checking | TransferState::Downloading | TransferState::Seeding)
+        matches!(
+            self,
+            TransferState::Checking | TransferState::Downloading | TransferState::Seeding
+        )
     }
 
     /// Check if the transfer is complete (downloaded or seeding).
@@ -756,7 +762,7 @@ pub struct State {
     // Connection
     /// Current connection state.
     pub connection: ConnectionState,
-    
+
     // Server state (when connected)
     /// List of rooms on the server.
     pub rooms: Vec<RoomInfo>,
@@ -766,18 +772,18 @@ pub struct State {
     pub my_user_id: Option<u64>,
     /// Our current room ID (if in a room).
     pub my_room_id: Option<Uuid>,
-    
+
     // Audio
     /// Audio subsystem state.
     pub audio: AudioState,
-    
+
     // Chat (recent messages, not persisted)
     /// Recent chat messages.
     pub chat_messages: Vec<ChatMessage>,
 
     // File Transfers
     pub file_transfers: Vec<FileTransferState>,
-    
+
     // Room tree (derived from rooms)
     /// Hierarchical tree structure of rooms, rebuilt when rooms change.
     pub room_tree: RoomTree,
@@ -789,17 +795,12 @@ impl State {
     pub fn rebuild_room_tree(&mut self) {
         self.room_tree.rebuild(&self.rooms);
     }
-    
+
     /// Get users in a specific room.
     pub fn users_in_room(&self, room_uuid: Uuid) -> Vec<&User> {
         self.users
             .iter()
-            .filter(|u| {
-                u.current_room
-                    .as_ref()
-                    .and_then(api::uuid_from_room_id)
-                    == Some(room_uuid)
-            })
+            .filter(|u| u.current_room.as_ref().and_then(api::uuid_from_room_id) == Some(room_uuid))
             .collect()
     }
 
@@ -807,10 +808,7 @@ impl State {
     pub fn is_user_in_room(&self, user_id: u64, room_uuid: Uuid) -> bool {
         self.users.iter().any(|u| {
             u.user_id.as_ref().map(|id| id.value) == Some(user_id)
-                && u.current_room
-                    .as_ref()
-                    .and_then(api::uuid_from_room_id)
-                    == Some(room_uuid)
+                && u.current_room.as_ref().and_then(api::uuid_from_room_id) == Some(room_uuid)
         })
     }
 
@@ -820,7 +818,7 @@ impl State {
             .iter()
             .find(|r| r.id.as_ref().and_then(api::uuid_from_room_id) == Some(room_uuid))
     }
-    
+
     /// Get a user by ID.
     pub fn get_user(&self, user_id: u64) -> Option<&User> {
         self.users
@@ -844,9 +842,9 @@ pub enum Command {
     Connect {
         addr: String,
         name: String,
-        public_key: [u8; 32],      // Ed25519 public key
-        signer: SigningCallback,   // Signs auth challenge
-        password: Option<String>,  // Server password (for unknown keys)
+        public_key: [u8; 32],     // Ed25519 public key
+        signer: SigningCallback,  // Signs auth challenge
+        password: Option<String>, // Server password (for unknown keys)
     },
     /// Disconnect from the current server.
     Disconnect,
@@ -858,109 +856,197 @@ pub enum Command {
 
     // Room/Chat
     /// Join a room by UUID.
-    JoinRoom { room_id: Uuid },
+    JoinRoom {
+        room_id: Uuid,
+    },
     /// Create a new room, optionally under a parent room.
-    CreateRoom { name: String, parent_id: Option<Uuid> },
+    CreateRoom {
+        name: String,
+        parent_id: Option<Uuid>,
+    },
     /// Delete a room by UUID.
-    DeleteRoom { room_id: Uuid },
+    DeleteRoom {
+        room_id: Uuid,
+    },
     /// Rename a room.
-    RenameRoom { room_id: Uuid, new_name: String },
+    RenameRoom {
+        room_id: Uuid,
+        new_name: String,
+    },
     /// Move a room to a new parent.
-    MoveRoom { room_id: Uuid, new_parent_id: Uuid },
+    MoveRoom {
+        room_id: Uuid,
+        new_parent_id: Uuid,
+    },
     /// Send a chat message.
-    SendChat { text: String },
+    SendChat {
+        text: String,
+    },
     /// Add a local status message (not sent to server).
-    LocalMessage { text: String },
+    LocalMessage {
+        text: String,
+    },
 
     // Audio configuration (always available)
     /// Set the input (microphone) device by ID.
-    SetInputDevice { device_id: Option<String> },
+    SetInputDevice {
+        device_id: Option<String>,
+    },
     /// Set the output (speaker) device by ID.
-    SetOutputDevice { device_id: Option<String> },
+    SetOutputDevice {
+        device_id: Option<String>,
+    },
     /// Refresh the list of available audio devices.
     RefreshAudioDevices,
 
     // Transmission control
     /// Set the voice activation mode (PTT vs Continuous).
-    SetVoiceMode { mode: VoiceMode },
+    SetVoiceMode {
+        mode: VoiceMode,
+    },
     /// Set self-muted state (stops transmission).
-    SetMuted { muted: bool },
+    SetMuted {
+        muted: bool,
+    },
     /// Set self-deafened state (stops receiving audio; implies muted).
-    SetDeafened { deafened: bool },
+    SetDeafened {
+        deafened: bool,
+    },
     /// Mute a specific user locally (we won't hear them).
-    MuteUser { user_id: u64 },
+    MuteUser {
+        user_id: u64,
+    },
     /// Unmute a specific user locally.
-    UnmuteUser { user_id: u64 },
+    UnmuteUser {
+        user_id: u64,
+    },
     /// Start transmitting (only effective in PushToTalk mode when not muted).
     StartTransmit,
     /// Stop transmitting.
     StopTransmit,
-    
+
     // Audio settings
     /// Update audio pipeline settings (denoise, bitrate, complexity, etc.).
-    UpdateAudioSettings { settings: AudioSettings },
+    UpdateAudioSettings {
+        settings: AudioSettings,
+    },
     /// Reset audio statistics.
     ResetAudioStats,
-    
+
     // Pipeline configuration
     /// Update the TX (transmit) pipeline configuration.
-    UpdateTxPipeline { config: PipelineConfig },
+    UpdateTxPipeline {
+        config: PipelineConfig,
+    },
     /// Update the default RX (receive) pipeline configuration for all users.
-    UpdateRxPipelineDefaults { config: PipelineConfig },
+    UpdateRxPipelineDefaults {
+        config: PipelineConfig,
+    },
     /// Update configuration for a specific user's RX pipeline.
-    UpdateUserRxConfig { user_id: u64, config: UserRxConfig },
+    UpdateUserRxConfig {
+        user_id: u64,
+        config: UserRxConfig,
+    },
     /// Remove per-user RX override, reverting to defaults.
-    ClearUserRxOverride { user_id: u64 },
+    ClearUserRxOverride {
+        user_id: u64,
+    },
     /// Set per-user volume (convenience command, updates UserRxConfig).
-    SetUserVolume { user_id: u64, volume_db: f32 },
-    
+    SetUserVolume {
+        user_id: u64,
+        volume_db: f32,
+    },
+
     // Registration
     /// Register a user (binds their username to their public key).
-    RegisterUser { user_id: u64 },
+    RegisterUser {
+        user_id: u64,
+    },
     /// Unregister a user.
-    UnregisterUser { user_id: u64 },
+    UnregisterUser {
+        user_id: u64,
+    },
 
     // File Sharing
-    ShareFile { path: std::path::PathBuf },
-    DownloadFile { magnet: String },
+    ShareFile {
+        path: std::path::PathBuf,
+    },
+    DownloadFile {
+        magnet: String,
+    },
     /// Pause a file transfer by infohash (hex-encoded).
-    PauseTransfer { infohash: String },
+    PauseTransfer {
+        infohash: String,
+    },
     /// Resume a paused file transfer by infohash (hex-encoded).
-    ResumeTransfer { infohash: String },
+    ResumeTransfer {
+        infohash: String,
+    },
     /// Cancel and remove a file transfer by infohash (hex-encoded).
-    CancelTransfer { infohash: String },
+    CancelTransfer {
+        infohash: String,
+    },
     /// Remove a completed/seeding transfer and optionally delete the local file.
-    RemoveTransfer { infohash: String, delete_file: bool },
+    RemoveTransfer {
+        infohash: String,
+        delete_file: bool,
+    },
     /// Save a completed file to a new location.
-    SaveFileAs { infohash: String, destination: std::path::PathBuf },
+    SaveFileAs {
+        infohash: String,
+        destination: std::path::PathBuf,
+    },
     /// Open a completed file with the system default application.
-    OpenFile { infohash: String },
+    OpenFile {
+        infohash: String,
+    },
 }
 
 // Implement Debug manually since SigningCallback doesn't implement Debug
 impl std::fmt::Debug for Command {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Command::Connect { addr, name, public_key, password, .. } => {
-                f.debug_struct("Connect")
-                    .field("addr", addr)
-                    .field("name", name)
-                    .field("public_key", &format!("{:02x?}...", &public_key[..4]))
-                    .field("password", &password.is_some())
-                    .finish()
-            }
+            Command::Connect {
+                addr,
+                name,
+                public_key,
+                password,
+                ..
+            } => f
+                .debug_struct("Connect")
+                .field("addr", addr)
+                .field("name", name)
+                .field("public_key", &format!("{:02x?}...", &public_key[..4]))
+                .field("password", &password.is_some())
+                .finish(),
             Command::Disconnect => write!(f, "Disconnect"),
             Command::AcceptCertificate => write!(f, "AcceptCertificate"),
             Command::RejectCertificate => write!(f, "RejectCertificate"),
             Command::JoinRoom { room_id } => f.debug_struct("JoinRoom").field("room_id", room_id).finish(),
-            Command::CreateRoom { name, parent_id } => f.debug_struct("CreateRoom").field("name", name).field("parent_id", parent_id).finish(),
+            Command::CreateRoom { name, parent_id } => f
+                .debug_struct("CreateRoom")
+                .field("name", name)
+                .field("parent_id", parent_id)
+                .finish(),
             Command::DeleteRoom { room_id } => f.debug_struct("DeleteRoom").field("room_id", room_id).finish(),
-            Command::RenameRoom { room_id, new_name } => f.debug_struct("RenameRoom").field("room_id", room_id).field("new_name", new_name).finish(),
-            Command::MoveRoom { room_id, new_parent_id } => f.debug_struct("MoveRoom").field("room_id", room_id).field("new_parent_id", new_parent_id).finish(),
+            Command::RenameRoom { room_id, new_name } => f
+                .debug_struct("RenameRoom")
+                .field("room_id", room_id)
+                .field("new_name", new_name)
+                .finish(),
+            Command::MoveRoom { room_id, new_parent_id } => f
+                .debug_struct("MoveRoom")
+                .field("room_id", room_id)
+                .field("new_parent_id", new_parent_id)
+                .finish(),
             Command::SendChat { text } => f.debug_struct("SendChat").field("text", text).finish(),
             Command::LocalMessage { text } => f.debug_struct("LocalMessage").field("text", text).finish(),
-            Command::SetInputDevice { device_id } => f.debug_struct("SetInputDevice").field("device_id", device_id).finish(),
-            Command::SetOutputDevice { device_id } => f.debug_struct("SetOutputDevice").field("device_id", device_id).finish(),
+            Command::SetInputDevice { device_id } => {
+                f.debug_struct("SetInputDevice").field("device_id", device_id).finish()
+            }
+            Command::SetOutputDevice { device_id } => {
+                f.debug_struct("SetOutputDevice").field("device_id", device_id).finish()
+            }
             Command::RefreshAudioDevices => write!(f, "RefreshAudioDevices"),
             Command::SetVoiceMode { mode } => f.debug_struct("SetVoiceMode").field("mode", mode).finish(),
             Command::SetMuted { muted } => f.debug_struct("SetMuted").field("muted", muted).finish(),
@@ -969,22 +1055,47 @@ impl std::fmt::Debug for Command {
             Command::UnmuteUser { user_id } => f.debug_struct("UnmuteUser").field("user_id", user_id).finish(),
             Command::StartTransmit => write!(f, "StartTransmit"),
             Command::StopTransmit => write!(f, "StopTransmit"),
-            Command::UpdateAudioSettings { settings } => f.debug_struct("UpdateAudioSettings").field("settings", settings).finish(),
+            Command::UpdateAudioSettings { settings } => f
+                .debug_struct("UpdateAudioSettings")
+                .field("settings", settings)
+                .finish(),
             Command::ResetAudioStats => write!(f, "ResetAudioStats"),
             Command::UpdateTxPipeline { .. } => write!(f, "UpdateTxPipeline {{ .. }}"),
-            Command::UpdateRxPipelineDefaults { .. } => write!(f, "UpdateRxPipelineDefaults {{ .. }}"),
-            Command::UpdateUserRxConfig { user_id, .. } => f.debug_struct("UpdateUserRxConfig").field("user_id", user_id).finish(),
-            Command::ClearUserRxOverride { user_id } => f.debug_struct("ClearUserRxOverride").field("user_id", user_id).finish(),
-            Command::SetUserVolume { user_id, volume_db } => f.debug_struct("SetUserVolume").field("user_id", user_id).field("volume_db", volume_db).finish(),
+            Command::UpdateRxPipelineDefaults { .. } => {
+                write!(f, "UpdateRxPipelineDefaults {{ .. }}")
+            }
+            Command::UpdateUserRxConfig { user_id, .. } => {
+                f.debug_struct("UpdateUserRxConfig").field("user_id", user_id).finish()
+            }
+            Command::ClearUserRxOverride { user_id } => {
+                f.debug_struct("ClearUserRxOverride").field("user_id", user_id).finish()
+            }
+            Command::SetUserVolume { user_id, volume_db } => f
+                .debug_struct("SetUserVolume")
+                .field("user_id", user_id)
+                .field("volume_db", volume_db)
+                .finish(),
             Command::RegisterUser { user_id } => f.debug_struct("RegisterUser").field("user_id", user_id).finish(),
             Command::UnregisterUser { user_id } => f.debug_struct("UnregisterUser").field("user_id", user_id).finish(),
             Command::ShareFile { path } => f.debug_struct("ShareFile").field("path", path).finish(),
             Command::DownloadFile { magnet } => f.debug_struct("DownloadFile").field("magnet", magnet).finish(),
             Command::PauseTransfer { infohash } => f.debug_struct("PauseTransfer").field("infohash", infohash).finish(),
-            Command::ResumeTransfer { infohash } => f.debug_struct("ResumeTransfer").field("infohash", infohash).finish(),
-            Command::CancelTransfer { infohash } => f.debug_struct("CancelTransfer").field("infohash", infohash).finish(),
-            Command::RemoveTransfer { infohash, delete_file } => f.debug_struct("RemoveTransfer").field("infohash", infohash).field("delete_file", delete_file).finish(),
-            Command::SaveFileAs { infohash, destination } => f.debug_struct("SaveFileAs").field("infohash", infohash).field("destination", destination).finish(),
+            Command::ResumeTransfer { infohash } => {
+                f.debug_struct("ResumeTransfer").field("infohash", infohash).finish()
+            }
+            Command::CancelTransfer { infohash } => {
+                f.debug_struct("CancelTransfer").field("infohash", infohash).finish()
+            }
+            Command::RemoveTransfer { infohash, delete_file } => f
+                .debug_struct("RemoveTransfer")
+                .field("infohash", infohash)
+                .field("delete_file", delete_file)
+                .finish(),
+            Command::SaveFileAs { infohash, destination } => f
+                .debug_struct("SaveFileAs")
+                .field("infohash", infohash)
+                .field("destination", destination)
+                .finish(),
             Command::OpenFile { infohash } => f.debug_struct("OpenFile").field("infohash", infohash).finish(),
         }
     }

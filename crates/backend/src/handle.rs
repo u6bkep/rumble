@@ -39,24 +39,23 @@
 //! ```
 
 use crate::{
+    ConnectConfig,
     audio::AudioSystem,
     audio_dump::AudioDumper,
-    audio_task::{spawn_audio_task, AudioCommand, AudioTaskConfig, AudioTaskHandle},
+    audio_task::{AudioCommand, AudioTaskConfig, AudioTaskHandle, spawn_audio_task},
     cert_verifier::{
-        is_cert_verification_error, new_captured_cert, take_captured_cert, 
-        CapturedCert, InteractiveCertVerifier,
+        CapturedCert, InteractiveCertVerifier, is_cert_verification_error, new_captured_cert, take_captured_cert,
     },
     events::{AudioState, Command, ConnectionState, PendingCertificate, SigningCallback, State, VoiceMode},
-    ConnectConfig,
 };
 use api::{
-    build_auth_payload, compute_cert_hash, encode_frame,
+    ROOT_ROOM_UUID, build_auth_payload, compute_cert_hash, encode_frame,
     proto::{self, envelope::Payload},
-    room_id_from_uuid, try_decode_frame, ROOT_ROOM_UUID,
+    room_id_from_uuid, try_decode_frame,
 };
 use bytes::BytesMut;
 use prost::Message;
-use quinn::{crypto::rustls::QuicClientConfig, Endpoint};
+use quinn::{Endpoint, crypto::rustls::QuicClientConfig};
 use std::{
     collections::HashSet,
     net::ToSocketAddrs,
@@ -106,7 +105,7 @@ impl BackendHandle {
     }
 
     /// Create a new backend handle with audio dumping enabled.
-    /// 
+    ///
     /// Audio dumping writes raw audio data to files for debugging:
     /// - `mic_raw.pcm` - Raw microphone input (f32 samples)
     /// - `tx_opus.bin` - Encoded opus packets being sent
@@ -120,15 +119,18 @@ impl BackendHandle {
     }
 
     /// Internal constructor with optional audio dumper.
-    fn with_config_and_dumper<F>(repaint_callback: F, connect_config: ConnectConfig, audio_dumper: Option<AudioDumper>) -> Self
+    fn with_config_and_dumper<F>(
+        repaint_callback: F,
+        connect_config: ConnectConfig,
+        audio_dumper: Option<AudioDumper>,
+    ) -> Self
     where
         F: Fn() + Send + Sync + 'static,
     {
         // Check for audio dump env var if no explicit dumper provided
-        let audio_dumper = audio_dumper.or_else(|| {
-            crate::audio_dump::AudioDumpConfig::from_env().map(AudioDumper::new)
-        });
-        
+        let audio_dumper =
+            audio_dumper.or_else(|| crate::audio_dump::AudioDumpConfig::from_env().map(AudioDumper::new));
+
         let repaint_callback = Arc::new(repaint_callback);
         let (command_tx, command_rx) = mpsc::unbounded_channel();
 
@@ -278,15 +280,13 @@ impl BackendHandle {
                 return;
             }
             Command::UpdateTxPipeline { config } => {
-                self.audio_task.send(AudioCommand::UpdateTxPipeline {
-                    config: config.clone(),
-                });
+                self.audio_task
+                    .send(AudioCommand::UpdateTxPipeline { config: config.clone() });
                 return;
             }
             Command::UpdateRxPipelineDefaults { config } => {
-                self.audio_task.send(AudioCommand::UpdateRxPipelineDefaults {
-                    config: config.clone(),
-                });
+                self.audio_task
+                    .send(AudioCommand::UpdateRxPipelineDefaults { config: config.clone() });
                 return;
             }
             Command::UpdateUserRxConfig { user_id, config } => {
@@ -297,9 +297,8 @@ impl BackendHandle {
                 return;
             }
             Command::ClearUserRxOverride { user_id } => {
-                self.audio_task.send(AudioCommand::ClearUserRxOverride {
-                    user_id: *user_id,
-                });
+                self.audio_task
+                    .send(AudioCommand::ClearUserRxOverride { user_id: *user_id });
                 return;
             }
             Command::SetUserVolume { user_id, volume_db } => {
@@ -450,7 +449,7 @@ async fn run_connection_task(
                 match cmd {
                     Command::Connect { addr, name, public_key, signer, password } => {
                         client_name = name.clone();
-                        
+
                         // Update state to Connecting
                         {
                             let mut s = state.write().unwrap();
@@ -483,16 +482,16 @@ async fn run_connection_task(
                                     s.rebuild_room_tree();
                                 }
                                 repaint();
-                                
+
                                 // Notify audio task of new connection
                                 audio_task.send(AudioCommand::ConnectionEstablished {
                                     connection: conn.clone(),
                                     my_user_id: user_id,
                                 });
-                                
+
                                 connection = Some(conn.clone());
                                 send_stream = Some(send);
-                                
+
                                 // Initialize TorrentManager
                                 let temp_dir = config.download_dir.clone()
                                     .unwrap_or_else(|| std::env::temp_dir().join("rumble_downloads"));
@@ -539,8 +538,8 @@ async fn run_connection_task(
                                     error!("Certificate verification error but no cert captured: {}", e);
                                     {
                                         let mut s = state.write().unwrap();
-                                        s.connection = ConnectionState::ConnectionLost { 
-                                            error: format!("Certificate error: {}", e) 
+                                        s.connection = ConnectionState::ConnectionLost {
+                                            error: format!("Certificate error: {}", e)
                                         };
                                     }
                                     repaint();
@@ -555,7 +554,7 @@ async fn run_connection_task(
                             }
                         }
                     }
-                    
+
                     Command::AcceptCertificate => {
                         // Get the pending certificate info from state
                         let pending_info = {
@@ -566,24 +565,24 @@ async fn run_connection_task(
                                 None
                             }
                         };
-                        
+
                         if let Some(pending) = pending_info {
                             info!("User accepted certificate for {}", pending.server_name);
-                            
+
                             // Update state to Connecting
                             {
                                 let mut s = state.write().unwrap();
                                 s.connection = ConnectionState::Connecting { server_addr: pending.server_addr.clone() };
                             }
                             repaint();
-                            
+
                             // Create a new config with the certificate added
                             let mut new_config = config.clone();
                             new_config.accepted_certs.push(pending.certificate_der.clone());
-                            
+
                             // Create a new captured cert holder (shouldn't capture again since cert is now trusted)
                             let captured_cert = new_captured_cert();
-                            
+
                             // Retry connection with the certificate trusted
                             match connect_to_server(
                                 &pending.server_addr,
@@ -613,17 +612,17 @@ async fn run_connection_task(
                                         s.rebuild_room_tree();
                                     }
                                     repaint();
-                                    
+
                                     // Notify audio task
                                     audio_task.send(AudioCommand::ConnectionEstablished {
                                         connection: conn.clone(),
                                         my_user_id: user_id,
                                     });
-                                    
+
                                     connection = Some(conn.clone());
                                     send_stream = Some(send);
                                     client_name = pending.username;
-                                    
+
                                     // Initialize TorrentManager
                                     let temp_dir = new_config.download_dir.clone()
                                         .unwrap_or_else(|| std::env::temp_dir().join("rumble_downloads"));
@@ -658,7 +657,7 @@ async fn run_connection_task(
                             warn!("AcceptCertificate received but no certificate pending");
                         }
                     }
-                    
+
                     Command::RejectCertificate => {
                         // Simply go back to disconnected state
                         {
@@ -673,11 +672,11 @@ async fn run_connection_task(
                         }
                         repaint();
                     }
-                    
+
                     Command::Disconnect => {
                         // Notify audio task before closing
                         audio_task.send(AudioCommand::ConnectionClosed);
-                        
+
                         if let Some(conn) = connection.take() {
                             conn.close(quinn::VarInt::from_u32(0), b"disconnect");
                         }
@@ -694,7 +693,7 @@ async fn run_connection_task(
                         }
                         repaint();
                     }
-                    
+
                     Command::JoinRoom { room_id } => {
                         if let Some(send) = &mut send_stream {
                             let env = proto::Envelope {
@@ -709,12 +708,12 @@ async fn run_connection_task(
                             }
                         }
                     }
-                    
+
                     Command::CreateRoom { name, parent_id } => {
                         if let Some(send) = &mut send_stream {
                             let env = proto::Envelope {
                                 state_hash: Vec::new(),
-                                payload: Some(Payload::CreateRoom(proto::CreateRoom { 
+                                payload: Some(Payload::CreateRoom(proto::CreateRoom {
                                     name,
                                     parent_id: parent_id.map(room_id_from_uuid),
                                 })),
@@ -725,7 +724,7 @@ async fn run_connection_task(
                             }
                         }
                     }
-                    
+
                     Command::DeleteRoom { room_id } => {
                         if let Some(send) = &mut send_stream {
                             let env = proto::Envelope {
@@ -740,7 +739,7 @@ async fn run_connection_task(
                             }
                         }
                     }
-                    
+
                     Command::RenameRoom { room_id, new_name } => {
                         if let Some(send) = &mut send_stream {
                             let env = proto::Envelope {
@@ -756,7 +755,7 @@ async fn run_connection_task(
                             }
                         }
                     }
-                    
+
                     Command::MoveRoom { room_id, new_parent_id } => {
                         if let Some(send) = &mut send_stream {
                             let env = proto::Envelope {
@@ -772,7 +771,7 @@ async fn run_connection_task(
                             }
                         }
                     }
-                    
+
                     Command::SendChat { text } => {
                         if let Some(send) = &mut send_stream {
                             let message_id = uuid::Uuid::new_v4().into_bytes().to_vec();
@@ -795,7 +794,7 @@ async fn run_connection_task(
                             }
                         }
                     }
-                    
+
                     Command::LocalMessage { text } => {
                         let mut s = state.write().unwrap();
                         s.chat_messages.push(crate::events::ChatMessage {
@@ -812,7 +811,7 @@ async fn run_connection_task(
                         drop(s);
                         repaint();
                     }
-                    
+
                     // Audio commands are routed to audio task in BackendHandle::send()
                     Command::SetMuted { muted } => {
                         // Send status update to server
@@ -833,7 +832,7 @@ async fn run_connection_task(
                             }
                         }
                     }
-                    
+
                     Command::SetDeafened { deafened } => {
                         // Send status update to server
                         // Note: deafen implies mute
@@ -854,11 +853,11 @@ async fn run_connection_task(
                             }
                         }
                     }
-                    
+
                     // Other audio commands are routed to audio task in BackendHandle::send()
-                    Command::StartTransmit 
+                    Command::StartTransmit
                     | Command::StopTransmit
-                    | Command::SetInputDevice { .. } 
+                    | Command::SetInputDevice { .. }
                     | Command::SetOutputDevice { .. }
                     | Command::SetVoiceMode { .. }
                     | Command::MuteUser { .. }
@@ -873,7 +872,7 @@ async fn run_connection_task(
                     | Command::SetUserVolume { .. } => {
                         debug!("Audio command received in connection task - should be routed to audio task");
                     }
-                    
+
                     Command::RegisterUser { user_id } => {
                         if let Some(send) = &mut send_stream {
                             let env = proto::Envelope {
@@ -888,7 +887,7 @@ async fn run_connection_task(
                             }
                         }
                     }
-                    
+
                     Command::UnregisterUser { user_id } => {
                         if let Some(send) = &mut send_stream {
                             let env = proto::Envelope {
@@ -1115,15 +1114,15 @@ async fn connect_to_server(
     quinn::SendStream,
     quinn::RecvStream,
     BytesMut, // remaining buffer after handshake
-    u64, // user_id
+    u64,      // user_id
     Vec<proto::RoomInfo>,
     Vec<proto::User>,
 )> {
     use std::net::SocketAddr;
     use url::Url;
-    
+
     const DEFAULT_PORT: u16 = 5000;
-    
+
     info!(server_addr = %addr, client_name, "Connecting to server");
 
     // Parse address using URL crate with rumble:// scheme
@@ -1133,14 +1132,14 @@ async fn connect_to_server(
     } else {
         format!("rumble://{}", addr)
     };
-    
-    let url = Url::parse(&addr_as_url)
-        .map_err(|e| anyhow::anyhow!("Invalid server address: {}", e))?;
-    
-    let host = url.host_str()
+
+    let url = Url::parse(&addr_as_url).map_err(|e| anyhow::anyhow!("Invalid server address: {}", e))?;
+
+    let host = url
+        .host_str()
         .ok_or_else(|| anyhow::anyhow!("No host in server address"))?;
     let port = url.port().unwrap_or(DEFAULT_PORT);
-    
+
     let socket_addr: SocketAddr = format!("{}:{}", host, port)
         .to_socket_addrs()
         .map_err(|e| anyhow::anyhow!("Failed to resolve address: {}", e))?
@@ -1172,28 +1171,18 @@ async fn connect_to_server(
     let mut buf = BytesMut::new();
     let (nonce, user_id) = wait_for_server_hello(&mut recv, &mut buf).await?;
     info!(user_id, "Received ServerHello with nonce");
-    
+
     // Step 3: Compute server certificate hash
     let server_cert_hash = compute_server_cert_hash(&conn);
-    
+
     // Step 4: Compute signature payload
-    let timestamp_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64;
-    
-    let payload = build_auth_payload(
-        &nonce,
-        timestamp_ms,
-        public_key,
-        user_id,
-        &server_cert_hash,
-    );
-    
+    let timestamp_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
+
+    let payload = build_auth_payload(&nonce, timestamp_ms, public_key, user_id, &server_cert_hash);
+
     // Step 5: Sign the payload
-    let signature = signer(&payload)
-        .map_err(|e| anyhow::anyhow!("Signing failed: {}", e))?;
-    
+    let signature = signer(&payload).map_err(|e| anyhow::anyhow!("Signing failed: {}", e))?;
+
     // Step 6: Send Authenticate
     let auth = proto::Envelope {
         state_hash: Vec::new(),
@@ -1205,7 +1194,7 @@ async fn connect_to_server(
     let frame = encode_frame(&auth);
     send.write_all(&frame).await?;
     debug!("Sent Authenticate");
-    
+
     // Step 7: Wait for ServerState or AuthFailed
     let (rooms, users) = wait_for_auth_result(&mut recv, &mut buf).await?;
 
@@ -1213,10 +1202,7 @@ async fn connect_to_server(
 }
 
 /// Wait for ServerHello message and extract nonce and user_id.
-async fn wait_for_server_hello(
-    recv: &mut quinn::RecvStream,
-    buf: &mut BytesMut,
-) -> anyhow::Result<([u8; 32], u64)> {
+async fn wait_for_server_hello(recv: &mut quinn::RecvStream, buf: &mut BytesMut) -> anyhow::Result<([u8; 32], u64)> {
     loop {
         let mut chunk = [0u8; 4096];
         match recv.read(&mut chunk).await? {
@@ -1333,21 +1319,21 @@ async fn run_receiver_task(
             }
         }
     }
-    
+
     // Connection closed or error - wait for the actual connection close
     let error = conn.closed().await;
-    
+
     warn!("Connection closed: {}", error);
-    
+
     // Notify audio task
     audio_task.send(AudioCommand::ConnectionClosed);
-    
+
     // Update state only if not already disconnected (explicit disconnect sets Disconnected)
     {
         let mut s = state.write().unwrap();
         if !matches!(s.connection, ConnectionState::Disconnected) {
-            s.connection = ConnectionState::ConnectionLost { 
-                error: error.to_string() 
+            s.connection = ConnectionState::ConnectionLost {
+                error: error.to_string(),
             };
             s.my_user_id = None;
             s.my_room_id = None;
@@ -1404,11 +1390,13 @@ fn handle_server_message(
                         s.rooms = ss.rooms;
                         s.users = ss.users.clone();
                         s.rebuild_room_tree();
-                        
+
                         // Notify audio task about users in our room (for proactive decoder creation)
                         if let Some(my_room_id) = &s.my_room_id {
                             let my_user_id = s.my_user_id;
-                            let user_ids_in_room: Vec<u64> = ss.users.iter()
+                            let user_ids_in_room: Vec<u64> = ss
+                                .users
+                                .iter()
                                 .filter_map(|u| {
                                     let user_id = u.user_id.as_ref().map(|id| id.value)?;
                                     let user_room = u.current_room.as_ref().and_then(api::uuid_from_room_id)?;
@@ -1483,17 +1471,18 @@ fn apply_state_update(
             }
             proto::state_update::Update::RoomDeleted(rd) => {
                 if let Some(rid) = rd.room_id.and_then(|r| api::uuid_from_room_id(&r)) {
-                    s.rooms.retain(|r| {
-                        r.id.as_ref().and_then(api::uuid_from_room_id) != Some(rid)
-                    });
+                    s.rooms
+                        .retain(|r| r.id.as_ref().and_then(api::uuid_from_room_id) != Some(rid));
                     s.rebuild_room_tree();
                 }
             }
             proto::state_update::Update::RoomRenamed(rr) => {
                 if let Some(rid) = rr.room_id.and_then(|r| api::uuid_from_room_id(&r)) {
-                    if let Some(room) = s.rooms.iter_mut().find(|r| {
-                        r.id.as_ref().and_then(api::uuid_from_room_id) == Some(rid)
-                    }) {
+                    if let Some(room) = s
+                        .rooms
+                        .iter_mut()
+                        .find(|r| r.id.as_ref().and_then(api::uuid_from_room_id) == Some(rid))
+                    {
                         room.name = rr.new_name;
                     }
                     s.rebuild_room_tree();
@@ -1501,9 +1490,11 @@ fn apply_state_update(
             }
             proto::state_update::Update::RoomMoved(rm) => {
                 if let Some(rid) = rm.room_id.and_then(|r| api::uuid_from_room_id(&r)) {
-                    if let Some(room) = s.rooms.iter_mut().find(|r| {
-                        r.id.as_ref().and_then(api::uuid_from_room_id) == Some(rid)
-                    }) {
+                    if let Some(room) = s
+                        .rooms
+                        .iter_mut()
+                        .find(|r| r.id.as_ref().and_then(api::uuid_from_room_id) == Some(rid))
+                    {
                         room.parent_id = rm.new_parent_id;
                     }
                     s.rebuild_room_tree();
@@ -1514,19 +1505,18 @@ fn apply_state_update(
                     // Only add if user doesn't already exist (avoid duplicates from
                     // receiving our own UserJoined broadcast after initial ServerState)
                     let user_id_value = user.user_id.as_ref().map(|id| id.value);
-                    let already_exists = s.users.iter().any(|u| {
-                        u.user_id.as_ref().map(|id| id.value) == user_id_value
-                    });
+                    let already_exists = s
+                        .users
+                        .iter()
+                        .any(|u| u.user_id.as_ref().map(|id| id.value) == user_id_value);
                     if !already_exists {
                         // Check if this user is joining our room - if so, notify audio task
                         let my_room_id = s.my_room_id;
                         let user_room = user.current_room.as_ref().and_then(api::uuid_from_room_id);
-                        let notify_audio = user_id_value.is_some() 
-                            && my_room_id.is_some() 
-                            && user_room == my_room_id;
-                        
+                        let notify_audio = user_id_value.is_some() && my_room_id.is_some() && user_room == my_room_id;
+
                         s.users.push(user);
-                        
+
                         if notify_audio {
                             if let Some(uid) = user_id_value {
                                 drop(s);
@@ -1542,16 +1532,16 @@ fn apply_state_update(
                 if let Some(uid) = ul.user_id {
                     // Check if the leaving user was in our room
                     let my_room_id = s.my_room_id;
-                    let was_in_our_room = s.users.iter().find(|u| {
-                        u.user_id.as_ref().map(|id| id.value) == Some(uid.value)
-                    }).map(|u| {
-                        u.current_room.as_ref().and_then(api::uuid_from_room_id) == my_room_id
-                    }).unwrap_or(false);
-                    
-                    s.users.retain(|u| {
-                        u.user_id.as_ref().map(|id| id.value) != Some(uid.value)
-                    });
-                    
+                    let was_in_our_room = s
+                        .users
+                        .iter()
+                        .find(|u| u.user_id.as_ref().map(|id| id.value) == Some(uid.value))
+                        .map(|u| u.current_room.as_ref().and_then(api::uuid_from_room_id) == my_room_id)
+                        .unwrap_or(false);
+
+                    s.users
+                        .retain(|u| u.user_id.as_ref().map(|id| id.value) != Some(uid.value));
+
                     // Notify audio task if user was in our room
                     if was_in_our_room && my_room_id.is_some() {
                         drop(s);
@@ -1567,26 +1557,32 @@ fn apply_state_update(
                     let to_room_id = api::uuid_from_room_id(&to_room_clone);
                     let my_room_id = s.my_room_id;
                     let my_user_id = s.my_user_id;
-                    
+
                     // Look up where the user was before (from_room is implicit in User.current_room)
-                    let from_room_id = s.users.iter()
+                    let from_room_id = s
+                        .users
+                        .iter()
                         .find(|u| u.user_id.as_ref().map(|id| id.value) == Some(uid.value))
                         .and_then(|u| u.current_room.as_ref().and_then(api::uuid_from_room_id));
-                    
+
                     // Now update the user's current room
-                    if let Some(user) = s.users.iter_mut().find(|u| {
-                        u.user_id.as_ref().map(|id| id.value) == Some(uid.value)
-                    }) {
+                    if let Some(user) = s
+                        .users
+                        .iter_mut()
+                        .find(|u| u.user_id.as_ref().map(|id| id.value) == Some(uid.value))
+                    {
                         user.current_room = Some(to_room);
                     }
-                    
+
                     // Check if this is us moving
                     if my_user_id == Some(uid.value) {
                         s.my_room_id = to_room_id;
-                        
+
                         // We changed rooms - rebuild decoder list
                         if let Some(new_room_id) = to_room_id {
-                            let user_ids_in_room: Vec<u64> = s.users.iter()
+                            let user_ids_in_room: Vec<u64> = s
+                                .users
+                                .iter()
                                 .filter_map(|u| {
                                     let user_id = u.user_id.as_ref().map(|id| id.value)?;
                                     let user_room = u.current_room.as_ref().and_then(api::uuid_from_room_id)?;
@@ -1606,7 +1602,7 @@ fn apply_state_update(
                         // Another user moved - check if they joined/left our room
                         let joined_our_room = my_room_id.is_some() && to_room_id == my_room_id;
                         let left_our_room = my_room_id.is_some() && from_room_id == my_room_id;
-                        
+
                         if joined_our_room {
                             drop(s);
                             audio_task.send(AudioCommand::UserJoinedRoom { user_id: uid.value });
@@ -1623,9 +1619,11 @@ fn apply_state_update(
             }
             proto::state_update::Update::UserStatusChanged(usc) => {
                 if let Some(uid) = usc.user_id {
-                    if let Some(user) = s.users.iter_mut().find(|u| {
-                        u.user_id.as_ref().map(|id| id.value) == Some(uid.value)
-                    }) {
+                    if let Some(user) = s
+                        .users
+                        .iter_mut()
+                        .find(|u| u.user_id.as_ref().map(|id| id.value) == Some(uid.value))
+                    {
                         user.is_muted = usc.is_muted;
                         user.is_deafened = usc.is_deafened;
                     }
@@ -1646,7 +1644,7 @@ fn apply_state_update(
 /// 4. For other self-signed certs, stores the cert in `captured_cert` and returns an error
 ///    that allows the UI to prompt the user for acceptance
 fn make_client_endpoint(
-    remote_addr: std::net::SocketAddr, 
+    remote_addr: std::net::SocketAddr,
     config: &ConnectConfig,
     captured_cert: CapturedCert,
 ) -> anyhow::Result<Endpoint> {
@@ -1670,10 +1668,8 @@ fn make_client_endpoint(
                 if cert_bytes.starts_with(b"-----BEGIN") {
                     // Parse as PEM - may contain multiple certificates
                     let mut reader = std::io::BufReader::new(cert_bytes.as_slice());
-                    let certs: Vec<rustls::pki_types::CertificateDer<'static>> = 
-                        rustls_pemfile::certs(&mut reader)
-                            .filter_map(|r| r.ok())
-                            .collect();
+                    let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+                        rustls_pemfile::certs(&mut reader).filter_map(|r| r.ok()).collect();
                     for cert in certs {
                         let _ = root_store.add(cert);
                     }
@@ -1690,7 +1686,7 @@ fn make_client_endpoint(
             }
         }
     }
-    
+
     // Add user-accepted certificates (from interactive prompts)
     for cert_der in &config.accepted_certs {
         let cert = rustls::pki_types::CertificateDer::from(cert_der.clone());
@@ -1703,9 +1699,13 @@ fn make_client_endpoint(
 
     // Create the crypto provider
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-    
+
     // Create the custom interactive verifier with the shared captured cert storage
-    let verifier = Arc::new(InteractiveCertVerifier::new(root_store, provider.clone(), captured_cert));
+    let verifier = Arc::new(InteractiveCertVerifier::new(
+        root_store,
+        provider.clone(),
+        captured_cert,
+    ));
 
     // Build client config with the custom verifier using dangerous() API
     let mut client_cfg = rustls::ClientConfig::builder_with_provider(provider)
@@ -1713,7 +1713,7 @@ fn make_client_endpoint(
         .dangerous()
         .with_custom_certificate_verifier(verifier)
         .with_no_client_auth();
-    
+
     client_cfg.alpn_protocols = vec![b"rumble".to_vec()];
     let rustls_config = Arc::new(client_cfg);
     let crypto = QuicClientConfig::try_from(rustls_config)?;

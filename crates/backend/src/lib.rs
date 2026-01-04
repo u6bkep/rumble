@@ -58,15 +58,14 @@ pub use audio::{
 // Opus codec for voice encoding/decoding
 pub mod codec;
 pub use codec::{
-    CodecError, DecoderStats, EncoderSettings, EncoderStats, OPUS_FRAME_SIZE, OPUS_MAX_PACKET_SIZE,
-    OPUS_SAMPLE_RATE, VoiceDecoder, VoiceEncoder, opus_version,
+    CodecError, DecoderStats, EncoderSettings, EncoderStats, OPUS_FRAME_SIZE, OPUS_MAX_PACKET_SIZE, OPUS_SAMPLE_RATE,
+    VoiceDecoder, VoiceEncoder, opus_version,
 };
 
 // Bounded voice channel for handling slow connections
 pub mod bounded_voice;
 pub use bounded_voice::{
-    BoundedVoiceReceiver, BoundedVoiceSender, VoiceChannelConfig, VoiceChannelStats,
-    bounded_voice_channel,
+    BoundedVoiceReceiver, BoundedVoiceSender, VoiceChannelConfig, VoiceChannelStats, bounded_voice_channel,
 };
 
 // Audio task (handles datagrams, cpal streams, Opus, jitter buffers)
@@ -80,8 +79,7 @@ pub use audio_dump::{AudioDumpConfig, AudioDumper};
 // Certificate verification for self-signed cert handling
 pub mod cert_verifier;
 pub use cert_verifier::{
-    CapturedCert, InteractiveCertVerifier, ServerCertInfo, 
-    compute_sha256_fingerprint, is_cert_verification_error, 
+    CapturedCert, InteractiveCertVerifier, ServerCertInfo, compute_sha256_fingerprint, is_cert_verification_error,
     new_captured_cert, peek_captured_cert, take_captured_cert,
 };
 
@@ -100,24 +98,18 @@ pub mod torrent;
 // Audio processing pipeline - processors
 pub mod processors;
 pub use processors::{
-    register_builtin_processors,
-    build_default_tx_pipeline,
-    merge_with_default_tx_pipeline,
-    GainProcessor, GainProcessorFactory,
-    DenoiseProcessor, DenoiseProcessorFactory,
-    VadProcessor, VadProcessorFactory,
+    DenoiseProcessor, DenoiseProcessorFactory, GainProcessor, GainProcessorFactory, VadProcessor, VadProcessorFactory,
+    build_default_tx_pipeline, merge_with_default_tx_pipeline, register_builtin_processors,
 };
 
 // Re-export pipeline crate types
 pub use pipeline::{
-    AudioPipeline, AudioProcessor, ProcessorConfig, ProcessorFactory,
-    ProcessorRegistry, ProcessorResult, PipelineConfig, UserRxConfig,
-    calculate_rms_db, calculate_peak_db, db_to_linear, linear_to_db,
+    AudioPipeline, AudioProcessor, PipelineConfig, ProcessorConfig, ProcessorFactory, ProcessorRegistry,
+    ProcessorResult, UserRxConfig, calculate_peak_db, calculate_rms_db, db_to_linear, linear_to_db,
 };
 
 // Re-exports from api crate
-pub use api::proto::VoiceDatagram;
-pub use api::ROOT_ROOM_UUID;
+pub use api::{ROOT_ROOM_UUID, proto::VoiceDatagram};
 
 /// Configuration for the backend client.
 #[derive(Clone, Debug, Default)]
@@ -126,7 +118,7 @@ pub struct ConnectConfig {
     /// These are added to the system root certificates (webpki_roots).
     /// Use this to add self-signed or development certificates from files.
     pub additional_certs: Vec<PathBuf>,
-    
+
     /// Certificates that have been accepted by the user during this session.
     /// These are DER-encoded certificate bytes that will be added to the trust store.
     /// This is typically populated when the user accepts a self-signed certificate prompt.

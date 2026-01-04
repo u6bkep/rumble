@@ -1,14 +1,17 @@
-use backend::{AudioSettings, BackendHandle, Command, ConnectionState, ConnectConfig, FileMessage, PipelineConfig, ProcessorRegistry, TransferState, VoiceMode, register_builtin_processors, build_default_tx_pipeline, merge_with_default_tx_pipeline};
+use backend::{
+    AudioSettings, BackendHandle, Command, ConnectConfig, ConnectionState, FileMessage, PipelineConfig,
+    ProcessorRegistry, TransferState, VoiceMode, build_default_tx_pipeline, merge_with_default_tx_pipeline,
+    register_builtin_processors,
+};
 use clap::Parser;
 use directories::ProjectDirs;
-use eframe::egui;
 use ed25519_dalek::SigningKey;
+use eframe::egui;
 use egui::Modal;
-use egui_ltreeview::{Action, TreeView, NodeBuilder};
+use egui_ltreeview::{Action, NodeBuilder, TreeView};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
-use std::fs;
-use std::path::PathBuf;
+use std::{fs, path::PathBuf};
 use uuid::Uuid;
 
 /// Node ID for the tree view - can be either a room or a user.
@@ -19,7 +22,10 @@ enum TreeNodeId {
 }
 
 mod key_manager;
-use key_manager::{FirstRunState, KeyManager, KeySource, KeyInfo, PendingAgentOp, SshAgentClient, connect_and_list_keys, generate_and_add_to_agent};
+use key_manager::{
+    FirstRunState, KeyInfo, KeyManager, KeySource, PendingAgentOp, SshAgentClient, connect_and_list_keys,
+    generate_and_add_to_agent,
+};
 
 /// Rumble - A voice chat client
 #[derive(Parser, Debug, Clone)]
@@ -76,7 +82,7 @@ impl TimestampFormat {
             TimestampFormat::Relative,
         ]
     }
-    
+
     fn label(&self) -> &'static str {
         match self {
             TimestampFormat::Time24h => "24-hour (14:30:05)",
@@ -86,22 +92,22 @@ impl TimestampFormat {
             TimestampFormat::Relative => "Relative (5m ago)",
         }
     }
-    
+
     /// Format a SystemTime according to this format.
     fn format(&self, time: std::time::SystemTime) -> String {
         use std::time::{Duration, UNIX_EPOCH};
-        
+
         // Get duration since UNIX epoch
         let duration = time.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO);
         let secs = duration.as_secs();
-        
+
         // Calculate date/time components (simplified, no timezone handling)
         let days_since_epoch = secs / 86400;
         let time_of_day = secs % 86400;
         let hours = (time_of_day / 3600) as u32;
         let minutes = ((time_of_day % 3600) / 60) as u32;
         let seconds = (time_of_day % 60) as u32;
-        
+
         match self {
             TimestampFormat::Time24h => {
                 format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
@@ -141,7 +147,7 @@ impl TimestampFormat {
                 let now = std::time::SystemTime::now();
                 let elapsed = now.duration_since(time).unwrap_or(Duration::ZERO);
                 let secs = elapsed.as_secs();
-                
+
                 if secs < 60 {
                     "just now".to_string()
                 } else if secs < 3600 {
@@ -225,27 +231,27 @@ pub struct PersistentSettings {
     pub trust_dev_cert: bool,
     pub custom_cert_path: Option<String>,
     pub client_name: String,
-    
+
     // Accepted server certificates (stored as hex-encoded fingerprints and DER bytes)
     /// List of accepted certificates: (fingerprint_hex, der_bytes_base64)
     pub accepted_certificates: Vec<AcceptedCertificate>,
-    
+
     // Identity (Ed25519 private key as hex string, 64 hex chars = 32 bytes)
     pub identity_private_key_hex: Option<String>,
-    
+
     // Autoconnect
     pub autoconnect_on_launch: bool,
-    
+
     // Audio settings
     pub audio: PersistentAudioSettings,
-    
+
     // Voice mode
     pub voice_mode: PersistentVoiceMode,
-    
+
     // Selected devices (by ID)
     pub input_device_id: Option<String>,
     pub output_device_id: Option<String>,
-    
+
     // Chat settings
     pub show_chat_timestamps: bool,
     pub chat_timestamp_format: TimestampFormat,
@@ -341,7 +347,7 @@ impl Default for PersistentSettings {
 }
 
 /// Serializable audio settings (mirrors backend::AudioSettings encoder settings).
-/// 
+///
 /// Audio processing settings (denoise, VAD, gain) are stored in `tx_pipeline`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -477,15 +483,15 @@ impl PersistentSettings {
         }
 
         let path = dir.join("settings.json");
-        let contents = serde_json::to_string_pretty(self)
-            .map_err(|e| format!("Failed to serialize settings: {}", e))?;
+        let contents =
+            serde_json::to_string_pretty(self).map_err(|e| format!("Failed to serialize settings: {}", e))?;
 
         fs::write(&path, contents).map_err(|e| format!("Failed to write settings file: {}", e))?;
 
         tracing::info!("Saved settings to {}", path.display());
         Ok(())
     }
-    
+
     /// Get or generate the Ed25519 signing key.
     /// If no key is stored, generates a new one and stores it in hex format.
     pub fn get_or_generate_signing_key(&mut self) -> SigningKey {
@@ -495,7 +501,7 @@ impl PersistentSettings {
             }
             tracing::warn!("Invalid stored signing key, generating new one");
         }
-        
+
         // Generate a new key
         let key = SigningKey::generate(&mut OsRng);
         let bytes = key.to_bytes();
@@ -503,7 +509,7 @@ impl PersistentSettings {
         tracing::info!("Generated new Ed25519 identity key");
         key
     }
-    
+
     /// Parse a signing key from hex string.
     fn parse_signing_key(hex_key: &str) -> Option<SigningKey> {
         let bytes = hex::decode(hex_key).ok()?;
@@ -514,14 +520,14 @@ impl PersistentSettings {
         arr.copy_from_slice(&bytes);
         Some(SigningKey::from_bytes(&arr))
     }
-    
+
     /// Get the public key bytes (32 bytes) if a signing key exists.
     pub fn public_key_bytes(&self) -> Option<[u8; 32]> {
-        self.identity_private_key_hex.as_ref().and_then(|hex| {
-            Self::parse_signing_key(hex).map(|key| key.verifying_key().to_bytes())
-        })
+        self.identity_private_key_hex
+            .as_ref()
+            .and_then(|hex| Self::parse_signing_key(hex).map(|key| key.verifying_key().to_bytes()))
     }
-    
+
     /// Get the public key as hex string for display.
     pub fn public_key_hex(&self) -> Option<String> {
         self.public_key_bytes().map(hex::encode)
@@ -654,16 +660,16 @@ struct MyApp {
     trust_dev_cert: bool,
     chat_input: String,
     client_name: String,
-    
+
     // Key manager for Ed25519 identity
     key_manager: KeyManager,
-    
+
     // First-run setup state (shown if no key is configured)
     first_run_state: FirstRunState,
-    
+
     // Cached signing key (from key manager after setup/unlock)
     signing_key: Option<SigningKey>,
-    
+
     // Pending async operation for SSH agent
     pending_agent_op: Option<PendingAgentOp>,
 
@@ -678,7 +684,7 @@ struct MyApp {
 
     // Tokio runtime for async operations (SSH agent, file dialogs)
     tokio_runtime: tokio::runtime::Runtime,
-    
+
     // Persistent settings
     persistent_settings: PersistentSettings,
     /// Whether to autoconnect on launch
@@ -686,7 +692,7 @@ struct MyApp {
 
     // Backend handle (manages connection, audio, and state)
     backend: BackendHandle,
-    
+
     // Processor registry for schema lookups
     processor_registry: ProcessorRegistry,
 
@@ -723,14 +729,13 @@ impl MyApp {
     fn new(ctx: egui::Context, args: Args) -> Self {
         // Load persistent settings
         let mut persistent_settings = PersistentSettings::load();
-        
+
         // Get config directory for key manager
-        let config_dir = PersistentSettings::config_dir()
-            .unwrap_or_else(|| PathBuf::from("."));
-        
+        let config_dir = PersistentSettings::config_dir().unwrap_or_else(|| PathBuf::from("."));
+
         // Create key manager and check for migration from old format
         let mut key_manager = KeyManager::new(config_dir);
-        
+
         // Migration: If we have an old-style key in persistent_settings but no new key config,
         // migrate it to the new key_manager format
         if key_manager.needs_setup() {
@@ -743,20 +748,26 @@ impl MyApp {
                 }
             }
         }
-        
+
         // Determine first-run state
         let first_run_state = if key_manager.needs_setup() {
             FirstRunState::SelectMethod
         } else {
             FirstRunState::NotNeeded
         };
-        
+
         // Get the cached signing key if available
         let signing_key = key_manager.signing_key().cloned();
-        
+
         // CLI args override persistent settings
-        let server_address = args.server.clone().unwrap_or_else(|| persistent_settings.server_address.clone());
-        let server_password = args.password.clone().unwrap_or_else(|| persistent_settings.server_password.clone());
+        let server_address = args
+            .server
+            .clone()
+            .unwrap_or_else(|| persistent_settings.server_address.clone());
+        let server_password = args
+            .password
+            .clone()
+            .unwrap_or_else(|| persistent_settings.server_password.clone());
         let client_name = args.name.clone().unwrap_or_else(|| {
             if persistent_settings.client_name.is_empty() {
                 format!("user-{}", Uuid::new_v4().simple())
@@ -765,7 +776,7 @@ impl MyApp {
             }
         });
         let trust_dev_cert = args.trust_dev_cert || persistent_settings.trust_dev_cert;
-        
+
         // Build connect config based on CLI args and persistent settings
         let mut config = ConnectConfig::new();
         if trust_dev_cert {
@@ -779,7 +790,7 @@ impl MyApp {
         if let Ok(cert_path) = std::env::var("RUMBLE_SERVER_CERT_PATH") {
             config = config.with_cert(cert_path);
         }
-        
+
         // Load previously accepted certificates from persistent settings
         {
             use base64::Engine;
@@ -790,7 +801,11 @@ impl MyApp {
                         config.accepted_certs.push(der_bytes);
                     }
                     Err(e) => {
-                        tracing::warn!("Failed to decode accepted certificate for {}: {}", accepted.server_name, e);
+                        tracing::warn!(
+                            "Failed to decode accepted certificate for {}: {}",
+                            accepted.server_name,
+                            e
+                        );
                     }
                 }
             }
@@ -804,19 +819,21 @@ impl MyApp {
             },
             config,
         );
-        
+
         // Apply persistent audio settings to backend
         let audio_settings: AudioSettings = (&persistent_settings.audio).into();
-        backend.send(Command::UpdateAudioSettings { settings: audio_settings.clone() });
-        
+        backend.send(Command::UpdateAudioSettings {
+            settings: audio_settings.clone(),
+        });
+
         // Apply voice mode
         let voice_mode: VoiceMode = persistent_settings.voice_mode.into();
         backend.send(Command::SetVoiceMode { mode: voice_mode });
-        
+
         // Create processor registry for schema lookups
         let mut processor_registry = ProcessorRegistry::new();
         register_builtin_processors(&mut processor_registry);
-        
+
         // Apply TX pipeline from persistent config, or build a default one
         // Use merge to ensure new processors are added to existing configs
         let tx_pipeline_config = if let Some(ref config) = persistent_settings.audio.tx_pipeline {
@@ -826,14 +843,20 @@ impl MyApp {
             // No persisted config - build fresh default
             build_default_tx_pipeline(&processor_registry)
         };
-        backend.send(Command::UpdateTxPipeline { config: tx_pipeline_config });
-        
+        backend.send(Command::UpdateTxPipeline {
+            config: tx_pipeline_config,
+        });
+
         // Apply device selections if set
         if persistent_settings.input_device_id.is_some() {
-            backend.send(Command::SetInputDevice { device_id: persistent_settings.input_device_id.clone() });
+            backend.send(Command::SetInputDevice {
+                device_id: persistent_settings.input_device_id.clone(),
+            });
         }
         if persistent_settings.output_device_id.is_some() {
-            backend.send(Command::SetOutputDevice { device_id: persistent_settings.output_device_id.clone() });
+            backend.send(Command::SetOutputDevice {
+                device_id: persistent_settings.output_device_id.clone(),
+            });
         }
 
         // Send initial status messages via backend
@@ -843,29 +866,29 @@ impl MyApp {
         backend.send(Command::LocalMessage {
             text: format!("Client name: {}", client_name),
         });
-        
+
         // Update persistent settings with current values (in case CLI overrode them)
         persistent_settings.server_address = server_address.clone();
         persistent_settings.server_password = server_password.clone();
         persistent_settings.client_name = client_name.clone();
         persistent_settings.trust_dev_cert = trust_dev_cert;
-        
+
         let autoconnect_on_launch = persistent_settings.autoconnect_on_launch;
-        
+
         // Save settings
         if let Err(e) = persistent_settings.save() {
             tracing::warn!("Failed to save settings: {}", e);
         }
 
         let needs_first_run = !matches!(first_run_state, FirstRunState::NotNeeded);
-        
+
         // Create a Tokio runtime for async operations (SSH agent)
         let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
             .build()
             .expect("Failed to create Tokio runtime");
-        
+
         let mut app = Self {
             show_connect: false,
             show_settings: false,
@@ -923,7 +946,7 @@ impl MyApp {
                 return;
             }
         };
-        
+
         let signer = match self.key_manager.create_signer() {
             Some(s) => s,
             None => {
@@ -940,7 +963,7 @@ impl MyApp {
                 return;
             }
         };
-        
+
         let addr = if self.connect_address.trim().is_empty() {
             "127.0.0.1:5000".to_string()
         } else {
@@ -964,7 +987,7 @@ impl MyApp {
             password,
         });
     }
-    
+
     /// Save current settings to persistent storage.
     fn save_settings(&mut self) {
         // Update persistent settings from current state
@@ -973,25 +996,31 @@ impl MyApp {
         self.persistent_settings.client_name = self.client_name.clone();
         self.persistent_settings.trust_dev_cert = self.trust_dev_cert;
         self.persistent_settings.autoconnect_on_launch = self.autoconnect_on_launch;
-        
+
         // Save audio settings from backend state
         let audio = self.backend.state().audio.clone();
         let mut persistent_audio: PersistentAudioSettings = (&audio.settings).into();
-        
+
         // Save the TX pipeline config - prefer pending modal config if available
         // (the async command to backend might not have processed yet)
-        persistent_audio.tx_pipeline = self.settings_modal.pending_tx_pipeline.clone()
+        persistent_audio.tx_pipeline = self
+            .settings_modal
+            .pending_tx_pipeline
+            .clone()
             .or_else(|| Some(audio.tx_pipeline.clone()));
-        
+
         self.persistent_settings.audio = persistent_audio;
-        self.persistent_settings.voice_mode = self.settings_modal.pending_voice_mode.clone()
+        self.persistent_settings.voice_mode = self
+            .settings_modal
+            .pending_voice_mode
+            .clone()
             .map(|m| (&m).into())
             .unwrap_or_else(|| (&audio.voice_mode).into());
         self.persistent_settings.input_device_id = audio.selected_input.clone();
         self.persistent_settings.output_device_id = audio.selected_output.clone();
-        
+
         // Chat settings are already in persistent_settings (applied in apply_pending_settings)
-        
+
         if let Err(e) = self.persistent_settings.save() {
             tracing::error!("Failed to save settings: {}", e);
             self.backend.send(Command::LocalMessage {
@@ -1027,26 +1056,26 @@ impl MyApp {
     fn is_connected(&self) -> bool {
         self.backend.state().connection.is_connected()
     }
-    
+
     /// Apply all pending settings from the settings modal to the backend.
     fn apply_pending_settings(&mut self) {
         // Apply pending autoconnect setting
         if let Some(autoconnect) = self.settings_modal.pending_autoconnect {
             self.autoconnect_on_launch = autoconnect;
         }
-        
+
         // Apply pending username
         if let Some(username) = self.settings_modal.pending_username.clone() {
             if !username.trim().is_empty() {
                 self.client_name = username;
             }
         }
-        
+
         // Apply pending audio settings
         if let Some(settings) = self.settings_modal.pending_settings.clone() {
             self.backend.send(Command::UpdateAudioSettings { settings });
         }
-        
+
         // Apply pending input device
         if let Some(device_id) = self.settings_modal.pending_input_device.clone() {
             let current = self.backend.state().audio.selected_input.clone();
@@ -1054,7 +1083,7 @@ impl MyApp {
                 self.backend.send(Command::SetInputDevice { device_id });
             }
         }
-        
+
         // Apply pending output device
         if let Some(device_id) = self.settings_modal.pending_output_device.clone() {
             let current = self.backend.state().audio.selected_output.clone();
@@ -1062,7 +1091,7 @@ impl MyApp {
                 self.backend.send(Command::SetOutputDevice { device_id });
             }
         }
-        
+
         // Apply pending voice mode
         if let Some(mode) = self.settings_modal.pending_voice_mode.clone() {
             let current = self.backend.state().audio.voice_mode.clone();
@@ -1070,12 +1099,12 @@ impl MyApp {
                 self.backend.send(Command::SetVoiceMode { mode: mode.clone() });
             }
         }
-        
+
         // Apply pending TX pipeline
         if let Some(config) = self.settings_modal.pending_tx_pipeline.clone() {
             self.backend.send(Command::UpdateTxPipeline { config });
         }
-        
+
         // Apply pending chat settings (these are UI-only, stored in persistent_settings)
         if let Some(show) = self.settings_modal.pending_show_timestamps {
             self.persistent_settings.show_chat_timestamps = show;
@@ -1084,12 +1113,12 @@ impl MyApp {
             self.persistent_settings.chat_timestamp_format = format;
         }
     }
-    
+
     /// Render the Connection settings category.
     fn render_settings_connection(&mut self, ui: &mut egui::Ui, state: &backend::State) {
         ui.heading("Connection");
         ui.add_space(8.0);
-        
+
         ui.horizontal(|ui| {
             ui.label("Server:");
             ui.label(&self.connect_address);
@@ -1102,45 +1131,53 @@ impl MyApp {
                 "Disconnected"
             });
         });
-        
+
         ui.add_space(8.0);
         ui.separator();
         ui.add_space(8.0);
-        
+
         // Username setting
         ui.label("Username:");
-        let mut pending_username = self.settings_modal.pending_username.clone()
+        let mut pending_username = self
+            .settings_modal
+            .pending_username
+            .clone()
             .unwrap_or_else(|| self.client_name.clone());
-        if ui.text_edit_singleline(&mut pending_username)
+        if ui
+            .text_edit_singleline(&mut pending_username)
             .on_hover_text("Your display name shown to other users")
             .changed()
         {
             self.settings_modal.pending_username = Some(pending_username);
             self.settings_modal.dirty = true;
         }
-        
+
         ui.add_space(8.0);
         ui.separator();
         ui.add_space(8.0);
-        
+
         // Autoconnect on launch toggle
-        let mut pending_autoconnect = self.settings_modal.pending_autoconnect.unwrap_or(self.autoconnect_on_launch);
-        if ui.checkbox(&mut pending_autoconnect, "Autoconnect on launch")
+        let mut pending_autoconnect = self
+            .settings_modal
+            .pending_autoconnect
+            .unwrap_or(self.autoconnect_on_launch);
+        if ui
+            .checkbox(&mut pending_autoconnect, "Autoconnect on launch")
             .on_hover_text("Automatically connect to the last server when the app starts")
-            .changed() 
+            .changed()
         {
             self.settings_modal.pending_autoconnect = Some(pending_autoconnect);
             self.settings_modal.dirty = true;
         }
-        
+
         ui.add_space(8.0);
         ui.separator();
         ui.add_space(8.0);
-        
+
         // Identity section
         ui.heading("Identity");
         ui.add_space(4.0);
-        
+
         if let Some(public_key_hex) = self.key_manager.public_key_hex() {
             ui.horizontal(|ui| {
                 ui.label("Public Key:");
@@ -1151,7 +1188,7 @@ impl MyApp {
                     ui.ctx().copy_text(public_key_hex.clone());
                 }
             });
-            
+
             // Show key source
             if let Some(config) = self.key_manager.config() {
                 let source_desc = match &config.source {
@@ -1164,9 +1201,13 @@ impl MyApp {
                     ui.label(source_desc);
                 });
             }
-            
+
             ui.add_space(8.0);
-            if ui.button("🔑 Generate New Identity...").on_hover_text("Generate a new identity key (will replace the current one)").clicked() {
+            if ui
+                .button("🔑 Generate New Identity...")
+                .on_hover_text("Generate a new identity key (will replace the current one)")
+                .clicked()
+            {
                 self.first_run_state = FirstRunState::SelectMethod;
             }
         } else {
@@ -1176,27 +1217,28 @@ impl MyApp {
             }
         }
     }
-    
+
     /// Render the Devices settings category.
     fn render_settings_devices(&mut self, ui: &mut egui::Ui, state: &backend::State) {
         ui.heading("Audio Devices");
         ui.add_space(8.0);
-        
+
         let audio = &state.audio;
-        
+
         // Refresh button (immediate action, not deferred)
         if ui.button("🔄 Refresh Devices").clicked() {
             self.backend.send(Command::RefreshAudioDevices);
         }
-        
+
         ui.add_space(8.0);
         ui.separator();
         ui.add_space(8.0);
-        
+
         // Input device selection (using pending state)
         ui.label("Input Device (Microphone):");
         let pending_input = self.settings_modal.pending_input_device.clone().flatten();
-        let current_input_name = pending_input.as_ref()
+        let current_input_name = pending_input
+            .as_ref()
             .and_then(|id| audio.input_devices.iter().find(|d| &d.id == id))
             .map(|d| d.name.clone())
             .unwrap_or_else(|| "Default".to_string());
@@ -1205,10 +1247,7 @@ impl MyApp {
             .selected_text(&current_input_name)
             .show_ui(ui, |ui| {
                 // Default option
-                if ui
-                    .selectable_label(pending_input.is_none(), "Default")
-                    .clicked()
-                {
+                if ui.selectable_label(pending_input.is_none(), "Default").clicked() {
                     self.settings_modal.pending_input_device = Some(None);
                     self.settings_modal.dirty = true;
                 }
@@ -1220,10 +1259,7 @@ impl MyApp {
                         device.name.clone()
                     };
                     if ui
-                        .selectable_label(
-                            pending_input.as_ref() == Some(&device.id),
-                            &label,
-                        )
+                        .selectable_label(pending_input.as_ref() == Some(&device.id), &label)
                         .clicked()
                     {
                         self.settings_modal.pending_input_device = Some(Some(device.id.clone()));
@@ -1231,13 +1267,14 @@ impl MyApp {
                     }
                 }
             });
-        
+
         ui.add_space(8.0);
-        
+
         // Output device selection (using pending state)
         ui.label("Output Device (Speakers):");
         let pending_output = self.settings_modal.pending_output_device.clone().flatten();
-        let current_output_name = pending_output.as_ref()
+        let current_output_name = pending_output
+            .as_ref()
             .and_then(|id| audio.output_devices.iter().find(|d| &d.id == id))
             .map(|d| d.name.clone())
             .unwrap_or_else(|| "Default".to_string());
@@ -1246,10 +1283,7 @@ impl MyApp {
             .selected_text(&current_output_name)
             .show_ui(ui, |ui| {
                 // Default option
-                if ui
-                    .selectable_label(pending_output.is_none(), "Default")
-                    .clicked()
-                {
+                if ui.selectable_label(pending_output.is_none(), "Default").clicked() {
                     self.settings_modal.pending_output_device = Some(None);
                     self.settings_modal.dirty = true;
                 }
@@ -1261,10 +1295,7 @@ impl MyApp {
                         device.name.clone()
                     };
                     if ui
-                        .selectable_label(
-                            pending_output.as_ref() == Some(&device.id),
-                            &label,
-                        )
+                        .selectable_label(pending_output.as_ref() == Some(&device.id), &label)
                         .clicked()
                     {
                         self.settings_modal.pending_output_device = Some(Some(device.id.clone()));
@@ -1272,11 +1303,11 @@ impl MyApp {
                     }
                 }
             });
-        
+
         ui.add_space(8.0);
         ui.separator();
         ui.add_space(8.0);
-        
+
         // Audio Input Level Meter
         ui.label("Input Level:");
         if let Some(level_db) = audio.input_level_db {
@@ -1290,26 +1321,26 @@ impl MyApp {
                 } else {
                     egui::Color32::GREEN // Normal
                 };
-                let (rect, _response) = ui.allocate_exact_size(
-                    egui::vec2(200.0, 16.0),
-                    egui::Sense::hover(),
-                );
+                let (rect, _response) = ui.allocate_exact_size(egui::vec2(200.0, 16.0), egui::Sense::hover());
                 ui.painter().rect_filled(rect, 2.0, egui::Color32::DARK_GRAY);
-                let filled_rect = egui::Rect::from_min_size(
-                    rect.min,
-                    egui::vec2(rect.width() * normalized, rect.height()),
-                );
+                let filled_rect =
+                    egui::Rect::from_min_size(rect.min, egui::vec2(rect.width() * normalized, rect.height()));
                 ui.painter().rect_filled(filled_rect, 2.0, color);
-                
+
                 // Draw VAD threshold line if VAD is enabled
-                let pipeline = self.settings_modal.pending_tx_pipeline.as_ref()
+                let pipeline = self
+                    .settings_modal
+                    .pending_tx_pipeline
+                    .as_ref()
                     .unwrap_or(&audio.tx_pipeline);
-                let vad_threshold = pipeline.processors.iter()
+                let vad_threshold = pipeline
+                    .processors
+                    .iter()
                     .find(|p| p.type_id == "builtin.vad" && p.enabled)
                     .and_then(|p| p.settings.get("threshold_db"))
                     .and_then(|v| v.as_f64())
                     .map(|t| t as f32);
-                
+
                 if let Some(threshold_db) = vad_threshold {
                     let threshold_normalized = ((threshold_db + 60.0) / 60.0).clamp(0.0, 1.0);
                     let threshold_x = rect.min.x + rect.width() * threshold_normalized;
@@ -1318,63 +1349,87 @@ impl MyApp {
                         egui::Stroke::new(2.0, egui::Color32::WHITE),
                     );
                 }
-                
+
                 ui.label(format!("{:.0} dB", level_db));
             });
         } else {
             ui.colored_label(egui::Color32::GRAY, "—");
         }
     }
-    
+
     /// Render the Voice settings category.
     fn render_settings_voice(&mut self, ui: &mut egui::Ui, state: &backend::State) {
         ui.heading("Voice Mode");
         ui.add_space(8.0);
-        
+
         let audio = &state.audio;
-        
+
         // Voice mode selector (using pending state)
-        let pending_voice_mode = self.settings_modal.pending_voice_mode.clone().unwrap_or(audio.voice_mode.clone());
+        let pending_voice_mode = self
+            .settings_modal
+            .pending_voice_mode
+            .clone()
+            .unwrap_or(audio.voice_mode.clone());
         ui.horizontal(|ui| {
-            if ui.selectable_label(
-                matches!(pending_voice_mode, VoiceMode::PushToTalk),
-                "🎤 Push-to-Talk",
-            ).on_hover_text("Hold SPACE to transmit").clicked() {
+            if ui
+                .selectable_label(matches!(pending_voice_mode, VoiceMode::PushToTalk), "🎤 Push-to-Talk")
+                .on_hover_text("Hold SPACE to transmit")
+                .clicked()
+            {
                 self.settings_modal.pending_voice_mode = Some(VoiceMode::PushToTalk);
                 self.settings_modal.dirty = true;
             }
-            if ui.selectable_label(
-                matches!(pending_voice_mode, VoiceMode::Continuous),
-                "📡 Continuous",
-            ).on_hover_text("Always transmitting when connected. Enable VAD processor for voice-activated behavior.").clicked() {
+            if ui
+                .selectable_label(matches!(pending_voice_mode, VoiceMode::Continuous), "📡 Continuous")
+                .on_hover_text("Always transmitting when connected. Enable VAD processor for voice-activated behavior.")
+                .clicked()
+            {
                 self.settings_modal.pending_voice_mode = Some(VoiceMode::Continuous);
                 self.settings_modal.dirty = true;
             }
         });
-        
+
         ui.add_space(8.0);
         ui.separator();
         ui.add_space(8.0);
-        
+
         // Mute and Deafen toggles (immediate action - these are real-time controls)
         ui.label("Quick Controls:");
         ui.horizontal(|ui| {
             let mute_text = if audio.self_muted { "🔇 Muted" } else { "🎤 Unmuted" };
-            let mute_color = if audio.self_muted { egui::Color32::RED } else { egui::Color32::GREEN };
-            if ui.add(egui::Button::new(egui::RichText::new(mute_text).color(mute_color)))
+            let mute_color = if audio.self_muted {
+                egui::Color32::RED
+            } else {
+                egui::Color32::GREEN
+            };
+            if ui
+                .add(egui::Button::new(egui::RichText::new(mute_text).color(mute_color)))
                 .on_hover_text("Toggle self-mute (stops transmitting)")
                 .clicked()
             {
-                self.backend.send(Command::SetMuted { muted: !audio.self_muted });
+                self.backend.send(Command::SetMuted {
+                    muted: !audio.self_muted,
+                });
             }
-            
-            let deafen_text = if audio.self_deafened { "🔕 Deafened" } else { "🔔 Hearing" };
-            let deafen_color = if audio.self_deafened { egui::Color32::RED } else { egui::Color32::GREEN };
-            if ui.add(egui::Button::new(egui::RichText::new(deafen_text).color(deafen_color)))
+
+            let deafen_text = if audio.self_deafened {
+                "🔕 Deafened"
+            } else {
+                "🔔 Hearing"
+            };
+            let deafen_color = if audio.self_deafened {
+                egui::Color32::RED
+            } else {
+                egui::Color32::GREEN
+            };
+            if ui
+                .add(egui::Button::new(egui::RichText::new(deafen_text).color(deafen_color)))
                 .on_hover_text("Toggle self-deafen (stops receiving audio; also mutes)")
                 .clicked()
             {
-                self.backend.send(Command::SetDeafened { deafened: !audio.self_deafened });
+                self.backend.send(Command::SetDeafened {
+                    deafened: !audio.self_deafened,
+                });
             }
         });
 
@@ -1396,7 +1451,7 @@ impl MyApp {
                 }
             }
         }
-        
+
         if audio.self_deafened {
             ui.colored_label(egui::Color32::RED, "🔕 Deafened (not receiving audio)");
         }
@@ -1407,42 +1462,44 @@ impl MyApp {
             ui.label("🔇 Not transmitting");
         }
     }
-    
+
     /// Render the Processing settings category.
     fn render_settings_processing(&mut self, ui: &mut egui::Ui, state: &backend::State) {
         ui.heading("Audio Processing");
         ui.add_space(8.0);
-        
+
         ui.label("TX Pipeline - Audio processing chain applied before encoding:");
         ui.add_space(4.0);
-        
+
         // Get processor info from registry for display names
-        let processor_info: std::collections::HashMap<&str, (&str, &str)> = self.processor_registry
+        let processor_info: std::collections::HashMap<&str, (&str, &str)> = self
+            .processor_registry
             .list_available()
             .into_iter()
             .map(|(type_id, display_name, desc)| (type_id, (display_name, desc)))
             .collect();
-        
+
         if let Some(ref mut pending_pipeline) = self.settings_modal.pending_tx_pipeline {
             let mut pipeline_changed = false;
-            
+
             for proc_config in pending_pipeline.processors.iter_mut() {
                 // Look up the processor info for display name and description
                 let (display_name, description) = processor_info
                     .get(proc_config.type_id.as_str())
                     .copied()
                     .unwrap_or((&proc_config.type_id, "Unknown processor"));
-                
+
                 ui.horizontal(|ui| {
                     // Enabled checkbox
-                    if ui.checkbox(&mut proc_config.enabled, display_name)
+                    if ui
+                        .checkbox(&mut proc_config.enabled, display_name)
                         .on_hover_text(description)
                         .changed()
                     {
                         pipeline_changed = true;
                     }
                 });
-                
+
                 // Show settings if processor is enabled
                 if proc_config.enabled {
                     if let Some(schema) = self.processor_registry.settings_schema(&proc_config.type_id) {
@@ -1461,17 +1518,17 @@ impl MyApp {
                 }
                 ui.add_space(4.0);
             }
-            
+
             if pipeline_changed {
                 self.settings_modal.dirty = true;
             }
         }
-        
+
         // Show input level meter with VAD threshold
         ui.add_space(8.0);
         ui.separator();
         ui.add_space(8.0);
-        
+
         let audio = &state.audio;
         ui.label("Input Level (with VAD threshold):");
         if let Some(level_db) = audio.input_level_db {
@@ -1484,26 +1541,26 @@ impl MyApp {
                 } else {
                     egui::Color32::GREEN
                 };
-                let (rect, _response) = ui.allocate_exact_size(
-                    egui::vec2(200.0, 16.0),
-                    egui::Sense::hover(),
-                );
+                let (rect, _response) = ui.allocate_exact_size(egui::vec2(200.0, 16.0), egui::Sense::hover());
                 ui.painter().rect_filled(rect, 2.0, egui::Color32::DARK_GRAY);
-                let filled_rect = egui::Rect::from_min_size(
-                    rect.min,
-                    egui::vec2(rect.width() * normalized, rect.height()),
-                );
+                let filled_rect =
+                    egui::Rect::from_min_size(rect.min, egui::vec2(rect.width() * normalized, rect.height()));
                 ui.painter().rect_filled(filled_rect, 2.0, color);
-                
+
                 // Draw VAD threshold line if VAD is enabled
-                let pipeline = self.settings_modal.pending_tx_pipeline.as_ref()
+                let pipeline = self
+                    .settings_modal
+                    .pending_tx_pipeline
+                    .as_ref()
                     .unwrap_or(&audio.tx_pipeline);
-                let vad_threshold = pipeline.processors.iter()
+                let vad_threshold = pipeline
+                    .processors
+                    .iter()
                     .find(|p| p.type_id == "builtin.vad" && p.enabled)
                     .and_then(|p| p.settings.get("threshold_db"))
                     .and_then(|v| v.as_f64())
                     .map(|t| t as f32);
-                
+
                 if let Some(threshold_db) = vad_threshold {
                     let threshold_normalized = ((threshold_db + 60.0) / 60.0).clamp(0.0, 1.0);
                     let threshold_x = rect.min.x + rect.width() * threshold_normalized;
@@ -1512,115 +1569,128 @@ impl MyApp {
                         egui::Stroke::new(2.0, egui::Color32::WHITE),
                     );
                 }
-                
+
                 ui.label(format!("{:.0} dB", level_db));
             });
         } else {
             ui.colored_label(egui::Color32::GRAY, "—");
         }
     }
-    
+
     /// Render the Encoder settings category.
     fn render_settings_encoder(&mut self, ui: &mut egui::Ui) {
         ui.heading("Encoder Settings");
         ui.add_space(8.0);
-        
+
         ui.label("Opus codec and network settings:");
         ui.add_space(4.0);
-        
+
         if let Some(ref mut settings) = self.settings_modal.pending_settings {
             // FEC toggle
-            if ui.checkbox(&mut settings.fec_enabled, "Enable Forward Error Correction")
+            if ui
+                .checkbox(&mut settings.fec_enabled, "Enable Forward Error Correction")
                 .on_hover_text("Add redundancy for packet loss recovery")
-                .changed() {
+                .changed()
+            {
                 self.settings_modal.dirty = true;
             }
-            
+
             ui.add_space(8.0);
             ui.separator();
             ui.add_space(8.0);
-            
+
             // Bitrate selection
             ui.label("Encoder Bitrate:");
             ui.horizontal(|ui| {
-                if ui.selectable_label(settings.bitrate == AudioSettings::BITRATE_LOW, "24 kbps")
+                if ui
+                    .selectable_label(settings.bitrate == AudioSettings::BITRATE_LOW, "24 kbps")
                     .on_hover_text("Low quality, minimal bandwidth")
-                    .clicked() {
+                    .clicked()
+                {
                     settings.bitrate = AudioSettings::BITRATE_LOW;
                     self.settings_modal.dirty = true;
                 }
-                if ui.selectable_label(settings.bitrate == AudioSettings::BITRATE_MEDIUM, "32 kbps")
+                if ui
+                    .selectable_label(settings.bitrate == AudioSettings::BITRATE_MEDIUM, "32 kbps")
                     .on_hover_text("Medium quality, good for voice")
-                    .clicked() {
+                    .clicked()
+                {
                     settings.bitrate = AudioSettings::BITRATE_MEDIUM;
                     self.settings_modal.dirty = true;
                 }
-                if ui.selectable_label(settings.bitrate == AudioSettings::BITRATE_HIGH, "64 kbps")
+                if ui
+                    .selectable_label(settings.bitrate == AudioSettings::BITRATE_HIGH, "64 kbps")
                     .on_hover_text("High quality (default)")
-                    .clicked() {
+                    .clicked()
+                {
                     settings.bitrate = AudioSettings::BITRATE_HIGH;
                     self.settings_modal.dirty = true;
                 }
-                if ui.selectable_label(settings.bitrate == AudioSettings::BITRATE_VERY_HIGH, "96 kbps")
+                if ui
+                    .selectable_label(settings.bitrate == AudioSettings::BITRATE_VERY_HIGH, "96 kbps")
                     .on_hover_text("Very high quality, more bandwidth")
-                    .clicked() {
+                    .clicked()
+                {
                     settings.bitrate = AudioSettings::BITRATE_VERY_HIGH;
                     self.settings_modal.dirty = true;
                 }
             });
-            
+
             ui.add_space(8.0);
             ui.separator();
             ui.add_space(8.0);
-            
+
             // Encoder complexity slider
             ui.horizontal(|ui| {
                 ui.label("Encoder Complexity:");
-                if ui.add(egui::Slider::new(&mut settings.encoder_complexity, 0..=10)
-                    .text(""))
+                if ui
+                    .add(egui::Slider::new(&mut settings.encoder_complexity, 0..=10).text(""))
                     .on_hover_text("Higher = better quality but more CPU (0-10)")
-                    .changed() {
+                    .changed()
+                {
                     self.settings_modal.dirty = true;
                 }
             });
-            
+
             ui.add_space(4.0);
-            
+
             // Jitter buffer delay slider
             ui.horizontal(|ui| {
                 ui.label("Jitter Buffer Delay:");
-                if ui.add(egui::Slider::new(&mut settings.jitter_buffer_delay_packets, 1..=10)
-                    .text("packets"))
+                if ui
+                    .add(egui::Slider::new(&mut settings.jitter_buffer_delay_packets, 1..=10).text("packets"))
                     .on_hover_text("Packets to buffer before playback (1-10). Higher = more latency, smoother audio")
-                    .changed() {
+                    .changed()
+                {
                     self.settings_modal.dirty = true;
                 }
             });
             let jitter_delay_ms = settings.jitter_buffer_delay_packets * 20;
             ui.label(format!("  Playback delay: ~{}ms", jitter_delay_ms));
-            
+
             ui.add_space(4.0);
-            
+
             // Packet loss percentage for FEC tuning
             ui.horizontal(|ui| {
                 ui.label("Expected Packet Loss:");
-                if ui.add(egui::Slider::new(&mut settings.packet_loss_percent, 0..=25)
-                    .text("%"))
+                if ui
+                    .add(egui::Slider::new(&mut settings.packet_loss_percent, 0..=25).text("%"))
                     .on_hover_text("Expected network packet loss for FEC tuning (0-25%)")
-                    .changed() {
+                    .changed()
+                {
                     self.settings_modal.dirty = true;
                 }
             });
         }
     }
-    
+
     /// Render the Statistics settings category.
     fn render_settings_statistics(&mut self, ui: &mut egui::Ui, state: &backend::State) {
         ui.heading("Audio Statistics");
         ui.add_space(8.0);
-        
+
         let stats = &state.audio.stats;
-        
+
         egui::Grid::new("stats_grid")
             .num_columns(2)
             .spacing([20.0, 4.0])
@@ -1628,19 +1698,19 @@ impl MyApp {
                 ui.label("Actual Bitrate:");
                 ui.label(format!("{:.1} kbps", stats.actual_bitrate_bps / 1000.0));
                 ui.end_row();
-                
+
                 ui.label("Avg Frame Size:");
                 ui.label(format!("{:.1} bytes", stats.avg_frame_size_bytes));
                 ui.end_row();
-                
+
                 ui.label("Packets Sent:");
                 ui.label(format!("{}", stats.packets_sent));
                 ui.end_row();
-                
+
                 ui.label("Packets Received:");
                 ui.label(format!("{}", stats.packets_received));
                 ui.end_row();
-                
+
                 ui.label("Packet Loss:");
                 let loss_pct = stats.packet_loss_percent();
                 let color = if loss_pct > 5.0 {
@@ -1652,37 +1722,40 @@ impl MyApp {
                 };
                 ui.colored_label(color, format!("{:.1}% ({} lost)", loss_pct, stats.packets_lost));
                 ui.end_row();
-                
+
                 ui.label("FEC Recovered:");
                 ui.label(format!("{}", stats.packets_recovered_fec));
                 ui.end_row();
-                
+
                 ui.label("Frames Concealed:");
                 ui.label(format!("{}", stats.frames_concealed));
                 ui.end_row();
-                
+
                 ui.label("Buffer Level:");
                 ui.label(format!("{} packets", stats.playback_buffer_packets));
                 ui.end_row();
             });
-        
+
         ui.add_space(8.0);
-        
+
         if ui.button("Reset Statistics").clicked() {
             self.backend.send(Command::ResetAudioStats);
         }
     }
-    
+
     /// Render the Chat settings category.
     fn render_settings_chat(&mut self, ui: &mut egui::Ui) {
         ui.heading("Chat Settings");
         ui.add_space(8.0);
 
         // Show timestamps toggle
-        let show_timestamps = self.settings_modal.pending_show_timestamps
+        let show_timestamps = self
+            .settings_modal
+            .pending_show_timestamps
             .unwrap_or(self.persistent_settings.show_chat_timestamps);
         let mut pending_show = show_timestamps;
-        if ui.checkbox(&mut pending_show, "Show timestamps")
+        if ui
+            .checkbox(&mut pending_show, "Show timestamps")
             .on_hover_text("Display timestamps next to chat messages")
             .changed()
         {
@@ -1695,7 +1768,9 @@ impl MyApp {
         // Timestamp format dropdown (only enabled when timestamps are shown)
         ui.add_enabled_ui(pending_show, |ui| {
             ui.label("Timestamp format:");
-            let current_format = self.settings_modal.pending_timestamp_format
+            let current_format = self
+                .settings_modal
+                .pending_timestamp_format
                 .unwrap_or(self.persistent_settings.chat_timestamp_format);
 
             // Ensure pending_timestamp_format is set so we can mutate it
@@ -1707,11 +1782,14 @@ impl MyApp {
                 .selected_text(current_format.label())
                 .show_ui(ui, |ui| {
                     for format in TimestampFormat::all() {
-                        if ui.selectable_value(
-                            self.settings_modal.pending_timestamp_format.as_mut().unwrap(),
-                            *format,
-                            format.label(),
-                        ).changed() {
+                        if ui
+                            .selectable_value(
+                                self.settings_modal.pending_timestamp_format.as_mut().unwrap(),
+                                *format,
+                                format.label(),
+                            )
+                            .changed()
+                        {
                             self.settings_modal.dirty = true;
                         }
                     }
@@ -1728,7 +1806,8 @@ impl MyApp {
         ui.add_space(4.0);
 
         let mut auto_download = self.persistent_settings.file_transfer.auto_download_enabled;
-        if ui.checkbox(&mut auto_download, "Enable auto-download")
+        if ui
+            .checkbox(&mut auto_download, "Enable auto-download")
             .on_hover_text("Automatically download files matching the rules below")
             .changed()
         {
@@ -1759,7 +1838,7 @@ impl MyApp {
                         let response = ui.add(
                             egui::TextEdit::singleline(&mut rule.mime_pattern)
                                 .desired_width(150.0)
-                                .hint_text("e.g. image/*")
+                                .hint_text("e.g. image/*"),
                         );
                         if response.changed() {
                             self.settings_modal.dirty = true;
@@ -1767,11 +1846,11 @@ impl MyApp {
 
                         // Max size drag value
                         let mut size_mb = rule.max_size_bytes / (1024 * 1024);
-                        if ui.add(
-                            egui::DragValue::new(&mut size_mb)
-                                .range(0..=1000)
-                                .suffix(" MB")
-                        ).on_hover_text("0 = disabled for this pattern").changed() {
+                        if ui
+                            .add(egui::DragValue::new(&mut size_mb).range(0..=1000).suffix(" MB"))
+                            .on_hover_text("0 = disabled for this pattern")
+                            .changed()
+                        {
                             rule.max_size_bytes = size_mb * 1024 * 1024;
                             self.settings_modal.dirty = true;
                         }
@@ -1813,9 +1892,12 @@ impl MyApp {
         ui.horizontal(|ui| {
             ui.label("Download limit:");
             let mut dl_limit_kbps = self.persistent_settings.file_transfer.download_speed_limit / 1024;
-            if ui.add(egui::DragValue::new(&mut dl_limit_kbps)
-                .range(0..=100000)
-                .suffix(" KB/s"))
+            if ui
+                .add(
+                    egui::DragValue::new(&mut dl_limit_kbps)
+                        .range(0..=100000)
+                        .suffix(" KB/s"),
+                )
                 .on_hover_text("0 = unlimited")
                 .changed()
             {
@@ -1830,9 +1912,12 @@ impl MyApp {
         ui.horizontal(|ui| {
             ui.label("Upload limit:");
             let mut ul_limit_kbps = self.persistent_settings.file_transfer.upload_speed_limit / 1024;
-            if ui.add(egui::DragValue::new(&mut ul_limit_kbps)
-                .range(0..=100000)
-                .suffix(" KB/s"))
+            if ui
+                .add(
+                    egui::DragValue::new(&mut ul_limit_kbps)
+                        .range(0..=100000)
+                        .suffix(" KB/s"),
+                )
                 .on_hover_text("0 = unlimited")
                 .changed()
             {
@@ -1853,7 +1938,8 @@ impl MyApp {
         ui.add_space(4.0);
 
         let mut seed_after = self.persistent_settings.file_transfer.seed_after_download;
-        if ui.checkbox(&mut seed_after, "Continue seeding after download")
+        if ui
+            .checkbox(&mut seed_after, "Continue seeding after download")
             .on_hover_text("Keep sharing files with others after download completes")
             .changed()
         {
@@ -1862,7 +1948,8 @@ impl MyApp {
         }
 
         let mut cleanup = self.persistent_settings.file_transfer.cleanup_on_exit;
-        if ui.checkbox(&mut cleanup, "Clean up downloaded files on exit")
+        if ui
+            .checkbox(&mut cleanup, "Clean up downloaded files on exit")
             .on_hover_text("Delete downloaded files when the application closes")
             .changed()
         {
@@ -1878,35 +1965,35 @@ impl MyApp {
         if matches!(self.first_run_state, FirstRunState::NotNeeded | FirstRunState::Complete) {
             return;
         }
-        
+
         // Track what action to take after the UI is rendered
         // This avoids borrow checker issues with closures
         let mut next_state: Option<FirstRunState> = None;
         let mut generate_key_password: Option<Option<String>> = None;
         let mut select_agent_key: Option<KeyInfo> = None;
         let mut generate_agent_key_comment: Option<String> = None;
-        
+
         let modal = Modal::new(egui::Id::new("first_run_modal")).show(ctx, |ui| {
             ui.set_min_width(400.0);
-            
+
             // Clone the state to avoid borrowing issues
             let state = self.first_run_state.clone();
-            
+
             match state {
                 FirstRunState::SelectMethod => {
                     ui.heading("Welcome to Rumble! 🎤");
                     ui.add_space(8.0);
-                    
+
                     ui.label("Rumble uses Ed25519 cryptographic keys for secure authentication.");
                     ui.label("This key is your identity and will be used to identify you on servers.");
-                    
+
                     ui.add_space(16.0);
                     ui.separator();
                     ui.add_space(16.0);
-                    
+
                     ui.heading("Choose how to store your key:");
                     ui.add_space(12.0);
-                    
+
                     // Option 1: Generate local key (simple)
                     ui.group(|ui| {
                         ui.horizontal(|ui| {
@@ -1924,9 +2011,9 @@ impl MyApp {
                             });
                         }
                     });
-                    
+
                     ui.add_space(8.0);
-                    
+
                     // Option 2: SSH Agent (advanced)
                     ui.group(|ui| {
                         ui.horizontal(|ui| {
@@ -1935,15 +2022,18 @@ impl MyApp {
                         });
                         ui.label("Use a key stored in your SSH agent for better security.");
                         ui.label("Requires ssh-agent to be running with Ed25519 keys.");
-                        
+
                         // Check if SSH agent is available
                         let agent_available = SshAgentClient::is_available();
-                        
+
                         ui.add_space(8.0);
                         if !agent_available {
-                            ui.colored_label(egui::Color32::YELLOW, "⚠ SSH_AUTH_SOCK not set - ssh-agent not available");
+                            ui.colored_label(
+                                egui::Color32::YELLOW,
+                                "⚠ SSH_AUTH_SOCK not set - ssh-agent not available",
+                            );
                         }
-                        
+
                         ui.add_enabled_ui(agent_available, |ui| {
                             if ui.button("Connect to SSH Agent →").clicked() {
                                 next_state = Some(FirstRunState::ConnectingAgent);
@@ -1951,30 +2041,34 @@ impl MyApp {
                         });
                     });
                 }
-                
-                FirstRunState::GenerateLocal { password, password_confirm, error } => {
+
+                FirstRunState::GenerateLocal {
+                    password,
+                    password_confirm,
+                    error,
+                } => {
                     ui.heading("Generate Local Key");
                     ui.add_space(8.0);
-                    
+
                     ui.label("Your key will be stored locally. Optionally add a password for extra security.");
                     ui.label("If you set a password, you'll need to enter it each time you start Rumble.");
-                    
+
                     ui.add_space(16.0);
-                    
+
                     // Clone values for editing
                     let mut pw = password.clone();
                     let mut pw_confirm = password_confirm.clone();
-                    
+
                     ui.horizontal(|ui| {
                         ui.label("Password (optional):");
                         ui.add(egui::TextEdit::singleline(&mut pw).password(true));
                     });
-                    
+
                     ui.horizontal(|ui| {
                         ui.label("Confirm password:");
                         ui.add(egui::TextEdit::singleline(&mut pw_confirm).password(true));
                     });
-                    
+
                     // If text changed, update the state
                     if pw != password || pw_confirm != password_confirm {
                         next_state = Some(FirstRunState::GenerateLocal {
@@ -1983,31 +2077,32 @@ impl MyApp {
                             error: error.clone(),
                         });
                     }
-                    
+
                     if let Some(err) = &error {
                         ui.add_space(8.0);
                         ui.colored_label(egui::Color32::RED, err);
                     }
-                    
+
                     // Show password mismatch warning
                     if !pw.is_empty() && !pw_confirm.is_empty() && pw != pw_confirm {
                         ui.add_space(4.0);
                         ui.colored_label(egui::Color32::YELLOW, "⚠ Passwords don't match");
                     }
-                    
+
                     ui.add_space(16.0);
                     ui.separator();
                     ui.add_space(8.0);
-                    
+
                     ui.horizontal(|ui| {
                         if ui.button("← Back").clicked() {
                             next_state = Some(FirstRunState::SelectMethod);
                         }
-                        
+
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let can_generate = pw.is_empty() || pw == pw_confirm;
-                            
-                            if ui.add_enabled(can_generate, egui::Button::new("Generate Key ✓"))
+
+                            if ui
+                                .add_enabled(can_generate, egui::Button::new("Generate Key ✓"))
                                 .on_disabled_hover_text("Passwords don't match")
                                 .clicked()
                             {
@@ -2018,32 +2113,32 @@ impl MyApp {
                         });
                     });
                 }
-                
+
                 FirstRunState::ConnectingAgent => {
                     ui.heading("Connecting to SSH Agent...");
                     ui.add_space(16.0);
                     ui.spinner();
                     ui.label("Fetching Ed25519 keys from ssh-agent...");
-                    
+
                     ui.add_space(16.0);
                     if ui.button("← Cancel").clicked() {
                         next_state = Some(FirstRunState::SelectMethod);
                     }
                 }
-                
+
                 FirstRunState::SelectAgentKey { keys, selected, error } => {
                     ui.heading("Select Key from SSH Agent");
                     ui.add_space(8.0);
-                    
+
                     let mut new_selected = selected;
-                    
+
                     if keys.is_empty() {
                         ui.label("No Ed25519 keys found in the SSH agent.");
                         ui.label("You can generate a new key to add to the agent.");
                     } else {
                         ui.label("Select an existing key or generate a new one:");
                         ui.add_space(8.0);
-                        
+
                         for (i, key) in keys.iter().enumerate() {
                             let text = format!("{} ({})", key.comment, key.fingerprint);
                             if ui.selectable_label(new_selected == Some(i), text).clicked() {
@@ -2051,7 +2146,7 @@ impl MyApp {
                             }
                         }
                     }
-                    
+
                     // Update selection if changed
                     if new_selected != selected {
                         next_state = Some(FirstRunState::SelectAgentKey {
@@ -2060,24 +2155,27 @@ impl MyApp {
                             error: error.clone(),
                         });
                     }
-                    
+
                     if let Some(err) = &error {
                         ui.add_space(8.0);
                         ui.colored_label(egui::Color32::RED, err);
                     }
-                    
+
                     ui.add_space(16.0);
                     ui.separator();
                     ui.add_space(8.0);
-                    
+
                     ui.horizontal(|ui| {
                         if ui.button("← Back").clicked() {
                             next_state = Some(FirstRunState::SelectMethod);
                         }
-                        
+
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let can_select = new_selected.is_some();
-                            if ui.add_enabled(can_select, egui::Button::new("Use Selected Key")).clicked() {
+                            if ui
+                                .add_enabled(can_select, egui::Button::new("Use Selected Key"))
+                                .clicked()
+                            {
                                 // Signal to save the selected key
                                 if let Some(idx) = new_selected {
                                     if let Some(key) = keys.get(idx) {
@@ -2085,7 +2183,7 @@ impl MyApp {
                                     }
                                 }
                             }
-                            
+
                             if ui.button("Generate New Key").clicked() {
                                 next_state = Some(FirstRunState::GenerateAgentKey {
                                     comment: "rumble-identity".to_string(),
@@ -2094,35 +2192,35 @@ impl MyApp {
                         });
                     });
                 }
-                
+
                 FirstRunState::GenerateAgentKey { comment } => {
                     ui.heading("Generate Key for SSH Agent");
                     ui.add_space(8.0);
-                    
+
                     ui.label("A new Ed25519 key will be generated and added to your SSH agent.");
-                    
+
                     ui.add_space(8.0);
-                    
+
                     let mut c = comment.clone();
                     ui.horizontal(|ui| {
                         ui.label("Key comment:");
                         ui.text_edit_singleline(&mut c);
                     });
-                    
+
                     if c != comment {
                         next_state = Some(FirstRunState::GenerateAgentKey { comment: c.clone() });
                     }
-                    
+
                     ui.add_space(16.0);
                     ui.separator();
                     ui.add_space(8.0);
-                    
+
                     ui.horizontal(|ui| {
                         if ui.button("← Back").clicked() {
                             // Go back to agent to re-list keys
                             next_state = Some(FirstRunState::ConnectingAgent);
                         }
-                        
+
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let generating = self.pending_agent_op.is_some();
                             if generating {
@@ -2135,27 +2233,27 @@ impl MyApp {
                         });
                     });
                 }
-                
+
                 FirstRunState::Error { message } => {
                     ui.heading("⚠ Error");
                     ui.add_space(8.0);
-                    
+
                     ui.colored_label(egui::Color32::RED, &message);
-                    
+
                     ui.add_space(16.0);
-                    
+
                     if ui.button("← Back to Start").clicked() {
                         next_state = Some(FirstRunState::SelectMethod);
                     }
                 }
-                
+
                 FirstRunState::NotNeeded | FirstRunState::Complete => {
                     // Should not be shown, but handle gracefully
                     ui.close();
                 }
             }
         });
-        
+
         // Apply state changes after the UI is done
         if let Some(new_state) = next_state {
             // If transitioning to ConnectingAgent, start the async operation
@@ -2165,7 +2263,7 @@ impl MyApp {
             }
             self.first_run_state = new_state;
         }
-        
+
         // Poll pending async operation
         if let Some(pending_op) = &mut self.pending_agent_op {
             match pending_op {
@@ -2231,7 +2329,7 @@ impl MyApp {
                 }
             }
         }
-        
+
         // Handle key generation if requested
         if let Some(password_opt) = generate_key_password {
             let password_str = password_opt.as_deref();
@@ -2240,7 +2338,7 @@ impl MyApp {
                     // Get the signing key
                     self.signing_key = self.key_manager.signing_key().cloned();
                     self.first_run_state = FirstRunState::Complete;
-                    
+
                     self.backend.send(Command::LocalMessage {
                         text: format!("Identity key generated: {}", key_info.fingerprint),
                     });
@@ -2254,7 +2352,7 @@ impl MyApp {
                 }
             }
         }
-        
+
         // Handle selecting an agent key
         if let Some(key_info) = select_agent_key {
             match self.key_manager.select_agent_key(&key_info) {
@@ -2262,7 +2360,7 @@ impl MyApp {
                     // Agent keys don't have a signing_key cached locally
                     self.signing_key = None;
                     self.first_run_state = FirstRunState::Complete;
-                    
+
                     self.backend.send(Command::LocalMessage {
                         text: format!("Using SSH agent key: {} ({})", key_info.comment, key_info.fingerprint),
                     });
@@ -2274,7 +2372,7 @@ impl MyApp {
                 }
             }
         }
-        
+
         // Handle generating and adding a key to the agent
         if let Some(comment) = generate_agent_key_comment {
             if self.pending_agent_op.is_none() {
@@ -2282,7 +2380,7 @@ impl MyApp {
                 self.pending_agent_op = Some(PendingAgentOp::AddKey(handle));
             }
         }
-        
+
         // Don't allow closing via escape/click outside during first run
         let _ = modal;
     }
@@ -2295,39 +2393,29 @@ fn render_schema_field(
     prop_schema: &serde_json::Value,
     settings: &mut serde_json::Value,
 ) -> bool {
-    let title = prop_schema.get("title")
-        .and_then(|t| t.as_str())
-        .unwrap_or(key);
-    let description = prop_schema.get("description")
-        .and_then(|d| d.as_str())
-        .unwrap_or("");
-    let prop_type = prop_schema.get("type")
-        .and_then(|t| t.as_str())
-        .unwrap_or("string");
-    
+    let title = prop_schema.get("title").and_then(|t| t.as_str()).unwrap_or(key);
+    let description = prop_schema.get("description").and_then(|d| d.as_str()).unwrap_or("");
+    let prop_type = prop_schema.get("type").and_then(|t| t.as_str()).unwrap_or("string");
+
     let mut changed = false;
-    
+
     ui.horizontal(|ui| {
         ui.label(format!("{}:", title));
-        
+
         match prop_type {
             "number" => {
-                let default = prop_schema.get("default")
-                    .and_then(|d| d.as_f64())
-                    .unwrap_or(0.0) as f32;
-                let min = prop_schema.get("minimum")
-                    .and_then(|m| m.as_f64())
-                    .unwrap_or(-100.0) as f32;
-                let max = prop_schema.get("maximum")
-                    .and_then(|m| m.as_f64())
-                    .unwrap_or(100.0) as f32;
-                
-                let mut value = settings.get(key)
+                let default = prop_schema.get("default").and_then(|d| d.as_f64()).unwrap_or(0.0) as f32;
+                let min = prop_schema.get("minimum").and_then(|m| m.as_f64()).unwrap_or(-100.0) as f32;
+                let max = prop_schema.get("maximum").and_then(|m| m.as_f64()).unwrap_or(100.0) as f32;
+
+                let mut value = settings
+                    .get(key)
                     .and_then(|v| v.as_f64())
                     .map(|v| v as f32)
                     .unwrap_or(default);
-                
-                if ui.add(egui::Slider::new(&mut value, min..=max))
+
+                if ui
+                    .add(egui::Slider::new(&mut value, min..=max))
                     .on_hover_text(description)
                     .changed()
                 {
@@ -2336,22 +2424,18 @@ fn render_schema_field(
                 }
             }
             "integer" => {
-                let default = prop_schema.get("default")
-                    .and_then(|d| d.as_i64())
-                    .unwrap_or(0) as i32;
-                let min = prop_schema.get("minimum")
-                    .and_then(|m| m.as_i64())
-                    .unwrap_or(0) as i32;
-                let max = prop_schema.get("maximum")
-                    .and_then(|m| m.as_i64())
-                    .unwrap_or(1000) as i32;
-                
-                let mut value = settings.get(key)
+                let default = prop_schema.get("default").and_then(|d| d.as_i64()).unwrap_or(0) as i32;
+                let min = prop_schema.get("minimum").and_then(|m| m.as_i64()).unwrap_or(0) as i32;
+                let max = prop_schema.get("maximum").and_then(|m| m.as_i64()).unwrap_or(1000) as i32;
+
+                let mut value = settings
+                    .get(key)
                     .and_then(|v| v.as_i64())
                     .map(|v| v as i32)
                     .unwrap_or(default);
-                
-                if ui.add(egui::Slider::new(&mut value, min..=max))
+
+                if ui
+                    .add(egui::Slider::new(&mut value, min..=max))
                     .on_hover_text(description)
                     .changed()
                 {
@@ -2360,42 +2444,31 @@ fn render_schema_field(
                 }
             }
             "boolean" => {
-                let default = prop_schema.get("default")
-                    .and_then(|d| d.as_bool())
-                    .unwrap_or(false);
-                let mut value = settings.get(key)
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(default);
-                
-                if ui.checkbox(&mut value, "")
-                    .on_hover_text(description)
-                    .changed()
-                {
+                let default = prop_schema.get("default").and_then(|d| d.as_bool()).unwrap_or(false);
+                let mut value = settings.get(key).and_then(|v| v.as_bool()).unwrap_or(default);
+
+                if ui.checkbox(&mut value, "").on_hover_text(description).changed() {
                     settings[key] = serde_json::json!(value);
                     changed = true;
                 }
             }
             _ => {
                 // String or unknown type - show as text field
-                let default = prop_schema.get("default")
-                    .and_then(|d| d.as_str())
-                    .unwrap_or("");
-                let mut value = settings.get(key)
+                let default = prop_schema.get("default").and_then(|d| d.as_str()).unwrap_or("");
+                let mut value = settings
+                    .get(key)
                     .and_then(|v| v.as_str())
                     .unwrap_or(default)
                     .to_string();
-                
-                if ui.text_edit_singleline(&mut value)
-                    .on_hover_text(description)
-                    .changed()
-                {
+
+                if ui.text_edit_singleline(&mut value).on_hover_text(description).changed() {
                     settings[key] = serde_json::json!(value);
                     changed = true;
                 }
             }
         }
     });
-    
+
     changed
 }
 
@@ -2482,9 +2555,7 @@ impl eframe::App for MyApp {
         }
 
         // Handle Ctrl+V to paste image from clipboard
-        let ctrl_v_pressed = ctx.input(|i| {
-            i.modifiers.command && i.key_pressed(egui::Key::V)
-        });
+        let ctrl_v_pressed = ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::V));
         if ctrl_v_pressed && state.connection.is_connected() {
             if let Some(clipboard) = &mut self.clipboard {
                 // Try to get image from clipboard
@@ -2597,9 +2668,11 @@ impl eframe::App for MyApp {
 
                                     // Progress bar (show for downloading/checking)
                                     if matches!(transfer.state, TransferState::Downloading | TransferState::Checking) {
-                                        ui.add(egui::ProgressBar::new(transfer.progress)
-                                            .show_percentage()
-                                            .animate(true));
+                                        ui.add(
+                                            egui::ProgressBar::new(transfer.progress)
+                                                .show_percentage()
+                                                .animate(true),
+                                        );
 
                                         // Speed info
                                         if transfer.download_speed > 0 || transfer.upload_speed > 0 {
@@ -2636,30 +2709,47 @@ impl eframe::App for MyApp {
 
                                         // Pause/Resume buttons
                                         match transfer.state {
-                                            TransferState::Downloading | TransferState::Seeding | TransferState::Checking => {
+                                            TransferState::Downloading
+                                            | TransferState::Seeding
+                                            | TransferState::Checking => {
                                                 if ui.button("⏸ Pause").clicked() {
-                                                    self.backend.send(Command::PauseTransfer { infohash: infohash.clone() });
+                                                    self.backend.send(Command::PauseTransfer {
+                                                        infohash: infohash.clone(),
+                                                    });
                                                 }
                                             }
                                             TransferState::Paused => {
                                                 if ui.button("▶ Resume").clicked() {
-                                                    self.backend.send(Command::ResumeTransfer { infohash: infohash.clone() });
+                                                    self.backend.send(Command::ResumeTransfer {
+                                                        infohash: infohash.clone(),
+                                                    });
                                                 }
                                             }
                                             _ => {}
                                         }
 
                                         // Cancel button for active transfers
-                                        if matches!(transfer.state, TransferState::Downloading | TransferState::Checking | TransferState::Pending | TransferState::Paused) {
+                                        if matches!(
+                                            transfer.state,
+                                            TransferState::Downloading
+                                                | TransferState::Checking
+                                                | TransferState::Pending
+                                                | TransferState::Paused
+                                        ) {
                                             if ui.button("✕ Cancel").clicked() {
-                                                self.backend.send(Command::CancelTransfer { infohash: infohash.clone() });
+                                                self.backend.send(Command::CancelTransfer {
+                                                    infohash: infohash.clone(),
+                                                });
                                             }
                                         }
 
                                         // Remove/Stop seeding button for completed transfers
                                         if matches!(transfer.state, TransferState::Seeding | TransferState::Completed) {
                                             if ui.button("🗑 Remove").clicked() {
-                                                self.backend.send(Command::RemoveTransfer { infohash: infohash.clone(), delete_file: false });
+                                                self.backend.send(Command::RemoveTransfer {
+                                                    infohash: infohash.clone(),
+                                                    delete_file: false,
+                                                });
                                             }
                                         }
 
@@ -2668,7 +2758,10 @@ impl eframe::App for MyApp {
                                             if transfer.local_path.is_some() {
                                                 // Store infohash for the save dialog
                                                 let dialog_pending = self.pending_save_dialog.is_some();
-                                                if ui.add_enabled(!dialog_pending, egui::Button::new("💾 Save As...")).clicked() {
+                                                if ui
+                                                    .add_enabled(!dialog_pending, egui::Button::new("💾 Save As..."))
+                                                    .clicked()
+                                                {
                                                     let infohash_for_dialog = infohash.clone();
                                                     let default_name = transfer.name.clone();
                                                     let handle = self.tokio_runtime.spawn(async move {
@@ -2747,7 +2840,10 @@ impl eframe::App for MyApp {
                 ui.menu_button("File Transfer", |ui| {
                     // Don't allow opening another dialog while one is pending
                     let dialog_pending = self.pending_file_dialog.is_some();
-                    if ui.add_enabled(!dialog_pending, egui::Button::new("Share File...")).clicked() {
+                    if ui
+                        .add_enabled(!dialog_pending, egui::Button::new("Share File..."))
+                        .clicked()
+                    {
                         // Spawn async file dialog to avoid blocking audio
                         let handle = self.tokio_runtime.spawn(async {
                             rfd::AsyncFileDialog::new()
@@ -2782,10 +2878,7 @@ impl eframe::App for MyApp {
                             if ui.button("⟳ Reconnect").clicked() {
                                 self.reconnect();
                             }
-                            ui.colored_label(
-                                egui::Color32::RED,
-                                format!("● Connection Lost: {}", error),
-                            );
+                            ui.colored_label(egui::Color32::RED, format!("● Connection Lost: {}", error));
                         }
                         ConnectionState::CertificatePending { .. } => {
                             ui.colored_label(egui::Color32::YELLOW, "⚠ Certificate Verification");
@@ -2802,29 +2895,47 @@ impl eframe::App for MyApp {
         egui::TopBottomPanel::top("toolbar_panel").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 let audio = &state.audio;
-                
+
                 // Mute button
                 let mute_icon = if audio.self_muted { "🔇" } else { "🎤" };
-                let mute_color = if audio.self_muted { egui::Color32::RED } else { egui::Color32::GREEN };
-                if ui.add(egui::Button::new(egui::RichText::new(mute_icon).size(18.0).color(mute_color)))
+                let mute_color = if audio.self_muted {
+                    egui::Color32::RED
+                } else {
+                    egui::Color32::GREEN
+                };
+                if ui
+                    .add(egui::Button::new(
+                        egui::RichText::new(mute_icon).size(18.0).color(mute_color),
+                    ))
                     .on_hover_text(if audio.self_muted { "Unmute" } else { "Mute" })
                     .clicked()
                 {
-                    self.backend.send(Command::SetMuted { muted: !audio.self_muted });
+                    self.backend.send(Command::SetMuted {
+                        muted: !audio.self_muted,
+                    });
                 }
-                
+
                 // Deafen button
                 let deafen_icon = if audio.self_deafened { "🔇" } else { "🔊" };
-                let deafen_color = if audio.self_deafened { egui::Color32::RED } else { egui::Color32::GREEN };
-                if ui.add(egui::Button::new(egui::RichText::new(deafen_icon).size(18.0).color(deafen_color)))
+                let deafen_color = if audio.self_deafened {
+                    egui::Color32::RED
+                } else {
+                    egui::Color32::GREEN
+                };
+                if ui
+                    .add(egui::Button::new(
+                        egui::RichText::new(deafen_icon).size(18.0).color(deafen_color),
+                    ))
                     .on_hover_text(if audio.self_deafened { "Undeafen" } else { "Deafen" })
                     .clicked()
                 {
-                    self.backend.send(Command::SetDeafened { deafened: !audio.self_deafened });
+                    self.backend.send(Command::SetDeafened {
+                        deafened: !audio.self_deafened,
+                    });
                 }
-                
+
                 ui.separator();
-                
+
                 // Transmit mode dropdown
                 let mode_text = match audio.voice_mode {
                     VoiceMode::PushToTalk => "🎤 PTT",
@@ -2833,30 +2944,35 @@ impl eframe::App for MyApp {
                 egui::ComboBox::from_id_salt("transmit_mode")
                     .selected_text(mode_text)
                     .show_ui(ui, |ui| {
-                        if ui.selectable_label(
-                            matches!(audio.voice_mode, VoiceMode::PushToTalk),
-                            "🎤 Push-to-Talk"
-                        ).clicked() {
-                            self.backend.send(Command::SetVoiceMode { mode: VoiceMode::PushToTalk });
+                        if ui
+                            .selectable_label(matches!(audio.voice_mode, VoiceMode::PushToTalk), "🎤 Push-to-Talk")
+                            .clicked()
+                        {
+                            self.backend.send(Command::SetVoiceMode {
+                                mode: VoiceMode::PushToTalk,
+                            });
                             // Set voice mode directly before saving (async command hasn't processed yet)
                             self.persistent_settings.voice_mode = PersistentVoiceMode::PushToTalk;
                             self.save_settings();
                         }
-                        if ui.selectable_label(
-                            matches!(audio.voice_mode, VoiceMode::Continuous),
-                            "📡 Continuous"
-                        ).clicked() {
-                            self.backend.send(Command::SetVoiceMode { mode: VoiceMode::Continuous });
+                        if ui
+                            .selectable_label(matches!(audio.voice_mode, VoiceMode::Continuous), "📡 Continuous")
+                            .clicked()
+                        {
+                            self.backend.send(Command::SetVoiceMode {
+                                mode: VoiceMode::Continuous,
+                            });
                             // Set voice mode directly before saving (async command hasn't processed yet)
                             self.persistent_settings.voice_mode = PersistentVoiceMode::Continuous;
                             self.save_settings();
                         }
                     });
-                
+
                 ui.separator();
-                
+
                 // Settings button
-                if ui.add(egui::Button::new(egui::RichText::new("⚙").size(18.0)))
+                if ui
+                    .add(egui::Button::new(egui::RichText::new("⚙").size(18.0)))
                     .on_hover_text("Settings")
                     .clicked()
                 {
@@ -2922,25 +3038,31 @@ impl eframe::App for MyApp {
                                         } else if let Some(file_msg) = FileMessage::parse(&msg.text) {
                                             // Look up transfer state for this file
                                             let infohash_hex = &file_msg.file.infohash;
-                                            let infohash_bytes: Option<[u8; 20]> = hex::decode(infohash_hex)
-                                                .ok()
-                                                .and_then(|v| v.try_into().ok());
+                                            let infohash_bytes: Option<[u8; 20]> =
+                                                hex::decode(infohash_hex).ok().and_then(|v| v.try_into().ok());
 
                                             let transfer = infohash_bytes.and_then(|hash| {
                                                 state.file_transfers.iter().find(|t| t.infohash == hash)
                                             });
 
-                                            let is_downloaded = transfer.map(|t| {
-                                                matches!(t.state, TransferState::Completed | TransferState::Seeding)
-                                            }).unwrap_or(false);
+                                            let is_downloaded = transfer
+                                                .map(|t| {
+                                                    matches!(t.state, TransferState::Completed | TransferState::Seeding)
+                                                })
+                                                .unwrap_or(false);
 
-                                            let is_downloading = transfer.map(|t| {
-                                                matches!(t.state, TransferState::Downloading | TransferState::Checking)
-                                            }).unwrap_or(false);
+                                            let is_downloading = transfer
+                                                .map(|t| {
+                                                    matches!(
+                                                        t.state,
+                                                        TransferState::Downloading | TransferState::Checking
+                                                    )
+                                                })
+                                                .unwrap_or(false);
 
-                                            let is_paused = transfer.map(|t| {
-                                                matches!(t.state, TransferState::Paused)
-                                            }).unwrap_or(false);
+                                            let is_paused = transfer
+                                                .map(|t| matches!(t.state, TransferState::Paused))
+                                                .unwrap_or(false);
 
                                             let is_image = file_msg.file.mime.starts_with("image/");
 
@@ -2964,7 +3086,7 @@ impl eframe::App for MyApp {
                                                                 egui::Image::new(&uri)
                                                                     .max_width(300.0)
                                                                     .max_height(200.0)
-                                                                    .corner_radius(4.0)
+                                                                    .corner_radius(4.0),
                                                             );
                                                         }
                                                     }
@@ -2982,7 +3104,11 @@ impl eframe::App for MyApp {
                                                         ui.horizontal(|ui| {
                                                             ui.label(egui::RichText::new(&msg.sender).strong());
                                                             if !timestamp_prefix.is_empty() {
-                                                                ui.label(egui::RichText::new(&timestamp_prefix).small().color(egui::Color32::GRAY));
+                                                                ui.label(
+                                                                    egui::RichText::new(&timestamp_prefix)
+                                                                        .small()
+                                                                        .color(egui::Color32::GRAY),
+                                                                );
                                                             }
                                                         });
 
@@ -2992,32 +3118,49 @@ impl eframe::App for MyApp {
                                                         // Size, mime type, and status
                                                         if is_downloading {
                                                             if let Some(t) = transfer {
-                                                                let downloaded = (file_msg.file.size as f32 * t.progress) as u64;
-                                                                ui.label(egui::RichText::new(format!(
-                                                                    "{} / {} · {}/s",
-                                                                    format_size(downloaded),
-                                                                    format_size(file_msg.file.size),
-                                                                    format_size(t.download_speed)
-                                                                )).small().color(egui::Color32::YELLOW));
+                                                                let downloaded =
+                                                                    (file_msg.file.size as f32 * t.progress) as u64;
+                                                                ui.label(
+                                                                    egui::RichText::new(format!(
+                                                                        "{} / {} · {}/s",
+                                                                        format_size(downloaded),
+                                                                        format_size(file_msg.file.size),
+                                                                        format_size(t.download_speed)
+                                                                    ))
+                                                                    .small()
+                                                                    .color(egui::Color32::YELLOW),
+                                                                );
                                                             }
                                                         } else if is_paused {
-                                                            ui.label(egui::RichText::new(format!(
-                                                                "{} · {} · Paused",
-                                                                format_size(file_msg.file.size),
-                                                                &file_msg.file.mime
-                                                            )).small().color(egui::Color32::GRAY));
+                                                            ui.label(
+                                                                egui::RichText::new(format!(
+                                                                    "{} · {} · Paused",
+                                                                    format_size(file_msg.file.size),
+                                                                    &file_msg.file.mime
+                                                                ))
+                                                                .small()
+                                                                .color(egui::Color32::GRAY),
+                                                            );
                                                         } else if is_downloaded {
-                                                            ui.label(egui::RichText::new(format!(
-                                                                "{} · {} · Downloaded ✓",
-                                                                format_size(file_msg.file.size),
-                                                                &file_msg.file.mime
-                                                            )).small().color(egui::Color32::GREEN));
+                                                            ui.label(
+                                                                egui::RichText::new(format!(
+                                                                    "{} · {} · Downloaded ✓",
+                                                                    format_size(file_msg.file.size),
+                                                                    &file_msg.file.mime
+                                                                ))
+                                                                .small()
+                                                                .color(egui::Color32::GREEN),
+                                                            );
                                                         } else {
-                                                            ui.label(egui::RichText::new(format!(
-                                                                "{} · {}",
-                                                                format_size(file_msg.file.size),
-                                                                &file_msg.file.mime
-                                                            )).small().color(egui::Color32::GRAY));
+                                                            ui.label(
+                                                                egui::RichText::new(format!(
+                                                                    "{} · {}",
+                                                                    format_size(file_msg.file.size),
+                                                                    &file_msg.file.mime
+                                                                ))
+                                                                .small()
+                                                                .color(egui::Color32::GRAY),
+                                                            );
                                                         }
                                                     });
                                                 });
@@ -3025,9 +3168,11 @@ impl eframe::App for MyApp {
                                                 // Progress bar during download
                                                 if is_downloading {
                                                     if let Some(t) = transfer {
-                                                        ui.add(egui::ProgressBar::new(t.progress)
-                                                            .show_percentage()
-                                                            .animate(true));
+                                                        ui.add(
+                                                            egui::ProgressBar::new(t.progress)
+                                                                .show_percentage()
+                                                                .animate(true),
+                                                        );
                                                     }
                                                 }
 
@@ -3039,7 +3184,10 @@ impl eframe::App for MyApp {
                                                             open_file_infohash = Some(infohash_hex.clone());
                                                         }
                                                         if ui.button("💾 Save As...").clicked() {
-                                                            save_file_info = Some((infohash_hex.clone(), file_msg.file.name.clone()));
+                                                            save_file_info = Some((
+                                                                infohash_hex.clone(),
+                                                                file_msg.file.name.clone(),
+                                                            ));
                                                         }
                                                         if ui.button("🔄 Repost").clicked() {
                                                             repost_text = Some(msg.text.clone());
@@ -3118,15 +3266,12 @@ impl eframe::App for MyApp {
                             ui.horizontal(|ui| {
                                 let send = {
                                     let resp = ui.text_edit_singleline(&mut self.chat_input);
-                                    resp.lost_focus()
-                                        && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                                    resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))
                                 } || ui.button("Send").clicked();
                                 if send {
                                     let text = self.chat_input.trim();
                                     if !text.is_empty() && state.connection.is_connected() {
-                                        self.backend.send(Command::SendChat {
-                                            text: text.to_owned(),
-                                        });
+                                        self.backend.send(Command::SendChat { text: text.to_owned() });
                                         self.chat_input.clear();
                                     }
                                 }
@@ -3163,7 +3308,7 @@ impl eframe::App for MyApp {
                 // Collect pending commands to execute after tree view
                 let mut pending_commands: Vec<Command> = Vec::new();
                 let mut pending_rename: Option<(Option<Uuid>, String)> = None;
-                
+
                 // Build set of rooms that have users in them or in any descendant
                 let mut rooms_with_users: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
                 for &room_id in state.room_tree.nodes.keys() {
@@ -3174,7 +3319,7 @@ impl eframe::App for MyApp {
                         }
                     }
                 }
-                
+
                 let (_response, actions) = TreeView::<TreeNodeId>::new(egui::Id::new("room_tree"))
                     .override_indent(Some(20.0))
                     .show(ui, |builder| {
@@ -3187,23 +3332,25 @@ impl eframe::App for MyApp {
                             pending_rename: &mut Option<(Option<Uuid>, String)>,
                             builder: &mut egui_ltreeview::TreeViewBuilder<TreeNodeId>,
                         ) {
-                            let Some(tree_node) = state.room_tree.get(room_id) else { return };
-                            
+                            let Some(tree_node) = state.room_tree.get(room_id) else {
+                                return;
+                            };
+
                             let is_current = state.my_room_id == Some(room_id);
                             let is_root = room_id == api::ROOT_ROOM_UUID;
                             let has_users_in_subtree = rooms_with_users.contains(&room_id);
-                            
+
                             // Capture values for context menu closure
                             let room_name = tree_node.name.clone();
                             let parent_id = tree_node.parent_id;
                             let my_room_id = state.my_room_id;
-                            
+
                             let room_label = if is_current {
                                 format!("📁 {}  (current)", room_name)
                             } else {
                                 format!("📁 {}", room_name)
                             };
-                            
+
                             let room_node = NodeBuilder::dir(TreeNodeId::Room(room_id))
                                 .label(room_label)
                                 .default_open(has_users_in_subtree)
@@ -3222,7 +3369,7 @@ impl eframe::App for MyApp {
                                         ui.label(format!("Current Room: {}", my_room));
                                     }
                                     ui.separator();
-                                    
+
                                     if ui.button("Join").clicked() {
                                         pending_commands.push(Command::JoinRoom { room_id });
                                         ui.close();
@@ -3243,24 +3390,31 @@ impl eframe::App for MyApp {
                                         ui.close();
                                     }
                                 });
-                            
+
                             let is_open = builder.node(room_node);
-                            
+
                             if is_open {
                                 // Render users in this room
                                 for user in state.users_in_room(room_id) {
                                     render_user(room_id, user, state, pending_commands, builder);
                                 }
-                                
+
                                 // Recursively render child rooms
                                 for &child_id in &tree_node.children {
-                                    render_room(child_id, state, rooms_with_users, pending_commands, pending_rename, builder);
+                                    render_room(
+                                        child_id,
+                                        state,
+                                        rooms_with_users,
+                                        pending_commands,
+                                        pending_rename,
+                                        builder,
+                                    );
                                 }
                             }
-                            
+
                             builder.close_dir();
                         }
-                        
+
                         // Helper to render a user node
                         fn render_user(
                             room_id: Uuid,
@@ -3271,25 +3425,25 @@ impl eframe::App for MyApp {
                         ) {
                             let user_id = user.user_id.as_ref().map(|id| id.value).unwrap_or(0);
                             let is_self = state.my_user_id == Some(user_id);
-                            
+
                             let is_talking = if is_self {
                                 state.audio.is_transmitting
                             } else {
                                 state.audio.talking_users.contains(&user_id)
                             };
-                            
+
                             let (user_muted, user_deafened) = if is_self {
                                 (state.audio.self_muted, state.audio.self_deafened)
                             } else {
                                 (user.is_muted, user.is_deafened)
                             };
-                            
+
                             let is_locally_muted = state.audio.muted_users.contains(&user_id);
                             let username = user.username.clone();
                             let self_muted = state.audio.self_muted;
                             let self_deafened = state.audio.self_deafened;
                             let my_room_id = state.my_room_id;
-                            
+
                             let user_node = NodeBuilder::leaf(TreeNodeId::User { room_id, user_id })
                                 .label_ui(|ui| {
                                     ui.horizontal(|ui| {
@@ -3300,21 +3454,21 @@ impl eframe::App for MyApp {
                                         } else {
                                             ui.colored_label(egui::Color32::DARK_GRAY, "🎤");
                                         }
-                                        
+
                                         if user_deafened {
                                             ui.colored_label(egui::Color32::DARK_RED, "🔇");
                                         }
-                                        
+
                                         if is_locally_muted && !is_self {
                                             ui.colored_label(egui::Color32::YELLOW, "🔕");
                                         }
-                                        
+
                                         ui.label(&username);
                                     });
                                 })
                                 .context_menu(|ui| {
                                     ui.set_min_width(200.0);
-                                    
+
                                     if is_self {
                                         ui.label(format!("User: {} (you)", username));
                                     } else {
@@ -3327,7 +3481,7 @@ impl eframe::App for MyApp {
                                         ui.label(format!("Your Room: {}", my_room));
                                     }
                                     ui.separator();
-                                    
+
                                     if is_self {
                                         if self_muted {
                                             if ui.button("🎤 Unmute").clicked() {
@@ -3340,7 +3494,7 @@ impl eframe::App for MyApp {
                                                 ui.close();
                                             }
                                         }
-                                        
+
                                         if self_deafened {
                                             if ui.button("🔊 Undeafen").clicked() {
                                                 pending_commands.push(Command::SetDeafened { deafened: false });
@@ -3352,9 +3506,9 @@ impl eframe::App for MyApp {
                                                 ui.close();
                                             }
                                         }
-                                        
+
                                         ui.separator();
-                                        
+
                                         if ui.button("📝 Register").clicked() {
                                             pending_commands.push(Command::RegisterUser { user_id });
                                             ui.close();
@@ -3375,9 +3529,9 @@ impl eframe::App for MyApp {
                                                 ui.close();
                                             }
                                         }
-                                        
+
                                         ui.separator();
-                                        
+
                                         if ui.button("📝 Register").clicked() {
                                             pending_commands.push(Command::RegisterUser { user_id });
                                             ui.close();
@@ -3388,16 +3542,23 @@ impl eframe::App for MyApp {
                                         }
                                     }
                                 });
-                            
+
                             builder.node(user_node);
                         }
-                        
+
                         // Render all root-level rooms
                         for &root_id in &state.room_tree.roots {
-                            render_room(root_id, &state, &rooms_with_users, &mut pending_commands, &mut pending_rename, builder);
+                            render_room(
+                                root_id,
+                                &state,
+                                &rooms_with_users,
+                                &mut pending_commands,
+                                &mut pending_rename,
+                                builder,
+                            );
                         }
                     });
-                
+
                 // Handle double-click activation (join room) and drag-and-drop moves
                 for action in actions {
                     match action {
@@ -3413,13 +3574,17 @@ impl eframe::App for MyApp {
                             if let Some(TreeNodeId::Room(source_room_id)) = drag_drop.source.first().cloned() {
                                 if let TreeNodeId::Room(target_room_id) = drag_drop.target {
                                     if source_room_id != target_room_id {
-                                        let source_name = state.room_tree.get(source_room_id)
+                                        let source_name = state
+                                            .room_tree
+                                            .get(source_room_id)
                                             .map(|n| n.name.clone())
                                             .unwrap_or_else(|| "Unknown".to_string());
-                                        let target_name = state.room_tree.get(target_room_id)
+                                        let target_name = state
+                                            .room_tree
+                                            .get(target_room_id)
                                             .map(|n| n.name.clone())
                                             .unwrap_or_else(|| "Unknown".to_string());
-                                        
+
                                         self.move_room_modal = MoveRoomModalState {
                                             open: true,
                                             room_id: Some(source_room_id),
@@ -3434,12 +3599,12 @@ impl eframe::App for MyApp {
                         _ => {}
                     }
                 }
-                
+
                 // Execute pending commands
                 for cmd in pending_commands {
                     self.backend.send(cmd);
                 }
-                
+
                 // Handle rename modal
                 if let Some((room_uuid, room_name)) = pending_rename {
                     self.rename_modal = RenameModalState {
@@ -3460,16 +3625,17 @@ impl eframe::App for MyApp {
             let server_name = cert_info.server_name.clone();
             let server_addr = cert_info.server_addr.clone();
             let certificate_der = cert_info.certificate_der.clone();
-            
+
             Modal::new(egui::Id::new("cert_modal")).show(ctx, |ui| {
                 ui.set_width(450.0);
                 ui.heading("⚠ Untrusted Certificate");
-                
+
                 ui.add_space(8.0);
-                ui.label(egui::RichText::new(
-                    "The server presented a certificate that is not trusted."
-                ).color(egui::Color32::YELLOW));
-                
+                ui.label(
+                    egui::RichText::new("The server presented a certificate that is not trusted.")
+                        .color(egui::Color32::YELLOW),
+                );
+
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     ui.label("Server:");
@@ -3479,24 +3645,29 @@ impl eframe::App for MyApp {
                     ui.label("Certificate for:");
                     ui.label(egui::RichText::new(&server_name).strong());
                 });
-                
+
                 ui.add_space(8.0);
                 ui.label("Certificate Fingerprint (SHA256):");
-                ui.add(egui::TextEdit::multiline(&mut fingerprint.as_str())
-                    .font(egui::TextStyle::Monospace)
-                    .desired_width(f32::INFINITY)
-                    .desired_rows(2)
-                    .interactive(false));
-                
+                ui.add(
+                    egui::TextEdit::multiline(&mut fingerprint.as_str())
+                        .font(egui::TextStyle::Monospace)
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(2)
+                        .interactive(false),
+                );
+
                 ui.add_space(8.0);
-                ui.label(egui::RichText::new(
-                    "If you expected to connect to a server with a self-signed certificate, \
-                     verify the fingerprint matches what the server administrator provided."
-                ).weak());
-                
+                ui.label(
+                    egui::RichText::new(
+                        "If you expected to connect to a server with a self-signed certificate, verify the \
+                         fingerprint matches what the server administrator provided.",
+                    )
+                    .weak(),
+                );
+
                 ui.add_space(8.0);
                 ui.separator();
-                
+
                 egui::Sides::new().show(
                     ui,
                     |ui| {
@@ -3509,11 +3680,15 @@ impl eframe::App for MyApp {
                             let accepted_cert = AcceptedCertificate {
                                 server_name: server_name.clone(),
                                 fingerprint_hex: fingerprint.clone(),
-                                certificate_der_base64: base64::engine::general_purpose::STANDARD.encode(&certificate_der),
+                                certificate_der_base64: base64::engine::general_purpose::STANDARD
+                                    .encode(&certificate_der),
                             };
-                            
+
                             // Add to persistent settings if not already present
-                            if !self.persistent_settings.accepted_certificates.iter()
+                            if !self
+                                .persistent_settings
+                                .accepted_certificates
+                                .iter()
                                 .any(|c| c.fingerprint_hex == fingerprint)
                             {
                                 self.persistent_settings.accepted_certificates.push(accepted_cert);
@@ -3521,10 +3696,13 @@ impl eframe::App for MyApp {
                                     tracing::error!("Failed to save accepted certificate: {}", e);
                                 }
                             }
-                            
+
                             self.backend.send(Command::AcceptCertificate);
                             self.backend.send(Command::LocalMessage {
-                                text: format!("Accepted certificate for {} (saved for future connections)", server_name),
+                                text: format!(
+                                    "Accepted certificate for {} (saved for future connections)",
+                                    server_name
+                                ),
                             });
                         }
                         if ui.button("Reject").clicked() {
@@ -3549,10 +3727,7 @@ impl eframe::App for MyApp {
                 ui.text_edit_singleline(&mut self.client_name);
                 ui.label("Password (optional):");
                 ui.text_edit_singleline(&mut self.connect_password);
-                ui.checkbox(
-                    &mut self.trust_dev_cert,
-                    "Trust dev cert (dev-certs/server-cert.der)",
-                );
+                ui.checkbox(&mut self.trust_dev_cert, "Trust dev cert (dev-certs/server-cert.der)");
                 ui.separator();
                 egui::Sides::new().show(
                     ui,
@@ -3592,12 +3767,11 @@ impl eframe::App for MyApp {
                     dirty: false,
                 };
             }
-            
-            let modal = Modal::new(egui::Id::new("settings_modal"))
-                .show(ctx, |ui| {
+
+            let modal = Modal::new(egui::Id::new("settings_modal")).show(ctx, |ui| {
                 ui.set_min_size(egui::vec2(600.0, 400.0));
                 ui.set_max_size(egui::vec2(800.0, 600.0));
-                
+
                 // Header
                 ui.horizontal(|ui| {
                     ui.heading("Settings");
@@ -3608,7 +3782,7 @@ impl eframe::App for MyApp {
                     });
                 });
                 ui.separator();
-                
+
                 // Main content area with sidebar and content panel
                 egui::TopBottomPanel::bottom("settings_footer")
                     .frame(egui::Frame::NONE)
@@ -3618,7 +3792,7 @@ impl eframe::App for MyApp {
                         if self.settings_modal.dirty {
                             ui.colored_label(egui::Color32::YELLOW, "⚠ Unsaved changes");
                         }
-                        
+
                         egui::Sides::new().show(
                             ui,
                             |_l| {},
@@ -3630,12 +3804,12 @@ impl eframe::App for MyApp {
                                     self.settings_modal.dirty = false;
                                     self.save_settings();
                                 }
-                                
+
                                 if ui.button("Cancel").clicked() {
                                     self.settings_modal = SettingsModalState::default();
                                     self.show_settings = false;
                                 }
-                                
+
                                 if ui.button("Ok").clicked() {
                                     // Apply changes before closing if dirty
                                     if self.settings_modal.dirty {
@@ -3648,88 +3822,84 @@ impl eframe::App for MyApp {
                             },
                         );
                     });
-                
+
                 egui::SidePanel::left("settings_sidebar_panel")
                     .resizable(false)
                     .default_width(130.0)
                     .frame(egui::Frame::NONE)
                     .show_inside(ui, |ui| {
-                        egui::ScrollArea::vertical()
-                            .id_salt("settings_sidebar")
-                            .show(ui, |ui| {
-                                ui.add_space(4.0);
-                                let ctrl_held = ui.input(|i| i.modifiers.ctrl);
-                                for category in SettingsCategory::all() {
-                                    let selected = self.settings_modal.selected_categories.contains(category);
-                                    if ui.selectable_label(selected, category.label()).clicked() {
-                                        if ctrl_held {
-                                            // Ctrl+click: toggle this category in the set
-                                            if selected {
-                                                self.settings_modal.selected_categories.remove(category);
-                                                // Ensure at least one category is selected
-                                                if self.settings_modal.selected_categories.is_empty() {
-                                                    self.settings_modal.selected_categories.insert(*category);
-                                                }
-                                            } else {
+                        egui::ScrollArea::vertical().id_salt("settings_sidebar").show(ui, |ui| {
+                            ui.add_space(4.0);
+                            let ctrl_held = ui.input(|i| i.modifiers.ctrl);
+                            for category in SettingsCategory::all() {
+                                let selected = self.settings_modal.selected_categories.contains(category);
+                                if ui.selectable_label(selected, category.label()).clicked() {
+                                    if ctrl_held {
+                                        // Ctrl+click: toggle this category in the set
+                                        if selected {
+                                            self.settings_modal.selected_categories.remove(category);
+                                            // Ensure at least one category is selected
+                                            if self.settings_modal.selected_categories.is_empty() {
                                                 self.settings_modal.selected_categories.insert(*category);
                                             }
                                         } else {
-                                            // Normal click: select only this category
-                                            self.settings_modal.selected_categories.clear();
                                             self.settings_modal.selected_categories.insert(*category);
                                         }
+                                    } else {
+                                        // Normal click: select only this category
+                                        self.settings_modal.selected_categories.clear();
+                                        self.settings_modal.selected_categories.insert(*category);
                                     }
                                 }
-                            });
+                            }
+                        });
                     });
-                
+
                 // Content panel takes remaining space
                 egui::CentralPanel::default()
                     .frame(egui::Frame::NONE)
                     .show_inside(ui, |ui| {
-                        egui::ScrollArea::vertical()
-                            .id_salt("settings_content")
-                            .show(ui, |ui| {
-                                // Render all selected categories in order
-                                let mut first = true;
-                                for category in SettingsCategory::all() {
-                                    if self.settings_modal.selected_categories.contains(category) {
-                                        if !first {
-                                            ui.add_space(16.0);
-                                            ui.separator();
-                                            ui.add_space(8.0);
+                        egui::ScrollArea::vertical().id_salt("settings_content").show(ui, |ui| {
+                            // Render all selected categories in order
+                            let mut first = true;
+                            for category in SettingsCategory::all() {
+                                if self.settings_modal.selected_categories.contains(category) {
+                                    if !first {
+                                        ui.add_space(16.0);
+                                        ui.separator();
+                                        ui.add_space(8.0);
+                                    }
+                                    first = false;
+
+                                    match category {
+                                        SettingsCategory::Connection => {
+                                            self.render_settings_connection(ui, &state);
                                         }
-                                        first = false;
-                                        
-                                        match category {
-                                            SettingsCategory::Connection => {
-                                                self.render_settings_connection(ui, &state);
-                                            }
-                                            SettingsCategory::Devices => {
-                                                self.render_settings_devices(ui, &state);
-                                            }
-                                            SettingsCategory::Voice => {
-                                                self.render_settings_voice(ui, &state);
-                                            }
-                                            SettingsCategory::Processing => {
-                                                self.render_settings_processing(ui, &state);
-                                            }
-                                            SettingsCategory::Encoder => {
-                                                self.render_settings_encoder(ui);
-                                            }
-                                            SettingsCategory::Chat => {
-                                                self.render_settings_chat(ui);
-                                            }
-                                            SettingsCategory::FileTransfer => {
-                                                self.render_settings_file_transfer(ui);
-                                            }
-                                            SettingsCategory::Statistics => {
-                                                self.render_settings_statistics(ui, &state);
-                                            }
+                                        SettingsCategory::Devices => {
+                                            self.render_settings_devices(ui, &state);
+                                        }
+                                        SettingsCategory::Voice => {
+                                            self.render_settings_voice(ui, &state);
+                                        }
+                                        SettingsCategory::Processing => {
+                                            self.render_settings_processing(ui, &state);
+                                        }
+                                        SettingsCategory::Encoder => {
+                                            self.render_settings_encoder(ui);
+                                        }
+                                        SettingsCategory::Chat => {
+                                            self.render_settings_chat(ui);
+                                        }
+                                        SettingsCategory::FileTransfer => {
+                                            self.render_settings_file_transfer(ui);
+                                        }
+                                        SettingsCategory::Statistics => {
+                                            self.render_settings_statistics(ui, &state);
                                         }
                                     }
                                 }
-                            });
+                            }
+                        });
                     });
             });
             // Don't auto-close on click outside - only close via Cancel/Close buttons
@@ -3777,18 +3947,15 @@ impl eframe::App for MyApp {
                 ui.set_width(350.0);
                 ui.heading("Move Room");
                 ui.add_space(8.0);
-                
+
                 ui.label(format!(
                     "Move \"{}\" into \"{}\"?",
-                    self.move_room_modal.room_name,
-                    self.move_room_modal.new_parent_name
+                    self.move_room_modal.room_name, self.move_room_modal.new_parent_name
                 ));
-                
+
                 ui.add_space(8.0);
-                ui.label(egui::RichText::new(
-                    "This will change the room's parent."
-                ).weak());
-                
+                ui.label(egui::RichText::new("This will change the room's parent.").weak());
+
                 ui.add_space(12.0);
                 ui.separator();
                 egui::Sides::new().show(
@@ -3796,13 +3963,10 @@ impl eframe::App for MyApp {
                     |_l| {},
                     |ui| {
                         if ui.button("Move").clicked() {
-                            if let (Some(room_id), Some(new_parent_id)) = 
-                                (self.move_room_modal.room_id, self.move_room_modal.new_parent_id) 
+                            if let (Some(room_id), Some(new_parent_id)) =
+                                (self.move_room_modal.room_id, self.move_room_modal.new_parent_id)
                             {
-                                self.backend.send(Command::MoveRoom {
-                                    room_id,
-                                    new_parent_id,
-                                });
+                                self.backend.send(Command::MoveRoom { room_id, new_parent_id });
                             }
                             ui.close();
                         }

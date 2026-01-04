@@ -41,9 +41,7 @@ pub fn root_room_id() -> proto::RoomId {
 
 /// Check if a RoomId represents the Root room.
 pub fn is_root_room(room_id: &proto::RoomId) -> bool {
-    uuid_from_room_id(room_id)
-        .map(|u| u == ROOT_ROOM_UUID)
-        .unwrap_or(false)
+    uuid_from_room_id(room_id).map(|u| u == ROOT_ROOM_UUID).unwrap_or(false)
 }
 
 /// Generate a new random RoomId.
@@ -131,7 +129,7 @@ pub fn with_state_hash(mut env: proto::Envelope, hash: Vec<u8>) -> proto::Envelo
 // =============================================================================
 
 /// Compute the signature payload for authentication.
-/// 
+///
 /// Layout (112 bytes total, all fixed-length):
 /// - nonce: 32 bytes
 /// - timestamp_ms: 8 bytes (big-endian)
@@ -156,7 +154,7 @@ pub fn build_auth_payload(
 
 /// Compute SHA256 hash of a DER-encoded certificate.
 pub fn compute_cert_hash(cert_der: &[u8]) -> [u8; 32] {
-    use sha2::{Sha256, Digest};
+    use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(cert_der);
     hasher.finalize().into()
@@ -263,9 +261,7 @@ pub fn parse_file_message(text: &str) -> FileMessageParseResult {
     // Validate schema if present
     if let Some(schema) = obj.get("$schema") {
         if schema.as_str() != Some(FILE_MESSAGE_SCHEMA) {
-            return FileMessageParseResult::InvalidFileMessage(
-                "Invalid schema URL".to_string()
-            );
+            return FileMessageParseResult::InvalidFileMessage("Invalid schema URL".to_string());
         }
     }
 
@@ -273,9 +269,7 @@ pub fn parse_file_message(text: &str) -> FileMessageParseResult {
     let allowed_fields = ["$schema", "type", "file"];
     for key in obj.keys() {
         if !allowed_fields.contains(&key.as_str()) {
-            return FileMessageParseResult::InvalidFileMessage(
-                format!("Extraneous field: {}", key)
-            );
+            return FileMessageParseResult::InvalidFileMessage(format!("Extraneous field: {}", key));
         }
     }
 
@@ -283,9 +277,7 @@ pub fn parse_file_message(text: &str) -> FileMessageParseResult {
     let file_obj = match obj.get("file").and_then(|v| v.as_object()) {
         Some(f) => f,
         None => {
-            return FileMessageParseResult::InvalidFileMessage(
-                "Missing 'file' object".to_string()
-            );
+            return FileMessageParseResult::InvalidFileMessage("Missing 'file' object".to_string());
         }
     };
 
@@ -293,9 +285,7 @@ pub fn parse_file_message(text: &str) -> FileMessageParseResult {
     let allowed_file_fields = ["name", "size", "mime", "infohash"];
     for key in file_obj.keys() {
         if !allowed_file_fields.contains(&key.as_str()) {
-            return FileMessageParseResult::InvalidFileMessage(
-                format!("Extraneous file field: {}", key)
-            );
+            return FileMessageParseResult::InvalidFileMessage(format!("Extraneous file field: {}", key));
         }
     }
 
@@ -303,43 +293,35 @@ pub fn parse_file_message(text: &str) -> FileMessageParseResult {
     let name = match file_obj.get("name").and_then(|v| v.as_str()) {
         Some(n) => n.to_string(),
         None => {
-            return FileMessageParseResult::InvalidFileMessage(
-                "Missing 'file.name'".to_string()
-            );
+            return FileMessageParseResult::InvalidFileMessage("Missing 'file.name'".to_string());
         }
     };
 
     let size = match file_obj.get("size").and_then(|v| v.as_u64()) {
         Some(s) => s,
         None => {
-            return FileMessageParseResult::InvalidFileMessage(
-                "Missing or invalid 'file.size'".to_string()
-            );
+            return FileMessageParseResult::InvalidFileMessage("Missing or invalid 'file.size'".to_string());
         }
     };
 
     let mime = match file_obj.get("mime").and_then(|v| v.as_str()) {
         Some(m) => m.to_string(),
         None => {
-            return FileMessageParseResult::InvalidFileMessage(
-                "Missing 'file.mime'".to_string()
-            );
+            return FileMessageParseResult::InvalidFileMessage("Missing 'file.mime'".to_string());
         }
     };
 
     let infohash = match file_obj.get("infohash").and_then(|v| v.as_str()) {
         Some(h) => h.to_string(),
         None => {
-            return FileMessageParseResult::InvalidFileMessage(
-                "Missing 'file.infohash'".to_string()
-            );
+            return FileMessageParseResult::InvalidFileMessage("Missing 'file.infohash'".to_string());
         }
     };
 
     // Validate infohash format (40 hex chars)
     if infohash.len() != 40 || !infohash.chars().all(|c| c.is_ascii_hexdigit()) {
         return FileMessageParseResult::InvalidFileMessage(
-            "Invalid infohash format (expected 40 hex characters)".to_string()
+            "Invalid infohash format (expected 40 hex characters)".to_string(),
         );
     }
 
@@ -468,7 +450,7 @@ mod file_message_tests {
 #[cfg(test)]
 mod auth_tests {
     use super::*;
-    
+
     #[test]
     fn test_build_auth_payload() {
         let nonce = [1u8; 32];
@@ -476,9 +458,9 @@ mod auth_tests {
         let public_key = [2u8; 32];
         let user_id = 42u64;
         let cert_hash = [3u8; 32];
-        
+
         let payload = build_auth_payload(&nonce, timestamp_ms, &public_key, user_id, &cert_hash);
-        
+
         assert_eq!(payload.len(), 112);
         assert_eq!(&payload[0..32], &nonce);
         assert_eq!(&payload[32..40], &timestamp_ms.to_be_bytes());
@@ -486,38 +468,32 @@ mod auth_tests {
         assert_eq!(&payload[72..80], &user_id.to_be_bytes());
         assert_eq!(&payload[80..112], &cert_hash);
     }
-    
+
     #[test]
     fn test_signature_verification() {
-        use ed25519_dalek::{SigningKey, Signer, Verifier};
+        use ed25519_dalek::{Signer, SigningKey, Verifier};
         use rand::rngs::OsRng;
-        
+
         let signing_key = SigningKey::generate(&mut OsRng);
         let public_key = signing_key.verifying_key();
-        
-        let payload = build_auth_payload(
-            &[0u8; 32],
-            1234567890123,
-            &public_key.to_bytes(),
-            42,
-            &[0u8; 32],
-        );
-        
+
+        let payload = build_auth_payload(&[0u8; 32], 1234567890123, &public_key.to_bytes(), 42, &[0u8; 32]);
+
         let signature = signing_key.sign(&payload);
-        
+
         assert!(public_key.verify(&payload, &signature).is_ok());
     }
-    
+
     #[test]
     fn test_compute_cert_hash() {
         let cert_data = b"test certificate data";
         let hash = compute_cert_hash(cert_data);
         assert_eq!(hash.len(), 32);
-        
+
         // Same input should produce same hash
         let hash2 = compute_cert_hash(cert_data);
         assert_eq!(hash, hash2);
-        
+
         // Different input should produce different hash
         let hash3 = compute_cert_hash(b"different data");
         assert_ne!(hash, hash3);

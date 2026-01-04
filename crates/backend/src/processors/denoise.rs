@@ -90,7 +90,8 @@ impl AudioProcessor for DenoiseProcessor {
             if !self.first_frame_done {
                 self.first_frame_done = true;
                 // Fill with zeros to maintain timing
-                self.output_buffer.extend(std::iter::repeat(0.0).take(DENOISE_FRAME_SIZE));
+                self.output_buffer
+                    .extend(std::iter::repeat(0.0).take(DENOISE_FRAME_SIZE));
                 continue;
             }
 
@@ -170,9 +171,8 @@ impl ProcessorFactory for DenoiseProcessorFactory {
 
     fn create_from_config(&self, config: &serde_json::Value) -> Result<Box<dyn AudioProcessor>, String> {
         // Currently no configurable parameters
-        let _settings: DenoiseSettings = serde_json::from_value(config.clone())
-            .unwrap_or_default();
-        
+        let _settings: DenoiseSettings = serde_json::from_value(config.clone()).unwrap_or_default();
+
         Ok(Box::new(DenoiseProcessor::new()))
     }
 
@@ -203,13 +203,13 @@ mod tests {
     #[test]
     fn test_denoise_process_single_frame() {
         let mut processor = DenoiseProcessor::new();
-        
+
         // Create a 960-sample frame (20ms at 48kHz)
         let mut samples = vec![0.1f32; 960];
-        
+
         // Process - first 480 samples will be zeroed due to first-frame discard
         let result = processor.process(&mut samples, 48000);
-        
+
         assert!(!result.suppress);
         // First chunk should be zeroed
         assert!(samples[..480].iter().all(|&s| s.abs() < 0.001));
@@ -218,14 +218,14 @@ mod tests {
     #[test]
     fn test_denoise_reset() {
         let mut processor = DenoiseProcessor::new();
-        
+
         // Process some audio
         let mut samples = vec![0.5f32; 960];
         processor.process(&mut samples, 48000);
-        
+
         // Reset
         processor.reset();
-        
+
         // Buffer should be cleared
         assert!(processor.input_buffer.is_empty());
         assert!(processor.output_buffer.is_empty());
@@ -236,7 +236,7 @@ mod tests {
     fn test_factory_create() {
         let factory = DenoiseProcessorFactory;
         let config = serde_json::json!({});
-        
+
         let processor = factory.create_from_config(&config).unwrap();
         assert_eq!(processor.name(), "Denoise (RNNoise)");
     }

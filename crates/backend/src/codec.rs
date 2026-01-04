@@ -90,20 +90,20 @@ pub struct EncoderSettings {
     /// Target bitrate in bits per second.
     /// Range: 6000 - 510000. Recommended: 24000 - 96000 for voice.
     pub bitrate: i32,
-    
+
     /// Encoder complexity (0-10).
     /// Higher values = better quality but more CPU usage.
     pub complexity: i32,
-    
+
     /// Enable Forward Error Correction for packet loss recovery.
     pub fec_enabled: bool,
-    
+
     /// Expected packet loss percentage (0-100) for FEC tuning.
     pub packet_loss_percent: i32,
-    
+
     /// Enable discontinuous transmission (silence compression).
     pub dtx_enabled: bool,
-    
+
     /// Enable variable bitrate for better quality/bandwidth trade-off.
     pub vbr_enabled: bool,
 }
@@ -148,11 +148,7 @@ impl fmt::Display for CodecError {
             CodecError::Encode(e) => write!(f, "encoding failed: {}", e),
             CodecError::Decode(e) => write!(f, "decoding failed: {}", e),
             CodecError::InvalidFrameSize { expected, got } => {
-                write!(
-                    f,
-                    "invalid frame size: expected {} samples, got {}",
-                    expected, got
-                )
+                write!(f, "invalid frame size: expected {} samples, got {}", expected, got)
             }
         }
     }
@@ -184,7 +180,7 @@ impl VoiceEncoder {
     pub fn new() -> Result<Self, CodecError> {
         Self::with_settings(EncoderSettings::default())
     }
-    
+
     /// Create a new voice encoder with custom settings.
     pub fn with_settings(settings: EncoderSettings) -> Result<Self, CodecError> {
         let mut encoder = Encoder::new(OPUS_SAMPLE_RATE, OPUS_CHANNELS, Application::Voip)
@@ -209,7 +205,7 @@ impl VoiceEncoder {
             settings,
         })
     }
-    
+
     /// Apply encoder settings to the underlying Opus encoder.
     fn apply_settings_to_encoder(encoder: &mut Encoder, settings: &EncoderSettings) -> Result<(), CodecError> {
         encoder
@@ -239,10 +235,10 @@ impl VoiceEncoder {
         encoder
             .set_signal(opus::Signal::Voice)
             .map_err(|e| CodecError::EncoderInit(e.description().to_string()))?;
-            
+
         Ok(())
     }
-    
+
     /// Update encoder settings at runtime.
     ///
     /// Returns true if settings were changed, false if they were already the same.
@@ -250,20 +246,20 @@ impl VoiceEncoder {
         if self.settings == new_settings {
             return Ok(false);
         }
-        
+
         Self::apply_settings_to_encoder(&mut self.encoder, &new_settings)?;
-        
+
         debug!(
             bitrate = new_settings.bitrate,
             complexity = new_settings.complexity,
             fec = new_settings.fec_enabled,
             "codec: encoder settings updated"
         );
-        
+
         self.settings = new_settings;
         Ok(true)
     }
-    
+
     /// Get the current encoder settings.
     pub fn settings(&self) -> &EncoderSettings {
         &self.settings
@@ -409,11 +405,7 @@ impl VoiceDecoder {
 
         self.frames_decoded += 1;
 
-        trace!(
-            samples,
-            frames = self.frames_decoded,
-            "codec: decoded frame"
-        );
+        trace!(samples, frames = self.frames_decoded, "codec: decoded frame");
 
         Ok(self.output_buffer[..samples].to_vec())
     }
@@ -422,11 +414,7 @@ impl VoiceDecoder {
     ///
     /// # Returns
     /// The number of samples written to the output buffer.
-    pub fn decode_into(
-        &mut self,
-        opus_data: &[u8],
-        output: &mut [f32],
-    ) -> Result<usize, CodecError> {
+    pub fn decode_into(&mut self, opus_data: &[u8], output: &mut [f32]) -> Result<usize, CodecError> {
         let samples = self
             .decoder
             .decode_float(opus_data, output, false)
@@ -570,25 +558,17 @@ mod tests {
         // Encode
         let opus_data = encoder.encode(&pcm).expect("encoding should succeed");
         assert!(!opus_data.is_empty(), "encoded data should not be empty");
-        assert!(
-            opus_data.len() < pcm.len() * 4,
-            "opus should compress the audio"
-        );
+        assert!(opus_data.len() < pcm.len() * 4, "opus should compress the audio");
 
         // Decode
         let decoded = decoder.decode(&opus_data).expect("decoding should succeed");
-        assert_eq!(
-            decoded.len(),
-            OPUS_FRAME_SIZE,
-            "decoded frame should have correct size"
-        );
+        assert_eq!(decoded.len(), OPUS_FRAME_SIZE, "decoded frame should have correct size");
 
         // Verify the decoded signal has similar characteristics to the original
         // (not exact due to lossy compression and codec latency)
         // Check that the signal has similar energy (RMS)
         let original_rms: f32 = (pcm.iter().map(|s| s * s).sum::<f32>() / pcm.len() as f32).sqrt();
-        let decoded_rms: f32 =
-            (decoded.iter().map(|s| s * s).sum::<f32>() / decoded.len() as f32).sqrt();
+        let decoded_rms: f32 = (decoded.iter().map(|s| s * s).sum::<f32>() / decoded.len() as f32).sqrt();
 
         // RMS should be within a factor of 2 (Opus preserves signal energy reasonably well)
         assert!(
@@ -668,7 +648,7 @@ mod tests {
         // Version string typically contains "libopus"
         println!("Opus version: {}", version);
     }
-    
+
     #[test]
     fn test_encoder_with_custom_settings() {
         let settings = EncoderSettings {
@@ -679,18 +659,21 @@ mod tests {
             dtx_enabled: true,
             vbr_enabled: true,
         };
-        
+
         let encoder = VoiceEncoder::with_settings(settings.clone());
-        assert!(encoder.is_ok(), "encoder with custom settings should be created successfully");
-        
+        assert!(
+            encoder.is_ok(),
+            "encoder with custom settings should be created successfully"
+        );
+
         let encoder = encoder.unwrap();
         assert_eq!(encoder.settings(), &settings);
     }
-    
+
     #[test]
     fn test_encoder_update_settings() {
         let mut encoder = VoiceEncoder::new().unwrap();
-        
+
         let new_settings = EncoderSettings {
             bitrate: 24000,
             complexity: 3,
@@ -699,50 +682,55 @@ mod tests {
             dtx_enabled: false,
             vbr_enabled: false,
         };
-        
+
         let changed = encoder.update_settings(new_settings.clone()).unwrap();
         assert!(changed, "settings should have changed");
         assert_eq!(encoder.settings(), &new_settings);
-        
+
         // Updating with same settings should return false
         let changed = encoder.update_settings(new_settings.clone()).unwrap();
         assert!(!changed, "settings should not have changed");
     }
-    
+
     #[test]
     fn test_bitrate_affects_frame_size() {
         let pcm = vec![0.5f32; OPUS_FRAME_SIZE]; // Non-silent audio
-        
+
         // Low bitrate encoder
         let low_settings = EncoderSettings {
             bitrate: 16000,
             ..Default::default()
         };
         let mut low_encoder = VoiceEncoder::with_settings(low_settings).unwrap();
-        
+
         // High bitrate encoder
         let high_settings = EncoderSettings {
             bitrate: 128000,
             ..Default::default()
         };
         let mut high_encoder = VoiceEncoder::with_settings(high_settings).unwrap();
-        
+
         // Encode several frames to get stable sizes
         let mut low_sizes = Vec::new();
         let mut high_sizes = Vec::new();
-        
+
         for _ in 0..10 {
             low_sizes.push(low_encoder.encode(&pcm).unwrap().len());
             high_sizes.push(high_encoder.encode(&pcm).unwrap().len());
         }
-        
+
         let avg_low: f32 = low_sizes.iter().sum::<usize>() as f32 / low_sizes.len() as f32;
         let avg_high: f32 = high_sizes.iter().sum::<usize>() as f32 / high_sizes.len() as f32;
-        
+
         // Higher bitrate should produce larger frames
-        assert!(avg_high > avg_low, "higher bitrate should produce larger frames (low: {}, high: {})", avg_low, avg_high);
+        assert!(
+            avg_high > avg_low,
+            "higher bitrate should produce larger frames (low: {}, high: {})",
+            avg_low,
+            avg_high
+        );
     }
-    
+
     #[test]
     fn test_is_dtx_frame() {
         // DTX frames are ≤2 bytes
@@ -752,7 +740,7 @@ mod tests {
         assert!(!is_dtx_frame(&[0x00, 0x01, 0x02]), "3-byte frame should not be DTX");
         assert!(!is_dtx_frame(&[0x00; 100]), "100-byte frame should not be DTX");
     }
-    
+
     #[test]
     fn test_dtx_produces_small_frames_on_silence() {
         // With DTX enabled, silence should produce very small frames (≤2 bytes)
@@ -761,19 +749,23 @@ mod tests {
             ..Default::default()
         };
         let mut encoder = VoiceEncoder::with_settings(settings).unwrap();
-        
+
         // Encode many silent frames to ensure encoder reaches DTX state
         let silent_pcm = vec![0.0f32; OPUS_FRAME_SIZE];
         let mut dtx_frames = 0;
-        
+
         for _ in 0..50 {
             let encoded = encoder.encode(&silent_pcm).unwrap();
             if is_dtx_frame(&encoded) {
                 dtx_frames += 1;
             }
         }
-        
+
         // After many silent frames, most should be DTX frames
-        assert!(dtx_frames > 30, "Expected most frames to be DTX on silence, got {}/50", dtx_frames);
+        assert!(
+            dtx_frames > 30,
+            "Expected most frames to be DTX on silence, got {}/50",
+            dtx_frames
+        );
     }
 }

@@ -201,8 +201,8 @@ impl ProcessorFactory for VadProcessorFactory {
     }
 
     fn create_from_config(&self, config: &serde_json::Value) -> Result<Box<dyn AudioProcessor>, String> {
-        let settings: VadSettings = serde_json::from_value(config.clone())
-            .map_err(|e| format!("Invalid VAD settings: {}", e))?;
+        let settings: VadSettings =
+            serde_json::from_value(config.clone()).map_err(|e| format!("Invalid VAD settings: {}", e))?;
 
         Ok(Box::new(VadProcessor::with_settings(settings)))
     }

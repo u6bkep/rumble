@@ -52,7 +52,7 @@ impl Persistence {
         let registered_users = db.open_tree("registered_users")?;
         let known_keys = db.open_tree("known_keys")?;
         let rooms = db.open_tree("rooms")?;
-        
+
         Ok(Self {
             db,
             registered_users,
@@ -60,14 +60,14 @@ impl Persistence {
             rooms,
         })
     }
-    
+
     /// Create an in-memory persistence layer (for testing).
     pub fn in_memory() -> Result<Self> {
         let db = sled::Config::new().temporary(true).open()?;
         let registered_users = db.open_tree("registered_users")?;
         let known_keys = db.open_tree("known_keys")?;
         let rooms = db.open_tree("rooms")?;
-        
+
         Ok(Self {
             db,
             registered_users,
@@ -99,11 +99,11 @@ impl Persistence {
     }
 
     /// Check if username is taken by a different key.
-    /// 
+    ///
     /// This returns true if:
     /// 1. The username is registered to a DIFFERENT public key, OR
     /// 2. The username matches a registered user's name and the provided key is NOT that registered user
-    /// 
+    ///
     /// This ensures that registered usernames can only be used by their registered key.
     pub fn is_username_taken(&self, username: &str, public_key: &[u8; 32]) -> bool {
         for result in self.registered_users.iter() {
@@ -122,7 +122,7 @@ impl Persistence {
         }
         false
     }
-    
+
     /// Check if a public key is registered (has a bound username).
     pub fn is_registered(&self, public_key: &[u8; 32]) -> bool {
         self.registered_users.contains_key(public_key).unwrap_or(false)
@@ -192,11 +192,7 @@ impl Persistence {
     }
 
     /// Update a registered user's last room.
-    pub fn update_user_last_room(
-        &self,
-        public_key: &[u8; 32],
-        room_uuid: Option<[u8; 16]>,
-    ) -> Result<()> {
+    pub fn update_user_last_room(&self, public_key: &[u8; 32], room_uuid: Option<[u8; 16]>) -> Result<()> {
         if let Some(mut user) = self.get_registered_user(public_key) {
             user.last_room = room_uuid;
             self.register_user(public_key, user)?;
@@ -266,7 +262,7 @@ mod tests {
         // Different username - not taken
         assert!(!persistence.is_username_taken("bob", &key2));
     }
-    
+
     #[test]
     fn test_is_registered() {
         let persistence = Persistence::in_memory().unwrap();
@@ -293,7 +289,7 @@ mod tests {
         persistence.unregister_user(&key1).unwrap();
         assert!(!persistence.is_registered(&key1));
     }
-    
+
     #[test]
     fn test_registered_username_protected() {
         let persistence = Persistence::in_memory().unwrap();
@@ -310,10 +306,10 @@ mod tests {
 
         // An unregistered key trying to use "alice" should be blocked
         assert!(persistence.is_username_taken("alice", &unregistered_key));
-        
+
         // The registered key can use "alice"
         assert!(!persistence.is_username_taken("alice", &registered_key));
-        
+
         // Anyone can use an unregistered username like "bob"
         assert!(!persistence.is_username_taken("bob", &unregistered_key));
         assert!(!persistence.is_username_taken("bob", &registered_key));
@@ -388,19 +384,29 @@ mod tests {
         let uuid1 = [1u8; 16];
         let uuid2 = [2u8; 16];
 
-        persistence.save_room(&uuid1, &PersistedRoom {
-            name: "Room 1".to_string(),
-            parent: None,
-            description: String::new(),
-            permanent: true,
-        }).unwrap();
+        persistence
+            .save_room(
+                &uuid1,
+                &PersistedRoom {
+                    name: "Room 1".to_string(),
+                    parent: None,
+                    description: String::new(),
+                    permanent: true,
+                },
+            )
+            .unwrap();
 
-        persistence.save_room(&uuid2, &PersistedRoom {
-            name: "Room 2".to_string(),
-            parent: None,
-            description: String::new(),
-            permanent: false,
-        }).unwrap();
+        persistence
+            .save_room(
+                &uuid2,
+                &PersistedRoom {
+                    name: "Room 2".to_string(),
+                    parent: None,
+                    description: String::new(),
+                    permanent: false,
+                },
+            )
+            .unwrap();
 
         let rooms = persistence.get_all_rooms();
         assert_eq!(rooms.len(), 2);

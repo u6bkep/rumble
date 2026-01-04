@@ -8,8 +8,8 @@ use std::{
     path::PathBuf,
     process::{Child, Command, Stdio},
     sync::{
-        atomic::{AtomicBool, AtomicU16, Ordering},
         Arc,
+        atomic::{AtomicBool, AtomicU16, Ordering},
     },
     time::Duration,
 };
@@ -104,8 +104,7 @@ fn create_backend_with_repaint_and_cert(cert_path: &std::path::Path) -> (Backend
 
     let config = ConnectConfig::new().with_cert(cert_path);
 
-    let handle =
-        BackendHandle::with_config(move || repaint_called_clone.store(true, Ordering::SeqCst), config);
+    let handle = BackendHandle::with_config(move || repaint_called_clone.store(true, Ordering::SeqCst), config);
 
     (handle, repaint_called)
 }
@@ -115,8 +114,10 @@ fn create_backend_without_cert() -> (BackendHandle, Arc<AtomicBool>) {
     let repaint_called = Arc::new(AtomicBool::new(false));
     let repaint_called_clone = repaint_called.clone();
 
-    let handle =
-        BackendHandle::with_config(move || repaint_called_clone.store(true, Ordering::SeqCst), ConnectConfig::new());
+    let handle = BackendHandle::with_config(
+        move || repaint_called_clone.store(true, Ordering::SeqCst),
+        ConnectConfig::new(),
+    );
 
     (handle, repaint_called)
 }
@@ -145,14 +146,14 @@ fn create_test_credentials() -> ([u8; 32], SigningCallback) {
     let signing_key = SigningKey::generate(&mut OsRng);
     let public_key = signing_key.verifying_key().to_bytes();
     let key_bytes = signing_key.to_bytes();
-    
+
     let signer: SigningCallback = Arc::new(move |payload: &[u8]| {
         use ed25519_dalek::Signer;
         let key = SigningKey::from_bytes(&key_bytes);
         let signature = key.sign(payload);
         Ok(signature.to_bytes())
     });
-    
+
     (public_key, signer)
 }
 
@@ -177,10 +178,7 @@ fn test_backend_connects_to_server() {
     let (handle, _repaint) = create_backend_with_repaint_and_cert(&server.cert_path);
 
     // Initially disconnected
-    assert!(matches!(
-        handle.state().connection,
-        ConnectionState::Disconnected
-    ));
+    assert!(matches!(handle.state().connection, ConnectionState::Disconnected));
 
     // Send connect command
     send_connect(&handle, format!("127.0.0.1:{}", port), "backend-test".to_string(), None);
@@ -195,10 +193,7 @@ fn test_backend_connects_to_server() {
     assert!(!state.rooms.is_empty(), "Should have rooms from server");
 
     // Check we got the Root room
-    assert!(
-        state.rooms.iter().any(|r| r.name == "Root"),
-        "Should have Root room"
-    );
+    assert!(state.rooms.iter().any(|r| r.name == "Root"), "Should have Root room");
 }
 
 #[test]
@@ -210,7 +205,12 @@ fn test_backend_disconnect() {
     let (handle, _repaint) = create_backend_with_repaint_and_cert(&server.cert_path);
 
     // Connect
-    send_connect(&handle, format!("127.0.0.1:{}", port), "disconnect-test".to_string(), None);
+    send_connect(
+        &handle,
+        format!("127.0.0.1:{}", port),
+        "disconnect-test".to_string(),
+        None,
+    );
 
     wait_for(&handle, Duration::from_secs(5), |s| s.connection.is_connected());
     assert!(handle.is_connected());
@@ -248,9 +248,7 @@ fn test_backend_create_room() {
     });
 
     // Wait for room to appear
-    let room_created = wait_for(&handle, Duration::from_secs(2), |s| {
-        s.rooms.len() > initial_room_count
-    });
+    let room_created = wait_for(&handle, Duration::from_secs(2), |s| s.rooms.len() > initial_room_count);
 
     assert!(room_created, "Room should be created");
     assert!(
@@ -370,10 +368,10 @@ fn test_backend_user_appears_in_state() {
 
     // Check that our user is in the users list
     assert!(
-        state.users.iter().any(|u| {
-            u.user_id.as_ref().map(|id| id.value) == Some(my_user_id)
-                && u.username == "visible-user"
-        }),
+        state
+            .users
+            .iter()
+            .any(|u| { u.user_id.as_ref().map(|id| id.value) == Some(my_user_id) && u.username == "visible-user" }),
         "Should see ourselves in users list"
     );
 }
@@ -388,13 +386,23 @@ fn test_two_backends_see_each_other() {
     let (handle2, _repaint2) = create_backend_with_repaint_and_cert(&server.cert_path);
 
     // Connect first backend
-    send_connect(&handle1, format!("127.0.0.1:{}", port), "first-backend".to_string(), None);
+    send_connect(
+        &handle1,
+        format!("127.0.0.1:{}", port),
+        "first-backend".to_string(),
+        None,
+    );
 
     wait_for(&handle1, Duration::from_secs(5), |s| s.connection.is_connected());
     let user1_id = handle1.state().my_user_id.expect("user 1 should have ID");
 
     // Connect second backend
-    send_connect(&handle2, format!("127.0.0.1:{}", port), "second-backend".to_string(), None);
+    send_connect(
+        &handle2,
+        format!("127.0.0.1:{}", port),
+        "second-backend".to_string(),
+        None,
+    );
 
     wait_for(&handle2, Duration::from_secs(5), |s| s.connection.is_connected());
     let user2_id = handle2.state().my_user_id.expect("user 2 should have ID");
@@ -430,7 +438,12 @@ fn test_no_duplicate_users_when_second_client_connects() {
     let (handle1, _repaint1) = create_backend_with_repaint_and_cert(&server.cert_path);
 
     // Connect first backend
-    send_connect(&handle1, format!("127.0.0.1:{}", port), "first-client".to_string(), None);
+    send_connect(
+        &handle1,
+        format!("127.0.0.1:{}", port),
+        "first-client".to_string(),
+        None,
+    );
 
     wait_for(&handle1, Duration::from_secs(5), |s| s.connection.is_connected());
     let user1_id = handle1.state().my_user_id.expect("user 1 should have ID");
@@ -442,11 +455,19 @@ fn test_no_duplicate_users_when_second_client_connects() {
         .iter()
         .filter(|u| u.user_id.as_ref().map(|id| id.value) == Some(user1_id))
         .count();
-    assert_eq!(user1_count_before, 1, "User 1 should appear exactly once before second client connects");
+    assert_eq!(
+        user1_count_before, 1,
+        "User 1 should appear exactly once before second client connects"
+    );
 
     // Connect second backend
     let (handle2, _repaint2) = create_backend_with_repaint_and_cert(&server.cert_path);
-    send_connect(&handle2, format!("127.0.0.1:{}", port), "second-client".to_string(), None);
+    send_connect(
+        &handle2,
+        format!("127.0.0.1:{}", port),
+        "second-client".to_string(),
+        None,
+    );
 
     wait_for(&handle2, Duration::from_secs(5), |s| s.connection.is_connected());
     let user2_id = handle2.state().my_user_id.expect("user 2 should have ID");
@@ -465,7 +486,10 @@ fn test_no_duplicate_users_when_second_client_connects() {
         .iter()
         .filter(|u| u.user_id.as_ref().map(|id| id.value) == Some(user1_id))
         .count();
-    assert_eq!(user1_count_after, 1, "User 1 should still appear exactly once after second client connects");
+    assert_eq!(
+        user1_count_after, 1,
+        "User 1 should still appear exactly once after second client connects"
+    );
 
     // Verify client 2 only appears once in both client lists
     let user2_count_in_handle1 = handle1
@@ -474,7 +498,10 @@ fn test_no_duplicate_users_when_second_client_connects() {
         .iter()
         .filter(|u| u.user_id.as_ref().map(|id| id.value) == Some(user2_id))
         .count();
-    assert_eq!(user2_count_in_handle1, 1, "User 2 should appear exactly once in client 1's list");
+    assert_eq!(
+        user2_count_in_handle1, 1,
+        "User 2 should appear exactly once in client 1's list"
+    );
 
     let user2_count_in_handle2 = handle2
         .state()
@@ -482,7 +509,10 @@ fn test_no_duplicate_users_when_second_client_connects() {
         .iter()
         .filter(|u| u.user_id.as_ref().map(|id| id.value) == Some(user2_id))
         .count();
-    assert_eq!(user2_count_in_handle2, 1, "User 2 should appear exactly once in its own list");
+    assert_eq!(
+        user2_count_in_handle2, 1,
+        "User 2 should appear exactly once in its own list"
+    );
 }
 
 #[test]
@@ -529,7 +559,12 @@ fn test_backend_disconnect_removes_user() {
     let (handle2, _repaint2) = create_backend_with_repaint_and_cert(&server.cert_path);
 
     // Connect both backends
-    send_connect(&handle1, format!("127.0.0.1:{}", port), "will-disconnect".to_string(), None);
+    send_connect(
+        &handle1,
+        format!("127.0.0.1:{}", port),
+        "will-disconnect".to_string(),
+        None,
+    );
 
     wait_for(&handle1, Duration::from_secs(5), |s| s.connection.is_connected());
     let user1_id = handle1.state().my_user_id.expect("user 1 should have ID");
@@ -598,10 +633,7 @@ fn test_backend_join_room() {
         let my_id = s.my_user_id;
         s.users.iter().any(|u| {
             u.user_id.as_ref().map(|id| id.value) == my_id
-                && u.current_room
-                    .as_ref()
-                    .and_then(api::uuid_from_room_id)
-                    == Some(room_uuid)
+                && u.current_room.as_ref().and_then(api::uuid_from_room_id) == Some(room_uuid)
         })
     });
 
@@ -617,7 +649,12 @@ fn test_backend_connection_lost_on_server_shutdown() {
 
     let (handle, _repaint) = create_backend_with_repaint_and_cert(&server_guard.cert_path);
 
-    send_connect(&handle, format!("127.0.0.1:{}", port), "connection-test".to_string(), None);
+    send_connect(
+        &handle,
+        format!("127.0.0.1:{}", port),
+        "connection-test".to_string(),
+        None,
+    );
 
     wait_for(&handle, Duration::from_secs(5), |s| s.connection.is_connected());
 
@@ -655,7 +692,10 @@ fn test_backend_repaint_callback_called() {
     wait_for(&handle, Duration::from_secs(5), |s| s.connection.is_connected());
 
     // Repaint should have been called at some point during connection
-    assert!(repaint_called.load(Ordering::SeqCst), "Repaint callback should be called");
+    assert!(
+        repaint_called.load(Ordering::SeqCst),
+        "Repaint callback should be called"
+    );
 }
 
 // =============================================================================
@@ -705,7 +745,10 @@ fn test_set_transmission_mode_updates_state() {
 
     // In continuous mode while connected, should be transmitting
     let transmitting = wait_for(&handle, Duration::from_secs(2), |s| s.audio.is_transmitting);
-    assert!(transmitting, "Should be transmitting in Continuous mode while connected");
+    assert!(
+        transmitting,
+        "Should be transmitting in Continuous mode while connected"
+    );
 
     // Set muted
     handle.send(BackendCommand::SetMuted { muted: true });
@@ -732,7 +775,10 @@ fn test_set_transmission_mode_updates_state() {
         matches!(s.audio.voice_mode, backend::VoiceMode::PushToTalk)
     });
     assert!(ptt, "Should be in PushToTalk mode");
-    assert!(!handle.state().audio.is_transmitting, "Should not be transmitting in PTT mode without key pressed");
+    assert!(
+        !handle.state().audio.is_transmitting,
+        "Should not be transmitting in PTT mode without key pressed"
+    );
 }
 
 #[test]
@@ -768,7 +814,12 @@ fn test_ptt_in_continuous_mode_ignored() {
 
     let (handle, _repaint) = create_backend_with_repaint_and_cert(&server.cert_path);
 
-    send_connect(&handle, format!("127.0.0.1:{}", port), "ptt-continuous-test".to_string(), None);
+    send_connect(
+        &handle,
+        format!("127.0.0.1:{}", port),
+        "ptt-continuous-test".to_string(),
+        None,
+    );
 
     wait_for(&handle, Duration::from_secs(5), |s| s.connection.is_connected());
 
@@ -789,7 +840,10 @@ fn test_ptt_in_continuous_mode_ignored() {
 
     // Should still be transmitting (continuous mode doesn't stop on PTT release)
     let still_transmitting = handle.state().audio.is_transmitting;
-    assert!(still_transmitting, "Continuous mode should keep transmitting after PTT release");
+    assert!(
+        still_transmitting,
+        "Continuous mode should keep transmitting after PTT release"
+    );
 }
 
 #[test]
@@ -802,7 +856,12 @@ fn test_switch_from_continuous_to_ptt_while_ptt_held() {
 
     let (handle, _repaint) = create_backend_with_repaint_and_cert(&server.cert_path);
 
-    send_connect(&handle, format!("127.0.0.1:{}", port), "mode-switch-test".to_string(), None);
+    send_connect(
+        &handle,
+        format!("127.0.0.1:{}", port),
+        "mode-switch-test".to_string(),
+        None,
+    );
 
     wait_for(&handle, Duration::from_secs(5), |s| s.connection.is_connected());
 
@@ -826,7 +885,10 @@ fn test_switch_from_continuous_to_ptt_while_ptt_held() {
 
     // Should still be transmitting because PTT was pressed before mode switch
     let still_transmitting = handle.state().audio.is_transmitting;
-    assert!(still_transmitting, "Should keep transmitting when switching to PTT with key held");
+    assert!(
+        still_transmitting,
+        "Should keep transmitting when switching to PTT with key held"
+    );
 
     // Now release PTT
     handle.send(BackendCommand::StopTransmit);
@@ -843,7 +905,12 @@ fn test_switch_from_ptt_to_continuous_continues_transmission() {
 
     let (handle, _repaint) = create_backend_with_repaint_and_cert(&server.cert_path);
 
-    send_connect(&handle, format!("127.0.0.1:{}", port), "ptt-to-continuous-test".to_string(), None);
+    send_connect(
+        &handle,
+        format!("127.0.0.1:{}", port),
+        "ptt-to-continuous-test".to_string(),
+        None,
+    );
 
     wait_for(&handle, Duration::from_secs(5), |s| s.connection.is_connected());
 
@@ -860,7 +927,10 @@ fn test_switch_from_ptt_to_continuous_continues_transmission() {
     std::thread::sleep(Duration::from_millis(200));
 
     // Should still be transmitting
-    assert!(handle.state().audio.is_transmitting, "Should keep transmitting when switching to Continuous");
+    assert!(
+        handle.state().audio.is_transmitting,
+        "Should keep transmitting when switching to Continuous"
+    );
 
     // Release PTT (should be ignored in continuous mode)
     handle.send(BackendCommand::StopTransmit);
@@ -868,7 +938,10 @@ fn test_switch_from_ptt_to_continuous_continues_transmission() {
     std::thread::sleep(Duration::from_millis(200));
 
     // Should still be transmitting (continuous mode)
-    assert!(handle.state().audio.is_transmitting, "Continuous mode should keep transmitting after PTT release");
+    assert!(
+        handle.state().audio.is_transmitting,
+        "Continuous mode should keep transmitting after PTT release"
+    );
 }
 
 #[test]
@@ -887,13 +960,21 @@ fn test_continuous_mode_starts_on_connect() {
     std::thread::sleep(Duration::from_millis(100));
 
     // Connect
-    send_connect(&handle, format!("127.0.0.1:{}", port), "continuous-on-connect-test".to_string(), None);
+    send_connect(
+        &handle,
+        format!("127.0.0.1:{}", port),
+        "continuous-on-connect-test".to_string(),
+        None,
+    );
 
     wait_for(&handle, Duration::from_secs(5), |s| s.connection.is_connected());
 
     // Should automatically start transmitting on connect in continuous mode
     let transmitting = wait_for(&handle, Duration::from_secs(2), |s| s.audio.is_transmitting);
-    assert!(transmitting, "Should start transmitting on connect when in Continuous mode");
+    assert!(
+        transmitting,
+        "Should start transmitting on connect when in Continuous mode"
+    );
 }
 
 #[test]
@@ -929,7 +1010,12 @@ fn test_mute_stops_continuous_transmission() {
 
     let (handle, _repaint) = create_backend_with_repaint_and_cert(&server.cert_path);
 
-    send_connect(&handle, format!("127.0.0.1:{}", port), "continuous-to-muted-test".to_string(), None);
+    send_connect(
+        &handle,
+        format!("127.0.0.1:{}", port),
+        "continuous-to-muted-test".to_string(),
+        None,
+    );
 
     wait_for(&handle, Duration::from_secs(5), |s| s.connection.is_connected());
 
@@ -955,7 +1041,12 @@ fn test_disconnect_clears_transmission_state() {
 
     let (handle, _repaint) = create_backend_with_repaint_and_cert(&server.cert_path);
 
-    send_connect(&handle, format!("127.0.0.1:{}", port), "disconnect-transmission-test".to_string(), None);
+    send_connect(
+        &handle,
+        format!("127.0.0.1:{}", port),
+        "disconnect-transmission-test".to_string(),
+        None,
+    );
 
     wait_for(&handle, Duration::from_secs(5), |s| s.connection.is_connected());
 
@@ -992,7 +1083,12 @@ fn test_continuous_mode_resumes_on_reconnect() {
     });
 
     // Connect
-    send_connect(&handle, format!("127.0.0.1:{}", port), "reconnect-continuous-test".to_string(), None);
+    send_connect(
+        &handle,
+        format!("127.0.0.1:{}", port),
+        "reconnect-continuous-test".to_string(),
+        None,
+    );
 
     wait_for(&handle, Duration::from_secs(5), |s| s.connection.is_connected());
     wait_for(&handle, Duration::from_secs(2), |s| s.audio.is_transmitting);
@@ -1012,13 +1108,21 @@ fn test_continuous_mode_resumes_on_reconnect() {
     );
 
     // Reconnect
-    send_connect(&handle, format!("127.0.0.1:{}", port), "reconnect-continuous-test".to_string(), None);
+    send_connect(
+        &handle,
+        format!("127.0.0.1:{}", port),
+        "reconnect-continuous-test".to_string(),
+        None,
+    );
 
     wait_for(&handle, Duration::from_secs(5), |s| s.connection.is_connected());
 
     // Should resume transmitting
     let transmitting = wait_for(&handle, Duration::from_secs(2), |s| s.audio.is_transmitting);
-    assert!(transmitting, "Should resume transmitting on reconnect in Continuous mode");
+    assert!(
+        transmitting,
+        "Should resume transmitting on reconnect in Continuous mode"
+    );
 }
 
 #[test]
@@ -1030,7 +1134,12 @@ fn test_ptt_not_transmitting_after_disconnect() {
 
     let (handle, _repaint) = create_backend_with_repaint_and_cert(&server.cert_path);
 
-    send_connect(&handle, format!("127.0.0.1:{}", port), "ptt-disconnect-test".to_string(), None);
+    send_connect(
+        &handle,
+        format!("127.0.0.1:{}", port),
+        "ptt-disconnect-test".to_string(),
+        None,
+    );
 
     wait_for(&handle, Duration::from_secs(5), |s| s.connection.is_connected());
 
@@ -1047,16 +1156,27 @@ fn test_ptt_not_transmitting_after_disconnect() {
     });
 
     // Should not be transmitting after disconnect
-    assert!(!handle.state().audio.is_transmitting, "Should not be transmitting after disconnect");
+    assert!(
+        !handle.state().audio.is_transmitting,
+        "Should not be transmitting after disconnect"
+    );
 
     // Reconnect
-    send_connect(&handle, format!("127.0.0.1:{}", port), "ptt-disconnect-test".to_string(), None);
+    send_connect(
+        &handle,
+        format!("127.0.0.1:{}", port),
+        "ptt-disconnect-test".to_string(),
+        None,
+    );
 
     wait_for(&handle, Duration::from_secs(5), |s| s.connection.is_connected());
 
     // Should NOT be transmitting automatically in PTT mode
     std::thread::sleep(Duration::from_millis(200));
-    assert!(!handle.state().audio.is_transmitting, "Should not transmit on reconnect in PTT mode without key pressed");
+    assert!(
+        !handle.state().audio.is_transmitting,
+        "Should not transmit on reconnect in PTT mode without key pressed"
+    );
 }
 
 // =============================================================================
@@ -1069,7 +1189,7 @@ fn test_audio_devices_available_before_connect() {
     let (handle, _repaint) = create_backend_without_cert();
 
     let state = handle.state();
-    
+
     // We just verify the lists exist - whether they have devices depends on the test environment
     // This test mainly ensures the backend initializes audio properly without a connection
     assert!(state.audio.input_devices.is_empty() || !state.audio.input_devices.is_empty());
@@ -1119,4 +1239,3 @@ fn test_set_output_device() {
 
     assert!(updated, "Selected output device should be updated");
 }
-

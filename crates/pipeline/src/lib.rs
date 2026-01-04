@@ -201,7 +201,7 @@ pub trait ProcessorFactory: Send + Sync {
     /// This can be used by UI code to generate appropriate controls.
     /// The schema should follow JSON Schema conventions.
     fn settings_schema(&self) -> serde_json::Value;
-    
+
     /// Get the default settings for this processor as JSON.
     ///
     /// This is used when creating a new processor config with default values.
@@ -210,7 +210,7 @@ pub trait ProcessorFactory: Send + Sync {
         // Default implementation: create a default processor and get its config
         self.create_default().config()
     }
-    
+
     /// Short description of what this processor does.
     fn description(&self) -> &'static str {
         ""
@@ -256,7 +256,7 @@ impl ProcessorConfig {
             settings,
         }
     }
-    
+
     /// Set enabled state.
     pub fn enabled(mut self, enabled: bool) -> Self {
         self.enabled = enabled;
@@ -413,17 +413,17 @@ impl ProcessorRegistry {
     pub fn has(&self, type_id: &str) -> bool {
         self.factories.contains_key(type_id)
     }
-    
+
     /// Get the settings schema for a processor type.
     pub fn settings_schema(&self, type_id: &str) -> Option<serde_json::Value> {
         self.factories.get(type_id).map(|f| f.settings_schema())
     }
-    
+
     /// Get the default settings for a processor type.
     pub fn default_settings(&self, type_id: &str) -> Option<serde_json::Value> {
         self.factories.get(type_id).map(|f| f.default_settings())
     }
-    
+
     /// Create a ProcessorConfig with default settings for a processor type.
     ///
     /// Returns None if the type_id is not registered.
@@ -460,10 +460,7 @@ impl AudioPipeline {
     }
 
     /// Create a pipeline from configuration.
-    pub fn from_config(
-        config: &PipelineConfig,
-        registry: &ProcessorRegistry,
-    ) -> Result<Self, String> {
+    pub fn from_config(config: &PipelineConfig, registry: &ProcessorRegistry) -> Result<Self, String> {
         let mut processors = Vec::with_capacity(config.processors.len());
 
         for proc_config in &config.processors {
@@ -543,15 +540,11 @@ impl AudioPipeline {
     pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut Box<dyn AudioProcessor>> {
         self.processors.iter_mut()
     }
-    
+
     /// Update pipeline from a new configuration.
-    /// 
+    ///
     /// This rebuilds the processor list from scratch.
-    pub fn update_config(
-        &mut self,
-        config: &PipelineConfig,
-        registry: &ProcessorRegistry,
-    ) -> Result<(), String> {
+    pub fn update_config(&mut self, config: &PipelineConfig, registry: &ProcessorRegistry) -> Result<(), String> {
         let new_pipeline = Self::from_config(config, registry)?;
         self.processors = new_pipeline.processors;
         self.frame_size = new_pipeline.frame_size;

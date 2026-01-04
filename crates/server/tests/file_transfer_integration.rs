@@ -3,8 +3,8 @@ use std::{
     path::PathBuf,
     process::{Child, Command, Stdio},
     sync::{
-        atomic::{AtomicBool, AtomicU16, Ordering},
         Arc,
+        atomic::{AtomicBool, AtomicU16, Ordering},
     },
     time::Duration,
 };
@@ -102,8 +102,7 @@ fn create_backend(cert_path: &std::path::Path, download_dir: PathBuf) -> (Backen
         .with_cert(cert_path)
         .with_download_dir(download_dir);
 
-    let handle =
-        BackendHandle::with_config(move || repaint_called_clone.store(true, Ordering::SeqCst), config);
+    let handle = BackendHandle::with_config(move || repaint_called_clone.store(true, Ordering::SeqCst), config);
 
     (handle, repaint_called)
 }
@@ -126,14 +125,14 @@ fn create_test_credentials() -> ([u8; 32], SigningCallback) {
     let signing_key = SigningKey::generate(&mut OsRng);
     let public_key = signing_key.verifying_key().to_bytes();
     let key_bytes = signing_key.to_bytes();
-    
+
     let signer: SigningCallback = Arc::new(move |payload: &[u8]| {
         use ed25519_dalek::Signer;
         let key = SigningKey::from_bytes(&key_bytes);
         let signature = key.sign(payload);
         Ok(signature.to_bytes())
     });
-    
+
     (public_key, signer)
 }
 
@@ -159,13 +158,19 @@ fn test_file_transfer() {
     let temp_dir_a = TempDir::new().expect("failed to create temp dir A");
     let (handle_a, _) = create_backend(&server.cert_path, temp_dir_a.path().to_path_buf());
     send_connect(&handle_a, format!("127.0.0.1:{}", port), "client-a".to_string());
-    assert!(wait_for(&handle_a, Duration::from_secs(5), |s| s.connection.is_connected()), "Client A failed to connect");
+    assert!(
+        wait_for(&handle_a, Duration::from_secs(5), |s| s.connection.is_connected()),
+        "Client A failed to connect"
+    );
 
     // Setup Client B (Downloader)
     let temp_dir_b = TempDir::new().expect("failed to create temp dir B");
     let (handle_b, _) = create_backend(&server.cert_path, temp_dir_b.path().to_path_buf());
     send_connect(&handle_b, format!("127.0.0.1:{}", port), "client-b".to_string());
-    assert!(wait_for(&handle_b, Duration::from_secs(5), |s| s.connection.is_connected()), "Client B failed to connect");
+    assert!(
+        wait_for(&handle_b, Duration::from_secs(5), |s| s.connection.is_connected()),
+        "Client B failed to connect"
+    );
 
     // Create a dummy file for Client A to share
     // Note: We create it in a separate directory to avoid conflicts with the download directory
@@ -176,7 +181,9 @@ fn test_file_transfer() {
     std::fs::write(&file_path, file_content).expect("failed to write test file");
 
     // Client A shares the file
-    handle_a.send(BackendCommand::ShareFile { path: file_path.clone() });
+    handle_a.send(BackendCommand::ShareFile {
+        path: file_path.clone(),
+    });
 
     // Wait for Client A to get the magnet link (it appears in chat messages)
     let mut magnet_link = String::new();
@@ -188,7 +195,7 @@ fn test_file_transfer() {
         }
         false
     });
-    
+
     if !found_magnet {
         let state = handle_a.state();
         println!("Client A chat messages:");
@@ -238,18 +245,20 @@ fn test_file_transfer() {
         }
         println!("Client B file transfers:");
         for transfer in &state.file_transfers {
-            println!("- Name: {}, Progress: {}, State: {:?}",
-                transfer.name, transfer.progress, transfer.state);
+            println!(
+                "- Name: {}, Progress: {}, State: {:?}",
+                transfer.name, transfer.progress, transfer.state
+            );
         }
     }
     assert!(download_finished, "Client B failed to finish download");
 
     // Verify file content on Client B side
     let downloaded_path = temp_dir_b.path().join(file_name);
-    
+
     // Wait a bit for file system sync
     std::thread::sleep(Duration::from_millis(500));
-    
+
     if !downloaded_path.exists() {
         // List dir to debug
         println!("Contents of {:?}:", temp_dir_b.path());

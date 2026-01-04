@@ -4,10 +4,7 @@
 //! audio samples. It's commonly used for per-user volume control on the
 //! receive path.
 
-use pipeline::{
-    AudioProcessor, ProcessorFactory, ProcessorResult,
-    db_to_linear,
-};
+use pipeline::{AudioProcessor, ProcessorFactory, ProcessorResult, db_to_linear};
 use serde::{Deserialize, Serialize};
 
 use super::type_ids;
@@ -122,9 +119,9 @@ impl ProcessorFactory for GainProcessorFactory {
     }
 
     fn create_from_config(&self, config: &serde_json::Value) -> Result<Box<dyn AudioProcessor>, String> {
-        let settings: GainSettings = serde_json::from_value(config.clone())
-            .map_err(|e| format!("Invalid gain settings: {}", e))?;
-        
+        let settings: GainSettings =
+            serde_json::from_value(config.clone()).map_err(|e| format!("Invalid gain settings: {}", e))?;
+
         Ok(Box::new(GainProcessor::new(settings.gain_db)))
     }
 
@@ -158,9 +155,9 @@ mod tests {
         let mut processor = GainProcessor::new(0.0);
         let mut samples = vec![0.5, -0.5, 1.0, -1.0];
         let original = samples.clone();
-        
+
         processor.process(&mut samples, 48000);
-        
+
         for (a, b) in samples.iter().zip(original.iter()) {
             assert!((a - b).abs() < 0.0001);
         }
@@ -170,9 +167,9 @@ mod tests {
     fn test_gain_minus_6db() {
         let mut processor = GainProcessor::new(-6.0);
         let mut samples = vec![1.0, -1.0];
-        
+
         processor.process(&mut samples, 48000);
-        
+
         // -6dB is approximately 0.5 linear
         assert!((samples[0] - 0.501).abs() < 0.01);
         assert!((samples[1] - (-0.501)).abs() < 0.01);
@@ -182,9 +179,9 @@ mod tests {
     fn test_gain_clipping() {
         let mut processor = GainProcessor::new(20.0); // +20dB = 10x
         let mut samples = vec![0.5];
-        
+
         processor.process(&mut samples, 48000);
-        
+
         // Should clip to 1.0
         assert_eq!(samples[0], 1.0);
     }
@@ -193,10 +190,10 @@ mod tests {
     fn test_gain_config_roundtrip() {
         let processor = GainProcessor::new(-12.0);
         let config = processor.config();
-        
+
         let mut processor2 = GainProcessor::default();
         processor2.set_config(&config);
-        
+
         assert!((processor2.gain_db() - (-12.0)).abs() < 0.001);
     }
 
@@ -204,7 +201,7 @@ mod tests {
     fn test_factory_create() {
         let factory = GainProcessorFactory;
         let config = serde_json::json!({ "gain_db": -3.0 });
-        
+
         let processor = factory.create_from_config(&config).unwrap();
         assert_eq!(processor.name(), "Gain");
     }

@@ -55,10 +55,7 @@ fn get_device_name(device: &Device) -> Option<String> {
     // Try the new description() API first, fall back to deprecated name()
     // #[allow(deprecated)]
     // device.name().ok()
-    device
-        .description()
-        .map(|desc| desc.name().to_string())
-        .ok()
+    device.description().map(|desc| desc.name().to_string()).ok()
 }
 
 /// Audio subsystem handle.
@@ -82,10 +79,7 @@ impl AudioSystem {
 
     /// List available input (microphone) devices.
     pub fn list_input_devices(&self) -> Vec<AudioDeviceInfo> {
-        let default_name = self
-            .host
-            .default_input_device()
-            .and_then(|d| get_device_name(&d));
+        let default_name = self.host.default_input_device().and_then(|d| get_device_name(&d));
 
         self.host
             .input_devices()
@@ -107,10 +101,7 @@ impl AudioSystem {
 
     /// List available output (speaker/headphone) devices.
     pub fn list_output_devices(&self) -> Vec<AudioDeviceInfo> {
-        let default_name = self
-            .host
-            .default_output_device()
-            .and_then(|d| get_device_name(&d));
+        let default_name = self.host.default_output_device().and_then(|d| get_device_name(&d));
 
         self.host
             .output_devices()
@@ -264,10 +255,7 @@ impl AudioInput {
 
         let format = supported
             .filter(|c| c.channels() == config.channels)
-            .filter(|c| {
-                c.min_sample_rate() <= config.sample_rate
-                    && c.max_sample_rate() >= config.sample_rate
-            })
+            .filter(|c| c.min_sample_rate() <= config.sample_rate && c.max_sample_rate() >= config.sample_rate)
             .max_by_key(|c| sample_format_preference(c.sample_format()));
 
         let stream = if let Some(supported_config) = format {
@@ -278,10 +266,7 @@ impl AudioInput {
             match sample_format {
                 SampleFormat::F32 => {
                     let is_capturing_clone = is_capturing.clone();
-                    let processor = Arc::new(Mutex::new(InputProcessor::new(
-                        frame_size,
-                        on_frame,
-                    )));
+                    let processor = Arc::new(Mutex::new(InputProcessor::new(frame_size, on_frame)));
                     device.build_input_stream(
                         &stream_config,
                         move |data: &[f32], _: &cpal::InputCallbackInfo| {
@@ -298,10 +283,7 @@ impl AudioInput {
                 }
                 SampleFormat::I16 => {
                     let is_capturing_clone = is_capturing.clone();
-                    let processor = Arc::new(Mutex::new(InputProcessor::new(
-                        frame_size,
-                        on_frame,
-                    )));
+                    let processor = Arc::new(Mutex::new(InputProcessor::new(frame_size, on_frame)));
                     device.build_input_stream(
                         &stream_config,
                         move |data: &[i16], _: &cpal::InputCallbackInfo| {
@@ -309,8 +291,7 @@ impl AudioInput {
                                 return;
                             }
                             // Convert i16 to f32
-                            let float_data: Vec<f32> =
-                                data.iter().map(|&s| s as f32 / i16::MAX as f32).collect();
+                            let float_data: Vec<f32> = data.iter().map(|&s| s as f32 / i16::MAX as f32).collect();
 
                             if let Ok(mut proc) = processor.lock() {
                                 proc.process_samples(&float_data);
@@ -322,10 +303,7 @@ impl AudioInput {
                 }
                 SampleFormat::U16 => {
                     let is_capturing_clone = is_capturing.clone();
-                    let processor = Arc::new(Mutex::new(InputProcessor::new(
-                        frame_size,
-                        on_frame,
-                    )));
+                    let processor = Arc::new(Mutex::new(InputProcessor::new(frame_size, on_frame)));
                     device.build_input_stream(
                         &stream_config,
                         move |data: &[u16], _: &cpal::InputCallbackInfo| {
@@ -333,10 +311,8 @@ impl AudioInput {
                                 return;
                             }
                             // Convert u16 to f32
-                            let float_data: Vec<f32> = data
-                                .iter()
-                                .map(|&s| (s as f32 / u16::MAX as f32) * 2.0 - 1.0)
-                                .collect();
+                            let float_data: Vec<f32> =
+                                data.iter().map(|&s| (s as f32 / u16::MAX as f32) * 2.0 - 1.0).collect();
 
                             if let Ok(mut proc) = processor.lock() {
                                 proc.process_samples(&float_data);
@@ -348,10 +324,7 @@ impl AudioInput {
                 }
                 SampleFormat::U8 => {
                     let is_capturing_clone = is_capturing.clone();
-                    let processor = Arc::new(Mutex::new(InputProcessor::new(
-                        frame_size,
-                        on_frame,
-                    )));
+                    let processor = Arc::new(Mutex::new(InputProcessor::new(frame_size, on_frame)));
                     device.build_input_stream(
                         &stream_config,
                         move |data: &[u8], _: &cpal::InputCallbackInfo| {
@@ -359,8 +332,7 @@ impl AudioInput {
                                 return;
                             }
                             // Convert u8 to f32 (128 is silence)
-                            let float_data: Vec<f32> =
-                                data.iter().map(|&s| (s as f32 - 128.0) / 128.0).collect();
+                            let float_data: Vec<f32> = data.iter().map(|&s| (s as f32 - 128.0) / 128.0).collect();
 
                             if let Ok(mut proc) = processor.lock() {
                                 proc.process_samples(&float_data);
@@ -376,10 +348,7 @@ impl AudioInput {
             // Try default f32 format
             warn!("audio: no matching format found, trying f32 default");
             let is_capturing_clone = is_capturing.clone();
-            let processor = Arc::new(Mutex::new(InputProcessor::new(
-                frame_size,
-                on_frame,
-            )));
+            let processor = Arc::new(Mutex::new(InputProcessor::new(frame_size, on_frame)));
             device.build_input_stream(
                 &stream_config,
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
@@ -401,10 +370,7 @@ impl AudioInput {
             .map_err(|e| format!("Failed to start input stream: {}", e))?;
         info!("audio: input stream started");
 
-        Ok(Self {
-            stream,
-            is_capturing,
-        })
+        Ok(Self { stream, is_capturing })
     }
 
     /// Pause audio capture.
@@ -481,10 +447,7 @@ impl AudioOutput {
 
         let format = supported
             .filter(|c| c.channels() == config.channels)
-            .filter(|c| {
-                c.min_sample_rate() <= config.sample_rate
-                    && c.max_sample_rate() >= config.sample_rate
-            })
+            .filter(|c| c.min_sample_rate() <= config.sample_rate && c.max_sample_rate() >= config.sample_rate)
             .max_by_key(|c| sample_format_preference(c.sample_format()));
 
         let stream = if let Some(supported_config) = format {
@@ -496,7 +459,7 @@ impl AudioOutput {
                     // Track underrun state for logging transitions
                     let in_underrun = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)); // Start in underrun (no audio yet)
                     let in_underrun_clone = in_underrun.clone();
-                    
+
                     device.build_output_stream(
                         &stream_config,
                         move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
@@ -509,7 +472,7 @@ impl AudioOutput {
                             let was_in_underrun = in_underrun_clone.load(Ordering::Relaxed);
                             let mut samples_played = 0usize;
                             let mut underrun_samples_this_callback = 0usize;
-                            
+
                             for sample in data.iter_mut() {
                                 // pop_front = oldest sample first (FIFO)
                                 if let Some(s) = buffer.pop_front() {
@@ -520,12 +483,12 @@ impl AudioOutput {
                                     underrun_samples_this_callback += 1;
                                 }
                             }
-                            
+
                             // Track underrun statistics
                             if underrun_samples_this_callback > 0 {
                                 underrun_samples_clone.fetch_add(underrun_samples_this_callback, Ordering::Relaxed);
                             }
-                            
+
                             // Log state transitions (useful for debugging audio issues)
                             let now_in_underrun = underrun_samples_this_callback > 0;
                             if now_in_underrun && !was_in_underrun {
@@ -538,10 +501,11 @@ impl AudioOutput {
                                 // Recovered from underrun - buffer has audio again
                                 debug!(
                                     "audio: EXIT underrun - buffer now has {} samples after playing {}",
-                                    buffer.len(), samples_played
+                                    buffer.len(),
+                                    samples_played
                                 );
                             }
-                            
+
                             in_underrun_clone.store(now_in_underrun, Ordering::Relaxed);
                         },
                         err_fn,
@@ -642,11 +606,7 @@ impl AudioOutput {
     /// Use this if you need to tune the latency/drop tradeoff.
     /// A larger buffer allows more network jitter but increases latency.
     /// A smaller buffer reduces latency but drops more samples on jitter.
-    pub fn with_max_buffer(
-        device: &Device,
-        config: &AudioConfig,
-        max_buffer_size: usize,
-    ) -> Result<Self, String> {
+    pub fn with_max_buffer(device: &Device, config: &AudioConfig, max_buffer_size: usize) -> Result<Self, String> {
         let mut output = Self::new(device, config)?;
         output.max_buffer_size = max_buffer_size;
         Ok(output)
@@ -667,8 +627,7 @@ impl AudioOutput {
         if buffer.len() > self.max_buffer_size {
             let samples_to_drop = buffer.len() - self.max_buffer_size;
             buffer.drain(..samples_to_drop);
-            self.dropped_samples
-                .fetch_add(samples_to_drop, Ordering::Relaxed);
+            self.dropped_samples.fetch_add(samples_to_drop, Ordering::Relaxed);
 
             debug!(
                 dropped = samples_to_drop,

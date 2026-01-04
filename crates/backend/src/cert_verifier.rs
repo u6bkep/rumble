@@ -12,16 +12,16 @@
 //! for user confirmation.
 
 use rustls::{
-    client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
-    crypto::{verify_tls12_signature, verify_tls13_signature, CryptoProvider},
-    pki_types::{CertificateDer, ServerName, UnixTime},
     CertificateError, DigitallySignedStruct, Error, RootCertStore, SignatureScheme,
+    client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+    crypto::{CryptoProvider, verify_tls12_signature, verify_tls13_signature},
+    pki_types::{CertificateDer, ServerName, UnixTime},
 };
 use sha2::{Digest, Sha256};
 use std::sync::{Arc, Mutex};
 
 /// Shared storage for a captured certificate during verification.
-/// 
+///
 /// This is used to pass the certificate info out of the verifier without
 /// relying on error message parsing, since errors get serialized through
 /// the TLS alert mechanism and lose structured data.
@@ -152,21 +152,13 @@ impl ServerCertVerifier for InteractiveCertVerifier {
         now: UnixTime,
     ) -> Result<ServerCertVerified, Error> {
         // Build a WebPKI verifier for delegation
-        let inner = rustls::client::WebPkiServerVerifier::builder_with_provider(
-            self.root_store.clone(),
-            self.provider.clone(),
-        )
-        .build()
-        .map_err(|e| Error::General(format!("Failed to build verifier: {}", e)))?;
+        let inner =
+            rustls::client::WebPkiServerVerifier::builder_with_provider(self.root_store.clone(), self.provider.clone())
+                .build()
+                .map_err(|e| Error::General(format!("Failed to build verifier: {}", e)))?;
 
         // Try normal verification
-        match inner.verify_server_cert(
-            end_entity,
-            intermediates,
-            server_name,
-            ocsp_response,
-            now,
-        ) {
+        match inner.verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now) {
             Ok(verified) => {
                 // Clear any previously captured cert on success
                 if let Ok(mut captured) = self.captured_cert.lock() {
@@ -181,11 +173,8 @@ impl ServerCertVerifier for InteractiveCertVerifier {
                     ServerName::IpAddress(ip) => format!("{:?}", ip),
                     _ => "unknown".to_string(),
                 };
-                
-                let cert_info = ServerCertInfo::new(
-                    end_entity.as_ref(),
-                    &server_name_str,
-                );
+
+                let cert_info = ServerCertInfo::new(end_entity.as_ref(), &server_name_str);
 
                 tracing::warn!(
                     "Self-signed certificate detected for '{}' (fingerprint: {})",
@@ -209,11 +198,8 @@ impl ServerCertVerifier for InteractiveCertVerifier {
                     ServerName::IpAddress(ip) => format!("{:?}", ip),
                     _ => "unknown".to_string(),
                 };
-                
-                let cert_info = ServerCertInfo::new(
-                    end_entity.as_ref(),
-                    &server_name_str,
-                );
+
+                let cert_info = ServerCertInfo::new(end_entity.as_ref(), &server_name_str);
 
                 tracing::warn!(
                     "Certificate with bad signature for '{}' - may be self-signed (fingerprint: {})",
@@ -238,12 +224,7 @@ impl ServerCertVerifier for InteractiveCertVerifier {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, Error> {
-        verify_tls12_signature(
-            message,
-            cert,
-            dss,
-            &self.provider.signature_verification_algorithms,
-        )
+        verify_tls12_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
     }
 
     fn verify_tls13_signature(
@@ -252,18 +233,11 @@ impl ServerCertVerifier for InteractiveCertVerifier {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, Error> {
-        verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &self.provider.signature_verification_algorithms,
-        )
+        verify_tls13_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        self.provider
-            .signature_verification_algorithms
-            .supported_schemes()
+        self.provider.signature_verification_algorithms.supported_schemes()
     }
 }
 
@@ -296,22 +270,23 @@ pub fn is_cert_verification_error(error: &anyhow::Error) -> bool {
                 _ => {}
             }
         }
-        
+
         // Check for quinn connection errors that wrap TLS errors
         if let Some(conn_err) = cause.downcast_ref::<quinn::ConnectionError>() {
             if let quinn::ConnectionError::TransportError(te) = conn_err {
                 let reason = te.to_string();
-                if reason.contains("UnknownIssuer") || reason.contains("BadSignature") 
-                    || reason.contains("invalid peer certificate") {
+                if reason.contains("UnknownIssuer")
+                    || reason.contains("BadSignature")
+                    || reason.contains("invalid peer certificate")
+                {
                     return true;
                 }
             }
         }
-        
+
         // Check error message as a fallback
         let msg = cause.to_string();
-        if msg.contains("UnknownIssuer") || msg.contains("BadSignature") 
-            || msg.contains("invalid peer certificate") {
+        if msg.contains("UnknownIssuer") || msg.contains("BadSignature") || msg.contains("invalid peer certificate") {
             return true;
         }
     }
@@ -326,14 +301,14 @@ mod tests {
     fn test_fingerprint_formatting() {
         let cert_der = [0u8; 100]; // Dummy cert data
         let info = ServerCertInfo::new(&cert_der, "example.com");
-        
+
         // Fingerprint should be 32 bytes (SHA256)
         assert_eq!(info.fingerprint.len(), 32);
-        
+
         // Hex fingerprint should be formatted with colons
         let hex = info.fingerprint_hex();
         assert!(hex.contains(':'));
-        
+
         // Short fingerprint should be truncated
         let short = info.fingerprint_short();
         assert!(short.len() < hex.len());
@@ -351,31 +326,31 @@ mod tests {
     #[test]
     fn test_captured_cert() {
         let captured = new_captured_cert();
-        
+
         // Initially empty
         assert!(take_captured_cert(&captured).is_none());
-        
+
         // Store a cert
         let cert_info = ServerCertInfo::new(&[1, 2, 3, 4, 5], "test.server.com");
         {
             let mut lock = captured.lock().unwrap();
             *lock = Some(cert_info);
         }
-        
+
         // Peek without removing
         let peeked = peek_captured_cert(&captured);
         assert!(peeked.is_some());
         assert_eq!(peeked.unwrap().server_name, "test.server.com");
-        
+
         // Should still be there
         let peeked2 = peek_captured_cert(&captured);
         assert!(peeked2.is_some());
-        
+
         // Take removes it
         let taken = take_captured_cert(&captured);
         assert!(taken.is_some());
         assert_eq!(taken.unwrap().server_name, "test.server.com");
-        
+
         // Now it's gone
         assert!(take_captured_cert(&captured).is_none());
     }
