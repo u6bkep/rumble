@@ -26,10 +26,9 @@ serde_json = "1.0"
 url = "2.5.7"
 sha2 = "0.10"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
-librqbit = { path = "../../vendor/rqbit/crates/librqbit" }
-axum = "0.7"
+librqbit = { git = "https://github.com/u6bkep/rqbit.git", rev = "558080c" }
+bencode = { git = "https://github.com/u6bkep/rqbit.git", rev = "558080c", package = "librqbit-bencode" }
 hex = "0.4"
-bencode = { path = "../../vendor/rqbit/crates/bencode", package = "librqbit-bencode" }
 urlencoding = "2"
 rand = "0.9"
 tokio-util = "0.7"
