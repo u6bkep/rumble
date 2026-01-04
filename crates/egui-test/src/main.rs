@@ -254,16 +254,23 @@ pub struct PersistentSettings {
     pub file_transfer: FileTransferSettings,
 }
 
+/// A single auto-download rule with a MIME pattern and max file size.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoDownloadRule {
+    /// MIME type pattern (e.g., "image/*", "audio/*", "application/pdf").
+    pub mime_pattern: String,
+    /// Maximum file size in bytes. 0 = disabled for this pattern.
+    pub max_size_bytes: u64,
+}
+
 /// File transfer settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct FileTransferSettings {
-    /// Auto-download files from trusted sources.
+    /// Auto-download files matching the rules below.
     pub auto_download_enabled: bool,
-    /// Maximum file size to auto-download (in bytes). 0 = disabled.
-    pub auto_download_max_size: u64,
-    /// MIME type patterns for auto-download (e.g., "image/*", "audio/*").
-    pub auto_download_mime_patterns: Vec<String>,
+    /// Auto-download rules, each with a MIME pattern and size limit.
+    pub auto_download_rules: Vec<AutoDownloadRule>,
     /// Download speed limit in bytes/sec. 0 = unlimited.
     pub download_speed_limit: u64,
     /// Upload speed limit in bytes/sec. 0 = unlimited.
@@ -278,11 +285,19 @@ impl Default for FileTransferSettings {
     fn default() -> Self {
         Self {
             auto_download_enabled: false,
-            auto_download_max_size: 10 * 1024 * 1024, // 10 MB
-            auto_download_mime_patterns: vec![
-                "image/*".to_string(),
-                "audio/*".to_string(),
-                "text/*".to_string(),
+            auto_download_rules: vec![
+                AutoDownloadRule {
+                    mime_pattern: "image/*".to_string(),
+                    max_size_bytes: 10 * 1024 * 1024, // 10 MB
+                },
+                AutoDownloadRule {
+                    mime_pattern: "audio/*".to_string(),
+                    max_size_bytes: 50 * 1024 * 1024, // 50 MB
+                },
+                AutoDownloadRule {
+                    mime_pattern: "text/*".to_string(),
+                    max_size_bytes: 1 * 1024 * 1024, // 1 MB
+                },
             ],
             download_speed_limit: 0, // Unlimited
             upload_speed_limit: 0,   // Unlimited
@@ -424,27 +439,27 @@ impl PersistentSettings {
     /// Load settings from disk, or return defaults if not found.
     pub fn load() -> Self {
         let Some(path) = Self::settings_path() else {
-            log::warn!("Could not determine config directory, using defaults");
+            tracing::warn!("Could not determine config directory, using defaults");
             return Self::default();
         };
 
         match fs::read_to_string(&path) {
             Ok(contents) => match serde_json::from_str(&contents) {
                 Ok(settings) => {
-                    log::info!("Loaded settings from {}", path.display());
+                    tracing::info!("Loaded settings from {}", path.display());
                     settings
                 }
                 Err(e) => {
-                    log::warn!("Failed to parse settings file: {}, using defaults", e);
+                    tracing::warn!("Failed to parse settings file: {}, using defaults", e);
                     Self::default()
                 }
             },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                log::info!("No settings file found, using defaults");
+                tracing::info!("No settings file found, using defaults");
                 Self::default()
             }
             Err(e) => {
-                log::warn!("Failed to read settings file: {}, using defaults", e);
+                tracing::warn!("Failed to read settings file: {}, using defaults", e);
                 Self::default()
             }
         }
@@ -467,7 +482,7 @@ impl PersistentSettings {
 
         fs::write(&path, contents).map_err(|e| format!("Failed to write settings file: {}", e))?;
 
-        log::info!("Saved settings to {}", path.display());
+        tracing::info!("Saved settings to {}", path.display());
         Ok(())
     }
     
@@ -478,14 +493,14 @@ impl PersistentSettings {
             if let Some(key) = Self::parse_signing_key(hex_key) {
                 return key;
             }
-            log::warn!("Invalid stored signing key, generating new one");
+            tracing::warn!("Invalid stored signing key, generating new one");
         }
         
         // Generate a new key
         let key = SigningKey::generate(&mut OsRng);
         let bytes = key.to_bytes();
         self.identity_private_key_hex = Some(hex::encode(bytes));
-        log::info!("Generated new Ed25519 identity key");
+        tracing::info!("Generated new Ed25519 identity key");
         key
     }
     
@@ -514,7 +529,9 @@ impl PersistentSettings {
 }
 
 fn main() -> eframe::Result<()> {
-    env_logger::init();
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
     let args = Args::parse();
 
     let options = eframe::NativeOptions {
@@ -649,8 +666,17 @@ struct MyApp {
     
     // Pending async operation for SSH agent
     pending_agent_op: Option<PendingAgentOp>,
-    
-    // Tokio runtime for async operations (SSH agent)
+
+    // Pending file dialog (async to avoid blocking audio)
+    pending_file_dialog: Option<tokio::task::JoinHandle<Option<std::path::PathBuf>>>,
+
+    // Pending save file dialog (returns infohash and destination path)
+    pending_save_dialog: Option<tokio::task::JoinHandle<Option<(String, std::path::PathBuf)>>>,
+
+    // Clipboard for image paste support
+    clipboard: Option<arboard::Clipboard>,
+
+    // Tokio runtime for async operations (SSH agent, file dialogs)
     tokio_runtime: tokio::runtime::Runtime,
     
     // Persistent settings
@@ -710,9 +736,9 @@ impl MyApp {
         if key_manager.needs_setup() {
             if let Some(ref hex_key) = persistent_settings.identity_private_key_hex {
                 if let Some(signing_key) = key_manager::parse_signing_key(hex_key) {
-                    log::info!("Migrating existing identity key to new format");
+                    tracing::info!("Migrating existing identity key to new format");
                     if let Err(e) = key_manager.import_signing_key(signing_key) {
-                        log::error!("Failed to migrate key: {}", e);
+                        tracing::error!("Failed to migrate key: {}", e);
                     }
                 }
             }
@@ -760,11 +786,11 @@ impl MyApp {
             for accepted in &persistent_settings.accepted_certificates {
                 match base64::engine::general_purpose::STANDARD.decode(&accepted.certificate_der_base64) {
                     Ok(der_bytes) => {
-                        log::info!("Loading accepted certificate for {}", accepted.server_name);
+                        tracing::info!("Loading accepted certificate for {}", accepted.server_name);
                         config.accepted_certs.push(der_bytes);
                     }
                     Err(e) => {
-                        log::warn!("Failed to decode accepted certificate for {}: {}", accepted.server_name, e);
+                        tracing::warn!("Failed to decode accepted certificate for {}: {}", accepted.server_name, e);
                     }
                 }
             }
@@ -828,7 +854,7 @@ impl MyApp {
         
         // Save settings
         if let Err(e) = persistent_settings.save() {
-            log::warn!("Failed to save settings: {}", e);
+            tracing::warn!("Failed to save settings: {}", e);
         }
 
         let needs_first_run = !matches!(first_run_state, FirstRunState::NotNeeded);
@@ -853,6 +879,9 @@ impl MyApp {
             first_run_state,
             signing_key,
             pending_agent_op: None,
+            pending_file_dialog: None,
+            pending_save_dialog: None,
+            clipboard: arboard::Clipboard::new().ok(),
             tokio_runtime,
             persistent_settings,
             autoconnect_on_launch,
@@ -964,7 +993,7 @@ impl MyApp {
         // Chat settings are already in persistent_settings (applied in apply_pending_settings)
         
         if let Err(e) = self.persistent_settings.save() {
-            log::error!("Failed to save settings: {}", e);
+            tracing::error!("Failed to save settings: {}", e);
             self.backend.send(Command::LocalMessage {
                 text: format!("Failed to save settings: {}", e),
             });
@@ -1708,50 +1737,69 @@ impl MyApp {
         }
 
         ui.add_enabled_ui(auto_download, |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Max file size:");
-                let mut max_size_mb = self.persistent_settings.file_transfer.auto_download_max_size / (1024 * 1024);
-                if ui.add(egui::DragValue::new(&mut max_size_mb)
-                    .range(1..=1000)
-                    .suffix(" MB"))
-                    .changed()
-                {
-                    self.persistent_settings.file_transfer.auto_download_max_size = max_size_mb * 1024 * 1024;
-                    self.settings_modal.dirty = true;
-                }
-            });
+            // Table-style UI for auto-download rules
+            let rules = &mut self.persistent_settings.file_transfer.auto_download_rules;
 
-            ui.add_space(4.0);
-            ui.label("Auto-download file types:");
-            let patterns = &mut self.persistent_settings.file_transfer.auto_download_mime_patterns;
+            // Table header
+            egui::Grid::new("auto_download_rules_table")
+                .num_columns(3)
+                .spacing([8.0, 4.0])
+                .striped(true)
+                .show(ui, |ui| {
+                    // Header row
+                    ui.strong("MIME Pattern");
+                    ui.strong("Max Size");
+                    ui.label(""); // For remove button
+                    ui.end_row();
 
-            // Display current patterns
-            let mut pattern_to_remove: Option<usize> = None;
-            for (i, pattern) in patterns.iter().enumerate() {
-                ui.horizontal(|ui| {
-                    ui.label(format!("  - {}", pattern));
-                    if ui.small_button("✕").clicked() {
-                        pattern_to_remove = Some(i);
-                    }
-                });
-            }
-            if let Some(i) = pattern_to_remove {
-                patterns.remove(i);
-                self.settings_modal.dirty = true;
-            }
-
-            // Add new pattern
-            ui.horizontal(|ui| {
-                ui.label("Add:");
-                for pattern in ["image/*", "audio/*", "video/*", "text/*", "application/pdf"] {
-                    if !patterns.contains(&pattern.to_string()) {
-                        if ui.small_button(pattern).clicked() {
-                            patterns.push(pattern.to_string());
+                    // Data rows
+                    let mut rule_to_remove: Option<usize> = None;
+                    for (i, rule) in rules.iter_mut().enumerate() {
+                        // MIME pattern text edit
+                        let response = ui.add(
+                            egui::TextEdit::singleline(&mut rule.mime_pattern)
+                                .desired_width(150.0)
+                                .hint_text("e.g. image/*")
+                        );
+                        if response.changed() {
                             self.settings_modal.dirty = true;
                         }
+
+                        // Max size drag value
+                        let mut size_mb = rule.max_size_bytes / (1024 * 1024);
+                        if ui.add(
+                            egui::DragValue::new(&mut size_mb)
+                                .range(0..=1000)
+                                .suffix(" MB")
+                        ).on_hover_text("0 = disabled for this pattern").changed() {
+                            rule.max_size_bytes = size_mb * 1024 * 1024;
+                            self.settings_modal.dirty = true;
+                        }
+
+                        // Remove button
+                        if ui.button("Remove").clicked() {
+                            rule_to_remove = Some(i);
+                        }
+                        ui.end_row();
                     }
-                }
-            });
+
+                    // Remove rule if requested
+                    if let Some(i) = rule_to_remove {
+                        rules.remove(i);
+                        self.settings_modal.dirty = true;
+                    }
+                });
+
+            ui.add_space(4.0);
+
+            // Add button
+            if ui.button("Add Rule").clicked() {
+                rules.push(AutoDownloadRule {
+                    mime_pattern: String::new(),
+                    max_size_bytes: 10 * 1024 * 1024, // 10 MB default
+                });
+                self.settings_modal.dirty = true;
+            }
         });
 
         ui.add_space(16.0);
@@ -2358,6 +2406,45 @@ impl eframe::App for MyApp {
         // Get current state from backend (clone to avoid borrow issues)
         let state = self.backend.state();
 
+        // Poll pending file dialog
+        if let Some(handle) = &self.pending_file_dialog {
+            if handle.is_finished() {
+                if let Some(handle) = self.pending_file_dialog.take() {
+                    match self.tokio_runtime.block_on(handle) {
+                        Ok(Some(path)) => {
+                            self.backend.send(Command::ShareFile { path });
+                            self.show_transfers = true;
+                        }
+                        Ok(None) => {
+                            // User cancelled the dialog
+                        }
+                        Err(e) => {
+                            tracing::error!("File dialog task panicked: {}", e);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Poll pending save dialog
+        if let Some(handle) = &self.pending_save_dialog {
+            if handle.is_finished() {
+                if let Some(handle) = self.pending_save_dialog.take() {
+                    match self.tokio_runtime.block_on(handle) {
+                        Ok(Some((infohash, destination))) => {
+                            self.backend.send(Command::SaveFileAs { infohash, destination });
+                        }
+                        Ok(None) => {
+                            // User cancelled the dialog
+                        }
+                        Err(e) => {
+                            tracing::error!("Save dialog task panicked: {}", e);
+                        }
+                    }
+                }
+            }
+        }
+
         // Request periodic repaint when settings dialog is open (for level meters)
         // This ensures the UI updates even when no user interaction occurs
         if self.show_settings {
@@ -2380,6 +2467,70 @@ impl eframe::App for MyApp {
         } else if !space_pressed && self.push_to_talk_active {
             self.push_to_talk_active = false;
             self.stop_transmit();
+        }
+
+        // Handle drag-and-drop file sharing
+        let dropped_files = ctx.input(|i| i.raw.dropped_files.clone());
+        if !dropped_files.is_empty() && state.connection.is_connected() {
+            for file in dropped_files {
+                if let Some(path) = file.path {
+                    // Share the dropped file
+                    self.backend.send(Command::ShareFile { path });
+                    self.show_transfers = true;
+                }
+            }
+        }
+
+        // Handle Ctrl+V to paste image from clipboard
+        let ctrl_v_pressed = ctx.input(|i| {
+            i.modifiers.command && i.key_pressed(egui::Key::V)
+        });
+        if ctrl_v_pressed && state.connection.is_connected() {
+            if let Some(clipboard) = &mut self.clipboard {
+                // Try to get image from clipboard
+                if let Ok(img_data) = clipboard.get_image() {
+                    // Convert to image and save to temp file
+                    if let Some(img) = image::RgbaImage::from_raw(
+                        img_data.width as u32,
+                        img_data.height as u32,
+                        img_data.bytes.into_owned(),
+                    ) {
+                        // Create a temp file with PNG extension
+                        if let Ok(temp_dir) = tempfile::tempdir() {
+                            let temp_path = temp_dir.path().join("clipboard_image.png");
+                            if img.save(&temp_path).is_ok() {
+                                // Keep the temp dir alive by leaking it (will be cleaned up on exit)
+                                let path = temp_path.clone();
+                                std::mem::forget(temp_dir);
+                                self.backend.send(Command::ShareFile { path });
+                                self.show_transfers = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Show drop target indicator when files are being dragged
+        let is_dragging = ctx.input(|i| !i.raw.hovered_files.is_empty());
+        if is_dragging && state.connection.is_connected() {
+            egui::Area::new(egui::Id::new("drop_target"))
+                .fixed_pos(egui::pos2(0.0, 0.0))
+                .order(egui::Order::Foreground)
+                .show(ctx, |ui| {
+                    let rect = ui.ctx().available_rect();
+                    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(rect), |ui| {
+                        egui::Frame::new()
+                            .fill(egui::Color32::from_rgba_unmultiplied(0, 100, 200, 100))
+                            .show(ui, |ui| {
+                                ui.allocate_ui(rect.size(), |ui| {
+                                    ui.centered_and_justified(|ui| {
+                                        ui.heading("Drop files here to share");
+                                    });
+                                });
+                            });
+                    });
+                });
         }
 
         // Download Modal
@@ -2481,6 +2632,57 @@ impl eframe::App for MyApp {
 
                                     // Actions
                                     ui.horizontal(|ui| {
+                                        let infohash = hex::encode(transfer.infohash);
+
+                                        // Pause/Resume buttons
+                                        match transfer.state {
+                                            TransferState::Downloading | TransferState::Seeding | TransferState::Checking => {
+                                                if ui.button("⏸ Pause").clicked() {
+                                                    self.backend.send(Command::PauseTransfer { infohash: infohash.clone() });
+                                                }
+                                            }
+                                            TransferState::Paused => {
+                                                if ui.button("▶ Resume").clicked() {
+                                                    self.backend.send(Command::ResumeTransfer { infohash: infohash.clone() });
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+
+                                        // Cancel button for active transfers
+                                        if matches!(transfer.state, TransferState::Downloading | TransferState::Checking | TransferState::Pending | TransferState::Paused) {
+                                            if ui.button("✕ Cancel").clicked() {
+                                                self.backend.send(Command::CancelTransfer { infohash: infohash.clone() });
+                                            }
+                                        }
+
+                                        // Remove/Stop seeding button for completed transfers
+                                        if matches!(transfer.state, TransferState::Seeding | TransferState::Completed) {
+                                            if ui.button("🗑 Remove").clicked() {
+                                                self.backend.send(Command::RemoveTransfer { infohash: infohash.clone(), delete_file: false });
+                                            }
+                                        }
+
+                                        // Save As button for completed downloads
+                                        if matches!(transfer.state, TransferState::Seeding | TransferState::Completed) {
+                                            if transfer.local_path.is_some() {
+                                                // Store infohash for the save dialog
+                                                let dialog_pending = self.pending_save_dialog.is_some();
+                                                if ui.add_enabled(!dialog_pending, egui::Button::new("💾 Save As...")).clicked() {
+                                                    let infohash_for_dialog = infohash.clone();
+                                                    let default_name = transfer.name.clone();
+                                                    let handle = self.tokio_runtime.spawn(async move {
+                                                        rfd::AsyncFileDialog::new()
+                                                            .set_file_name(&default_name)
+                                                            .save_file()
+                                                            .await
+                                                            .map(|f| (infohash_for_dialog, f.path().to_path_buf()))
+                                                    });
+                                                    self.pending_save_dialog = Some(handle);
+                                                }
+                                            }
+                                        }
+
                                         // Show magnet link copy for seeding transfers
                                         if matches!(transfer.state, TransferState::Seeding | TransferState::Completed) {
                                             if let Some(magnet) = &transfer.magnet {
@@ -2543,11 +2745,17 @@ impl eframe::App for MyApp {
                 });
 
                 ui.menu_button("File Transfer", |ui| {
-                    if ui.button("Share File...").clicked() {
-                        if let Some(path) = rfd::FileDialog::new().pick_file() {
-                            self.backend.send(Command::ShareFile { path });
-                            self.show_transfers = true;
-                        }
+                    // Don't allow opening another dialog while one is pending
+                    let dialog_pending = self.pending_file_dialog.is_some();
+                    if ui.add_enabled(!dialog_pending, egui::Button::new("Share File...")).clicked() {
+                        // Spawn async file dialog to avoid blocking audio
+                        let handle = self.tokio_runtime.spawn(async {
+                            rfd::AsyncFileDialog::new()
+                                .pick_file()
+                                .await
+                                .map(|f| f.path().to_path_buf())
+                        });
+                        self.pending_file_dialog = Some(handle);
                         ui.close();
                     }
                     if ui.button("Download File...").clicked() {
@@ -2684,8 +2892,14 @@ impl eframe::App for MyApp {
                         strip.cell(|ui| {
                             ui.heading("Text Chat");
                             ui.separator();
-                            // Collect file downloads to trigger (can't trigger inside loop due to borrow)
+                            // Collect file actions to trigger (can't trigger inside loop due to borrow)
                             let mut download_magnet: Option<String> = None;
+                            let mut open_file_infohash: Option<String> = None;
+                            let mut save_file_info: Option<(String, String)> = None; // (infohash, default_name)
+                            let mut repost_text: Option<String> = None;
+                            let mut pause_infohash: Option<String> = None;
+                            let mut resume_infohash: Option<String> = None;
+                            let mut cancel_infohash: Option<String> = None;
 
                             egui::ScrollArea::vertical()
                                 .auto_shrink([false; 2])
@@ -2706,12 +2920,62 @@ impl eframe::App for MyApp {
                                             let text = format!("{}{}", timestamp_prefix, msg.text);
                                             ui.label(egui::RichText::new(text).italics().color(egui::Color32::GRAY));
                                         } else if let Some(file_msg) = FileMessage::parse(&msg.text) {
+                                            // Look up transfer state for this file
+                                            let infohash_hex = &file_msg.file.infohash;
+                                            let infohash_bytes: Option<[u8; 20]> = hex::decode(infohash_hex)
+                                                .ok()
+                                                .and_then(|v| v.try_into().ok());
+
+                                            let transfer = infohash_bytes.and_then(|hash| {
+                                                state.file_transfers.iter().find(|t| t.infohash == hash)
+                                            });
+
+                                            let is_downloaded = transfer.map(|t| {
+                                                matches!(t.state, TransferState::Completed | TransferState::Seeding)
+                                            }).unwrap_or(false);
+
+                                            let is_downloading = transfer.map(|t| {
+                                                matches!(t.state, TransferState::Downloading | TransferState::Checking)
+                                            }).unwrap_or(false);
+
+                                            let is_paused = transfer.map(|t| {
+                                                matches!(t.state, TransferState::Paused)
+                                            }).unwrap_or(false);
+
+                                            let is_image = file_msg.file.mime.starts_with("image/");
+
                                             // File message - render as file widget
                                             ui.group(|ui| {
+                                                // For downloaded images, show inline preview
+                                                if is_downloaded && is_image {
+                                                    if let Some(t) = transfer {
+                                                        if let Some(ref path) = t.local_path {
+                                                            // Create a unique URI for caching
+                                                            let uri = format!("bytes://file_preview/{}", infohash_hex);
+
+                                                            // Try to load the image bytes if not already cached
+                                                            if ui.ctx().try_load_bytes(&uri).is_err() {
+                                                                if let Ok(bytes) = std::fs::read(path) {
+                                                                    ui.ctx().include_bytes(uri.clone(), bytes);
+                                                                }
+                                                            }
+
+                                                            ui.add(
+                                                                egui::Image::new(&uri)
+                                                                    .max_width(300.0)
+                                                                    .max_height(200.0)
+                                                                    .corner_radius(4.0)
+                                                            );
+                                                        }
+                                                    }
+                                                }
+
                                                 ui.horizontal(|ui| {
-                                                    // File icon based on mime type
-                                                    let icon = get_file_icon(&file_msg.file.mime);
-                                                    ui.label(egui::RichText::new(icon).size(24.0));
+                                                    // File icon based on mime type (skip for downloaded images since we show preview)
+                                                    if !(is_downloaded && is_image) {
+                                                        let icon = get_file_icon(&file_msg.file.mime);
+                                                        ui.label(egui::RichText::new(icon).size(24.0));
+                                                    }
 
                                                     ui.vertical(|ui| {
                                                         // Sender and timestamp
@@ -2725,22 +2989,85 @@ impl eframe::App for MyApp {
                                                         // File name
                                                         ui.label(&file_msg.file.name);
 
-                                                        // Size and mime type
-                                                        ui.label(egui::RichText::new(format!(
-                                                            "{} · {}",
-                                                            format_size(file_msg.file.size),
-                                                            &file_msg.file.mime
-                                                        )).small().color(egui::Color32::GRAY));
+                                                        // Size, mime type, and status
+                                                        if is_downloading {
+                                                            if let Some(t) = transfer {
+                                                                let downloaded = (file_msg.file.size as f32 * t.progress) as u64;
+                                                                ui.label(egui::RichText::new(format!(
+                                                                    "{} / {} · {}/s",
+                                                                    format_size(downloaded),
+                                                                    format_size(file_msg.file.size),
+                                                                    format_size(t.download_speed)
+                                                                )).small().color(egui::Color32::YELLOW));
+                                                            }
+                                                        } else if is_paused {
+                                                            ui.label(egui::RichText::new(format!(
+                                                                "{} · {} · Paused",
+                                                                format_size(file_msg.file.size),
+                                                                &file_msg.file.mime
+                                                            )).small().color(egui::Color32::GRAY));
+                                                        } else if is_downloaded {
+                                                            ui.label(egui::RichText::new(format!(
+                                                                "{} · {} · Downloaded ✓",
+                                                                format_size(file_msg.file.size),
+                                                                &file_msg.file.mime
+                                                            )).small().color(egui::Color32::GREEN));
+                                                        } else {
+                                                            ui.label(egui::RichText::new(format!(
+                                                                "{} · {}",
+                                                                format_size(file_msg.file.size),
+                                                                &file_msg.file.mime
+                                                            )).small().color(egui::Color32::GRAY));
+                                                        }
                                                     });
                                                 });
 
-                                                // Download button
-                                                ui.horizontal(|ui| {
-                                                    if ui.button("⬇ Download").clicked() {
-                                                        download_magnet = Some(file_msg.magnet_link());
+                                                // Progress bar during download
+                                                if is_downloading {
+                                                    if let Some(t) = transfer {
+                                                        ui.add(egui::ProgressBar::new(t.progress)
+                                                            .show_percentage()
+                                                            .animate(true));
                                                     }
-                                                    if ui.button("📋 Copy Magnet").clicked() {
-                                                        ui.ctx().copy_text(file_msg.magnet_link());
+                                                }
+
+                                                // Action buttons - different based on transfer state
+                                                ui.horizontal(|ui| {
+                                                    if is_downloaded {
+                                                        // Downloaded: show Open, Save As, Repost buttons
+                                                        if ui.button("📂 Open").clicked() {
+                                                            open_file_infohash = Some(infohash_hex.clone());
+                                                        }
+                                                        if ui.button("💾 Save As...").clicked() {
+                                                            save_file_info = Some((infohash_hex.clone(), file_msg.file.name.clone()));
+                                                        }
+                                                        if ui.button("🔄 Repost").clicked() {
+                                                            repost_text = Some(msg.text.clone());
+                                                        }
+                                                    } else if is_downloading {
+                                                        // Downloading: show Pause, Cancel buttons
+                                                        if ui.button("⏸ Pause").clicked() {
+                                                            pause_infohash = Some(infohash_hex.clone());
+                                                        }
+                                                        if ui.button("✕ Cancel").clicked() {
+                                                            cancel_infohash = Some(infohash_hex.clone());
+                                                        }
+                                                    } else if is_paused {
+                                                        // Paused: show Resume, Cancel buttons
+                                                        if ui.button("▶ Resume").clicked() {
+                                                            resume_infohash = Some(infohash_hex.clone());
+                                                        }
+                                                        if ui.button("✕ Cancel").clicked() {
+                                                            cancel_infohash = Some(infohash_hex.clone());
+                                                        }
+                                                    } else {
+                                                        // Not downloaded: show Download, Copy Magnet buttons
+                                                        if ui.button("⬇ Download").clicked() {
+                                                            download_magnet = Some(file_msg.magnet_link());
+                                                        }
+                                                        if ui.button("📋 Copy Magnet").clicked() {
+                                                            ui.ctx().copy_text(file_msg.magnet_link());
+                                                        }
                                                     }
                                                 });
                                             });
@@ -2751,10 +3078,36 @@ impl eframe::App for MyApp {
                                     }
                                 });
 
-                            // Handle file download trigger
+                            // Handle file actions
                             if let Some(magnet) = download_magnet {
                                 self.backend.send(Command::DownloadFile { magnet });
                                 self.show_transfers = true;
+                            }
+                            if let Some(infohash) = open_file_infohash {
+                                self.backend.send(Command::OpenFile { infohash });
+                            }
+                            if let Some((infohash, default_name)) = save_file_info {
+                                // Spawn async save dialog
+                                let handle = self.tokio_runtime.spawn(async move {
+                                    rfd::AsyncFileDialog::new()
+                                        .set_file_name(&default_name)
+                                        .save_file()
+                                        .await
+                                        .map(|f| (infohash, f.path().to_path_buf()))
+                                });
+                                self.pending_save_dialog = Some(handle);
+                            }
+                            if let Some(text) = repost_text {
+                                self.backend.send(Command::SendChat { text });
+                            }
+                            if let Some(infohash) = pause_infohash {
+                                self.backend.send(Command::PauseTransfer { infohash });
+                            }
+                            if let Some(infohash) = resume_infohash {
+                                self.backend.send(Command::ResumeTransfer { infohash });
+                            }
+                            if let Some(infohash) = cancel_infohash {
+                                self.backend.send(Command::CancelTransfer { infohash });
                             }
                         });
                         strip.cell(|ui| {
@@ -3165,7 +3518,7 @@ impl eframe::App for MyApp {
                             {
                                 self.persistent_settings.accepted_certificates.push(accepted_cert);
                                 if let Err(e) = self.persistent_settings.save() {
-                                    log::error!("Failed to save accepted certificate: {}", e);
+                                    tracing::error!("Failed to save accepted certificate: {}", e);
                                 }
                             }
                             

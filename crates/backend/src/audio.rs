@@ -243,10 +243,12 @@ impl AudioInput {
     where
         F: FnMut(&[f32]) + Send + 'static,
     {
+        // Use a fixed buffer size matching our frame size for lower latency
+        // and more predictable timing. 960 samples = 20ms at 48kHz.
         let stream_config = StreamConfig {
             channels: config.channels,
             sample_rate: config.sample_rate,
-            buffer_size: cpal::BufferSize::Default,
+            buffer_size: cpal::BufferSize::Fixed(config.frame_size as u32),
         };
 
         let is_capturing = Arc::new(AtomicBool::new(true));
@@ -443,6 +445,8 @@ pub struct AudioOutput {
     max_buffer_size: usize,
     /// Counter for dropped samples (for statistics/debugging).
     dropped_samples: Arc<std::sync::atomic::AtomicUsize>,
+    /// Counter for underrun samples (buffer was empty when we needed samples).
+    underrun_samples: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl AudioOutput {
@@ -452,17 +456,21 @@ impl AudioOutput {
     /// * `device` - The output device to use
     /// * `config` - Audio configuration
     pub fn new(device: &Device, config: &AudioConfig) -> Result<Self, String> {
+        // Use a fixed buffer size matching our frame size for lower latency
+        // and more predictable timing. 960 samples = 20ms at 48kHz.
         let stream_config = StreamConfig {
             channels: config.channels,
             sample_rate: config.sample_rate,
-            buffer_size: cpal::BufferSize::Default,
+            buffer_size: cpal::BufferSize::Fixed(config.frame_size as u32),
         };
 
         let is_playing = Arc::new(AtomicBool::new(true));
         let playback_buffer = Arc::new(Mutex::new(VecDeque::with_capacity(config.frame_size * 10)));
+        let underrun_samples = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
         let is_playing_clone = is_playing.clone();
         let playback_buffer_clone = playback_buffer.clone();
+        let underrun_samples_clone = underrun_samples.clone();
 
         let err_fn = |err| error!("audio output error: {}", err);
 
@@ -485,6 +493,10 @@ impl AudioOutput {
 
             match sample_format {
                 SampleFormat::F32 => {
+                    // Track underrun state for logging transitions
+                    let in_underrun = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)); // Start in underrun (no audio yet)
+                    let in_underrun_clone = in_underrun.clone();
+                    
                     device.build_output_stream(
                         &stream_config,
                         move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
@@ -493,10 +505,44 @@ impl AudioOutput {
                                 return;
                             }
                             let mut buffer = playback_buffer_clone.lock().unwrap();
+                            let buffer_len_before = buffer.len();
+                            let was_in_underrun = in_underrun_clone.load(Ordering::Relaxed);
+                            let mut samples_played = 0usize;
+                            let mut underrun_samples_this_callback = 0usize;
+                            
                             for sample in data.iter_mut() {
                                 // pop_front = oldest sample first (FIFO)
-                                *sample = buffer.pop_front().unwrap_or(0.0);
+                                if let Some(s) = buffer.pop_front() {
+                                    *sample = s;
+                                    samples_played += 1;
+                                } else {
+                                    *sample = 0.0;
+                                    underrun_samples_this_callback += 1;
+                                }
                             }
+                            
+                            // Track underrun statistics
+                            if underrun_samples_this_callback > 0 {
+                                underrun_samples_clone.fetch_add(underrun_samples_this_callback, Ordering::Relaxed);
+                            }
+                            
+                            // Log state transitions (useful for debugging audio issues)
+                            let now_in_underrun = underrun_samples_this_callback > 0;
+                            if now_in_underrun && !was_in_underrun {
+                                // Entered underrun state - buffer ran dry
+                                debug!(
+                                    "audio: ENTER underrun - buffer had {} samples, played {}, missing {}",
+                                    buffer_len_before, samples_played, underrun_samples_this_callback
+                                );
+                            } else if !now_in_underrun && was_in_underrun && samples_played > 0 {
+                                // Recovered from underrun - buffer has audio again
+                                debug!(
+                                    "audio: EXIT underrun - buffer now has {} samples after playing {}",
+                                    buffer.len(), samples_played
+                                );
+                            }
+                            
+                            in_underrun_clone.store(now_in_underrun, Ordering::Relaxed);
                         },
                         err_fn,
                         None,
@@ -587,6 +633,7 @@ impl AudioOutput {
             playback_buffer,
             max_buffer_size: MAX_PLAYBACK_BUFFER_SAMPLES,
             dropped_samples: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            underrun_samples,
         })
     }
 
@@ -634,6 +681,11 @@ impl AudioOutput {
     /// Get the number of samples that have been dropped.
     pub fn dropped_samples(&self) -> usize {
         self.dropped_samples.load(Ordering::Relaxed)
+    }
+
+    /// Get the number of underrun samples (buffer was empty when playback needed samples).
+    pub fn underrun_samples(&self) -> usize {
+        self.underrun_samples.load(Ordering::Relaxed)
     }
 
     /// Get the number of samples currently buffered.

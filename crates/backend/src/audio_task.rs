@@ -26,6 +26,7 @@
 
 use crate::{
     audio::{AudioConfig, AudioInput, AudioOutput, AudioSystem, FRAME_SIZE},
+    audio_dump::AudioDumper,
     codec::{is_dtx_frame, EncoderSettings, VoiceDecoder, VoiceEncoder, OPUS_FRAME_SIZE},
     events::{AudioSettings, AudioStats, State, VoiceMode},
 };
@@ -33,15 +34,14 @@ use api::proto::VoiceDatagram;
 use bytes::Bytes;
 use pipeline;
 use prost::Message;
-use std::{
-    collections::{BTreeMap, HashMap},
-    sync::{Arc, RwLock},
-    time::{Duration, Instant},
-};
+use std::collections::BTreeMap;
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
 
-/// Commands sent to the audio task.
+/// Audio-task command channel.
 #[derive(Debug)]
 pub enum AudioCommand {
     /// A QUIC connection was established - start datagram handling.
@@ -91,6 +91,8 @@ pub enum AudioCommand {
     UserLeftRoom { user_id: u64 },
     /// We changed rooms - destroy all decoders, create new ones for users in new room.
     RoomChanged { user_ids_in_room: Vec<u64> },
+    /// Explicitly drop per-peer decode state (call when a peer leaves).
+    PeerLeft { user_id: u64 },
     /// Shutdown the audio task.
     Shutdown,
 }
@@ -134,6 +136,9 @@ struct UserAudioState {
     /// Whether the sender has signaled end of stream.
     /// When true, we stop expecting more packets and won't count missing packets as lost.
     stream_ended: bool,
+    /// Whether we need to prime the decoder with a PLC frame before the first real frame.
+    /// This helps the decoder transition smoothly and prevents clicks/pops at stream start.
+    needs_plc_prime: bool,
 }
 
 /// Maximum jitter buffer size (drop old packets beyond this).
@@ -168,6 +173,7 @@ impl UserAudioState {
             rx_pipeline: None,
             volume_db: 0.0,
             stream_ended: false,
+            needs_plc_prime: false,
         })
     }
     
@@ -208,6 +214,9 @@ impl UserAudioState {
             self.next_play_seq = sequence;
             self.started = false;
             self.buffered_since_stream_start = 0;
+            // Prime the decoder with a PLC frame before the first real frame
+            // This helps the decoder transition smoothly and prevents clicks
+            self.needs_plc_prime = true;
             // NOTE: Decoder is NOT reset - it persists for the entire user session
         }
         
@@ -278,6 +287,20 @@ impl UserAudioState {
             return None;
         }
         
+        // Track if this is the first frame after stream start for diagnostics
+        let is_first_frame = self.needs_plc_prime;
+        
+        // Prime the decoder with a PLC frame before the first real frame.
+        // This helps the decoder transition smoothly from silence/previous stream
+        // and prevents clicks/pops at stream start. The PLC frame is discarded
+        // (not played) - it just warms up the decoder's internal state.
+        if self.needs_plc_prime {
+            self.needs_plc_prime = false;
+            // Run PLC to prime decoder state - discard the output
+            let _ = self.decoder.conceal(OPUS_FRAME_SIZE);
+            debug!("Primed decoder with PLC frame before first real frame");
+        }
+        
         self.started = true;
 
         let seq = self.next_play_seq;
@@ -286,9 +309,18 @@ impl UserAudioState {
         if let Some(opus_data) = self.jitter_buffer.remove(&seq) {
             // Packet present - decode it
             match self.decoder.decode(&opus_data) {
-                Ok(pcm) => Some(pcm),
+                Ok(pcm) => {
+                    // Log first frame for diagnostics
+                    if is_first_frame && pcm.len() >= 8 {
+                        debug!(
+                            "First decoded frame: samples=[{:.4}, {:.4}, {:.4}, {:.4}, ...]",
+                            pcm[0], pcm[1], pcm[2], pcm[3]
+                        );
+                    }
+                    Some(pcm)
+                }
                 Err(e) => {
-                    trace!("Decode error for seq {}: {}", seq, e);
+                    warn!("Decode error for seq {}: {}", seq, e);
                     // Try PLC on decode error
                     self.frames_concealed += 1;
                     self.decoder.conceal(OPUS_FRAME_SIZE).ok()
@@ -308,21 +340,21 @@ impl UserAudioState {
             let next_seq = seq.wrapping_add(1);
             if let Some(next_opus_data) = self.jitter_buffer.get(&next_seq) {
                 // We have the next packet - use its FEC data to recover this frame
-                trace!("Missing packet seq {}, recovering with FEC from seq {}", seq, next_seq);
+                warn!("Missing packet seq {}, recovering with FEC from seq {}", seq, next_seq);
                 match self.decoder.decode_fec(next_opus_data) {
                     Ok(pcm) => {
                         self.packets_recovered_fec += 1;
                         Some(pcm)
                     }
                     Err(e) => {
-                        trace!("FEC recovery failed for seq {}: {}, falling back to PLC", seq, e);
+                        warn!("FEC recovery failed for seq {}: {}, falling back to PLC", seq, e);
                         self.frames_concealed += 1;
                         self.decoder.conceal(OPUS_FRAME_SIZE).ok()
                     }
                 }
             } else {
                 // No next packet available - fall back to pure PLC
-                trace!("Missing packet seq {}, no FEC available, using PLC", seq);
+                warn!("Missing packet seq {}, no FEC available, using PLC", seq);
                 self.frames_concealed += 1;
                 self.decoder.conceal(OPUS_FRAME_SIZE).ok()
             }
@@ -349,6 +381,8 @@ pub struct AudioTaskConfig {
     pub state: Arc<RwLock<State>>,
     /// Repaint callback for UI updates.
     pub repaint: Arc<dyn Fn() + Send + Sync>,
+    /// Audio dumper for debugging (optional).
+    pub audio_dumper: Option<AudioDumper>,
 }
 
 /// Spawn the audio task and return a handle for sending commands.
@@ -374,6 +408,7 @@ pub fn spawn_audio_task(config: AudioTaskConfig) -> AudioTaskHandle {
 async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, config: AudioTaskConfig) {
     let state = config.state;
     let repaint = config.repaint;
+    let audio_dumper = config.audio_dumper.unwrap_or_else(AudioDumper::disabled);
 
     // Audio system for device access (not Send, so lives on this thread)
     let audio_system = AudioSystem::new();
@@ -454,7 +489,7 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
     // Instead of sending every DTX frame, we:
     // 1. Skip DTX frames if we sent something within the last 400ms
     // 2. Send DTX frames as keepalives every ~400ms during silence
-    // 3. Only increment sequence number when we actually send a packet
+    // 3. Only increment sequence when we actually send a packet
     const DTX_KEEPALIVE_INTERVAL: Duration = Duration::from_millis(400);
     let last_send_time: Arc<std::sync::Mutex<Option<Instant>>> = Arc::new(std::sync::Mutex::new(None));
     
@@ -518,6 +553,7 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
                     &mut audio_input,
                     &state,
                     &repaint,
+                    &audio_dumper,
                 );
             } else if !want && have {
                 // Send end-of-stream before stopping transmission
@@ -567,7 +603,7 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
 
                         // Start audio output for receiving (unless deafened)
                         if audio_output.is_none() && !self_deafened {
-                            audio_output = start_audio_output(&audio_system, &selected_output, &mut user_audio);
+                            audio_output = start_audio_output(&audio_system, &selected_output);
                         }
 
                         // Sync transmission state
@@ -627,7 +663,7 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
                         // Restart output
                         audio_output = None;
                         if connection.is_some() && !self_deafened {
-                            audio_output = start_audio_output(&audio_system, &selected_output, &mut user_audio);
+                            audio_output = start_audio_output(&audio_system, &selected_output);
                         }
                     }
 
@@ -683,7 +719,7 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
                                 s.audio.talking_users.clear();
                             }
                         } else if connection.is_some() && audio_output.is_none() {
-                            audio_output = start_audio_output(&audio_system, &selected_output, &mut user_audio);
+                            audio_output = start_audio_output(&audio_system, &selected_output);
                         }
                         
                         sync_transmission!();
@@ -947,6 +983,11 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
                         repaint();
                     }
 
+                    AudioCommand::PeerLeft { user_id } => {
+                        // Destroy decoder/pipeline for this user
+                        user_audio.remove(&user_id);
+                    }
+
                     AudioCommand::Shutdown => {
                         info!("Audio task shutting down");
                         break;
@@ -1055,6 +1096,7 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
                                         &processor_registry,
                                         &state,
                                         &repaint,
+                                        &audio_dumper,
                                     );
                                 }
                             }
@@ -1069,12 +1111,12 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
 
             // Mix audio from all users' jitter buffers every 20ms
             _ = mix_interval.tick() => {
-                mix_and_play_audio(&mut user_audio, &audio_output);
+                mix_and_play_audio(&mut user_audio, &audio_output, &audio_dumper);
             }
 
-            // Periodic cleanup of stale talking_users
+            // Periodic cleanup of stale talking_users (does not destroy decoders)
             _ = cleanup_interval.tick() => {
-                cleanup_stale_users(&mut user_audio, &state, &repaint);
+                cleanup_stale_users(&user_audio, &state, &repaint);
             }
             
             // Periodic stats update
@@ -1097,6 +1139,7 @@ fn start_transmission(
     audio_input: &mut Option<AudioInput>,
     state: &Arc<RwLock<State>>,
     repaint: &Arc<dyn Fn() + Send + Sync>,
+    audio_dumper: &AudioDumper,
 ) {
     if audio_input.is_some() {
         return; // Already transmitting
@@ -1166,8 +1209,17 @@ fn start_transmission(
     let was_transmitting = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let was_transmitting_for_callback = was_transmitting.clone();
     
+    // Discard the first few frames to avoid stale samples from the hardware buffer.
+    // When an audio stream starts, the hardware often delivers stale/garbage data
+    // from its internal ring buffer. Discarding 2-3 frames (~40-60ms) fixes this.
+    let frames_to_discard = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(3));
+    let frames_to_discard_for_callback = frames_to_discard.clone();
+    
     // Repaint callback for notifying UI of VAD state changes
     let repaint_for_callback = repaint.clone();
+    
+    // Audio dumper for debugging
+    let dumper_for_callback = audio_dumper.clone();
 
     // Audio config uses defaults - audio processing (denoise, VAD, etc.)
     // is handled by the TX pipeline, not by AudioConfig
@@ -1176,6 +1228,16 @@ fn start_transmission(
     // Create audio input with pipeline + encoding callback
     let encoded_tx = encoded_tx.clone();
     let input = AudioInput::new(&device, &audio_config, move |samples| {
+        // Discard first few frames to avoid stale hardware buffer samples
+        let remaining = frames_to_discard_for_callback.load(std::sync::atomic::Ordering::Relaxed);
+        if remaining > 0 {
+            frames_to_discard_for_callback.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+        
+        // Dump raw mic samples (before any processing)
+        dumper_for_callback.write_mic_raw(samples);
+        
         // Run samples through the TX pipeline
         // We make a mutable copy since the callback receives &[f32]
         let mut processed_samples = samples.to_vec();
@@ -1225,6 +1287,9 @@ fn start_transmission(
             if let Some(enc) = guard.as_mut() {
                 match enc.encode(&processed_samples) {
                     Ok(encoded) => {
+                        // Dump TX opus packet (after encoding)
+                        dumper_for_callback.write_tx_opus(&encoded);
+                        
                         let size_bytes = encoded.len();
                         let _ = encoded_tx.send(CaptureMessage::EncodedFrame {
                             data: Bytes::from(encoded),
@@ -1281,7 +1346,6 @@ fn stop_transmission(
 fn start_audio_output(
     audio_system: &AudioSystem,
     selected_output: &Option<String>,
-    user_audio: &mut HashMap<u64, UserAudioState>,
 ) -> Option<AudioOutput> {
     let device = match selected_output {
         Some(id) => audio_system.get_output_device_by_id(id),
@@ -1296,8 +1360,9 @@ fn start_audio_output(
         }
     };
 
-    // Clear any existing user audio state
-    user_audio.clear();
+    // NOTE: Opus decoders in user_audio persist for the entire session.
+    // They are only cleared when users leave the room, connection closes, etc.
+    // This avoids crackle at speech start.
 
     // Create and return the audio output
     match AudioOutput::new(&device, &AudioConfig::default()) {
@@ -1325,7 +1390,13 @@ fn handle_voice_datagram(
     processor_registry: &pipeline::ProcessorRegistry,
     state: &Arc<RwLock<State>>,
     repaint: &Arc<dyn Fn() + Send + Sync>,
+    audio_dumper: &AudioDumper,
 ) {
+    // Dump RX opus packet (before jitter buffer)
+    if !end_of_stream && !opus_data.is_empty() {
+        audio_dumper.write_rx_opus(&opus_data);
+    }
+    
     // Handle end-of-stream: mark the user's stream as ended
     if end_of_stream {
         if let Some(user_state) = user_audio.get_mut(&sender_id) {
@@ -1387,6 +1458,7 @@ fn handle_voice_datagram(
 fn mix_and_play_audio(
     user_audio: &mut HashMap<u64, UserAudioState>,
     audio_output: &Option<AudioOutput>,
+    audio_dumper: &AudioDumper,
 ) {
     let output = match audio_output {
         Some(o) => o,
@@ -1405,6 +1477,9 @@ fn mix_and_play_audio(
 
         // Get next frame (decoded or PLC)
         if let Some(mut pcm) = user_state.get_next_frame() {
+            // Dump decoded audio (before RX pipeline processing)
+            audio_dumper.write_rx_decoded(&pcm);
+            
             // Run through user's RX pipeline if present
             if let Some(ref mut pipeline) = user_state.rx_pipeline {
                 let result = pipeline.process(&mut pcm, 48000);
@@ -1429,19 +1504,29 @@ fn mix_and_play_audio(
 
     // Queue mixed audio if we have any
     if has_audio {
+        // Dump the final mixed audio that goes to playback
+        audio_dumper.write_playback(&mixed_buffer);
         output.queue_samples(&mixed_buffer);
     }
 }
 
-/// Clean up users who haven't sent audio recently.
+/// Clean up users who haven't sent audio recently from the "talking" UI state.
+/// 
+/// NOTE: This function only updates the `talking_users` set for UI display.
+/// It does NOT destroy decoders - those must persist for the entire session
+/// to avoid crackle/pop at speech start. Decoders are only destroyed when:
+/// - User leaves the room (UserLeftRoom / PeerLeft commands)
+/// - We change rooms (RoomChanged command)
+/// - Connection is closed (ConnectionClosed command)
 fn cleanup_stale_users(
-    user_audio: &mut HashMap<u64, UserAudioState>,
+    user_audio: &HashMap<u64, UserAudioState>,
     state: &Arc<RwLock<State>>,
     repaint: &Arc<dyn Fn() + Send + Sync>,
 ) {
     let stale_threshold = Duration::from_millis(300);
     let now = Instant::now();
 
+    // Find users who haven't sent audio recently
     let stale_users: Vec<u64> = user_audio
         .iter()
         .filter(|(_, audio)| now.duration_since(audio.last_received) > stale_threshold)
@@ -1452,12 +1537,8 @@ fn cleanup_stale_users(
         return;
     }
 
-    // Remove from user_audio
-    for user_id in &stale_users {
-        user_audio.remove(user_id);
-    }
-
-    // Remove from talking_users
+    // Only remove from talking_users (UI state), NOT from user_audio (decoder state)
+    // The decoder must persist to avoid crackle when the user starts talking again
     let mut needs_repaint = false;
     {
         let mut s = state.write().unwrap();

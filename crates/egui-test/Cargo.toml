@@ -8,7 +8,8 @@ eframe = "0.33.3"
 # egui = "0.33.2"
 egui_extras = { version = "0.33.3", features = ["image"] }
 egui_ltreeview = { git = "https://github.com/u6bkep/egui_ltreeview.git", branch = "main" }
-env_logger = { version = "0.11.8", features = ["auto-color", "humantime"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1.18.1", features = ["v4"] }
 backend = { path = "../backend" }
 api = { path = "../api" }
@@ -17,7 +18,6 @@ clap = { version = "4.5.53", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 directories = "6.0"
-log = "0.4"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"
 hex = "0.4"
@@ -28,5 +28,8 @@ anyhow = "1.0"
 ssh-agent-lib = "0.5"
 ssh-key = { version = "0.6", features = ["ed25519"] }
 service-binding = "3.0"
-rfd = "0.15"
+rfd = "0.16"
 base64 = "0.22"
+arboard = "3"
+image = { version = "0.25", default-features = false, features = ["avif", "bmp", "dds", "ff", "gif", "hdr", "ico", "jpeg", "png", "pnm", "qoi", "tga", "tiff", "webp"] }
+tempfile = "3"

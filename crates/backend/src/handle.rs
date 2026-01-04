@@ -40,6 +40,7 @@
 
 use crate::{
     audio::AudioSystem,
+    audio_dump::AudioDumper,
     audio_task::{spawn_audio_task, AudioCommand, AudioTaskConfig, AudioTaskHandle},
     cert_verifier::{
         is_cert_verification_error, new_captured_cert, take_captured_cert, 
@@ -93,7 +94,7 @@ impl BackendHandle {
     where
         F: Fn() + Send + Sync + 'static,
     {
-        Self::with_config(repaint_callback, ConnectConfig::new())
+        Self::with_config_and_dumper(repaint_callback, ConnectConfig::new(), None)
     }
 
     /// Create a new backend handle with a repaint callback and connect config.
@@ -101,6 +102,33 @@ impl BackendHandle {
     where
         F: Fn() + Send + Sync + 'static,
     {
+        Self::with_config_and_dumper(repaint_callback, connect_config, None)
+    }
+
+    /// Create a new backend handle with audio dumping enabled.
+    /// 
+    /// Audio dumping writes raw audio data to files for debugging:
+    /// - `mic_raw.pcm` - Raw microphone input (f32 samples)
+    /// - `tx_opus.bin` - Encoded opus packets being sent
+    /// - `rx_opus.bin` - Received opus packets
+    /// - `rx_decoded.pcm` - Decoded audio before mixing (f32 samples)
+    pub fn with_audio_dumper<F>(repaint_callback: F, connect_config: ConnectConfig, audio_dumper: AudioDumper) -> Self
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        Self::with_config_and_dumper(repaint_callback, connect_config, Some(audio_dumper))
+    }
+
+    /// Internal constructor with optional audio dumper.
+    fn with_config_and_dumper<F>(repaint_callback: F, connect_config: ConnectConfig, audio_dumper: Option<AudioDumper>) -> Self
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        // Check for audio dump env var if no explicit dumper provided
+        let audio_dumper = audio_dumper.or_else(|| {
+            crate::audio_dump::AudioDumpConfig::from_env().map(AudioDumper::new)
+        });
+        
         let repaint_callback = Arc::new(repaint_callback);
         let (command_tx, command_rx) = mpsc::unbounded_channel();
 
@@ -145,6 +173,7 @@ impl BackendHandle {
         let audio_task = spawn_audio_task(AudioTaskConfig {
             state: state.clone(),
             repaint: repaint_callback.clone(),
+            audio_dumper,
         });
 
         // Clone handles for the connection task
@@ -355,7 +384,15 @@ async fn run_connection_task(
                             };
 
                             let info_hash = handle.info_hash();
-                            let magnet = format!("magnet:?xt=urn:btih:{}", hex::encode(info_hash.0));
+                            let infohash_hex = hex::encode(info_hash.0);
+                            let magnet = format!("magnet:?xt=urn:btih:{}", &infohash_hex);
+
+                            // Get local file path for completed downloads
+                            let local_path = if stats.finished {
+                                tm.get_file_path(&infohash_hex).ok()
+                            } else {
+                                None
+                            };
 
                             // Extract speed and peer info from live stats
                             let (download_speed, upload_speed, peers) = stats.live.as_ref()
@@ -388,7 +425,7 @@ async fn run_connection_task(
                                 state,
                                 error,
                                 magnet: Some(magnet),
-                                local_path: None, // Output folder is not easily accessible
+                                local_path,
                             });
                         }
                         transfers
@@ -970,6 +1007,92 @@ async fn run_connection_task(
                                     }
                                 }
                             });
+                        }
+                    }
+
+                    Command::PauseTransfer { infohash } => {
+                        if let Some(tm) = &torrent_manager {
+                            let tm = tm.clone();
+                            let infohash = infohash.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = tm.pause_transfer(&infohash).await {
+                                    error!("Failed to pause transfer: {}", e);
+                                }
+                            });
+                        }
+                    }
+
+                    Command::ResumeTransfer { infohash } => {
+                        if let Some(tm) = &torrent_manager {
+                            let tm = tm.clone();
+                            let infohash = infohash.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = tm.resume_transfer(&infohash).await {
+                                    error!("Failed to resume transfer: {}", e);
+                                }
+                            });
+                        }
+                    }
+
+                    Command::CancelTransfer { infohash } => {
+                        if let Some(tm) = &torrent_manager {
+                            let tm = tm.clone();
+                            let infohash = infohash.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = tm.cancel_transfer(&infohash, false).await {
+                                    error!("Failed to cancel transfer: {}", e);
+                                }
+                            });
+                        }
+                    }
+
+                    Command::RemoveTransfer { infohash, delete_file } => {
+                        if let Some(tm) = &torrent_manager {
+                            let tm = tm.clone();
+                            let infohash = infohash.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = tm.cancel_transfer(&infohash, delete_file).await {
+                                    error!("Failed to remove transfer: {}", e);
+                                }
+                            });
+                        }
+                    }
+
+                    Command::SaveFileAs { infohash, destination } => {
+                        if let Some(tm) = &torrent_manager {
+                            // Get source path and copy to destination
+                            match tm.get_file_path(&infohash) {
+                                Ok(source) => {
+                                    let dest = destination.clone();
+                                    tokio::spawn(async move {
+                                        if let Err(e) = tokio::fs::copy(&source, &dest).await {
+                                            error!("Failed to save file: {}", e);
+                                        } else {
+                                            info!("Saved file to: {:?}", dest);
+                                        }
+                                    });
+                                }
+                                Err(e) => {
+                                    error!("Failed to get file path for save: {}", e);
+                                }
+                            }
+                        }
+                    }
+
+                    Command::OpenFile { infohash } => {
+                        if let Some(tm) = &torrent_manager {
+                            match tm.get_file_path(&infohash) {
+                                Ok(path) => {
+                                    if let Err(e) = open::that(&path) {
+                                        error!("Failed to open file: {}", e);
+                                    } else {
+                                        info!("Opened file: {:?}", path);
+                                    }
+                                }
+                                Err(e) => {
+                                    error!("Failed to get file path for open: {}", e);
+                                }
+                            }
                         }
                     }
                 }

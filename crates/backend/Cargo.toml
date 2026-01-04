@@ -33,3 +33,4 @@ bencode = { path = "../../vendor/rqbit/crates/bencode", package = "librqbit-benc
 urlencoding = "2"
 rand = "0.9"
 tokio-util = "0.7"
+open = "5"

@@ -234,32 +234,55 @@ pub async fn handle_connection(
     let public_key = Arc::new(RwLock::new(None));
     let authenticated = Arc::new(AtomicBool::new(false));
 
+    // Track whether we've registered the client (only register once, on first stream)
+    let mut client_handle: Option<Arc<ClientHandle>> = None;
+    let mut is_first_stream = true;
+
     loop {
         match conn.accept_bi().await {
             Ok((send_stream, mut recv)) => {
-                info!("new bi stream opened");
+                info!("new bi stream opened (first={})", is_first_stream);
 
-                // Create client handle using the new constructor
-                let client_handle = Arc::new(ClientHandle::new(
-                    send_stream, 
-                    user_id, 
-                    conn.clone(),
-                    username.clone(),
-                    public_key.clone(),
-                    authenticated.clone()
-                ));
+                // Create or reuse client handle
+                let handle = if is_first_stream {
+                    // First stream - create and register the client
+                    let handle = Arc::new(ClientHandle::new(
+                        send_stream,
+                        user_id,
+                        conn.clone(),
+                        username.clone(),
+                        public_key.clone(),
+                        authenticated.clone()
+                    ));
 
-                // Register client (lock-free DashMap insert)
-                state.register_client(client_handle.clone());
-                let client_count = state.client_count();
-                debug!(total_clients = client_count, "server: client registered");
+                    // Register client (lock-free DashMap insert)
+                    state.register_client(handle.clone());
+                    let client_count = state.client_count();
+                    debug!(total_clients = client_count, "server: client registered");
+
+                    client_handle = Some(handle.clone());
+                    is_first_stream = false;
+                    handle
+                } else {
+                    // Additional stream (e.g., tracker announce) - create handle for this stream
+                    // but don't register as a new client
+                    Arc::new(ClientHandle::new(
+                        send_stream,
+                        user_id,
+                        conn.clone(),
+                        username.clone(),
+                        public_key.clone(),
+                        authenticated.clone()
+                    ))
+                };
 
                 let persistence = persistence.clone();
-                let state = state.clone();
-                
+                let state_clone = state.clone();
+                let is_primary = client_handle.as_ref().map(|h| Arc::ptr_eq(h, &handle)).unwrap_or(false);
+
                 tokio::spawn(async move {
                     let mut buf = BytesMut::new();
-                    
+
                     // Read loop - handle errors gracefully
                     loop {
                         let mut chunk = [0u8; 1024];
@@ -282,8 +305,8 @@ pub async fn handle_connection(
                                             );
                                             if let Err(e) = handle_envelope(
                                                 env,
-                                                client_handle.clone(),
-                                                state.clone(),
+                                                handle.clone(),
+                                                state_clone.clone(),
                                                 persistence.clone(),
                                             )
                                             .await
@@ -296,7 +319,7 @@ pub async fn handle_connection(
                                 }
                             }
                             Ok(Ok(None)) => {
-                                info!("stream closed by peer");
+                                info!("stream closed by peer (primary={})", is_primary);
                                 break;
                             }
                             Ok(Err(e)) => {
@@ -312,7 +335,7 @@ pub async fn handle_connection(
                                 };
                                 let frame = api::encode_frame(&env);
                                 // Use the send_frame helper method
-                                if client_handle.send_frame(&frame).await.is_err() {
+                                if handle.send_frame(&frame).await.is_err() {
                                     info!("connection dead after read timeout");
                                     break;
                                 }
@@ -320,8 +343,10 @@ pub async fn handle_connection(
                         }
                     }
 
-                    // Stream closed - clean up this client
-                    cleanup_client(&client_handle, &state).await;
+                    // Only cleanup if this was the primary stream
+                    if is_primary {
+                        cleanup_client(&handle, &state_clone).await;
+                    }
                 });
             }
             Err(e) => {
@@ -329,6 +354,11 @@ pub async fn handle_connection(
                 break;
             }
         }
+    }
+
+    // Connection closed - ensure cleanup happens if primary stream is still active
+    if let Some(handle) = client_handle {
+        cleanup_client(&handle, &state).await;
     }
 
     Ok(())

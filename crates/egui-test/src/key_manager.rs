@@ -341,7 +341,7 @@ impl KeyManager {
         self.cached_signing_key = None;
         self.save_config()?;
         
-        log::info!("Selected SSH agent key: {} ({})", key_info.fingerprint, key_info.comment);
+        tracing::info!("Selected SSH agent key: {} ({})", key_info.fingerprint, key_info.comment);
         Ok(())
     }
     
@@ -354,7 +354,7 @@ impl KeyManager {
             let contents = serde_json::to_string_pretty(config)?;
             std::fs::write(&self.config_path, contents)?;
             
-            log::info!("Saved identity config to {}", self.config_path.display());
+            tracing::info!("Saved identity config to {}", self.config_path.display());
         }
         Ok(())
     }
@@ -365,7 +365,7 @@ impl KeyManager {
         match serde_json::from_str(&data) {
             Ok(config) => Some(config),
             Err(e) => {
-                log::warn!("Failed to parse identity config: {}", e);
+                tracing::warn!("Failed to parse identity config: {}", e);
                 None
             }
         }
@@ -522,7 +522,7 @@ impl SshAgentClient {
     pub async fn connect() -> anyhow::Result<Self> {
         let agent_path = get_agent_path()?;
         
-        log::debug!("Connecting to SSH agent at: {}", agent_path);
+        tracing::debug!("Connecting to SSH agent at: {}", agent_path);
         
         // Parse the path into a service-binding Binding
         let binding = Self::parse_agent_binding(&agent_path)?;
@@ -534,7 +534,7 @@ impl SshAgentClient {
         let client = ssh_agent_lib::client::connect(stream)
             .map_err(|e| anyhow::anyhow!("Failed to create SSH agent client: {}", e))?;
         
-        log::info!("Connected to SSH agent");
+        tracing::info!("Connected to SSH agent");
         Ok(Self { client })
     }
     
@@ -575,7 +575,7 @@ impl SshAgentClient {
         let identities = self.client.request_identities().await
             .map_err(|e| anyhow::anyhow!("Failed to request identities: {}", e))?;
         
-        log::debug!("Found {} keys in SSH agent", identities.len());
+        tracing::debug!("Found {} keys in SSH agent", identities.len());
         
         let mut ed25519_keys = Vec::new();
         
@@ -585,12 +585,12 @@ impl SshAgentClient {
                 // Extract the 32-byte public key
                 let public_key: [u8; 32] = ed_key.0;
                 let key_info = KeyInfo::from_public_key(public_key, id.comment.clone());
-                log::debug!("Found Ed25519 key: {} ({})", key_info.fingerprint, key_info.comment);
+                tracing::debug!("Found Ed25519 key: {} ({})", key_info.fingerprint, key_info.comment);
                 ed25519_keys.push(key_info);
             }
         }
         
-        log::info!("Found {} Ed25519 keys in SSH agent", ed25519_keys.len());
+        tracing::info!("Found {} Ed25519 keys in SSH agent", ed25519_keys.len());
         Ok(ed25519_keys)
     }
     
@@ -599,7 +599,7 @@ impl SshAgentClient {
         use ssh_agent_lib::proto::SignRequest;
         use ssh_key::public::KeyData;
         
-        log::debug!("Signing {} bytes with key {}", data.len(), fingerprint);
+        tracing::debug!("Signing {} bytes with key {}", data.len(), fingerprint);
         
         // Find the key by fingerprint
         let identities = self.client.request_identities().await
@@ -629,7 +629,7 @@ impl SshAgentClient {
         // For Ed25519, this is already the 64-byte raw signature.
         let sig_bytes = signature.as_bytes();
         
-        log::debug!("Signature algorithm: {:?}, length: {}", signature.algorithm(), sig_bytes.len());
+        tracing::debug!("Signature algorithm: {:?}, length: {}", signature.algorithm(), sig_bytes.len());
         
         if sig_bytes.len() != 64 {
             return Err(anyhow::anyhow!(
@@ -641,7 +641,7 @@ impl SshAgentClient {
         let mut raw_sig = [0u8; 64];
         raw_sig.copy_from_slice(sig_bytes);
         
-        log::debug!("Successfully signed data");
+        tracing::debug!("Successfully signed data");
         Ok(raw_sig)
     }
     
@@ -651,7 +651,7 @@ impl SshAgentClient {
         use ssh_key::private::{Ed25519Keypair, KeypairData};
         use ssh_key::public::Ed25519PublicKey;
         
-        log::debug!("Adding key to SSH agent with comment: {}", comment);
+        tracing::debug!("Adding key to SSH agent with comment: {}", comment);
         
         // Create ssh-key types
         let public_key_bytes = signing_key.verifying_key().to_bytes();
@@ -674,7 +674,7 @@ impl SshAgentClient {
         self.client.add_identity(identity).await
             .map_err(|e| anyhow::anyhow!("Failed to add key to agent: {}", e))?;
         
-        log::info!("Successfully added key to SSH agent");
+        tracing::info!("Successfully added key to SSH agent");
         Ok(())
     }
 }

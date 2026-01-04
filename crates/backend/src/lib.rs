@@ -40,6 +40,11 @@
 //!     _ => { /* render disconnected UI */ }
 //! }
 //! ```
+//!
+//! ## Invariants / gotchas
+//! - Remote Opus decoders must be **per-peer and long-lived** (persist across talk spurts).
+//!   They should be cleared only when the peer leaves (or as a long-TTL fallback), otherwise
+//!   you will hear a crackle at speech start and see repeated `decoder initialized` logs.
 
 use std::path::PathBuf;
 
@@ -68,6 +73,10 @@ pub use bounded_voice::{
 pub mod audio_task;
 pub use audio_task::{AudioCommand, AudioTaskConfig, AudioTaskHandle, spawn_audio_task};
 
+// Audio dumping for debugging
+pub mod audio_dump;
+pub use audio_dump::{AudioDumpConfig, AudioDumper};
+
 // Certificate verification for self-signed cert handling
 pub mod cert_verifier;
 pub use cert_verifier::{
@@ -78,7 +87,9 @@ pub use cert_verifier::{
 
 // State and command types
 pub mod events;
-pub use events::{AudioSettings, AudioState, AudioStats, ChatMessage, Command, ConnectionState, FileInfo, FileMessage, FileTransferState, PendingCertificate, RoomTree, RoomTreeNode, SigningCallback, State, TransferState, TransmissionMode, VoiceMode};
+// Replace the brittle, hand-maintained re-export list with a wildcard re-export to avoid
+// build breaks when items in `events` are renamed/moved.
+pub use events::*;
 
 // Backend handle
 pub mod handle;

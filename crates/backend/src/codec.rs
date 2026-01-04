@@ -366,7 +366,9 @@ pub struct EncoderStats {
 /// - Mono audio
 /// - Packet loss concealment
 pub struct VoiceDecoder {
-    decoder: Decoder,
+    // If you currently store Option<opus::Decoder> and (re)create it in decode(),
+    // replace that with a concrete decoder that is constructed once.
+    decoder: opus::Decoder,
     /// Reusable output buffer to avoid allocations.
     output_buffer: Vec<f32>,
     /// Total frames decoded (for statistics).

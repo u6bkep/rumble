@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use librqbit::{
     AddTorrent, AddTorrentOptions, ManagedTorrent, ManagedTorrentState, Session,
-    SessionOptions, ListenerOptions,
+    SessionOptions, ListenerOptions, api::TorrentIdOrHash,
 };
 use quinn::Connection;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -25,13 +25,21 @@ const RELAY_ROLE_ACCEPTOR: u8 = 0x01;
 #[allow(dead_code)] // Used when dialing through relay (future implementation)
 const RELAY_ROLE_DIALER: u8 = 0x02;
 
-/// Unmaps IPv4-mapped IPv6 addresses to their IPv4 equivalent.
-/// Returns the original address unchanged if it's not a mapped address.
-fn unmap_ipv4(ip: IpAddr) -> IpAddr {
+/// Normalizes IP addresses for BitTorrent peer connections:
+/// - Unmaps IPv4-mapped IPv6 addresses (::ffff:x.x.x.x -> x.x.x.x)
+/// - Converts IPv6 loopback (::1) to IPv4 loopback (127.0.0.1)
+///
+/// The loopback conversion is needed because librqbit listens on 0.0.0.0 (IPv4 only),
+/// so peers reported as ::1 won't be reachable unless converted.
+fn normalize_peer_ip(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V6(v6) => {
+            // Handle IPv4-mapped addresses (::ffff:x.x.x.x)
             if let Some(v4) = v6.to_ipv4_mapped() {
                 IpAddr::V4(v4)
+            // Handle IPv6 loopback - convert to IPv4 loopback since our listener is IPv4-only
+            } else if v6.is_loopback() {
+                IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
             } else {
                 IpAddr::V6(v6)
             }
@@ -136,12 +144,16 @@ pub struct TorrentManager {
     needs_relay: AtomicBool,
     /// Current relay info (if relay mode is enabled)
     relay_info: RwLock<Option<RelayInfo>>,
+    /// Output folder for downloads.
+    output_folder: PathBuf,
 }
 
 impl TorrentManager {
     pub async fn new(connection: Connection, temp_dir: PathBuf) -> anyhow::Result<Self> {
         let peer_id_bytes: [u8; 20] = rand::random();
         let peer_id = librqbit::dht::Id20::new(peer_id_bytes);
+
+        let output_folder = temp_dir.clone();
 
         let session = Session::new_with_opts(
             temp_dir,
@@ -152,7 +164,8 @@ impl TorrentManager {
                 peer_id: Some(peer_id),
                 disable_trackers: false, // Enable trackers so add_torrent doesn't fail immediately
                 listen: Some(ListenerOptions {
-                    listen_addr: SocketAddr::from(([0, 0, 0, 0], 0)),
+                    // Use IPv6 unspecified address for dual-stack support (both IPv4 and IPv6)
+                    listen_addr: SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0)),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -169,6 +182,7 @@ impl TorrentManager {
             cancel_token: CancellationToken::new(),
             needs_relay: AtomicBool::new(false),
             relay_info: RwLock::new(None),
+            output_folder,
         })
     }
 
@@ -345,7 +359,7 @@ impl TorrentManager {
         let mut peers = Vec::new();
         for peer in response.peers {
             if let Ok(ip) = peer.ip.parse::<IpAddr>() {
-                let ip = unmap_ipv4(ip);
+                let ip = normalize_peer_ip(ip);
                 let addr = SocketAddr::new(ip, peer.port as u16);
                 // Skip self
                 if addr.port() == port {
@@ -526,7 +540,7 @@ impl TorrentManager {
                                         if let ManagedTorrentState::Live(live) = state {
                                             for peer in response.peers {
                                                 if let Ok(ip) = peer.ip.parse::<IpAddr>() {
-                                                    let ip = unmap_ipv4(ip);
+                                                    let ip = normalize_peer_ip(ip);
                                                     let addr = SocketAddr::new(ip, peer.port as u16);
                                                     // Skip self
                                                     if addr.port() == listen_port {
@@ -578,6 +592,60 @@ impl TorrentManager {
 
             debug!("Announce loop ended for infohash: {}", hex::encode(&info_hash_bytes));
         });
+    }
+
+    /// Pause a torrent by infohash (hex-encoded).
+    pub async fn pause_transfer(&self, infohash: &str) -> anyhow::Result<()> {
+        let hash_bytes = hex::decode(infohash)?;
+        let hash: [u8; 20] = hash_bytes.try_into().map_err(|_| anyhow::anyhow!("Invalid infohash length"))?;
+        let id = librqbit::dht::Id20::new(hash);
+
+        let handle = self.session.get(TorrentIdOrHash::Hash(id))
+            .ok_or_else(|| anyhow::anyhow!("Transfer not found"))?;
+
+        self.session.pause(&handle).await?;
+        info!("Paused transfer: {}", infohash);
+        Ok(())
+    }
+
+    /// Resume a paused torrent by infohash (hex-encoded).
+    pub async fn resume_transfer(&self, infohash: &str) -> anyhow::Result<()> {
+        let hash_bytes = hex::decode(infohash)?;
+        let hash: [u8; 20] = hash_bytes.try_into().map_err(|_| anyhow::anyhow!("Invalid infohash length"))?;
+        let id = librqbit::dht::Id20::new(hash);
+
+        let handle = self.session.get(TorrentIdOrHash::Hash(id))
+            .ok_or_else(|| anyhow::anyhow!("Transfer not found"))?;
+
+        self.session.unpause(&handle).await?;
+        info!("Resumed transfer: {}", infohash);
+        Ok(())
+    }
+
+    /// Cancel and remove a torrent by infohash (hex-encoded).
+    pub async fn cancel_transfer(&self, infohash: &str, delete_files: bool) -> anyhow::Result<()> {
+        let hash_bytes = hex::decode(infohash)?;
+        let hash: [u8; 20] = hash_bytes.try_into().map_err(|_| anyhow::anyhow!("Invalid infohash length"))?;
+        let id = librqbit::dht::Id20::new(hash);
+
+        self.session.delete(TorrentIdOrHash::Hash(id), delete_files).await?;
+        info!("Cancelled transfer: {} (delete_files={})", infohash, delete_files);
+        Ok(())
+    }
+
+    /// Get the local file path for a completed torrent.
+    pub fn get_file_path(&self, infohash: &str) -> anyhow::Result<std::path::PathBuf> {
+        let hash_bytes = hex::decode(infohash)?;
+        let hash: [u8; 20] = hash_bytes.try_into().map_err(|_| anyhow::anyhow!("Invalid infohash length"))?;
+        let id = librqbit::dht::Id20::new(hash);
+
+        let handle = self.session.get(TorrentIdOrHash::Hash(id))
+            .ok_or_else(|| anyhow::anyhow!("Transfer not found"))?;
+
+        // Get the file name from the torrent metadata
+        let name = handle.name().ok_or_else(|| anyhow::anyhow!("No file name available"))?;
+
+        Ok(self.output_folder.join(name))
     }
 }
 

@@ -923,6 +923,18 @@ pub enum Command {
     // File Sharing
     ShareFile { path: std::path::PathBuf },
     DownloadFile { magnet: String },
+    /// Pause a file transfer by infohash (hex-encoded).
+    PauseTransfer { infohash: String },
+    /// Resume a paused file transfer by infohash (hex-encoded).
+    ResumeTransfer { infohash: String },
+    /// Cancel and remove a file transfer by infohash (hex-encoded).
+    CancelTransfer { infohash: String },
+    /// Remove a completed/seeding transfer and optionally delete the local file.
+    RemoveTransfer { infohash: String, delete_file: bool },
+    /// Save a completed file to a new location.
+    SaveFileAs { infohash: String, destination: std::path::PathBuf },
+    /// Open a completed file with the system default application.
+    OpenFile { infohash: String },
 }
 
 // Implement Debug manually since SigningCallback doesn't implement Debug
@@ -968,6 +980,12 @@ impl std::fmt::Debug for Command {
             Command::UnregisterUser { user_id } => f.debug_struct("UnregisterUser").field("user_id", user_id).finish(),
             Command::ShareFile { path } => f.debug_struct("ShareFile").field("path", path).finish(),
             Command::DownloadFile { magnet } => f.debug_struct("DownloadFile").field("magnet", magnet).finish(),
+            Command::PauseTransfer { infohash } => f.debug_struct("PauseTransfer").field("infohash", infohash).finish(),
+            Command::ResumeTransfer { infohash } => f.debug_struct("ResumeTransfer").field("infohash", infohash).finish(),
+            Command::CancelTransfer { infohash } => f.debug_struct("CancelTransfer").field("infohash", infohash).finish(),
+            Command::RemoveTransfer { infohash, delete_file } => f.debug_struct("RemoveTransfer").field("infohash", infohash).field("delete_file", delete_file).finish(),
+            Command::SaveFileAs { infohash, destination } => f.debug_struct("SaveFileAs").field("infohash", infohash).field("destination", destination).finish(),
+            Command::OpenFile { infohash } => f.debug_struct("OpenFile").field("infohash", infohash).finish(),
         }
     }
 }

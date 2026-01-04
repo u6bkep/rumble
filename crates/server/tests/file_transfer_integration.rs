@@ -222,14 +222,14 @@ fn test_file_transfer() {
     // We check file_transfers state
     let download_finished = wait_for(&handle_b, Duration::from_secs(30), |s| {
         for transfer in &s.file_transfers {
-            // If progress is 1.0, it's finished, so is_download might be false.
-            if transfer.name == file_name && !transfer.is_checking && transfer.progress >= 1.0 {
+            // Check if transfer is finished (Seeding or Completed state, with full progress)
+            if transfer.name == file_name && transfer.state.is_finished() && transfer.progress >= 1.0 {
                 return true;
             }
         }
         false
     });
-    
+
     if !download_finished {
         let state = handle_b.state();
         println!("Client B chat messages:");
@@ -238,8 +238,8 @@ fn test_file_transfer() {
         }
         println!("Client B file transfers:");
         for transfer in &state.file_transfers {
-            println!("- Name: {}, Progress: {}, Is Download: {}, Is Checking: {}", 
-                transfer.name, transfer.progress, transfer.is_download, transfer.is_checking);
+            println!("- Name: {}, Progress: {}, State: {:?}",
+                transfer.name, transfer.progress, transfer.state);
         }
     }
     assert!(download_finished, "Client B failed to finish download");
