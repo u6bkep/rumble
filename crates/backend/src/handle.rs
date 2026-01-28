@@ -193,6 +193,7 @@ impl BackendHandle {
         let repaint_for_task = repaint_callback.clone();
         let config_for_task = connect_config.clone();
         let audio_task_for_connection = audio_task.clone();
+        let command_tx_for_task = command_tx.clone();
 
         // Spawn background thread with tokio runtime for connection task
         let runtime_thread = std::thread::spawn(move || {
@@ -200,6 +201,7 @@ impl BackendHandle {
             rt.block_on(async move {
                 run_connection_task(
                     command_rx,
+                    command_tx_for_task,
                     state_for_task,
                     repaint_for_task,
                     config_for_task,
@@ -351,6 +353,7 @@ impl BackendHandle {
 /// It notifies the audio task when a connection is established or closed.
 async fn run_connection_task(
     mut command_rx: mpsc::UnboundedReceiver<Command>,
+    command_tx: mpsc::UnboundedSender<Command>,
     state: Arc<RwLock<State>>,
     repaint: Arc<dyn Fn() + Send + Sync>,
     config: ConnectConfig,
@@ -612,8 +615,9 @@ async fn run_connection_task(
                                 let repaint_clone = repaint.clone();
                                 let audio_task_clone = audio_task.clone();
                                 let torrent_manager_clone = torrent_manager.clone();
+                                let command_tx_clone = command_tx.clone();
                                 tokio::spawn(async move {
-                                    run_receiver_task(conn, recv, recv_buf, state_clone, repaint_clone, audio_task_clone, torrent_manager_clone).await;
+                                    run_receiver_task(conn, recv, recv_buf, state_clone, repaint_clone, audio_task_clone, torrent_manager_clone, command_tx_clone).await;
                                 });
                             }
                             Err(e) => {
@@ -765,8 +769,9 @@ async fn run_connection_task(
                                     let repaint_clone = repaint.clone();
                                     let audio_task_clone = audio_task.clone();
                                     let torrent_manager_clone = torrent_manager.clone();
+                                    let command_tx_clone = command_tx.clone();
                                     tokio::spawn(async move {
-                                        run_receiver_task(conn, recv, recv_buf, state_clone, repaint_clone, audio_task_clone, torrent_manager_clone).await;
+                                        run_receiver_task(conn, recv, recv_buf, state_clone, repaint_clone, audio_task_clone, torrent_manager_clone, command_tx_clone).await;
                                     });
                                 }
                                 Err(e) => {
@@ -1193,6 +1198,50 @@ async fn run_connection_task(
 
                                     match p2p.fetch_file(peer_id, file_id).await {
                                         Ok((name, data)) => {
+                                            // Check if this is a chat history file
+                                            if name == "chat-history.json" {
+                                                // Parse and merge chat history
+                                                if let Ok(json_str) = std::str::from_utf8(&data) {
+                                                    if let Some(history) = crate::events::ChatHistoryContent::parse(json_str) {
+                                                        let received_messages = history.to_messages();
+                                                        let msg_count = received_messages.len();
+
+                                                        let mut s = state.write().unwrap();
+                                                        // Merge: add messages with new UUIDs
+                                                        let existing_ids: std::collections::HashSet<[u8; 16]> =
+                                                            s.chat_messages.iter().map(|m| m.id).collect();
+
+                                                        let mut added = 0;
+                                                        for msg in received_messages {
+                                                            if !existing_ids.contains(&msg.id) {
+                                                                s.chat_messages.push(msg);
+                                                                added += 1;
+                                                            }
+                                                        }
+
+                                                        // Sort by timestamp
+                                                        s.chat_messages.sort_by_key(|m| m.timestamp);
+
+                                                        // Add system message about the sync
+                                                        s.chat_messages.push(crate::events::ChatMessage {
+                                                            id: uuid::Uuid::new_v4().into_bytes(),
+                                                            sender: "System".to_string(),
+                                                            text: format!(
+                                                                "Synced chat history: {} new messages (of {} received)",
+                                                                added, msg_count
+                                                            ),
+                                                            timestamp: SystemTime::now(),
+                                                            is_local: true,
+                                                        });
+                                                        repaint();
+                                                        return; // Done with chat history
+                                                    }
+                                                }
+                                                error!("Failed to parse chat history JSON");
+                                                return; // Don't process as regular file
+                                            }
+
+                                            // Regular file download
                                             if let Err(e) = tokio::fs::create_dir_all(&download_dir).await {
                                                 error!("Failed to create download dir: {}", e);
                                             }
@@ -1375,6 +1424,137 @@ async fn run_connection_task(
                         s.file_transfer_settings = settings;
                         drop(s);
                         repaint();
+                    }
+
+                    Command::RequestChatHistory => {
+                        // Send a chat history request to the room
+                        if let Some(send) = &mut send_stream {
+                            let request = crate::events::ChatHistoryRequestMessage::new();
+                            let message_id = uuid::Uuid::new_v4().into_bytes().to_vec();
+                            let timestamp_ms = SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_millis() as i64;
+
+                            let env = proto::Envelope {
+                                state_hash: Vec::new(),
+                                payload: Some(Payload::ChatMessage(proto::ChatMessage {
+                                    id: message_id,
+                                    timestamp_ms,
+                                    sender: client_name.clone(),
+                                    text: request.to_json(),
+                                })),
+                            };
+                            let frame = encode_frame(&env);
+                            if let Err(e) = send.write_all(&frame).await {
+                                error!("Failed to send chat history request: {}", e);
+                            } else {
+                                info!("Sent chat history request to room");
+                                let mut s = state.write().unwrap();
+                                s.chat_messages.push(crate::events::ChatMessage {
+                                    id: uuid::Uuid::new_v4().into_bytes(),
+                                    sender: "System".to_string(),
+                                    text: "Requesting chat history from peers...".to_string(),
+                                    timestamp: SystemTime::now(),
+                                    is_local: true,
+                                });
+                                repaint();
+                            }
+                        }
+                    }
+
+                    Command::ShareChatHistory => {
+                        // Share our chat history via P2P in response to a request
+                        #[cfg(feature = "p2p")]
+                        if let Some(p2p) = &p2p_manager {
+                            // Serialize chat history (excluding local messages)
+                            let history = {
+                                let s = state.read().unwrap();
+                                crate::events::ChatHistoryContent::from_messages(&s.chat_messages)
+                            };
+
+                            if history.messages.is_empty() {
+                                debug!("No chat history to share");
+                                continue;
+                            }
+
+                            let json = history.to_json();
+                            let json_bytes = json.as_bytes();
+
+                            // Write to temp file
+                            let temp_path = std::env::temp_dir().join(format!(
+                                "rumble-chat-history-{}.json",
+                                uuid::Uuid::new_v4()
+                            ));
+
+                            if let Err(e) = std::fs::write(&temp_path, json_bytes) {
+                                error!("Failed to write chat history temp file: {}", e);
+                                continue;
+                            }
+
+                            // Share via P2P
+                            match p2p.share_file(temp_path.clone()).await {
+                                Ok(shared) => {
+                                    let addrs = p2p.listen_addrs().await;
+                                    let addr_strings: Vec<String> =
+                                        addrs.iter().map(|a| a.to_string()).collect();
+
+                                    // Create file message with chat history MIME type
+                                    let msg = crate::events::P2pFileMessage::new(
+                                        "chat-history.json".to_string(),
+                                        shared.size,
+                                        hex::encode(shared.id),
+                                        p2p.peer_id().to_string(),
+                                        addr_strings,
+                                    );
+
+                                    // Send as chat message
+                                    if let Some(send) = &mut send_stream {
+                                        let message_id = uuid::Uuid::new_v4().into_bytes().to_vec();
+                                        let timestamp_ms = SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap()
+                                            .as_millis() as i64;
+
+                                        let env = proto::Envelope {
+                                            state_hash: Vec::new(),
+                                            payload: Some(Payload::ChatMessage(proto::ChatMessage {
+                                                id: message_id,
+                                                timestamp_ms,
+                                                sender: client_name.clone(),
+                                                text: msg.to_json(),
+                                            })),
+                                        };
+                                        let frame = encode_frame(&env);
+                                        if let Err(e) = send.write_all(&frame).await {
+                                            error!("Failed to send chat history share message: {}", e);
+                                        } else {
+                                            info!(
+                                                "Shared chat history ({} messages, {} bytes)",
+                                                history.messages.len(),
+                                                shared.size
+                                            );
+                                        }
+                                    }
+
+                                    // Clean up temp file after a delay (let P2P transfer complete)
+                                    let temp_path_clone = temp_path.clone();
+                                    tokio::spawn(async move {
+                                        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                                        let _ = std::fs::remove_file(temp_path_clone);
+                                    });
+                                }
+                                Err(e) => {
+                                    error!("Failed to share chat history via P2P: {}", e);
+                                    let _ = std::fs::remove_file(&temp_path);
+                                }
+                            }
+                        }
+
+                        #[cfg(not(feature = "p2p"))]
+                        {
+                            debug!("Chat history sharing requires P2P feature");
+                        }
                     }
                 }
             }
@@ -1669,6 +1849,7 @@ async fn run_receiver_task(
     repaint: Arc<dyn Fn() + Send + Sync>,
     audio_task: AudioTaskHandle,
     torrent_manager: Option<Arc<crate::torrent::TorrentManager>>,
+    command_tx: mpsc::UnboundedSender<Command>,
 ) {
     loop {
         let mut chunk = [0u8; 4096];
@@ -1677,7 +1858,7 @@ async fn run_receiver_task(
                 buf.extend_from_slice(&chunk[..n]);
                 while let Some(frame) = try_decode_frame(&mut buf) {
                     if let Ok(env) = proto::Envelope::decode(&*frame) {
-                        handle_server_message(env, &state, &repaint, &audio_task, &torrent_manager);
+                        handle_server_message(env, &state, &repaint, &audio_task, &torrent_manager, &command_tx);
                     }
                 }
             }
@@ -1745,6 +1926,7 @@ fn handle_server_message(
     repaint: &Arc<dyn Fn() + Send + Sync>,
     audio_task: &AudioTaskHandle,
     torrent_manager: &Option<Arc<crate::torrent::TorrentManager>>,
+    command_tx: &mpsc::UnboundedSender<Command>,
 ) {
     match env.payload {
         Some(Payload::TrackerAnnounceResponse(_)) => {
@@ -1802,6 +1984,28 @@ fn handle_server_message(
                         } else {
                             std::time::SystemTime::now()
                         };
+
+                        // Check if this is a chat history request
+                        if crate::events::ChatHistoryRequestMessage::parse(&cb.text).is_some() {
+                            debug!("Received chat history request from {}", cb.sender);
+                            // Trigger sharing our chat history
+                            let _ = command_tx.send(Command::ShareChatHistory);
+                            // Don't add this message to chat - it's a protocol message
+                            return;
+                        }
+
+                        // Check if this is a P2P chat history file
+                        if let Some(p2p_msg) = crate::events::P2pFileMessage::parse(&cb.text) {
+                            if p2p_msg.file.name == "chat-history.json" {
+                                debug!("Received chat history file from {}", cb.sender);
+                                // Send command to download and merge history
+                                let _ = command_tx.send(Command::DownloadFile {
+                                    magnet: p2p_msg.magnet_link(),
+                                });
+                                // Don't add this message to chat - it's a protocol message
+                                return;
+                            }
+                        }
 
                         // Check if this is a file message that should be auto-downloaded
                         let mut should_auto_download = None;

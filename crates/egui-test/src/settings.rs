@@ -503,6 +503,8 @@ pub struct FileTransferSettings {
     pub seed_after_download: bool,
     /// Clean up downloaded files on application exit.
     pub cleanup_on_exit: bool,
+    /// Automatically sync chat history when joining a room.
+    pub auto_sync_history: bool,
 }
 
 impl Default for FileTransferSettings {
@@ -527,6 +529,7 @@ impl Default for FileTransferSettings {
             upload_speed_limit: 0,   // Unlimited
             seed_after_download: true,
             cleanup_on_exit: false,
+            auto_sync_history: false, // Manual sync by default
         }
     }
 }

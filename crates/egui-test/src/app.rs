@@ -653,6 +653,15 @@ impl RumbleApp {
         });
     }
 
+    /// Join a room and optionally request chat history if auto-sync is enabled.
+    fn join_room(&self, room_id: uuid::Uuid) {
+        self.backend.send(Command::JoinRoom { room_id });
+        if self.persistent_settings.file_transfer.auto_sync_history {
+            // Delay the history request slightly to allow room join to complete
+            self.backend.send(Command::RequestChatHistory);
+        }
+    }
+
     /// Render the Connection settings category.
     fn render_settings_connection(&mut self, ui: &mut egui::Ui, state: &backend::State) {
         ui.heading("Connection");
@@ -1493,6 +1502,21 @@ impl RumbleApp {
             .changed()
         {
             self.persistent_settings.file_transfer.cleanup_on_exit = cleanup;
+            self.settings_modal.dirty = true;
+        }
+
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(8.0);
+        ui.heading("Chat History");
+
+        let mut auto_sync = self.persistent_settings.file_transfer.auto_sync_history;
+        if ui
+            .checkbox(&mut auto_sync, "Auto-sync history on room join")
+            .on_hover_text("Automatically request chat history from peers when joining a room")
+            .changed()
+        {
+            self.persistent_settings.file_transfer.auto_sync_history = auto_sync;
             self.settings_modal.dirty = true;
         }
     }
@@ -2906,6 +2930,17 @@ impl RumbleApp {
                                         self.chat_input.clear();
                                     }
                                 }
+
+                                // Sync history button
+                                if state.connection.is_connected() {
+                                    if ui
+                                        .button("↻ Sync")
+                                        .on_hover_text("Request chat history from peers")
+                                        .clicked()
+                                    {
+                                        self.backend.send(Command::RequestChatHistory);
+                                    }
+                                }
                             });
                         });
                     });
@@ -2923,14 +2958,10 @@ impl RumbleApp {
                 ui.horizontal(|ui| {
                     ui.label("No rooms received yet.");
                     if ui.button("Join Root").clicked() {
-                        self.backend.send(Command::JoinRoom {
-                            room_id: api::ROOT_ROOM_UUID,
-                        });
+                        self.join_room(api::ROOT_ROOM_UUID);
                     }
                     if ui.button("Refresh").clicked() {
-                        self.backend.send(Command::JoinRoom {
-                            room_id: api::ROOT_ROOM_UUID,
-                        });
+                        self.join_room(api::ROOT_ROOM_UUID);
                     }
                 });
                 ui.separator();
@@ -3280,7 +3311,12 @@ impl RumbleApp {
 
                 // Execute pending commands
                 for cmd in pending_commands {
+                    // Check for JoinRoom to trigger auto-sync
+                    let is_join_room = matches!(cmd, Command::JoinRoom { .. });
                     self.backend.send(cmd);
+                    if is_join_room && self.persistent_settings.file_transfer.auto_sync_history {
+                        self.backend.send(Command::RequestChatHistory);
+                    }
                 }
 
                 // Handle rename modal

@@ -777,6 +777,149 @@ impl P2pFileMessage {
 }
 
 // =============================================================================
+// Chat History Sync Messages
+// =============================================================================
+
+/// MIME type for chat history files.
+pub const CHAT_HISTORY_MIME: &str = "application/x-rumble-chat-history";
+
+/// A chat history request message.
+///
+/// Sent to request chat history from peers in the room.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ChatHistoryRequestMessage {
+    /// Message type marker (always "chat-history-request").
+    #[serde(rename = "type")]
+    pub msg_type: String,
+}
+
+impl ChatHistoryRequestMessage {
+    pub fn new() -> Self {
+        Self {
+            msg_type: "chat-history-request".to_string(),
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        let value: serde_json::Value = serde_json::from_str(text).ok()?;
+        let obj = value.as_object()?;
+
+        if obj.get("type")?.as_str()? != "chat-history-request" {
+            return None;
+        }
+
+        // Only allow type and optional $schema fields
+        for key in obj.keys() {
+            if !["type", "$schema"].contains(&key.as_str()) {
+                return None;
+            }
+        }
+
+        Some(Self::new())
+    }
+
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
+}
+
+impl Default for ChatHistoryRequestMessage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A single message in the chat history export format.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ChatHistoryEntry {
+    /// Hex-encoded 16-byte UUID.
+    pub id: String,
+    /// Sender username.
+    pub sender: String,
+    /// Message text.
+    pub text: String,
+    /// Unix timestamp in milliseconds.
+    pub timestamp: u64,
+}
+
+/// Chat history file content.
+///
+/// Serialized as JSON and transferred via P2P file sharing.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ChatHistoryContent {
+    /// Schema version for forward compatibility.
+    pub version: u32,
+    /// Messages in chronological order.
+    pub messages: Vec<ChatHistoryEntry>,
+}
+
+impl ChatHistoryContent {
+    /// Current schema version.
+    pub const VERSION: u32 = 1;
+
+    /// Create a new chat history content from chat messages.
+    ///
+    /// Filters out local messages (system messages, etc.).
+    pub fn from_messages(messages: &[ChatMessage]) -> Self {
+        let entries = messages
+            .iter()
+            .filter(|m| !m.is_local)
+            .map(|m| ChatHistoryEntry {
+                id: hex::encode(m.id),
+                sender: m.sender.clone(),
+                text: m.text.clone(),
+                timestamp: m
+                    .timestamp
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0),
+            })
+            .collect();
+
+        Self {
+            version: Self::VERSION,
+            messages: entries,
+        }
+    }
+
+    /// Parse chat history from JSON.
+    pub fn parse(json: &str) -> Option<Self> {
+        serde_json::from_str(json).ok()
+    }
+
+    /// Serialize to JSON.
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
+
+    /// Convert entries back to ChatMessage structs for merging.
+    pub fn to_messages(&self) -> Vec<ChatMessage> {
+        self.messages
+            .iter()
+            .filter_map(|e| {
+                let id_bytes = hex::decode(&e.id).ok()?;
+                if id_bytes.len() != 16 {
+                    return None;
+                }
+                let mut id = [0u8; 16];
+                id.copy_from_slice(&id_bytes);
+
+                let timestamp = std::time::UNIX_EPOCH
+                    + std::time::Duration::from_millis(e.timestamp);
+
+                Some(ChatMessage {
+                    id,
+                    sender: e.sender.clone(),
+                    text: e.text.clone(),
+                    timestamp,
+                    is_local: false,
+                })
+            })
+            .collect()
+    }
+}
+
+// =============================================================================
 // Auto-Download Settings
 // =============================================================================
 
@@ -1252,6 +1395,14 @@ pub enum Command {
     UpdateFileTransferSettings {
         settings: FileTransferSettings,
     },
+
+    // Chat History Sync
+    /// Request chat history from peers in the current room.
+    RequestChatHistory,
+    /// Internal: Share chat history in response to a request.
+    /// This is triggered by receiving a ChatHistoryRequestMessage.
+    #[doc(hidden)]
+    ShareChatHistory,
 }
 
 // Implement Debug manually since SigningCallback doesn't implement Debug
@@ -1354,6 +1505,8 @@ impl std::fmt::Debug for Command {
                 .field("auto_download_enabled", &settings.auto_download_enabled)
                 .field("rules_count", &settings.auto_download_rules.len())
                 .finish(),
+            Command::RequestChatHistory => write!(f, "RequestChatHistory"),
+            Command::ShareChatHistory => write!(f, "ShareChatHistory"),
         }
     }
 }
