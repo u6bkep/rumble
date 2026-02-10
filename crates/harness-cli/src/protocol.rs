@@ -2,6 +2,15 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Crop rectangle for screenshots.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CropRect {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
 /// Commands sent from CLI to daemon.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -44,6 +53,8 @@ pub enum Command {
         id: u32,
         /// Output path for the PNG file. If None, uses a temp file.
         output: Option<String>,
+        /// Optional crop rectangle.
+        crop: Option<CropRect>,
     },
 
     /// Click at a position.
@@ -162,10 +173,7 @@ pub enum ResponseData {
     Pong,
 
     /// Daemon status.
-    Status {
-        server_running: bool,
-        client_count: u32,
-    },
+    Status { server_running: bool, client_count: u32 },
 
     /// New client created.
     ClientCreated { id: u32 },
@@ -204,10 +212,7 @@ pub enum ResponseData {
     },
 
     /// File shared result.
-    FileShared {
-        infohash: String,
-        magnet_link: String,
-    },
+    FileShared { infohash: String, magnet_link: String },
 
     /// List of file transfers.
     FileTransfers { transfers: Vec<FileTransferInfo> },

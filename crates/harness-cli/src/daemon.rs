@@ -10,8 +10,8 @@ use std::{
     collections::HashMap,
     path::PathBuf,
     sync::{
-        atomic::{AtomicU32, Ordering},
         Arc,
+        atomic::{AtomicU32, Ordering},
     },
 };
 
@@ -120,10 +120,8 @@ impl ClientInstance {
     }
 
     fn run_frame(&mut self) {
-        let screen_rect = egui::Rect::from_min_size(
-            egui::Pos2::ZERO,
-            egui::vec2(self.width as f32, self.height as f32),
-        );
+        let screen_rect =
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(self.width as f32, self.height as f32));
 
         let mut raw_input = egui::RawInput::default();
         raw_input.screen_rect = Some(screen_rect);
@@ -237,7 +235,11 @@ impl ClientInstance {
         });
     }
 
-    fn screenshot(&mut self, output_path: Option<&str>) -> Result<(String, u32, u32)> {
+    fn screenshot(
+        &mut self,
+        output_path: Option<&str>,
+        crop: Option<&crate::protocol::CropRect>,
+    ) -> Result<(String, u32, u32)> {
         // Run a frame first to ensure we have current content
         self.run_frame();
 
@@ -246,7 +248,37 @@ impl ClientInstance {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("No frame output available"))?;
 
-        let png_data = self.renderer.render_to_png(&self.ctx, output)?;
+        let image = self
+            .renderer
+            .render(&self.ctx, output)
+            .map_err(|e| anyhow::anyhow!(e))?;
+
+        let (final_image, out_width, out_height) = if let Some(crop) = crop {
+            let (img_w, img_h) = image.dimensions();
+            anyhow::ensure!(
+                crop.x < img_w && crop.y < img_h,
+                "Crop origin ({},{}) is outside image bounds ({}x{})",
+                crop.x,
+                crop.y,
+                img_w,
+                img_h
+            );
+
+            // Clamp width/height to image bounds
+            let cw = crop.width.min(img_w - crop.x);
+            let ch = crop.height.min(img_h - crop.y);
+
+            let cropped = image::imageops::crop_imm(&image, crop.x, crop.y, cw, ch).to_image();
+            (cropped, cw, ch)
+        } else {
+            let w = self.width;
+            let h = self.height;
+            (image, w, h)
+        };
+
+        let mut png_data = Vec::new();
+        let encoder = image::codecs::png::PngEncoder::new(&mut png_data);
+        final_image.write_with_encoder(encoder)?;
 
         let path = if let Some(p) = output_path {
             PathBuf::from(p)
@@ -258,7 +290,7 @@ impl ClientInstance {
 
         std::fs::write(&path, &png_data)?;
 
-        Ok((path.to_string_lossy().to_string(), self.width, self.height))
+        Ok((path.to_string_lossy().to_string(), out_width, out_height))
     }
 
     fn is_connected(&self) -> bool {
@@ -575,8 +607,7 @@ impl Daemon {
             std::fs::remove_file(&self.socket_path)?;
         }
 
-        let listener = UnixListener::bind(&self.socket_path)
-            .context("Failed to bind Unix socket")?;
+        let listener = UnixListener::bind(&self.socket_path).context("Failed to bind Unix socket")?;
 
         info!("Daemon listening on {:?}", self.socket_path);
 
@@ -616,10 +647,7 @@ impl Drop for Daemon {
 }
 
 /// Handle a single client connection.
-async fn handle_connection(
-    stream: UnixStream,
-    state: Arc<RwLock<DaemonState>>,
-) -> Result<()> {
+async fn handle_connection(stream: UnixStream, state: Arc<RwLock<DaemonState>>) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
@@ -650,7 +678,12 @@ async fn handle_connection(
         writer.flush().await?;
 
         // Check if this was a shutdown command
-        if matches!(response, Response::Ok { data: ResponseData::Ack }) {
+        if matches!(
+            response,
+            Response::Ok {
+                data: ResponseData::Ack
+            }
+        ) {
             if let Ok(Command::Shutdown) = serde_json::from_str::<Command>(line) {
                 info!("Shutdown requested, exiting...");
                 std::process::exit(0);
@@ -711,10 +744,7 @@ async fn process_command(cmd: Command, state: &Arc<RwLock<DaemonState>>) -> Resp
             let id = state.next_client_id.fetch_add(1, Ordering::SeqCst);
 
             // Pass the server cert path if the daemon started the server
-            let cert = state
-                .server_cert_path
-                .as_ref()
-                .map(|p| p.to_string_lossy().to_string());
+            let cert = state.server_cert_path.as_ref().map(|p| p.to_string_lossy().to_string());
 
             let args = Args {
                 name,
@@ -748,13 +778,11 @@ async fn process_command(cmd: Command, state: &Arc<RwLock<DaemonState>>) -> Resp
             }
         }
 
-        Command::Screenshot { id, output } => {
+        Command::Screenshot { id, output, crop } => {
             let mut state = state.write().await;
             if let Some(client) = state.clients.get_mut(&id) {
-                match client.screenshot(output.as_deref()) {
-                    Ok((path, width, height)) => {
-                        Response::ok(ResponseData::Screenshot { path, width, height })
-                    }
+                match client.screenshot(output.as_deref(), crop.as_ref()) {
+                    Ok((path, width, height)) => Response::ok(ResponseData::Screenshot { path, width, height }),
                     Err(e) => Response::error(format!("Screenshot failed: {}", e)),
                 }
             } else {
@@ -1021,10 +1049,7 @@ async fn process_command(cmd: Command, state: &Arc<RwLock<DaemonState>>) -> Resp
                         settings.keyboard.toggle_deafen_hotkey = binding;
                         Response::ack()
                     }
-                    _ => Response::error(format!(
-                        "Unknown action '{}'. Use 'ptt', 'mute', or 'deafen'.",
-                        action
-                    )),
+                    _ => Response::error(format!("Unknown action '{}'. Use 'ptt', 'mute', or 'deafen'.", action)),
                 }
             } else {
                 Response::error(format!("Client {} not found", id))
@@ -1074,7 +1099,7 @@ async fn process_command(cmd: Command, state: &Arc<RwLock<DaemonState>>) -> Resp
 
 /// Start the Rumble server.
 async fn start_server(port: u16) -> Result<ServerHandle> {
-    use server::{generate_self_signed_cert, Config, Server};
+    use server::{Config, Server, generate_self_signed_cert};
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
 

@@ -40,7 +40,7 @@ use tokio::{
     net::UnixStream,
 };
 
-use crate::protocol::{Command, Response, ResponseData};
+use crate::protocol::{Command, CropRect, Response, ResponseData};
 
 #[derive(Parser)]
 #[command(name = "rumble-harness")]
@@ -90,6 +90,10 @@ enum Commands {
         /// Take initial screenshot (saves to specified path)
         #[arg(short, long)]
         screenshot: Option<String>,
+
+        /// Crop region as "x,y,width,height" (e.g., "100,50,400,300")
+        #[arg(long)]
+        crop: Option<String>,
     },
 
     /// Clean teardown: close all clients, stop server, stop daemon
@@ -112,6 +116,10 @@ enum Commands {
         /// Server address
         #[arg(short, long, default_value = "127.0.0.1:5000")]
         server: String,
+
+        /// Crop region as "x,y,width,height" (e.g., "100,50,400,300")
+        #[arg(long)]
+        crop: Option<String>,
     },
 }
 
@@ -174,6 +182,10 @@ enum ClientAction {
         /// Output file path
         #[arg(short, long)]
         output: Option<String>,
+
+        /// Crop region as "x,y,width,height" (e.g., "100,50,400,300")
+        #[arg(long)]
+        crop: Option<String>,
     },
 
     /// Click at a position
@@ -337,6 +349,21 @@ enum ClientAction {
     },
 }
 
+/// Parse a crop string like "x,y,width,height" into a CropRect.
+fn parse_crop(s: &str) -> Result<CropRect> {
+    let parts: Vec<&str> = s.split(',').collect();
+    anyhow::ensure!(
+        parts.len() == 4,
+        "Crop must be 4 comma-separated values: x,y,width,height"
+    );
+    Ok(CropRect {
+        x: parts[0].trim().parse().context("Invalid crop x value")?,
+        y: parts[1].trim().parse().context("Invalid crop y value")?,
+        width: parts[2].trim().parse().context("Invalid crop width value")?,
+        height: parts[3].trim().parse().context("Invalid crop height value")?,
+    })
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -351,14 +378,22 @@ async fn main() -> Result<()> {
             port,
             name,
             screenshot,
-        } => handle_up(&socket_path, port, name, screenshot).await,
+            crop,
+        } => {
+            let crop = crop.map(|s| parse_crop(&s)).transpose()?;
+            handle_up(&socket_path, port, name, screenshot, crop).await
+        }
         Commands::Down => handle_down(&socket_path).await,
         Commands::Iterate {
             client,
             output,
             name,
             server,
-        } => handle_iterate(&socket_path, client, output, name, server).await,
+            crop,
+        } => {
+            let crop = crop.map(|s| parse_crop(&s)).transpose()?;
+            handle_iterate(&socket_path, client, output, name, server, crop).await
+        }
     }
 }
 
@@ -439,7 +474,10 @@ async fn handle_client(action: ClientAction, socket_path: &PathBuf) -> Result<()
         ClientAction::New { name, server } => Command::ClientNew { name, server },
         ClientAction::List => Command::ClientList,
         ClientAction::Close { id } => Command::ClientClose { id },
-        ClientAction::Screenshot { id, output } => Command::Screenshot { id, output },
+        ClientAction::Screenshot { id, output, crop } => {
+            let crop = crop.map(|s| parse_crop(&s)).transpose()?;
+            Command::Screenshot { id, output, crop }
+        }
         ClientAction::Click { id, x, y } => Command::Click { id, x, y },
         ClientAction::MouseMove { id, x, y } => Command::MouseMove { id, x, y },
         ClientAction::KeyPress { id, key } => Command::KeyPress { id, key },
@@ -455,8 +493,9 @@ async fn handle_client(action: ClientAction, socket_path: &PathBuf) -> Result<()
         ClientAction::Run { id } => Command::Run { id },
         ClientAction::SetAutoDownload { id, enabled } => Command::SetAutoDownload { id, enabled },
         ClientAction::SetAutoDownloadRules { id, rules_json } => {
-            let rules: Vec<protocol::AutoDownloadRuleConfig> = serde_json::from_str(&rules_json)
-                .context("Invalid JSON for rules. Expected: [{\"mime_pattern\": \"image/*\", \"max_size_bytes\": 10485760}]")?;
+            let rules: Vec<protocol::AutoDownloadRuleConfig> = serde_json::from_str(&rules_json).context(
+                "Invalid JSON for rules. Expected: [{\"mime_pattern\": \"image/*\", \"max_size_bytes\": 10485760}]",
+            )?;
             Command::SetAutoDownloadRules { id, rules }
         }
         ClientAction::GetFileTransferSettings { id } => Command::GetFileTransferSettings { id },
@@ -521,14 +560,7 @@ async fn handle_status(socket_path: &PathBuf) -> Result<()> {
     } = &response
     {
         println!("Daemon:  running (socket: {})", socket_path.display());
-        println!(
-            "Server:  {}",
-            if *server_running {
-                "running"
-            } else {
-                "not running"
-            }
-        );
+        println!("Server:  {}", if *server_running { "running" } else { "not running" });
         println!("Clients: {}", client_count);
 
         // List clients if any
@@ -539,10 +571,7 @@ async fn handle_status(socket_path: &PathBuf) -> Result<()> {
             } = list_response
             {
                 for client in clients {
-                    println!(
-                        "  [{}] {} (connected: {})",
-                        client.id, client.name, client.connected
-                    );
+                    println!("  [{}] {} (connected: {})", client.id, client.name, client.connected);
                 }
             }
         }
@@ -563,6 +592,7 @@ async fn handle_up(
     port: u16,
     name: String,
     screenshot: Option<String>,
+    crop: Option<CropRect>,
 ) -> Result<()> {
     // Step 1: Start daemon if not running
     let daemon_running = send_command(socket_path, Command::Ping).await.is_ok();
@@ -679,6 +709,7 @@ async fn handle_up(
             Command::Screenshot {
                 id: client_id,
                 output: Some(output_path.clone()),
+                crop,
             },
         )
         .await?;
@@ -693,7 +724,10 @@ async fn handle_up(
     }
 
     println!("\nReady! Client ID: {}", client_id);
-    println!("  Take screenshot: rumble-harness client screenshot {} -o ui.png", client_id);
+    println!(
+        "  Take screenshot: rumble-harness client screenshot {} -o ui.png",
+        client_id
+    );
     println!("  Rebuild & screenshot: rumble-harness iterate -c {}", client_id);
 
     Ok(())
@@ -738,12 +772,11 @@ async fn handle_iterate(
     output: String,
     name: String,
     server: String,
+    crop: Option<CropRect>,
 ) -> Result<()> {
     // Check daemon is running
     if send_command(socket_path, Command::Ping).await.is_err() {
-        anyhow::bail!(
-            "Daemon not running. Run `rumble-harness up` first, or `rumble-harness daemon start`."
-        );
+        anyhow::bail!("Daemon not running. Run `rumble-harness up` first, or `rumble-harness daemon start`.");
     }
 
     // Step 1: Close the client (ignore errors if it doesn't exist)
@@ -807,6 +840,7 @@ async fn handle_iterate(
         Command::Screenshot {
             id: new_client_id,
             output: Some(output.clone()),
+            crop,
         },
     )
     .await?;
@@ -827,107 +861,99 @@ async fn handle_iterate(
 /// Print a response to stdout.
 fn print_response(response: &Response) {
     match response {
-        Response::Ok { data } => {
-            match data {
-                ResponseData::Ack => {
-                    println!("OK");
-                }
-                ResponseData::Pong => {
-                    println!("pong");
-                }
-                ResponseData::Status {
-                    server_running,
-                    client_count,
-                } => {
-                    println!("Server running: {}", server_running);
-                    println!("Active clients: {}", client_count);
-                }
-                ResponseData::ClientCreated { id } => {
-                    println!("Client created: {}", id);
-                }
-                ResponseData::ClientList { clients } => {
-                    if clients.is_empty() {
-                        println!("No active clients");
-                    } else {
-                        println!("Active clients:");
-                        for client in clients {
-                            println!(
-                                "  [{}] {} (connected: {})",
-                                client.id, client.name, client.connected
-                            );
-                        }
-                    }
-                }
-                ResponseData::Screenshot { path, width, height } => {
-                    println!("Screenshot saved: {} ({}x{})", path, width, height);
-                }
-                ResponseData::Connected { connected } => {
-                    println!("{}", connected);
-                }
-                ResponseData::State { state } => {
-                    println!("{}", serde_json::to_string_pretty(state).unwrap());
-                }
-                ResponseData::FramesRun { count } => {
-                    println!("Ran {} frames", count);
-                }
-                ResponseData::WidgetExists { exists } => {
-                    println!("{}", exists);
-                }
-                ResponseData::WidgetRect {
-                    found,
-                    x,
-                    y,
-                    width,
-                    height,
-                } => {
-                    if *found {
-                        println!(
-                            "x: {}, y: {}, width: {}, height: {}",
-                            x.unwrap_or(0.0),
-                            y.unwrap_or(0.0),
-                            width.unwrap_or(0.0),
-                            height.unwrap_or(0.0)
-                        );
-                    } else {
-                        println!("Widget not found");
-                    }
-                }
-                ResponseData::FileTransferSettings {
-                    auto_download_enabled,
-                    auto_download_rules,
-                } => {
-                    println!("Auto-download enabled: {}", auto_download_enabled);
-                    println!("Rules:");
-                    for rule in auto_download_rules {
-                        println!(
-                            "  {} (max {} bytes)",
-                            rule.mime_pattern, rule.max_size_bytes
-                        );
-                    }
-                }
-                ResponseData::FileShared { infohash, magnet_link } => {
-                    println!("File shared!");
-                    println!("Infohash: {}", infohash);
-                    println!("Magnet: {}", magnet_link);
-                }
-                ResponseData::FileTransfers { transfers } => {
-                    if transfers.is_empty() {
-                        println!("No file transfers");
-                    } else {
-                        println!("File transfers:");
-                        for t in transfers {
-                            println!(
-                                "  [{}] {} ({:.1}% - {})",
-                                &t.infohash[..8],
-                                t.name,
-                                t.progress * 100.0,
-                                t.state
-                            );
-                        }
+        Response::Ok { data } => match data {
+            ResponseData::Ack => {
+                println!("OK");
+            }
+            ResponseData::Pong => {
+                println!("pong");
+            }
+            ResponseData::Status {
+                server_running,
+                client_count,
+            } => {
+                println!("Server running: {}", server_running);
+                println!("Active clients: {}", client_count);
+            }
+            ResponseData::ClientCreated { id } => {
+                println!("Client created: {}", id);
+            }
+            ResponseData::ClientList { clients } => {
+                if clients.is_empty() {
+                    println!("No active clients");
+                } else {
+                    println!("Active clients:");
+                    for client in clients {
+                        println!("  [{}] {} (connected: {})", client.id, client.name, client.connected);
                     }
                 }
             }
-        }
+            ResponseData::Screenshot { path, width, height } => {
+                println!("Screenshot saved: {} ({}x{})", path, width, height);
+            }
+            ResponseData::Connected { connected } => {
+                println!("{}", connected);
+            }
+            ResponseData::State { state } => {
+                println!("{}", serde_json::to_string_pretty(state).unwrap());
+            }
+            ResponseData::FramesRun { count } => {
+                println!("Ran {} frames", count);
+            }
+            ResponseData::WidgetExists { exists } => {
+                println!("{}", exists);
+            }
+            ResponseData::WidgetRect {
+                found,
+                x,
+                y,
+                width,
+                height,
+            } => {
+                if *found {
+                    println!(
+                        "x: {}, y: {}, width: {}, height: {}",
+                        x.unwrap_or(0.0),
+                        y.unwrap_or(0.0),
+                        width.unwrap_or(0.0),
+                        height.unwrap_or(0.0)
+                    );
+                } else {
+                    println!("Widget not found");
+                }
+            }
+            ResponseData::FileTransferSettings {
+                auto_download_enabled,
+                auto_download_rules,
+            } => {
+                println!("Auto-download enabled: {}", auto_download_enabled);
+                println!("Rules:");
+                for rule in auto_download_rules {
+                    println!("  {} (max {} bytes)", rule.mime_pattern, rule.max_size_bytes);
+                }
+            }
+            ResponseData::FileShared { infohash, magnet_link } => {
+                println!("File shared!");
+                println!("Infohash: {}", infohash);
+                println!("Magnet: {}", magnet_link);
+            }
+            ResponseData::FileTransfers { transfers } => {
+                if transfers.is_empty() {
+                    println!("No file transfers");
+                } else {
+                    println!("File transfers:");
+                    for t in transfers {
+                        println!(
+                            "  [{}] {} ({:.1}% - {})",
+                            &t.infohash[..8],
+                            t.name,
+                            t.progress * 100.0,
+                            t.state
+                        );
+                    }
+                }
+            }
+        },
         Response::Error { message } => {
             eprintln!("Error: {}", message);
             std::process::exit(1);
