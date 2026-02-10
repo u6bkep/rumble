@@ -235,7 +235,10 @@ impl TestHarness {
     /// Type text into the UI by injecting a text event, then run frames.
     #[cfg(feature = "test-harness")]
     pub fn type_into_focused(&mut self, text: &str) {
-        self.harness.input_mut().events.push(egui::Event::Text(text.to_string()));
+        self.harness
+            .input_mut()
+            .events
+            .push(egui::Event::Text(text.to_string()));
         self.harness.run();
     }
 
@@ -360,7 +363,10 @@ impl TestHarness {
     /// Inject text input.
     #[cfg(feature = "test-harness")]
     pub fn type_text(&mut self, text: &str) {
-        self.harness.input_mut().events.push(egui::Event::Text(text.to_string()));
+        self.harness
+            .input_mut()
+            .events
+            .push(egui::Event::Text(text.to_string()));
         self.harness.run_steps(1);
     }
 

@@ -12,8 +12,8 @@
 
 use crate::settings::{HotkeyBinding, HotkeyModifiers, KeyboardSettings};
 use global_hotkey::{
-    hotkey::{Code, HotKey, Modifiers},
     GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState,
+    hotkey::{Code, HotKey, Modifiers},
 };
 use std::collections::HashMap;
 
@@ -71,9 +71,7 @@ impl HotkeyManager {
         let is_wayland = Self::detect_wayland();
 
         if is_wayland {
-            tracing::info!(
-                "Running on Wayland - will use XDG Portal for global shortcuts if available"
-            );
+            tracing::info!("Running on Wayland - will use XDG Portal for global shortcuts if available");
             return Self {
                 manager: None,
                 hotkey_actions: HashMap::new(),
@@ -129,16 +127,12 @@ impl HotkeyManager {
                 if backend.is_available() {
                     tracing::info!("XDG Portal GlobalShortcuts backend initialized successfully");
                 } else {
-                    tracing::warn!(
-                        "XDG Portal connected but no shortcuts bound - user may need to configure them"
-                    );
+                    tracing::warn!("XDG Portal connected but no shortcuts bound - user may need to configure them");
                 }
                 self.portal_backend = Some(backend);
             }
             None => {
-                tracing::warn!(
-                    "XDG Portal GlobalShortcuts not available - falling back to window-focused shortcuts"
-                );
+                tracing::warn!("XDG Portal GlobalShortcuts not available - falling back to window-focused shortcuts");
             }
         }
     }
@@ -152,10 +146,7 @@ impl HotkeyManager {
     /// Check if portal-based shortcuts are available (Wayland).
     #[cfg(target_os = "linux")]
     pub fn has_portal_backend(&self) -> bool {
-        self.portal_backend
-            .as_ref()
-            .map(|b| b.is_available())
-            .unwrap_or(false)
+        self.portal_backend.as_ref().map(|b| b.is_available()).unwrap_or(false)
     }
 
     /// Check if portal-based shortcuts are available (always false on non-Linux).
@@ -365,11 +356,7 @@ impl HotkeyManager {
         if mods.super_key {
             result |= Modifiers::SUPER;
         }
-        if result.is_empty() {
-            None
-        } else {
-            Some(result)
-        }
+        if result.is_empty() { None } else { Some(result) }
     }
 
     /// Convert key string to Code enum.
@@ -668,22 +655,10 @@ mod tests {
 
     #[test]
     fn test_key_string_to_code() {
-        assert!(matches!(
-            HotkeyManager::key_string_to_code("Space"),
-            Ok(Code::Space)
-        ));
-        assert!(matches!(
-            HotkeyManager::key_string_to_code("space"),
-            Ok(Code::Space)
-        ));
-        assert!(matches!(
-            HotkeyManager::key_string_to_code("F1"),
-            Ok(Code::F1)
-        ));
-        assert!(matches!(
-            HotkeyManager::key_string_to_code("a"),
-            Ok(Code::KeyA)
-        ));
+        assert!(matches!(HotkeyManager::key_string_to_code("Space"), Ok(Code::Space)));
+        assert!(matches!(HotkeyManager::key_string_to_code("space"), Ok(Code::Space)));
+        assert!(matches!(HotkeyManager::key_string_to_code("F1"), Ok(Code::F1)));
+        assert!(matches!(HotkeyManager::key_string_to_code("a"), Ok(Code::KeyA)));
         assert!(HotkeyManager::key_string_to_code("InvalidKey").is_err());
     }
 
@@ -731,21 +706,12 @@ mod tests {
     fn test_key_string_to_egui_key() {
         use eframe::egui::Key;
 
-        assert_eq!(
-            HotkeyManager::key_string_to_egui_key("Space"),
-            Some(Key::Space)
-        );
-        assert_eq!(
-            HotkeyManager::key_string_to_egui_key("space"),
-            Some(Key::Space)
-        );
+        assert_eq!(HotkeyManager::key_string_to_egui_key("Space"), Some(Key::Space));
+        assert_eq!(HotkeyManager::key_string_to_egui_key("space"), Some(Key::Space));
         assert_eq!(HotkeyManager::key_string_to_egui_key("F1"), Some(Key::F1));
         assert_eq!(HotkeyManager::key_string_to_egui_key("A"), Some(Key::A));
         assert_eq!(HotkeyManager::key_string_to_egui_key("a"), Some(Key::A));
-        assert_eq!(
-            HotkeyManager::key_string_to_egui_key("0"),
-            Some(Key::Num0)
-        );
+        assert_eq!(HotkeyManager::key_string_to_egui_key("0"), Some(Key::Num0));
         assert_eq!(HotkeyManager::key_string_to_egui_key("InvalidKey"), None);
     }
 }

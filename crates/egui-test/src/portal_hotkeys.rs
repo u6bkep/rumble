@@ -14,9 +14,8 @@
 use crate::hotkeys::HotkeyEvent;
 use ashpd::desktop::global_shortcuts::{GlobalShortcuts, NewShortcut};
 use futures_util::StreamExt;
-use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::{mpsc, RwLock};
+use std::{collections::HashMap, sync::Arc};
+use tokio::sync::{RwLock, mpsc};
 
 /// Shortcut IDs used for portal registration.
 pub const SHORTCUT_PTT: &str = "push-to-talk";
@@ -102,10 +101,7 @@ impl PortalHotkeyBackend {
         let state = Arc::new(RwLock::new(PortalShortcutState::default()));
 
         // Bind shortcuts - this may show a system dialog
-        let shortcuts_bound = match shortcuts
-            .bind_shortcuts(&session, &shortcut_definitions, None)
-            .await
-        {
+        let shortcuts_bound = match shortcuts.bind_shortcuts(&session, &shortcut_definitions, None).await {
             Ok(request) => {
                 // Wait for the response
                 match request.response() {
@@ -118,11 +114,7 @@ impl PortalHotkeyBackend {
                         state_guard.shortcuts = bound
                             .iter()
                             .map(|s| {
-                                tracing::info!(
-                                    "Shortcut '{}' bound: {}",
-                                    s.id(),
-                                    s.trigger_description()
-                                );
+                                tracing::info!("Shortcut '{}' bound: {}", s.id(), s.trigger_description());
                                 ShortcutInfo {
                                     id: s.id().to_string(),
                                     description: shortcut_description(s.id()),
@@ -165,10 +157,7 @@ impl PortalHotkeyBackend {
     }
 
     /// Listen for Activated/Deactivated signals from the portal.
-    async fn listen_for_signals(
-        shortcuts: GlobalShortcuts<'static>,
-        event_tx: mpsc::UnboundedSender<HotkeyEvent>,
-    ) {
+    async fn listen_for_signals(shortcuts: GlobalShortcuts<'static>, event_tx: mpsc::UnboundedSender<HotkeyEvent>) {
         tracing::debug!("Starting GlobalShortcuts signal listener");
 
         // Map shortcut IDs to event handlers
@@ -186,21 +175,13 @@ impl PortalHotkeyBackend {
             (
                 SHORTCUT_MUTE,
                 (|pressed| {
-                    if pressed {
-                        Some(HotkeyEvent::ToggleMute)
-                    } else {
-                        None
-                    }
+                    if pressed { Some(HotkeyEvent::ToggleMute) } else { None }
                 }) as fn(bool) -> Option<HotkeyEvent>,
             ),
             (
                 SHORTCUT_DEAFEN,
                 (|pressed| {
-                    if pressed {
-                        Some(HotkeyEvent::ToggleDeafen)
-                    } else {
-                        None
-                    }
+                    if pressed { Some(HotkeyEvent::ToggleDeafen) } else { None }
                 }) as fn(bool) -> Option<HotkeyEvent>,
             ),
         ]
@@ -327,37 +308,26 @@ fn shortcut_description(id: &str) -> String {
 /// This creates a new session and triggers the bind dialog, which allows
 /// the user to configure shortcuts in system settings. The updated bindings
 /// are stored in the provided state.
-async fn open_shortcut_settings_and_update(
-    state: Arc<RwLock<PortalShortcutState>>,
-) -> Result<(), ashpd::Error> {
+async fn open_shortcut_settings_and_update(state: Arc<RwLock<PortalShortcutState>>) -> Result<(), ashpd::Error> {
     let shortcuts = GlobalShortcuts::new().await?;
     let session = shortcuts.create_session().await?;
 
     // Re-bind shortcuts to trigger the config dialog
     let definitions = shortcut_definitions();
 
-    let request = shortcuts
-        .bind_shortcuts(&session, &definitions, None)
-        .await?;
+    let request = shortcuts.bind_shortcuts(&session, &definitions, None).await?;
 
     // Wait for the response and update state with new bindings
     match request.response() {
         Ok(response) => {
             let bound = response.shortcuts();
-            tracing::info!(
-                "Shortcuts reconfigured: {} shortcuts bound",
-                bound.len()
-            );
+            tracing::info!("Shortcuts reconfigured: {} shortcuts bound", bound.len());
 
             let mut state_guard = state.write().await;
             state_guard.shortcuts = bound
                 .iter()
                 .map(|s| {
-                    tracing::info!(
-                        "Shortcut '{}' now bound to: {}",
-                        s.id(),
-                        s.trigger_description()
-                    );
+                    tracing::info!("Shortcut '{}' now bound to: {}", s.id(), s.trigger_description());
                     ShortcutInfo {
                         id: s.id().to_string(),
                         description: shortcut_description(s.id()),
@@ -385,9 +355,7 @@ pub async fn open_shortcut_settings() -> Result<(), ashpd::Error> {
 
     let definitions = shortcut_definitions();
 
-    shortcuts
-        .bind_shortcuts(&session, &definitions, None)
-        .await?;
+    shortcuts.bind_shortcuts(&session, &definitions, None).await?;
 
     Ok(())
 }

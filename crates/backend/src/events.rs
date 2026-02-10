@@ -904,8 +904,7 @@ impl ChatHistoryContent {
                 let mut id = [0u8; 16];
                 id.copy_from_slice(&id_bytes);
 
-                let timestamp = std::time::UNIX_EPOCH
-                    + std::time::Duration::from_millis(e.timestamp);
+                let timestamp = std::time::UNIX_EPOCH + std::time::Duration::from_millis(e.timestamp);
 
                 Some(ChatMessage {
                     id,

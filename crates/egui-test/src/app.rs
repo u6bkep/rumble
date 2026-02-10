@@ -666,10 +666,7 @@ impl RumbleApp {
                 }
             }
             HotkeyEvent::PttReleased => {
-                tracing::debug!(
-                    "Global hotkey: PTT released (was_active={})",
-                    self.push_to_talk_active
-                );
+                tracing::debug!("Global hotkey: PTT released (was_active={})", self.push_to_talk_active);
                 if self.push_to_talk_active {
                     self.push_to_talk_active = false;
                     self.stop_transmit();
@@ -1643,8 +1640,10 @@ impl RumbleApp {
 
     /// Render the keyboard settings panel.
     fn render_settings_keyboard(&mut self, ui: &mut egui::Ui) {
-        use crate::hotkeys::HotkeyManager;
-        use crate::settings::{HotkeyBinding, HotkeyModifiers};
+        use crate::{
+            hotkeys::HotkeyManager,
+            settings::{HotkeyBinding, HotkeyModifiers},
+        };
 
         ui.heading("Keyboard Shortcuts");
         ui.add_space(8.0);
@@ -1768,12 +1767,12 @@ impl RumbleApp {
 
         // Helper to render a hotkey binding row with capture
         let render_hotkey_row = |ui: &mut egui::Ui,
-                                  label: &str,
-                                  binding: &Option<HotkeyBinding>,
-                                  target: HotkeyCaptureTarget,
-                                  capture_target: &mut Option<HotkeyCaptureTarget>,
-                                  dirty: &mut bool,
-                                  allow_edit: bool|
+                                 label: &str,
+                                 binding: &Option<HotkeyBinding>,
+                                 target: HotkeyCaptureTarget,
+                                 capture_target: &mut Option<HotkeyCaptureTarget>,
+                                 dirty: &mut bool,
+                                 allow_edit: bool|
          -> Option<Option<HotkeyBinding>> {
             let mut result = None;
 
@@ -2844,7 +2843,9 @@ impl RumbleApp {
                                         egui::CollapsingHeader::new(format!("Peers ({})", transfer.peer_details.len()))
                                             .id_salt(&infohash_hex)
                                             .show(ui, |ui| {
-                                                use backend::events::{PeerConnectionType, PeerState as TransferPeerState};
+                                                use backend::events::{
+                                                    PeerConnectionType, PeerState as TransferPeerState,
+                                                };
 
                                                 egui::Grid::new(format!("peer_grid_{}", infohash_hex))
                                                     .striped(true)
@@ -2869,18 +2870,32 @@ impl RumbleApp {
 
                                                             // Connection type with color
                                                             let (type_text, type_color) = match peer.connection_type {
-                                                                PeerConnectionType::Direct => ("Direct", egui::Color32::GREEN),
-                                                                PeerConnectionType::Relay => ("Relay", egui::Color32::YELLOW),
-                                                                PeerConnectionType::Utp => ("uTP", egui::Color32::LIGHT_BLUE),
-                                                                PeerConnectionType::Socks => ("SOCKS", egui::Color32::LIGHT_GRAY),
+                                                                PeerConnectionType::Direct => {
+                                                                    ("Direct", egui::Color32::GREEN)
+                                                                }
+                                                                PeerConnectionType::Relay => {
+                                                                    ("Relay", egui::Color32::YELLOW)
+                                                                }
+                                                                PeerConnectionType::Utp => {
+                                                                    ("uTP", egui::Color32::LIGHT_BLUE)
+                                                                }
+                                                                PeerConnectionType::Socks => {
+                                                                    ("SOCKS", egui::Color32::LIGHT_GRAY)
+                                                                }
                                                             };
                                                             ui.colored_label(type_color, type_text);
 
                                                             // Peer state with color
                                                             let (state_text, state_color) = match peer.state {
-                                                                TransferPeerState::Live => ("Live", egui::Color32::GREEN),
-                                                                TransferPeerState::Connecting => ("Connecting", egui::Color32::YELLOW),
-                                                                TransferPeerState::Queued => ("Queued", egui::Color32::GRAY),
+                                                                TransferPeerState::Live => {
+                                                                    ("Live", egui::Color32::GREEN)
+                                                                }
+                                                                TransferPeerState::Connecting => {
+                                                                    ("Connecting", egui::Color32::YELLOW)
+                                                                }
+                                                                TransferPeerState::Queued => {
+                                                                    ("Queued", egui::Color32::GRAY)
+                                                                }
                                                                 TransferPeerState::Dead => ("Dead", egui::Color32::RED),
                                                             };
                                                             ui.colored_label(state_color, state_text);

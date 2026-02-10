@@ -67,10 +67,7 @@ fn test_ptt_fallback_key_press() {
     let mut harness = TestHarness::new();
 
     // Verify initial state - PTT should be inactive
-    assert!(
-        !harness.app().push_to_talk_active(),
-        "PTT should be inactive initially"
-    );
+    assert!(!harness.app().push_to_talk_active(), "PTT should be inactive initially");
 
     // Run a few frames to initialize
     harness.run_frames(5);
@@ -116,35 +113,22 @@ fn test_key_down_detection() {
     // Test 2: Check after running a step (which processes input)
     harness.kittest_mut().run_steps(1);
     let key_is_down_after_step = harness.kittest().ctx.input(|i| i.key_down(egui::Key::Space));
-    println!(
-        "Test 2 - Key down state after run_steps(1): {}",
-        key_is_down_after_step
-    );
+    println!("Test 2 - Key down state after run_steps(1): {}", key_is_down_after_step);
 
     // Test 3: Check key_pressed (event-based) instead of key_down (state-based)
     harness.kittest_mut().key_down(egui::Key::F1);
     harness.kittest_mut().run_steps(1);
     let key_was_pressed = harness.kittest().ctx.input(|i| i.key_pressed(egui::Key::F1));
-    println!(
-        "Test 3 - key_pressed after key_down + run: {}",
-        key_was_pressed
-    );
+    println!("Test 3 - key_pressed after key_down + run: {}", key_was_pressed);
 
     // Release keys
     harness.kittest_mut().key_up(egui::Key::Space);
     harness.kittest_mut().key_up(egui::Key::F1);
     harness.run_frames(1);
 
-    let key_is_down_after_release =
-        harness.kittest().ctx.input(|i| i.key_down(egui::Key::Space));
-    println!(
-        "Test 4 - Key down state after release: {}",
-        key_is_down_after_release
-    );
-    assert!(
-        !key_is_down_after_release,
-        "Key should not be down after release"
-    );
+    let key_is_down_after_release = harness.kittest().ctx.input(|i| i.key_down(egui::Key::Space));
+    println!("Test 4 - Key down state after release: {}", key_is_down_after_release);
+    assert!(!key_is_down_after_release, "Key should not be down after release");
 }
 
 /// Test keyboard settings can be modified.
@@ -199,10 +183,7 @@ fn test_handle_hotkey_event() {
     harness.run_frames(2);
 
     // Verify initial state
-    assert!(
-        !harness.app().push_to_talk_active(),
-        "PTT should be inactive initially"
-    );
+    assert!(!harness.app().push_to_talk_active(), "PTT should be inactive initially");
 
     // Simulate a PttPressed event (this bypasses global-hotkey and tests the handler directly)
     harness.app_mut().handle_hotkey_event(HotkeyEvent::PttPressed);
@@ -329,12 +310,7 @@ fn test_mute_hotkey_settings_modification() {
     let mut harness = TestHarness::new();
 
     // Initially, mute hotkey may not be set
-    let initial = harness
-        .app()
-        .persistent_settings()
-        .keyboard
-        .toggle_mute_hotkey
-        .clone();
+    let initial = harness.app().persistent_settings().keyboard.toggle_mute_hotkey.clone();
     println!("Initial mute hotkey: {:?}", initial);
 
     // Set the mute hotkey to M
@@ -343,19 +319,11 @@ fn test_mute_hotkey_settings_modification() {
         key: "M".to_string(),
     };
 
-    harness
-        .app_mut()
-        .persistent_settings_mut()
-        .keyboard
-        .toggle_mute_hotkey = Some(new_binding);
+    harness.app_mut().persistent_settings_mut().keyboard.toggle_mute_hotkey = Some(new_binding);
     harness.run_frames(2);
 
     // Verify the change
-    let mute_hotkey = &harness
-        .app()
-        .persistent_settings()
-        .keyboard
-        .toggle_mute_hotkey;
+    let mute_hotkey = &harness.app().persistent_settings().keyboard.toggle_mute_hotkey;
     assert!(mute_hotkey.is_some());
     assert_eq!(mute_hotkey.as_ref().unwrap().key, "M");
 }
@@ -379,11 +347,7 @@ fn test_deafen_hotkey_settings_modification() {
     harness.run_frames(2);
 
     // Verify the change
-    let deafen_hotkey = &harness
-        .app()
-        .persistent_settings()
-        .keyboard
-        .toggle_deafen_hotkey;
+    let deafen_hotkey = &harness.app().persistent_settings().keyboard.toggle_deafen_hotkey;
     assert!(deafen_hotkey.is_some());
     assert_eq!(deafen_hotkey.as_ref().unwrap().key, "D");
 }
