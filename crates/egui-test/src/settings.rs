@@ -46,6 +46,10 @@ pub struct Args {
     /// RPC socket path override
     #[arg(long)]
     pub rpc_socket: Option<String>,
+
+    /// Enable the RPC server for external process control
+    #[arg(long)]
+    pub rpc_server: bool,
 }
 
 // =============================================================================

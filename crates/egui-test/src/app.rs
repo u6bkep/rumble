@@ -476,16 +476,25 @@ impl RumbleApp {
 
         let needs_first_run = !matches!(first_run_state, FirstRunState::NotNeeded);
 
-        // Start RPC server for external process control
-        let rpc_server = match backend.start_rpc_server(backend::rpc::default_socket_path()) {
-            Ok(server) => {
-                tracing::info!("RPC server started");
-                Some(server)
+        // Start RPC server for external process control (opt-in via --rpc-server flag or --rpc-socket)
+        let rpc_server = if args.rpc_server || args.rpc_socket.is_some() {
+            let socket_path = args
+                .rpc_socket
+                .as_ref()
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(backend::rpc::default_socket_path);
+            match backend.start_rpc_server(socket_path) {
+                Ok(server) => {
+                    tracing::info!("RPC server started");
+                    Some(server)
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to start RPC server: {}", e);
+                    None
+                }
             }
-            Err(e) => {
-                tracing::warn!("Failed to start RPC server: {}", e);
-                None
-            }
+        } else {
+            None
         };
 
         let mut app = Self {

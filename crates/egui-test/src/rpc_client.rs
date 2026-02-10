@@ -20,7 +20,7 @@ pub async fn run_rpc_command(socket_path: PathBuf, command: &str) -> anyhow::Res
         "stop-transmit" => r#"{"method":"stop_transmit"}"#.to_string(),
         cmd if cmd.starts_with("join-room ") => {
             let uuid = cmd.strip_prefix("join-room ").unwrap();
-            format!(r#"{{"method":"join_room","room_id":"{}"}}"#, uuid)
+            serde_json::json!({"method": "join_room", "room_id": uuid}).to_string()
         }
         cmd if cmd.starts_with("send-chat ") => {
             let text = cmd.strip_prefix("send-chat ").unwrap();
@@ -32,7 +32,7 @@ pub async fn run_rpc_command(socket_path: PathBuf, command: &str) -> anyhow::Res
         }
         cmd if cmd.starts_with("delete-room ") => {
             let uuid = cmd.strip_prefix("delete-room ").unwrap();
-            format!(r#"{{"method":"delete_room","room_id":"{}"}}"#, uuid)
+            serde_json::json!({"method": "delete_room", "room_id": uuid}).to_string()
         }
         cmd if cmd.starts_with("share-file ") => {
             let path = cmd.strip_prefix("share-file ").unwrap();

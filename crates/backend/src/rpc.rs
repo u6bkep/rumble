@@ -13,7 +13,7 @@ use tokio::{
     net::UnixListener,
     sync::{broadcast, mpsc},
 };
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 /// Get the default socket path for the RPC server.
@@ -184,8 +184,8 @@ impl RpcServer {
                     });
                 }
                 Err(e) => {
-                    error!("RPC accept error: {}", e);
-                    break;
+                    warn!("RPC accept error (transient): {}", e);
+                    continue;
                 }
             }
         }
