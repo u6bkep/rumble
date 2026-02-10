@@ -39,7 +39,7 @@ pub const CHANNELS: u16 = 1;
 pub const FRAME_SIZE: usize = 960;
 
 /// Information about an audio device.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct AudioDeviceInfo {
     /// Stable identifier for the device (used for selection).
     /// This is the device name, which should be stable across sessions.

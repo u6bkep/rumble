@@ -301,6 +301,21 @@ impl BackendHandle {
         read_state(&self.state).clone()
     }
 
+    /// Get a reference to the shared state Arc (for RPC server).
+    pub fn state_arc(&self) -> &Arc<RwLock<State>> {
+        &self.state
+    }
+
+    /// Get a reference to the command sender (for RPC server).
+    pub fn command_sender(&self) -> &mpsc::UnboundedSender<Command> {
+        &self.command_tx
+    }
+
+    /// Start the RPC server on the given Unix socket path.
+    pub fn start_rpc_server(&self, socket_path: std::path::PathBuf) -> anyhow::Result<crate::rpc::RpcServer> {
+        crate::rpc::RpcServer::start(socket_path, self.state.clone(), self.command_tx.clone())
+    }
+
     /// Send a command to the backend.
     ///
     /// Commands are fire-and-forget. The backend will update state

@@ -277,6 +277,9 @@ pub struct RumbleApp {
 
     // Previous connection state for detecting transitions
     prev_connection_state: ConnectionState,
+
+    // RPC server (kept alive for the lifetime of the app)
+    _rpc_server: Option<backend::rpc::RpcServer>,
 }
 
 impl Drop for RumbleApp {
@@ -473,6 +476,18 @@ impl RumbleApp {
 
         let needs_first_run = !matches!(first_run_state, FirstRunState::NotNeeded);
 
+        // Start RPC server for external process control
+        let rpc_server = match backend.start_rpc_server(backend::rpc::default_socket_path()) {
+            Ok(server) => {
+                tracing::info!("RPC server started");
+                Some(server)
+            }
+            Err(e) => {
+                tracing::warn!("Failed to start RPC server: {}", e);
+                None
+            }
+        };
+
         let mut app = Self {
             show_connect: false,
             show_settings: false,
@@ -509,6 +524,7 @@ impl RumbleApp {
             egui_ctx: ctx,
             toast_manager: ToastManager::new(),
             prev_connection_state: ConnectionState::Disconnected,
+            _rpc_server: rpc_server,
         };
 
         // If server was specified on command line, connect immediately (unless first run)

@@ -95,6 +95,9 @@ pub use events::*;
 pub mod handle;
 pub use handle::BackendHandle;
 
+// RPC server for external process control
+pub mod rpc;
+
 #[cfg(feature = "p2p")]
 pub mod p2p;
 pub mod torrent;
