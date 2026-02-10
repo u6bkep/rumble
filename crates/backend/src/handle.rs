@@ -716,8 +716,9 @@ async fn run_connection_task(
                                 let audio_task_clone = audio_task.clone();
                                 let torrent_manager_clone = torrent_manager.clone();
                                 let command_tx_clone = command_tx.clone();
+                                let client_name_clone = client_name.clone();
                                 tokio::spawn(async move {
-                                    run_receiver_task(conn, recv, recv_buf, state_clone, repaint_clone, audio_task_clone, torrent_manager_clone, command_tx_clone).await;
+                                    run_receiver_task(conn, recv, recv_buf, state_clone, repaint_clone, audio_task_clone, torrent_manager_clone, command_tx_clone, client_name_clone).await;
                                 });
                             }
                             Err(e) => {
@@ -870,8 +871,9 @@ async fn run_connection_task(
                                     let audio_task_clone = audio_task.clone();
                                     let torrent_manager_clone = torrent_manager.clone();
                                     let command_tx_clone = command_tx.clone();
+                                    let client_name_clone = client_name.clone();
                                     tokio::spawn(async move {
-                                        run_receiver_task(conn, recv, recv_buf, state_clone, repaint_clone, audio_task_clone, torrent_manager_clone, command_tx_clone).await;
+                                        run_receiver_task(conn, recv, recv_buf, state_clone, repaint_clone, audio_task_clone, torrent_manager_clone, command_tx_clone, client_name_clone).await;
                                     });
                                 }
                                 Err(e) => {
@@ -1952,6 +1954,7 @@ async fn run_receiver_task(
     audio_task: AudioTaskHandle,
     torrent_manager: Option<Arc<crate::torrent::TorrentManager>>,
     command_tx: mpsc::UnboundedSender<Command>,
+    client_name: String,
 ) {
     loop {
         let mut chunk = [0u8; 4096];
@@ -1960,7 +1963,15 @@ async fn run_receiver_task(
                 buf.extend_from_slice(&chunk[..n]);
                 while let Some(frame) = try_decode_frame(&mut buf) {
                     if let Ok(env) = proto::Envelope::decode(&*frame) {
-                        handle_server_message(env, &state, &repaint, &audio_task, &torrent_manager, &command_tx);
+                        handle_server_message(
+                            env,
+                            &state,
+                            &repaint,
+                            &audio_task,
+                            &torrent_manager,
+                            &command_tx,
+                            &client_name,
+                        );
                     }
                 }
             }
@@ -2029,6 +2040,7 @@ fn handle_server_message(
     audio_task: &AudioTaskHandle,
     torrent_manager: &Option<Arc<crate::torrent::TorrentManager>>,
     command_tx: &mpsc::UnboundedSender<Command>,
+    client_name: &str,
 ) {
     match env.payload {
         Some(Payload::TrackerAnnounceResponse(_)) => {
@@ -2110,11 +2122,15 @@ fn handle_server_message(
                         }
 
                         // Check if this is a file message that should be auto-downloaded
+                        // Skip auto-download if we sent this message (we already have the file)
                         let mut should_auto_download = None;
                         if let Some(file_msg) = crate::events::FileMessage::parse(&cb.text) {
+                            let is_own_message = cb.sender == client_name;
+
                             let s = read_state(&state);
-                            if s.file_transfer_settings
-                                .should_auto_download(&file_msg.file.mime, file_msg.file.size)
+                            if !is_own_message
+                                && s.file_transfer_settings
+                                    .should_auto_download(&file_msg.file.mime, file_msg.file.size)
                             {
                                 // Check we're not already downloading this file
                                 let infohash_bytes = hex::decode(&file_msg.file.infohash).ok();
