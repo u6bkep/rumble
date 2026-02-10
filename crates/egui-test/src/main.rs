@@ -83,6 +83,9 @@ impl EframeWrapper {
         // Tell the app if portal hotkeys are available (for settings UI)
         app.set_portal_hotkeys_available(hotkey_manager.has_portal_backend());
 
+        // Pass registration status to the app for UI indicators
+        app.set_hotkey_registration_status(hotkey_manager.registration_status_map().clone());
+
         // Pass portal shortcuts and callback to the app (Linux/Wayland only)
         #[cfg(target_os = "linux")]
         {

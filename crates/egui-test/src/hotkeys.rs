@@ -28,6 +28,17 @@ pub enum HotkeyAction {
     ToggleDeafen,
 }
 
+/// Registration status for a hotkey action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HotkeyRegistrationStatus {
+    /// Hotkey registered successfully.
+    Registered,
+    /// Registration failed.
+    Failed,
+    /// No binding configured for this action.
+    NotConfigured,
+}
+
 /// Result of checking for hotkey events.
 #[derive(Debug, Clone, Copy)]
 pub enum HotkeyEvent {
@@ -50,6 +61,8 @@ pub struct HotkeyManager {
     hotkey_actions: HashMap<u32, HotkeyAction>,
     /// Registered hotkeys (for unregistration).
     registered_hotkeys: Vec<HotKey>,
+    /// Registration status per action (populated by register_from_settings).
+    registration_status: HashMap<HotkeyAction, HotkeyRegistrationStatus>,
     /// Whether we're running on Wayland.
     is_wayland: bool,
     /// Whether initialization failed.
@@ -76,6 +89,7 @@ impl HotkeyManager {
                 manager: None,
                 hotkey_actions: HashMap::new(),
                 registered_hotkeys: Vec::new(),
+                registration_status: HashMap::new(),
                 is_wayland: true,
                 init_failed: false,
                 #[cfg(target_os = "linux")]
@@ -90,6 +104,7 @@ impl HotkeyManager {
                     manager: Some(manager),
                     hotkey_actions: HashMap::new(),
                     registered_hotkeys: Vec::new(),
+                    registration_status: HashMap::new(),
                     is_wayland: false,
                     init_failed: false,
                     #[cfg(target_os = "linux")]
@@ -102,6 +117,7 @@ impl HotkeyManager {
                     manager: None,
                     hotkey_actions: HashMap::new(),
                     registered_hotkeys: Vec::new(),
+                    registration_status: HashMap::new(),
                     is_wayland: false,
                     init_failed: true,
                     #[cfg(target_os = "linux")]
@@ -213,10 +229,31 @@ impl HotkeyManager {
         self.init_failed
     }
 
+    /// Get the registration status for a given hotkey action.
+    pub fn get_registration_status(&self, action: HotkeyAction) -> HotkeyRegistrationStatus {
+        self.registration_status
+            .get(&action)
+            .copied()
+            .unwrap_or(HotkeyRegistrationStatus::NotConfigured)
+    }
+
+    /// Get the full registration status map.
+    pub fn registration_status_map(&self) -> &HashMap<HotkeyAction, HotkeyRegistrationStatus> {
+        &self.registration_status
+    }
+
     /// Register hotkeys from settings.
     pub fn register_from_settings(&mut self, settings: &KeyboardSettings) -> Result<(), String> {
         // Unregister existing hotkeys first
         self.unregister_all();
+
+        // Initialize all actions as not-configured
+        self.registration_status
+            .insert(HotkeyAction::PushToTalk, HotkeyRegistrationStatus::NotConfigured);
+        self.registration_status
+            .insert(HotkeyAction::ToggleMute, HotkeyRegistrationStatus::NotConfigured);
+        self.registration_status
+            .insert(HotkeyAction::ToggleDeafen, HotkeyRegistrationStatus::NotConfigured);
 
         let Some(ref manager) = self.manager else {
             return Ok(()); // No manager = no-op
@@ -233,14 +270,21 @@ impl HotkeyManager {
                 Ok(hotkey) => {
                     let id = hotkey.id();
                     if let Err(e) = manager.register(hotkey.clone()) {
-                        return Err(format!("Failed to register PTT hotkey: {}", e));
+                        tracing::warn!("Failed to register PTT hotkey: {}", e);
+                        self.registration_status
+                            .insert(HotkeyAction::PushToTalk, HotkeyRegistrationStatus::Failed);
+                    } else {
+                        self.hotkey_actions.insert(id, HotkeyAction::PushToTalk);
+                        self.registered_hotkeys.push(hotkey);
+                        self.registration_status
+                            .insert(HotkeyAction::PushToTalk, HotkeyRegistrationStatus::Registered);
+                        tracing::info!("Registered PTT hotkey: {}", binding.display());
                     }
-                    self.hotkey_actions.insert(id, HotkeyAction::PushToTalk);
-                    self.registered_hotkeys.push(hotkey);
-                    tracing::info!("Registered PTT hotkey: {}", binding.display());
                 }
                 Err(e) => {
                     tracing::warn!("Invalid PTT hotkey binding: {}", e);
+                    self.registration_status
+                        .insert(HotkeyAction::PushToTalk, HotkeyRegistrationStatus::Failed);
                 }
             }
         }
@@ -252,14 +296,20 @@ impl HotkeyManager {
                     let id = hotkey.id();
                     if let Err(e) = manager.register(hotkey.clone()) {
                         tracing::warn!("Failed to register mute hotkey: {}", e);
+                        self.registration_status
+                            .insert(HotkeyAction::ToggleMute, HotkeyRegistrationStatus::Failed);
                     } else {
                         self.hotkey_actions.insert(id, HotkeyAction::ToggleMute);
                         self.registered_hotkeys.push(hotkey);
+                        self.registration_status
+                            .insert(HotkeyAction::ToggleMute, HotkeyRegistrationStatus::Registered);
                         tracing::info!("Registered mute hotkey: {}", binding.display());
                     }
                 }
                 Err(e) => {
                     tracing::warn!("Invalid mute hotkey binding: {}", e);
+                    self.registration_status
+                        .insert(HotkeyAction::ToggleMute, HotkeyRegistrationStatus::Failed);
                 }
             }
         }
@@ -271,14 +321,20 @@ impl HotkeyManager {
                     let id = hotkey.id();
                     if let Err(e) = manager.register(hotkey.clone()) {
                         tracing::warn!("Failed to register deafen hotkey: {}", e);
+                        self.registration_status
+                            .insert(HotkeyAction::ToggleDeafen, HotkeyRegistrationStatus::Failed);
                     } else {
                         self.hotkey_actions.insert(id, HotkeyAction::ToggleDeafen);
                         self.registered_hotkeys.push(hotkey);
+                        self.registration_status
+                            .insert(HotkeyAction::ToggleDeafen, HotkeyRegistrationStatus::Registered);
                         tracing::info!("Registered deafen hotkey: {}", binding.display());
                     }
                 }
                 Err(e) => {
                     tracing::warn!("Invalid deafen hotkey binding: {}", e);
+                    self.registration_status
+                        .insert(HotkeyAction::ToggleDeafen, HotkeyRegistrationStatus::Failed);
                 }
             }
         }

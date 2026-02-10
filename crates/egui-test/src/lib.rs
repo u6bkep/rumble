@@ -15,5 +15,5 @@ pub mod settings;
 
 pub use app::RumbleApp;
 pub use harness::TestHarness;
-pub use hotkeys::{HotkeyEvent, HotkeyManager};
+pub use hotkeys::{HotkeyAction, HotkeyEvent, HotkeyManager, HotkeyRegistrationStatus};
 pub use settings::{Args, HotkeyBinding, HotkeyModifiers, KeyboardSettings, PersistentSettings};

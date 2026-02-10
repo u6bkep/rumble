@@ -141,6 +141,8 @@ struct SettingsModalState {
     dirty: bool,
     /// Which hotkey is currently being captured (None if not capturing)
     hotkey_capture_target: Option<HotkeyCaptureTarget>,
+    /// Pending hotkey binding that has a conflict, waiting for user confirmation
+    hotkey_conflict_pending: Option<(HotkeyCaptureTarget, crate::settings::HotkeyBinding, &'static str)>,
 }
 
 /// The main Rumble application.
@@ -208,6 +210,10 @@ pub struct RumbleApp {
 
     /// Push-to-talk key is held
     push_to_talk_active: bool,
+
+    /// Global hotkey registration status per action (set by EframeWrapper)
+    hotkey_registration_status:
+        std::collections::HashMap<crate::hotkeys::HotkeyAction, crate::hotkeys::HotkeyRegistrationStatus>,
 
     /// Whether XDG Portal global shortcuts are available (Wayland)
     portal_hotkeys_available: bool,
@@ -443,6 +449,7 @@ impl RumbleApp {
             download_modal: DownloadModalState::default(),
             settings_modal: SettingsModalState::default(),
             push_to_talk_active: false,
+            hotkey_registration_status: std::collections::HashMap::new(),
             portal_hotkeys_available: false,
             #[cfg(target_os = "linux")]
             portal_shortcuts: Vec::new(),
@@ -475,6 +482,14 @@ impl RumbleApp {
     /// Check if the client is connected to a server.
     pub fn is_connected(&self) -> bool {
         self.backend.state().connection.is_connected()
+    }
+
+    /// Set the global hotkey registration status from the HotkeyManager.
+    pub fn set_hotkey_registration_status(
+        &mut self,
+        status: std::collections::HashMap<crate::hotkeys::HotkeyAction, crate::hotkeys::HotkeyRegistrationStatus>,
+    ) {
+        self.hotkey_registration_status = status;
     }
 
     /// Set whether XDG Portal global shortcuts are available.
@@ -1641,7 +1656,7 @@ impl RumbleApp {
     /// Render the keyboard settings panel.
     fn render_settings_keyboard(&mut self, ui: &mut egui::Ui) {
         use crate::{
-            hotkeys::HotkeyManager,
+            hotkeys::{HotkeyAction, HotkeyManager, HotkeyRegistrationStatus},
             settings::{HotkeyBinding, HotkeyModifiers},
         };
 
@@ -1765,29 +1780,88 @@ impl RumbleApp {
         ui.separator();
         ui.add_space(8.0);
 
-        // Helper to render a hotkey binding row with capture
+        // Helper: render a registration status indicator
+        let render_status_indicator = |ui: &mut egui::Ui, status: HotkeyRegistrationStatus| {
+            let (color, tooltip) = match status {
+                HotkeyRegistrationStatus::Registered => {
+                    (egui::Color32::from_rgb(80, 200, 80), "Global hotkey registered")
+                }
+                HotkeyRegistrationStatus::Failed => (
+                    egui::Color32::from_rgb(220, 60, 60),
+                    "Global hotkey registration failed",
+                ),
+                HotkeyRegistrationStatus::NotConfigured => {
+                    (egui::Color32::from_rgb(128, 128, 128), "No global hotkey configured")
+                }
+            };
+            let (rect, response) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+            ui.painter().circle_filled(rect.center(), 5.0, color);
+            response.on_hover_text(tooltip);
+        };
+
+        // Helper: check if a binding conflicts with another action's binding
+        let find_conflict = |binding: &HotkeyBinding,
+                             target: HotkeyCaptureTarget,
+                             keyboard: &crate::settings::KeyboardSettings|
+         -> Option<&'static str> {
+            let bindings: [(HotkeyCaptureTarget, &Option<HotkeyBinding>, &str); 3] = [
+                (HotkeyCaptureTarget::Ptt, &keyboard.ptt_hotkey, "Push-to-Talk"),
+                (
+                    HotkeyCaptureTarget::ToggleMute,
+                    &keyboard.toggle_mute_hotkey,
+                    "Toggle Mute",
+                ),
+                (
+                    HotkeyCaptureTarget::ToggleDeafen,
+                    &keyboard.toggle_deafen_hotkey,
+                    "Toggle Deafen",
+                ),
+            ];
+            for (other_target, other_binding, name) in &bindings {
+                if *other_target != target {
+                    if let Some(existing) = other_binding {
+                        if existing == binding {
+                            return Some(name);
+                        }
+                    }
+                }
+            }
+            None
+        };
+
+        // Helper to render a hotkey binding row with capture and status indicator
         let render_hotkey_row = |ui: &mut egui::Ui,
                                  label: &str,
                                  binding: &Option<HotkeyBinding>,
                                  target: HotkeyCaptureTarget,
                                  capture_target: &mut Option<HotkeyCaptureTarget>,
                                  dirty: &mut bool,
-                                 allow_edit: bool|
+                                 allow_edit: bool,
+                                 reg_status: HotkeyRegistrationStatus|
          -> Option<Option<HotkeyBinding>> {
             let mut result = None;
 
-            ui.strong(label);
+            ui.horizontal(|ui| {
+                render_status_indicator(ui, reg_status);
+                ui.strong(label);
+            });
             ui.add_space(4.0);
 
             ui.horizontal(|ui| {
                 let is_capturing = *capture_target == Some(target);
 
                 if is_capturing {
-                    // Show capture UI
-                    ui.colored_label(
-                        egui::Color32::from_rgb(100, 200, 255),
-                        "Press any key (with optional modifiers)... [Esc to cancel]",
-                    );
+                    // Show highlighted capture instruction box
+                    egui::Frame::new()
+                        .fill(egui::Color32::from_rgba_premultiplied(30, 80, 120, 200))
+                        .corner_radius(4.0)
+                        .inner_margin(8.0)
+                        .show(ui, |ui| {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(100, 220, 255),
+                                "Press the desired key combination, then release. Press Escape to cancel.",
+                            );
+                        });
                 } else {
                     // Show current binding
                     let binding_label = binding
@@ -1813,114 +1887,60 @@ impl RumbleApp {
             result
         };
 
-        // Capture key input if we're in capture mode
+        // Capture key input if we're in capture mode using events API
         let mut captured_binding: Option<(HotkeyCaptureTarget, HotkeyBinding)> = None;
         let mut cancel_capture = false;
 
         if let Some(target) = self.settings_modal.hotkey_capture_target {
-            // Check for Escape to cancel
-            if ui.ctx().input(|i| i.key_pressed(egui::Key::Escape)) {
-                cancel_capture = true;
-            } else {
-                // Check for any other key press
-                let modifiers = ui.ctx().input(|i| i.modifiers);
-
-                // Iterate through all keys to find which one was pressed
-                for key in [
-                    egui::Key::Space,
-                    egui::Key::Enter,
-                    egui::Key::Tab,
-                    egui::Key::Backspace,
-                    egui::Key::Insert,
-                    egui::Key::Delete,
-                    egui::Key::Home,
-                    egui::Key::End,
-                    egui::Key::PageUp,
-                    egui::Key::PageDown,
-                    egui::Key::ArrowUp,
-                    egui::Key::ArrowDown,
-                    egui::Key::ArrowLeft,
-                    egui::Key::ArrowRight,
-                    egui::Key::F1,
-                    egui::Key::F2,
-                    egui::Key::F3,
-                    egui::Key::F4,
-                    egui::Key::F5,
-                    egui::Key::F6,
-                    egui::Key::F7,
-                    egui::Key::F8,
-                    egui::Key::F9,
-                    egui::Key::F10,
-                    egui::Key::F11,
-                    egui::Key::F12,
-                    egui::Key::A,
-                    egui::Key::B,
-                    egui::Key::C,
-                    egui::Key::D,
-                    egui::Key::E,
-                    egui::Key::F,
-                    egui::Key::G,
-                    egui::Key::H,
-                    egui::Key::I,
-                    egui::Key::J,
-                    egui::Key::K,
-                    egui::Key::L,
-                    egui::Key::M,
-                    egui::Key::N,
-                    egui::Key::O,
-                    egui::Key::P,
-                    egui::Key::Q,
-                    egui::Key::R,
-                    egui::Key::S,
-                    egui::Key::T,
-                    egui::Key::U,
-                    egui::Key::V,
-                    egui::Key::W,
-                    egui::Key::X,
-                    egui::Key::Y,
-                    egui::Key::Z,
-                    egui::Key::Num0,
-                    egui::Key::Num1,
-                    egui::Key::Num2,
-                    egui::Key::Num3,
-                    egui::Key::Num4,
-                    egui::Key::Num5,
-                    egui::Key::Num6,
-                    egui::Key::Num7,
-                    egui::Key::Num8,
-                    egui::Key::Num9,
-                    egui::Key::Minus,
-                    egui::Key::Equals,
-                    egui::Key::OpenBracket,
-                    egui::Key::CloseBracket,
-                    egui::Key::Backslash,
-                    egui::Key::Semicolon,
-                    egui::Key::Quote,
-                    egui::Key::Backtick,
-                    egui::Key::Comma,
-                    egui::Key::Period,
-                    egui::Key::Slash,
-                ] {
-                    if ui.ctx().input(|i| i.key_pressed(key)) {
-                        if let Some(key_str) = HotkeyManager::egui_key_to_string(key) {
-                            captured_binding = Some((
-                                target,
-                                HotkeyBinding {
-                                    modifiers: HotkeyModifiers {
-                                        ctrl: modifiers.ctrl,
-                                        shift: modifiers.shift,
-                                        alt: modifiers.alt,
-                                        super_key: modifiers.command,
-                                    },
-                                    key: key_str,
+            let events = ui.ctx().input(|i| i.events.clone());
+            for event in &events {
+                if let egui::Event::Key {
+                    key,
+                    pressed: true,
+                    modifiers,
+                    repeat: false,
+                    ..
+                } = event
+                {
+                    if *key == egui::Key::Escape {
+                        cancel_capture = true;
+                        break;
+                    }
+                    if let Some(key_str) = HotkeyManager::egui_key_to_string(*key) {
+                        captured_binding = Some((
+                            target,
+                            HotkeyBinding {
+                                modifiers: HotkeyModifiers {
+                                    ctrl: modifiers.ctrl,
+                                    shift: modifiers.shift,
+                                    alt: modifiers.alt,
+                                    super_key: modifiers.command,
                                 },
-                            ));
-                        }
+                                key: key_str,
+                            },
+                        ));
                         break;
                     }
                 }
             }
         }
+
+        // Snapshot registration status
+        let ptt_status = self
+            .hotkey_registration_status
+            .get(&HotkeyAction::PushToTalk)
+            .copied()
+            .unwrap_or(HotkeyRegistrationStatus::NotConfigured);
+        let mute_status = self
+            .hotkey_registration_status
+            .get(&HotkeyAction::ToggleMute)
+            .copied()
+            .unwrap_or(HotkeyRegistrationStatus::NotConfigured);
+        let deafen_status = self
+            .hotkey_registration_status
+            .get(&HotkeyAction::ToggleDeafen)
+            .copied()
+            .unwrap_or(HotkeyRegistrationStatus::NotConfigured);
 
         // PTT Hotkey
         if let Some(new_binding) = render_hotkey_row(
@@ -1931,6 +1951,7 @@ impl RumbleApp {
             &mut self.settings_modal.hotkey_capture_target,
             &mut self.settings_modal.dirty,
             show_capture_ui,
+            ptt_status,
         ) {
             self.persistent_settings.keyboard.ptt_hotkey = new_binding;
         }
@@ -1948,6 +1969,7 @@ impl RumbleApp {
             &mut self.settings_modal.hotkey_capture_target,
             &mut self.settings_modal.dirty,
             show_capture_ui,
+            mute_status,
         ) {
             self.persistent_settings.keyboard.toggle_mute_hotkey = new_binding;
         }
@@ -1965,30 +1987,97 @@ impl RumbleApp {
             &mut self.settings_modal.hotkey_capture_target,
             &mut self.settings_modal.dirty,
             show_capture_ui,
+            deafen_status,
         ) {
             self.persistent_settings.keyboard.toggle_deafen_hotkey = new_binding;
         }
 
-        // Apply captured binding
+        // Apply captured binding (with conflict detection)
         if let Some((target, binding)) = captured_binding {
-            match target {
-                HotkeyCaptureTarget::Ptt => {
-                    self.persistent_settings.keyboard.ptt_hotkey = Some(binding);
+            // Check for conflicts with other bindings
+            if let Some(conflict_name) = find_conflict(&binding, target, &self.persistent_settings.keyboard) {
+                // Store the conflict for user confirmation (persists across frames)
+                self.settings_modal.hotkey_conflict_pending = Some((target, binding, conflict_name));
+            } else {
+                // No conflict - apply directly
+                match target {
+                    HotkeyCaptureTarget::Ptt => {
+                        self.persistent_settings.keyboard.ptt_hotkey = Some(binding);
+                    }
+                    HotkeyCaptureTarget::ToggleMute => {
+                        self.persistent_settings.keyboard.toggle_mute_hotkey = Some(binding);
+                    }
+                    HotkeyCaptureTarget::ToggleDeafen => {
+                        self.persistent_settings.keyboard.toggle_deafen_hotkey = Some(binding);
+                    }
                 }
-                HotkeyCaptureTarget::ToggleMute => {
-                    self.persistent_settings.keyboard.toggle_mute_hotkey = Some(binding);
-                }
-                HotkeyCaptureTarget::ToggleDeafen => {
-                    self.persistent_settings.keyboard.toggle_deafen_hotkey = Some(binding);
-                }
+                self.settings_modal.hotkey_capture_target = None;
+                self.settings_modal.dirty = true;
             }
-            self.settings_modal.hotkey_capture_target = None;
-            self.settings_modal.dirty = true;
+        }
+
+        // Show conflict warning UI if a conflict is pending
+        if let Some((target, ref binding, conflict_name)) = self.settings_modal.hotkey_conflict_pending.clone() {
+            ui.add_space(8.0);
+            egui::Frame::new()
+                .fill(egui::Color32::from_rgba_premultiplied(80, 60, 20, 200))
+                .corner_radius(4.0)
+                .inner_margin(8.0)
+                .show(ui, |ui| {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(255, 200, 80),
+                        format!(
+                            "This key is already bound to {}. Setting it here will remove the other binding.",
+                            conflict_name
+                        ),
+                    );
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Apply anyway").clicked() {
+                            // Clear the conflicting binding
+                            if self.persistent_settings.keyboard.ptt_hotkey.as_ref() == Some(&binding)
+                                && target != HotkeyCaptureTarget::Ptt
+                            {
+                                self.persistent_settings.keyboard.ptt_hotkey = None;
+                            }
+                            if self.persistent_settings.keyboard.toggle_mute_hotkey.as_ref() == Some(&binding)
+                                && target != HotkeyCaptureTarget::ToggleMute
+                            {
+                                self.persistent_settings.keyboard.toggle_mute_hotkey = None;
+                            }
+                            if self.persistent_settings.keyboard.toggle_deafen_hotkey.as_ref() == Some(&binding)
+                                && target != HotkeyCaptureTarget::ToggleDeafen
+                            {
+                                self.persistent_settings.keyboard.toggle_deafen_hotkey = None;
+                            }
+                            // Apply the new binding
+                            match target {
+                                HotkeyCaptureTarget::Ptt => {
+                                    self.persistent_settings.keyboard.ptt_hotkey = Some(binding.clone());
+                                }
+                                HotkeyCaptureTarget::ToggleMute => {
+                                    self.persistent_settings.keyboard.toggle_mute_hotkey = Some(binding.clone());
+                                }
+                                HotkeyCaptureTarget::ToggleDeafen => {
+                                    self.persistent_settings.keyboard.toggle_deafen_hotkey = Some(binding.clone());
+                                }
+                            }
+                            self.settings_modal.hotkey_capture_target = None;
+                            self.settings_modal.hotkey_conflict_pending = None;
+                            self.settings_modal.dirty = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.settings_modal.hotkey_capture_target = None;
+                            self.settings_modal.hotkey_conflict_pending = None;
+                        }
+                    });
+                });
         }
 
         // Cancel capture if escape was pressed
         if cancel_capture {
             self.settings_modal.hotkey_capture_target = None;
+            self.settings_modal.hotkey_conflict_pending = None;
         }
     }
 
@@ -3039,6 +3128,7 @@ impl RumbleApp {
                             pending_timestamp_format: Some(self.persistent_settings.chat_timestamp_format),
                             dirty: false,
                             hotkey_capture_target: None,
+                            hotkey_conflict_pending: None,
                         };
                         self.show_settings = true;
                         ui.close();
@@ -3199,6 +3289,7 @@ impl RumbleApp {
                         pending_timestamp_format: Some(self.persistent_settings.chat_timestamp_format),
                         dirty: false,
                         hotkey_capture_target: None,
+                        hotkey_conflict_pending: None,
                     };
                     self.show_settings = true;
                 }
@@ -4065,6 +4156,7 @@ impl RumbleApp {
                     pending_timestamp_format: Some(self.persistent_settings.chat_timestamp_format),
                     dirty: false,
                     hotkey_capture_target: None,
+                    hotkey_conflict_pending: None,
                 };
             }
 
