@@ -65,7 +65,7 @@ use quinn::{Endpoint, crypto::rustls::QuicClientConfig};
 use std::{
     collections::{HashMap, HashSet},
     net::ToSocketAddrs,
-    sync::{Arc, RwLock},
+    sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard},
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::mpsc;
@@ -225,7 +225,7 @@ impl BackendHandle {
     /// This returns a clone of the state. The UI should call this
     /// in its render loop to get the latest state.
     pub fn state(&self) -> State {
-        self.state.read().unwrap().clone()
+        read_state(&self.state).clone()
     }
 
     /// Send a command to the backend.
@@ -329,17 +329,39 @@ impl BackendHandle {
 
     /// Check if we are currently connected.
     pub fn is_connected(&self) -> bool {
-        self.state.read().unwrap().connection.is_connected()
+        read_state(&self.state).connection.is_connected()
     }
 
     /// Get our user ID if connected.
     pub fn my_user_id(&self) -> Option<u64> {
-        self.state.read().unwrap().my_user_id
+        read_state(&self.state).my_user_id
     }
 
     /// Get our current room ID if in a room.
     pub fn my_room_id(&self) -> Option<Uuid> {
-        self.state.read().unwrap().my_room_id
+        read_state(&self.state).my_room_id
+    }
+}
+
+/// Acquire a read lock on the state, recovering from lock poisoning.
+pub(crate) fn read_state(state: &Arc<RwLock<State>>) -> RwLockReadGuard<'_, State> {
+    match state.read() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            warn!("State RwLock was poisoned (read), recovering");
+            poisoned.into_inner()
+        }
+    }
+}
+
+/// Acquire a write lock on the state, recovering from lock poisoning.
+pub(crate) fn write_state(state: &Arc<RwLock<State>>) -> RwLockWriteGuard<'_, State> {
+    match state.write() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            warn!("State RwLock was poisoned (write), recovering");
+            poisoned.into_inner()
+        }
     }
 }
 
@@ -511,7 +533,7 @@ async fn run_connection_task(
                     });
 
                     {
-                        let mut s = state.write().unwrap();
+                        let mut s = write_state(&state);
                         s.file_transfers = transfers;
                     }
                     repaint();
@@ -536,7 +558,7 @@ async fn run_connection_task(
 
                         // Update state to Connecting
                         {
-                            let mut s = state.write().unwrap();
+                            let mut s = write_state(&state);
                             s.connection = ConnectionState::Connecting { server_addr: addr.clone() };
                         }
                         repaint();
@@ -549,7 +571,7 @@ async fn run_connection_task(
                             Ok((conn, send, recv, recv_buf, user_id, rooms, users, session_info)) => {
                                 // Update state to Connected
                                 {
-                                    let mut s = state.write().unwrap();
+                                    let mut s = write_state(&state);
                                     s.connection = ConnectionState::Connected {
                                         server_name: "Rumble Server".to_string(),
                                         user_id,
@@ -635,7 +657,7 @@ async fn run_connection_task(
                                         signer: signer.clone(),
                                     };
                                     {
-                                        let mut s = state.write().unwrap();
+                                        let mut s = write_state(&state);
                                         s.connection = ConnectionState::CertificatePending { cert_info: pending };
                                     }
                                     repaint();
@@ -644,7 +666,7 @@ async fn run_connection_task(
                                     // but log and treat as connection failure
                                     error!("Certificate verification error but no cert captured: {}", e);
                                     {
-                                        let mut s = state.write().unwrap();
+                                        let mut s = write_state(&state);
                                         s.connection = ConnectionState::ConnectionLost {
                                             error: format!("Certificate error: {}", e)
                                         };
@@ -653,7 +675,7 @@ async fn run_connection_task(
                                 } else {
                                     error!("Connection failed: {}", e);
                                     {
-                                        let mut s = state.write().unwrap();
+                                        let mut s = write_state(&state);
                                         s.connection = ConnectionState::ConnectionLost { error: e.to_string() };
                                     }
                                     repaint();
@@ -665,7 +687,7 @@ async fn run_connection_task(
                     Command::AcceptCertificate => {
                         // Get the pending certificate info from state
                         let pending_info = {
-                            let s = state.read().unwrap();
+                            let s = read_state(&state);
                             if let ConnectionState::CertificatePending { cert_info } = &s.connection {
                                 Some(cert_info.clone())
                             } else {
@@ -678,7 +700,7 @@ async fn run_connection_task(
 
                             // Update state to Connecting
                             {
-                                let mut s = state.write().unwrap();
+                                let mut s = write_state(&state);
                                 s.connection = ConnectionState::Connecting { server_addr: pending.server_addr.clone() };
                             }
                             repaint();
@@ -703,7 +725,7 @@ async fn run_connection_task(
                                 Ok((conn, send, recv, recv_buf, user_id, rooms, users, session_info)) => {
                                     // Success! Update state
                                     {
-                                        let mut s = state.write().unwrap();
+                                        let mut s = write_state(&state);
                                         s.connection = ConnectionState::Connected {
                                             server_name: "Rumble Server".to_string(),
                                             user_id,
@@ -777,7 +799,7 @@ async fn run_connection_task(
                                 Err(e) => {
                                     error!("Connection failed after accepting certificate: {}", e);
                                     {
-                                        let mut s = state.write().unwrap();
+                                        let mut s = write_state(&state);
                                         s.connection = ConnectionState::ConnectionLost { error: e.to_string() };
                                     }
                                     repaint();
@@ -791,13 +813,13 @@ async fn run_connection_task(
                     Command::RejectCertificate => {
                         // Simply go back to disconnected state
                         {
-                            let s = state.read().unwrap();
+                            let s = read_state(&state);
                             if let ConnectionState::CertificatePending { cert_info } = &s.connection {
                                 info!("User rejected certificate for {}", cert_info.server_name);
                             }
                         }
                         {
-                            let mut s = state.write().unwrap();
+                            let mut s = write_state(&state);
                             s.connection = ConnectionState::Disconnected;
                         }
                         repaint();
@@ -817,7 +839,7 @@ async fn run_connection_task(
                             p2p.shutdown().await;
                         }
                         {
-                            let mut s = state.write().unwrap();
+                            let mut s = write_state(&state);
                             s.connection = ConnectionState::Disconnected;
                             s.my_user_id = None;
                             s.my_room_id = None;
@@ -932,7 +954,7 @@ async fn run_connection_task(
                     }
 
                     Command::LocalMessage { text } => {
-                        let mut s = state.write().unwrap();
+                        let mut s = write_state(&state);
                         s.chat_messages.push(crate::events::ChatMessage {
                             id: uuid::Uuid::new_v4().into_bytes(),
                             sender: String::new(),
@@ -952,7 +974,7 @@ async fn run_connection_task(
                     Command::SetMuted { muted } => {
                         // Send status update to server
                         if let Some(send) = &mut send_stream {
-                            let s = state.read().unwrap();
+                            let s = read_state(&state);
                             let is_deafened = s.audio.self_deafened;
                             drop(s);
                             let env = proto::Envelope {
@@ -973,7 +995,7 @@ async fn run_connection_task(
                         // Send status update to server
                         // Note: deafen implies mute
                         if let Some(send) = &mut send_stream {
-                            let s = state.read().unwrap();
+                            let s = read_state(&state);
                             let is_muted = s.audio.self_muted || deafened;
                             drop(s);
                             let env = proto::Envelope {
@@ -1084,7 +1106,7 @@ async fn run_connection_task(
                                         }
                                     }
 
-                                    let mut s = state.write().unwrap();
+                                    let mut s = write_state(&state);
                                     s.chat_messages.push(crate::events::ChatMessage {
                                         id: uuid::Uuid::new_v4().into_bytes(),
                                         sender: "System".to_string(),
@@ -1097,7 +1119,7 @@ async fn run_connection_task(
                                 }
                                 Err(e) => {
                                     error!("Failed to share file via P2P: {}", e);
-                                    let mut s = state.write().unwrap();
+                                    let mut s = write_state(&state);
                                     s.chat_messages.push(crate::events::ChatMessage {
                                         id: uuid::Uuid::new_v4().into_bytes(),
                                         sender: "System".to_string(),
@@ -1153,7 +1175,7 @@ async fn run_connection_task(
                                     }
 
                                     // Add local confirmation with magnet link
-                                    let mut s = state.write().unwrap();
+                                    let mut s = write_state(&state);
                                     s.chat_messages.push(crate::events::ChatMessage {
                                         id: uuid::Uuid::new_v4().into_bytes(),
                                         sender: "System".to_string(),
@@ -1165,7 +1187,7 @@ async fn run_connection_task(
                                 }
                                 Err(e) => {
                                     error!("Failed to share file: {}", e);
-                                    let mut s = state.write().unwrap();
+                                    let mut s = write_state(&state);
                                     s.chat_messages.push(crate::events::ChatMessage {
                                         id: uuid::Uuid::new_v4().into_bytes(),
                                         sender: "System".to_string(),
@@ -1206,7 +1228,7 @@ async fn run_connection_task(
                                                         let received_messages = history.to_messages();
                                                         let msg_count = received_messages.len();
 
-                                                        let mut s = state.write().unwrap();
+                                                        let mut s = write_state(&state);
                                                         // Merge: add messages with new UUIDs
                                                         let existing_ids: std::collections::HashSet<[u8; 16]> =
                                                             s.chat_messages.iter().map(|m| m.id).collect();
@@ -1249,7 +1271,7 @@ async fn run_connection_task(
                                             let dest = download_dir.join(&name);
                                             match tokio::fs::write(&dest, &data).await {
                                                 Ok(_) => {
-                                                    let mut s = state.write().unwrap();
+                                                    let mut s = write_state(&state);
                                                     s.chat_messages.push(crate::events::ChatMessage {
                                                         id: uuid::Uuid::new_v4().into_bytes(),
                                                         sender: "System".to_string(),
@@ -1265,7 +1287,7 @@ async fn run_connection_task(
                                                 }
                                                 Err(e) => {
                                                     error!("Failed to save P2P download: {}", e);
-                                                    let mut s = state.write().unwrap();
+                                                    let mut s = write_state(&state);
                                                     s.chat_messages.push(crate::events::ChatMessage {
                                                         id: uuid::Uuid::new_v4().into_bytes(),
                                                         sender: "System".to_string(),
@@ -1279,7 +1301,7 @@ async fn run_connection_task(
                                         }
                                         Err(e) => {
                                             error!("Failed to download via P2P: {}", e);
-                                            let mut s = state.write().unwrap();
+                                            let mut s = write_state(&state);
                                             s.chat_messages.push(crate::events::ChatMessage {
                                                 id: uuid::Uuid::new_v4().into_bytes(),
                                                 sender: "System".to_string(),
@@ -1305,7 +1327,7 @@ async fn run_connection_task(
                                 match tm.download_file(magnet).await {
                                     Ok(_) => {
                                         info!("Started download");
-                                        let mut s = state.write().unwrap();
+                                        let mut s = write_state(&state);
                                         s.chat_messages.push(crate::events::ChatMessage {
                                             id: uuid::Uuid::new_v4().into_bytes(),
                                             sender: "System".to_string(),
@@ -1317,7 +1339,7 @@ async fn run_connection_task(
                                     }
                                     Err(e) => {
                                         error!("Failed to download file: {}", e);
-                                        let mut s = state.write().unwrap();
+                                        let mut s = write_state(&state);
                                         s.chat_messages.push(crate::events::ChatMessage {
                                             id: uuid::Uuid::new_v4().into_bytes(),
                                             sender: "System".to_string(),
@@ -1420,7 +1442,7 @@ async fn run_connection_task(
 
                     Command::UpdateFileTransferSettings { settings } => {
                         debug!("Updating file transfer settings: auto_download_enabled={}", settings.auto_download_enabled);
-                        let mut s = state.write().unwrap();
+                        let mut s = write_state(&state);
                         s.file_transfer_settings = settings;
                         drop(s);
                         repaint();
@@ -1450,7 +1472,7 @@ async fn run_connection_task(
                                 error!("Failed to send chat history request: {}", e);
                             } else {
                                 info!("Sent chat history request to room");
-                                let mut s = state.write().unwrap();
+                                let mut s = write_state(&state);
                                 s.chat_messages.push(crate::events::ChatMessage {
                                     id: uuid::Uuid::new_v4().into_bytes(),
                                     sender: "System".to_string(),
@@ -1469,7 +1491,7 @@ async fn run_connection_task(
                         if let Some(p2p) = &p2p_manager {
                             // Serialize chat history (excluding local messages)
                             let history = {
-                                let s = state.read().unwrap();
+                                let s = read_state(&state);
                                 crate::events::ChatHistoryContent::from_messages(&s.chat_messages)
                             };
 
@@ -1884,7 +1906,7 @@ async fn run_receiver_task(
 
     // Update state only if not already disconnected (explicit disconnect sets Disconnected)
     {
-        let mut s = state.write().unwrap();
+        let mut s = write_state(&state);
         if !matches!(s.connection, ConnectionState::Disconnected) {
             s.connection = ConnectionState::ConnectionLost {
                 error: error.to_string(),
@@ -1903,7 +1925,7 @@ async fn run_receiver_task(
 
 /// Add a local status message to the chat.
 fn add_local_message(state: &Arc<RwLock<State>>, text: String, repaint: &Arc<dyn Fn() + Send + Sync>) {
-    let mut s = state.write().unwrap();
+    let mut s = write_state(&state);
     s.chat_messages.push(crate::events::ChatMessage {
         id: uuid::Uuid::new_v4().into_bytes(),
         sender: String::new(),
@@ -1943,7 +1965,7 @@ fn handle_server_message(
                 match kind {
                     proto::server_event::Kind::ServerState(ss) => {
                         // Full state replacement
-                        let mut s = state.write().unwrap();
+                        let mut s = write_state(&state);
                         s.rooms = ss.rooms;
                         s.users = ss.users.clone();
                         s.rebuild_room_tree();
@@ -2010,7 +2032,7 @@ fn handle_server_message(
                         // Check if this is a file message that should be auto-downloaded
                         let mut should_auto_download = None;
                         if let Some(file_msg) = crate::events::FileMessage::parse(&cb.text) {
-                            let s = state.read().unwrap();
+                            let s = read_state(&state);
                             if s.file_transfer_settings
                                 .should_auto_download(&file_msg.file.mime, file_msg.file.size)
                             {
@@ -2040,7 +2062,7 @@ fn handle_server_message(
                             drop(s);
                         }
 
-                        let mut s = state.write().unwrap();
+                        let mut s = write_state(&state);
                         s.chat_messages.push(crate::events::ChatMessage {
                             id,
                             sender: cb.sender,
@@ -2064,7 +2086,7 @@ fn handle_server_message(
                                 match tm.download_file(magnet).await {
                                     Ok(_) => {
                                         info!("Auto-download started");
-                                        let mut s = state.write().unwrap();
+                                        let mut s = write_state(&state);
                                         s.chat_messages.push(crate::events::ChatMessage {
                                             id: uuid::Uuid::new_v4().into_bytes(),
                                             sender: "System".to_string(),
@@ -2076,7 +2098,7 @@ fn handle_server_message(
                                     }
                                     Err(e) => {
                                         error!("Auto-download failed: {}", e);
-                                        let mut s = state.write().unwrap();
+                                        let mut s = write_state(&state);
                                         s.chat_messages.push(crate::events::ChatMessage {
                                             id: uuid::Uuid::new_v4().into_bytes(),
                                             sender: "System".to_string(),
@@ -2114,7 +2136,7 @@ fn apply_state_update(
     audio_task: &AudioTaskHandle,
 ) {
     if let Some(u) = update.update {
-        let mut s = state.write().unwrap();
+        let mut s = write_state(&state);
         match u {
             proto::state_update::Update::RoomCreated(rc) => {
                 if let Some(room) = rc.room {
@@ -2299,7 +2321,7 @@ fn handle_peer_announce(
 
     if announce.is_removal {
         // Peer left - remove from our list
-        let mut s = state.write().unwrap();
+        let mut s = write_state(&state);
         s.p2p_peers.remove(&user_id);
         info!(user_id, "P2P peer removed");
         drop(s);
@@ -2319,7 +2341,7 @@ fn handle_peer_announce(
         supports_p2p_voice: announce.supports_p2p_voice,
     };
 
-    let mut s = state.write().unwrap();
+    let mut s = write_state(&state);
     s.p2p_peers.insert(user_id, peer_info);
     info!(
         user_id,

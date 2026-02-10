@@ -29,6 +29,7 @@ use crate::{
     audio_dump::AudioDumper,
     codec::{EncoderSettings, OPUS_FRAME_SIZE, VoiceDecoder, VoiceEncoder, is_dtx_frame},
     events::{AudioSettings, AudioStats, State, VoiceMode},
+    handle::{read_state, write_state},
 };
 use api::proto::VoiceDatagram;
 use bytes::Bytes;
@@ -440,23 +441,23 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
 
     // Current audio settings (start with defaults from state)
     let mut audio_settings = {
-        let s = state.read().unwrap();
+        let s = read_state(&state);
         s.audio.settings.clone()
     };
 
     // TX pipeline configuration (start with defaults from state)
     let mut tx_pipeline_config = {
-        let s = state.read().unwrap();
+        let s = read_state(&state);
         s.audio.tx_pipeline.clone()
     };
 
     // RX pipeline defaults and per-user configs
     let mut rx_pipeline_defaults = {
-        let s = state.read().unwrap();
+        let s = read_state(&state);
         s.audio.rx_pipeline_defaults.clone()
     };
     let mut per_user_rx: HashMap<u64, pipeline::UserRxConfig> = {
-        let s = state.read().unwrap();
+        let s = read_state(&state);
         s.audio.per_user_rx.clone()
     };
 
@@ -624,7 +625,7 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
 
                         // Clear talking users
                         {
-                            let mut s = state.write().unwrap();
+                            let mut s = write_state(&state);
                             s.audio.talking_users.clear();
                         }
                         repaint();
@@ -636,7 +637,7 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
                     AudioCommand::SetInputDevice { device_id } => {
                         selected_input = device_id.clone();
                         {
-                            let mut s = state.write().unwrap();
+                            let mut s = write_state(&state);
                             s.audio.selected_input = device_id;
                         }
                         repaint();
@@ -651,7 +652,7 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
                     AudioCommand::SetOutputDevice { device_id } => {
                         selected_output = device_id.clone();
                         {
-                            let mut s = state.write().unwrap();
+                            let mut s = write_state(&state);
                             s.audio.selected_output = device_id;
                         }
                         repaint();
@@ -676,7 +677,7 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
                     AudioCommand::SetVoiceMode { mode } => {
                         voice_mode = mode;
                         {
-                            let mut s = state.write().unwrap();
+                            let mut s = write_state(&state);
                             s.audio.voice_mode = mode;
                         }
                         repaint();
@@ -686,7 +687,7 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
                     AudioCommand::SetMuted { muted } => {
                         self_muted = muted;
                         {
-                            let mut s = state.write().unwrap();
+                            let mut s = write_state(&state);
                             s.audio.self_muted = muted;
                         }
                         repaint();
@@ -700,7 +701,7 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
                             self_muted = true;
                         }
                         {
-                            let mut s = state.write().unwrap();
+                            let mut s = write_state(&state);
                             s.audio.self_deafened = deafened;
                             s.audio.self_muted = self_muted;
                         }
@@ -711,7 +712,7 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
                             audio_output = None;
                             user_audio.clear();
                             {
-                                let mut s = state.write().unwrap();
+                                let mut s = write_state(&state);
                                 s.audio.talking_users.clear();
                             }
                         } else if connection.is_some() && audio_output.is_none() {
@@ -724,7 +725,7 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
                     AudioCommand::MuteUser { user_id } => {
                         muted_users.insert(user_id);
                         {
-                            let mut s = state.write().unwrap();
+                            let mut s = write_state(&state);
                             s.audio.muted_users.insert(user_id);
                         }
                         repaint();
@@ -733,7 +734,7 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
                     AudioCommand::UnmuteUser { user_id } => {
                         muted_users.remove(&user_id);
                         {
-                            let mut s = state.write().unwrap();
+                            let mut s = write_state(&state);
                             s.audio.muted_users.remove(&user_id);
                         }
                         repaint();
@@ -743,7 +744,7 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
                         let input_devices = audio_system.list_input_devices();
                         let output_devices = audio_system.list_output_devices();
                         {
-                            let mut s = state.write().unwrap();
+                            let mut s = write_state(&state);
                             s.audio.input_devices = input_devices;
                             s.audio.output_devices = output_devices;
                         }
@@ -756,7 +757,7 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
 
                         // Update settings in shared state
                         {
-                            let mut s = state.write().unwrap();
+                            let mut s = write_state(&state);
                             s.audio.settings = settings;
                         }
                         repaint();
@@ -783,7 +784,7 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
 
                         // Update state
                         {
-                            let mut s = state.write().unwrap();
+                            let mut s = write_state(&state);
                             s.audio.stats = AudioStats::default();
                         }
                         repaint();
@@ -793,7 +794,7 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
                         info!("Audio task: updating TX pipeline config");
                         tx_pipeline_config = config.clone();
                         {
-                            let mut s = state.write().unwrap();
+                            let mut s = write_state(&state);
                             s.audio.tx_pipeline = config;
                         }
                         repaint();
@@ -809,7 +810,7 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
                         info!("Audio task: updating RX pipeline defaults");
                         rx_pipeline_defaults = config.clone();
                         {
-                            let mut s = state.write().unwrap();
+                            let mut s = write_state(&state);
                             s.audio.rx_pipeline_defaults = config;
                         }
                         // Rebuild pipelines for users without overrides
@@ -831,7 +832,7 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
                         let pipeline_config_owned = config.pipeline_override.clone();
                         per_user_rx.insert(user_id, config.clone());
                         {
-                            let mut s = state.write().unwrap();
+                            let mut s = write_state(&state);
                             s.audio.per_user_rx.insert(user_id, config);
                         }
                         // Rebuild this user's pipeline if they exist
@@ -850,7 +851,7 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
                         info!("Audio task: clearing RX override for user {}", user_id);
                         per_user_rx.remove(&user_id);
                         {
-                            let mut s = state.write().unwrap();
+                            let mut s = write_state(&state);
                             s.audio.per_user_rx.remove(&user_id);
                         }
                         // Rebuild user's pipeline with defaults
@@ -872,7 +873,7 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
                             .or_insert_with(pipeline::UserRxConfig::default);
                         user_rx.volume_db = volume_db;
                         {
-                            let mut s = state.write().unwrap();
+                            let mut s = write_state(&state);
                             let user_rx = s.audio.per_user_rx
                                 .entry(user_id)
                                 .or_insert_with(pipeline::UserRxConfig::default);
@@ -925,7 +926,7 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
                             // Also remove from talking users
                             let mut needs_repaint = false;
                             {
-                                let mut s = state.write().unwrap();
+                                let mut s = write_state(&state);
                                 if s.audio.talking_users.remove(&user_id) {
                                     needs_repaint = true;
                                 }
@@ -943,7 +944,7 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
                         // Clear all existing user audio state
                         user_audio.clear();
                         {
-                            let mut s = state.write().unwrap();
+                            let mut s = write_state(&state);
                             s.audio.talking_users.clear();
                         }
 
@@ -1304,7 +1305,7 @@ fn start_transmission(
         Ok(input) => {
             *audio_input = Some(input);
             {
-                let mut s = state.write().unwrap();
+                let mut s = write_state(&state);
                 s.audio.is_transmitting = true;
             }
             repaint();
@@ -1334,7 +1335,7 @@ fn stop_transmission(
     *audio_input = None;
 
     {
-        let mut s = state.write().unwrap();
+        let mut s = write_state(&state);
         s.audio.is_transmitting = false;
     }
     repaint();
@@ -1439,7 +1440,7 @@ fn handle_voice_datagram(
     // Update talking_users
     let mut needs_repaint = false;
     {
-        let mut s = state.write().unwrap();
+        let mut s = write_state(&state);
         if !s.audio.talking_users.contains(&sender_id) {
             s.audio.talking_users.insert(sender_id);
             needs_repaint = true;
@@ -1537,7 +1538,7 @@ fn cleanup_stale_users(
     // The decoder must persist to avoid crackle when the user starts talking again
     let mut needs_repaint = false;
     {
-        let mut s = state.write().unwrap();
+        let mut s = write_state(&state);
         for user_id in &stale_users {
             if s.audio.talking_users.remove(user_id) {
                 needs_repaint = true;
@@ -1588,7 +1589,7 @@ fn update_stats(
 
     // Update state
     {
-        let mut s = state.write().unwrap();
+        let mut s = write_state(&state);
         s.audio.stats.packets_sent = packets_sent;
         s.audio.stats.packets_received = total_packets_received;
         s.audio.stats.packets_lost = total_packets_lost;
