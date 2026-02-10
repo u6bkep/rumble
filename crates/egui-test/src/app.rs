@@ -27,6 +27,7 @@ use crate::{
         AcceptedCertificate, Args, AutoDownloadRule, PersistentAudioSettings, PersistentSettings, PersistentVoiceMode,
         TimestampFormat, format_size, get_file_icon,
     },
+    toasts::ToastManager,
 };
 
 /// Node ID for the tree view - can be either a room or a user.
@@ -244,6 +245,12 @@ pub struct RumbleApp {
     open_portal_settings_callback: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
 
     egui_ctx: egui::Context,
+
+    // Toast notification manager
+    toast_manager: ToastManager,
+
+    // Previous connection state for detecting transitions
+    prev_connection_state: ConnectionState,
 }
 
 impl Drop for RumbleApp {
@@ -474,6 +481,8 @@ impl RumbleApp {
             #[cfg(target_os = "linux")]
             open_portal_settings_callback: None,
             egui_ctx: ctx,
+            toast_manager: ToastManager::new(),
+            prev_connection_state: ConnectionState::Disconnected,
         };
 
         // If server was specified on command line, connect immediately (unless first run)
@@ -495,6 +504,11 @@ impl RumbleApp {
     /// Get access to the backend handle.
     pub fn backend(&self) -> &BackendHandle {
         &self.backend
+    }
+
+    /// Get access to the toast manager.
+    pub fn toast_manager(&mut self) -> &mut ToastManager {
+        &mut self.toast_manager
     }
 
     /// Check if the client is connected to a server.
@@ -2624,6 +2638,29 @@ impl RumbleApp {
         // Get current state from backend (clone to avoid borrow issues)
         let state = self.backend.state();
 
+        // Detect connection state transitions and fire toasts
+        if state.connection != self.prev_connection_state {
+            match &state.connection {
+                ConnectionState::Connected { .. } => {
+                    self.toast_manager.success("Connected to server");
+                }
+                ConnectionState::ConnectionLost { error } => {
+                    self.toast_manager.error(format!("Connection lost: {}", error));
+                }
+                ConnectionState::Connecting { .. } => {
+                    // Only show reconnecting toast if we were previously connected or lost
+                    if matches!(
+                        self.prev_connection_state,
+                        ConnectionState::Connected { .. } | ConnectionState::ConnectionLost { .. }
+                    ) {
+                        self.toast_manager.info("Reconnecting to server...");
+                    }
+                }
+                _ => {}
+            }
+            self.prev_connection_state = state.connection.clone();
+        }
+
         // Poll pending file dialog
         if let Some(handle) = &self.pending_file_dialog {
             if handle.is_finished() {
@@ -4290,6 +4327,7 @@ impl RumbleApp {
                                     self.apply_pending_settings();
                                     self.settings_modal.dirty = false;
                                     self.save_settings();
+                                    self.toast_manager.success("Settings saved");
                                 }
 
                                 if ui.button("Cancel").clicked() {
@@ -4297,11 +4335,12 @@ impl RumbleApp {
                                     self.show_settings = false;
                                 }
 
-                                if ui.button("Ok").clicked() {
+                                if ui.button("Close").clicked() {
                                     // Apply changes before closing if dirty
                                     if self.settings_modal.dirty {
                                         self.apply_pending_settings();
                                         self.save_settings();
+                                        self.toast_manager.success("Settings saved");
                                     }
                                     self.settings_modal = SettingsModalState::default();
                                     self.show_settings = false;
@@ -4512,5 +4551,8 @@ impl RumbleApp {
                 self.delete_room_modal.open = false;
             }
         }
+
+        // Render toast notifications (always last, so they overlay everything)
+        self.toast_manager.render(ctx);
     }
 }

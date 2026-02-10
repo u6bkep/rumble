@@ -12,8 +12,10 @@ pub mod key_manager;
 #[cfg(target_os = "linux")]
 pub mod portal_hotkeys;
 pub mod settings;
+pub mod toasts;
 
 pub use app::RumbleApp;
 pub use harness::TestHarness;
 pub use hotkeys::{HotkeyAction, HotkeyEvent, HotkeyManager, HotkeyRegistrationStatus};
 pub use settings::{Args, HotkeyBinding, HotkeyModifiers, KeyboardSettings, PersistentSettings};
+pub use toasts::ToastManager;
