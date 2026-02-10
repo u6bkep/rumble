@@ -4678,17 +4678,16 @@ impl RumbleApp {
                 self.image_view_modal.fullsize_loaded = true;
             }
 
-            // Handle Ctrl+Scroll zoom before the modal consumes events
-            let ctrl_scroll_zoom = ctx.input(|i| {
-                if i.modifiers.ctrl {
-                    // Use raw scroll events when Ctrl is held
-                    let delta = i.smooth_scroll_delta.y;
-                    if delta != 0.0 { Some(delta) } else { None }
-                } else {
-                    None
-                }
+            // Handle scroll-wheel zoom before the modal consumes events.
+            // We use raw_scroll_delta which is always populated regardless of
+            // modifier keys (smooth_scroll_delta is empty when Ctrl is held
+            // because egui routes Ctrl+Scroll to its global zoom system).
+            // Scroll wheel always zooms; drag-to-pan is used for panning.
+            let scroll_zoom = ctx.input(|i| {
+                let delta = i.raw_scroll_delta.y;
+                if delta != 0.0 { Some(delta) } else { None }
             });
-            if let Some(delta) = ctrl_scroll_zoom {
+            if let Some(delta) = scroll_zoom {
                 let zoom_factor = 1.0 + delta * 0.005;
                 self.image_view_modal.zoom = (self.image_view_modal.zoom * zoom_factor).clamp(0.25, 10.0);
             }
@@ -4720,12 +4719,16 @@ impl RumbleApp {
                 });
                 ui.add_space(4.0);
 
-                // Calculate the viewport for the image
+                // Calculate the viewport for the image: use ~90% of the window
                 let content_rect = ctx.content_rect();
                 let viewport_width = content_rect.width();
                 let viewport_height = content_rect.height();
-                let max_width = ui.available_width().min(viewport_width * 0.9);
-                let max_height = (viewport_height * 0.9) - 80.0;
+                let max_width = (viewport_width * 0.9).max(1.0);
+                let max_height = ((viewport_height * 0.9) - 80.0).max(1.0);
+
+                // Force the modal to allocate the full space so it doesn't
+                // shrink-wrap to a small image
+                ui.set_min_size(egui::vec2(max_width, max_height));
 
                 // Get the native image size to compute fitted dimensions
                 let image_uri = &self.image_view_modal.image_uri;
@@ -4746,7 +4749,6 @@ impl RumbleApp {
 
                 if let Some(native_size) = image_size.filter(|s| s.x > 0.0 && s.y > 0.0) {
                     // Compute the fitted size at zoom 1.0 (fit to viewport)
-                    let max_height = max_height.max(1.0);
                     let aspect = native_size.x / native_size.y;
                     let (fit_w, fit_h) = if max_width / max_height > aspect {
                         (max_height * aspect, max_height)
@@ -4758,15 +4760,19 @@ impl RumbleApp {
                     let zoomed_w = fit_w * zoom;
                     let zoomed_h = fit_h * zoom;
 
-                    // ScrollArea for panning when zoomed in (scroll without Ctrl)
-                    let scroll_w = max_width.min(zoomed_w);
-                    let scroll_h = max_height.min(zoomed_h);
-
+                    // ScrollArea for panning when zoomed in.
+                    // Mouse wheel is disabled here (used for zoom instead);
+                    // scrollbars and drag handle panning.
                     egui::ScrollArea::both()
                         .id_salt("image_zoom_scroll")
-                        .max_width(scroll_w)
-                        .max_height(scroll_h)
-                        .auto_shrink([true, true])
+                        .max_width(max_width)
+                        .max_height(max_height)
+                        .auto_shrink([false, false])
+                        .scroll_source(egui::containers::scroll_area::ScrollSource {
+                            scroll_bar: true,
+                            drag: true,
+                            mouse_wheel: false,
+                        })
                         .show(ui, |ui| {
                             ui.add(
                                 egui::Image::new(image_uri)
@@ -4777,7 +4783,7 @@ impl RumbleApp {
 
                     ui.add_space(4.0);
                     ui.label(
-                        egui::RichText::new("Ctrl+Scroll to zoom, scroll to pan")
+                        egui::RichText::new("Scroll to zoom, drag to pan")
                             .small()
                             .color(egui::Color32::GRAY),
                     );
