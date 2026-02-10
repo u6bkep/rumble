@@ -99,6 +99,13 @@ pub use handle::BackendHandle;
 pub mod p2p;
 pub mod torrent;
 
+// Waveform synthesizer for sound effects
+pub mod synth;
+
+// Sound effect definitions and library
+pub mod sfx;
+pub use sfx::{SfxKind, SfxLibrary};
+
 // Audio processing pipeline - processors
 pub mod processors;
 pub use processors::{

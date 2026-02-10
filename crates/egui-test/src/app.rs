@@ -7,7 +7,7 @@
 
 use backend::{
     AudioSettings, BackendHandle, Command, ConnectConfig, ConnectionState, FileMessage, P2pFileMessage, PipelineConfig,
-    ProcessorRegistry, TransferState, VoiceMode, build_default_tx_pipeline, merge_with_default_tx_pipeline,
+    ProcessorRegistry, SfxKind, TransferState, VoiceMode, build_default_tx_pipeline, merge_with_default_tx_pipeline,
     register_builtin_processors,
 };
 use ed25519_dalek::SigningKey;
@@ -109,6 +109,7 @@ enum SettingsCategory {
     Connection,
     Devices,
     Voice,
+    Sounds,
     Processing,
     Encoder,
     Chat,
@@ -123,6 +124,7 @@ impl SettingsCategory {
             SettingsCategory::Connection,
             SettingsCategory::Devices,
             SettingsCategory::Voice,
+            SettingsCategory::Sounds,
             SettingsCategory::Processing,
             SettingsCategory::Encoder,
             SettingsCategory::Chat,
@@ -137,6 +139,7 @@ impl SettingsCategory {
             SettingsCategory::Connection => "🔗 Connection",
             SettingsCategory::Devices => "🔊 Devices",
             SettingsCategory::Voice => "🎤 Voice",
+            SettingsCategory::Sounds => "🔔 Sounds",
             SettingsCategory::Processing => "⚙ Processing",
             SettingsCategory::Encoder => "📦 Encoder",
             SettingsCategory::Chat => "💬 Chat",
@@ -277,6 +280,11 @@ pub struct RumbleApp {
 
     // Previous connection state for detecting transitions
     prev_connection_state: ConnectionState,
+
+    // SFX event tracking
+    prev_self_muted: bool,
+    prev_user_ids_in_room: std::collections::HashSet<u64>,
+    prev_chat_count: usize,
 }
 
 impl Drop for RumbleApp {
@@ -509,6 +517,9 @@ impl RumbleApp {
             egui_ctx: ctx,
             toast_manager: ToastManager::new(),
             prev_connection_state: ConnectionState::Disconnected,
+            prev_self_muted: false,
+            prev_user_ids_in_room: std::collections::HashSet::new(),
+            prev_chat_count: 0,
         };
 
         // If server was specified on command line, connect immediately (unless first run)
@@ -649,6 +660,18 @@ impl RumbleApp {
     /// Check if push-to-talk is currently active.
     pub fn push_to_talk_active(&self) -> bool {
         self.push_to_talk_active
+    }
+
+    /// Play a sound effect if enabled in settings.
+    fn play_sfx(&self, kind: SfxKind) {
+        let sfx = &self.persistent_settings.sfx;
+        if !sfx.enabled || sfx.disabled_sounds.contains(&kind) || sfx.volume <= 0.0 {
+            return;
+        }
+        self.backend.send(Command::PlaySfx {
+            kind,
+            volume: sfx.volume,
+        });
     }
 
     /// Connect to the server using current settings.
@@ -1247,6 +1270,70 @@ impl RumbleApp {
             ui.colored_label(egui::Color32::GREEN, "🎤 Transmitting...");
         } else if !audio.self_muted {
             ui.label("🔇 Not transmitting");
+        }
+    }
+
+    /// Render the Sounds settings category.
+    fn render_settings_sounds(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Sound Effects");
+        ui.add_space(8.0);
+
+        let mut changed = false;
+
+        // Master enable checkbox
+        let mut enabled = self.persistent_settings.sfx.enabled;
+        if ui.checkbox(&mut enabled, "Enable sound effects").changed() {
+            self.persistent_settings.sfx.enabled = enabled;
+            changed = true;
+        }
+
+        ui.add_space(4.0);
+
+        // Volume slider
+        ui.horizontal(|ui| {
+            ui.label("Volume:");
+            let mut volume_pct = (self.persistent_settings.sfx.volume * 100.0).round() as i32;
+            if ui
+                .add(egui::Slider::new(&mut volume_pct, 0..=100).suffix("%"))
+                .changed()
+            {
+                self.persistent_settings.sfx.volume = volume_pct as f32 / 100.0;
+                changed = true;
+            }
+        });
+
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(4.0);
+
+        ui.label("Individual sounds:");
+        ui.add_space(4.0);
+
+        // Per-sound toggle with label and preview button
+        for kind in SfxKind::all() {
+            ui.horizontal(|ui| {
+                let is_disabled = self.persistent_settings.sfx.disabled_sounds.contains(kind);
+                let mut sound_enabled = !is_disabled;
+                if ui.checkbox(&mut sound_enabled, kind.label()).changed() {
+                    if sound_enabled {
+                        self.persistent_settings.sfx.disabled_sounds.remove(kind);
+                    } else {
+                        self.persistent_settings.sfx.disabled_sounds.insert(*kind);
+                    }
+                    changed = true;
+                }
+                if ui.small_button("Preview").clicked() {
+                    // Play directly regardless of enabled state so user can hear what it sounds like
+                    self.backend.send(Command::PlaySfx {
+                        kind: *kind,
+                        volume: self.persistent_settings.sfx.volume.max(0.3),
+                    });
+                }
+            });
+        }
+
+        if changed {
+            let _ = self.persistent_settings.save();
         }
     }
 
@@ -2747,14 +2834,22 @@ impl RumbleApp {
         // Get current state from backend (clone to avoid borrow issues)
         let state = self.backend.state();
 
-        // Detect connection state transitions and fire toasts
+        // Detect connection state transitions and fire toasts + SFX
         if state.connection != self.prev_connection_state {
             match &state.connection {
                 ConnectionState::Connected { .. } => {
                     self.toast_manager.success("Connected to server");
+                    self.play_sfx(SfxKind::Connect);
                 }
                 ConnectionState::ConnectionLost { error } => {
                     self.toast_manager.error(format!("Connection lost: {}", error));
+                    self.play_sfx(SfxKind::Disconnect);
+                }
+                ConnectionState::Disconnected => {
+                    // Only play disconnect sound if we were previously connected
+                    if matches!(self.prev_connection_state, ConnectionState::Connected { .. }) {
+                        self.play_sfx(SfxKind::Disconnect);
+                    }
                 }
                 ConnectionState::Connecting { .. } => {
                     // Only show reconnecting toast if we were previously connected or lost
@@ -2768,6 +2863,64 @@ impl RumbleApp {
                 _ => {}
             }
             self.prev_connection_state = state.connection.clone();
+        }
+
+        // Detect mute/unmute transitions for SFX
+        {
+            let current_muted = state.audio.self_muted;
+            if current_muted != self.prev_self_muted {
+                if current_muted {
+                    self.play_sfx(SfxKind::Mute);
+                } else {
+                    self.play_sfx(SfxKind::Unmute);
+                }
+                self.prev_self_muted = current_muted;
+            }
+        }
+
+        // Detect user join/leave in current room for SFX
+        if state.connection.is_connected() {
+            if let Some(my_room_id) = &state.my_room_id {
+                let current_user_ids: std::collections::HashSet<u64> = state
+                    .users_in_room(*my_room_id)
+                    .iter()
+                    .filter_map(|u| u.user_id.as_ref().map(|id| id.value))
+                    .filter(|id| state.my_user_id != Some(*id))
+                    .collect();
+
+                // Only detect diffs after the first frame (prev is populated)
+                if !self.prev_user_ids_in_room.is_empty() || !current_user_ids.is_empty() {
+                    for id in &current_user_ids {
+                        if !self.prev_user_ids_in_room.contains(id) {
+                            self.play_sfx(SfxKind::UserJoin);
+                            break; // One sound per frame is enough
+                        }
+                    }
+                    for id in &self.prev_user_ids_in_room {
+                        if !current_user_ids.contains(id) {
+                            self.play_sfx(SfxKind::UserLeave);
+                            break;
+                        }
+                    }
+                }
+
+                self.prev_user_ids_in_room = current_user_ids;
+            }
+        } else {
+            self.prev_user_ids_in_room.clear();
+        }
+
+        // Detect new non-local chat messages for SFX
+        {
+            let current_count = state.chat_messages.len();
+            if current_count > self.prev_chat_count && self.prev_chat_count > 0 {
+                // Check if any of the new messages are non-local
+                let has_new_remote = state.chat_messages[self.prev_chat_count..].iter().any(|m| !m.is_local);
+                if has_new_remote {
+                    self.play_sfx(SfxKind::Message);
+                }
+            }
+            self.prev_chat_count = current_count;
         }
 
         // Poll pending file dialog
@@ -4541,6 +4694,9 @@ impl RumbleApp {
                                         }
                                         SettingsCategory::Voice => {
                                             self.render_settings_voice(ui, &state);
+                                        }
+                                        SettingsCategory::Sounds => {
+                                            self.render_settings_sounds(ui);
                                         }
                                         SettingsCategory::Processing => {
                                             self.render_settings_processing(ui, &state);

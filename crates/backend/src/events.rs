@@ -1395,6 +1395,13 @@ pub enum Command {
         settings: FileTransferSettings,
     },
 
+    // Sound Effects
+    /// Play a sound effect.
+    PlaySfx {
+        kind: crate::sfx::SfxKind,
+        volume: f32,
+    },
+
     // Chat History Sync
     /// Request chat history from peers in the current room.
     RequestChatHistory,
@@ -1503,6 +1510,11 @@ impl std::fmt::Debug for Command {
                 .debug_struct("UpdateFileTransferSettings")
                 .field("auto_download_enabled", &settings.auto_download_enabled)
                 .field("rules_count", &settings.auto_download_rules.len())
+                .finish(),
+            Command::PlaySfx { kind, volume } => f
+                .debug_struct("PlaySfx")
+                .field("kind", kind)
+                .field("volume", volume)
                 .finish(),
             Command::RequestChatHistory => write!(f, "RequestChatHistory"),
             Command::ShareChatHistory => write!(f, "ShareChatHistory"),

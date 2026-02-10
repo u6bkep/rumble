@@ -161,6 +161,8 @@ pub struct BackendHandle {
     _runtime_thread: std::thread::JoinHandle<()>,
     /// Connection configuration (certificates, etc.). stored incase we want to inspect it later.
     _connect_config: ConnectConfig,
+    /// Pre-generated sound effects library.
+    sfx_library: crate::sfx::SfxLibrary,
 }
 
 impl BackendHandle {
@@ -290,6 +292,7 @@ impl BackendHandle {
             audio_task,
             _runtime_thread: runtime_thread,
             _connect_config: connect_config,
+            sfx_library: crate::sfx::SfxLibrary::new(),
         }
     }
 
@@ -391,6 +394,13 @@ impl BackendHandle {
                     user_id: *user_id,
                     volume_db: *volume_db,
                 });
+                return;
+            }
+            Command::PlaySfx { kind, volume } => {
+                if let Some(samples) = self.sfx_library.get(*kind) {
+                    let scaled: Vec<f32> = samples.iter().map(|s| s * volume).collect();
+                    self.audio_task.send(AudioCommand::PlaySfx { samples: scaled });
+                }
                 return;
             }
             _ => {}
@@ -1663,6 +1673,9 @@ async fn run_connection_task(
                             debug!("Chat history sharing requires P2P feature");
                         }
                     }
+
+                    // PlaySfx is intercepted in BackendHandle::send() and never reaches here
+                    Command::PlaySfx { .. } => {}
                 }
             }
         }

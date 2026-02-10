@@ -36,7 +36,7 @@ use bytes::Bytes;
 use pipeline;
 use prost::Message;
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, VecDeque},
     sync::{Arc, RwLock, atomic::AtomicBool},
     time::{Duration, Instant},
 };
@@ -44,7 +44,6 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
 
 /// Audio-task command channel.
-#[derive(Debug)]
 pub enum AudioCommand {
     /// A QUIC connection was established - start datagram handling.
     ConnectionEstablished {
@@ -98,8 +97,64 @@ pub enum AudioCommand {
     RoomChanged { user_ids_in_room: Vec<u64> },
     /// Explicitly drop per-peer decode state (call when a peer leaves).
     PeerLeft { user_id: u64 },
+    /// Play a sound effect (pre-scaled PCM samples).
+    PlaySfx { samples: Vec<f32> },
     /// Shutdown the audio task.
     Shutdown,
+}
+
+impl std::fmt::Debug for AudioCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AudioCommand::ConnectionEstablished { my_user_id, .. } => f
+                .debug_struct("ConnectionEstablished")
+                .field("my_user_id", my_user_id)
+                .finish(),
+            AudioCommand::ConnectionClosed => write!(f, "ConnectionClosed"),
+            AudioCommand::SetInputDevice { device_id } => {
+                f.debug_struct("SetInputDevice").field("device_id", device_id).finish()
+            }
+            AudioCommand::SetOutputDevice { device_id } => {
+                f.debug_struct("SetOutputDevice").field("device_id", device_id).finish()
+            }
+            AudioCommand::StartTransmit => write!(f, "StartTransmit"),
+            AudioCommand::StopTransmit => write!(f, "StopTransmit"),
+            AudioCommand::SetVoiceMode { mode } => f.debug_struct("SetVoiceMode").field("mode", mode).finish(),
+            AudioCommand::SetMuted { muted } => f.debug_struct("SetMuted").field("muted", muted).finish(),
+            AudioCommand::SetDeafened { deafened } => {
+                f.debug_struct("SetDeafened").field("deafened", deafened).finish()
+            }
+            AudioCommand::MuteUser { user_id } => f.debug_struct("MuteUser").field("user_id", user_id).finish(),
+            AudioCommand::UnmuteUser { user_id } => f.debug_struct("UnmuteUser").field("user_id", user_id).finish(),
+            AudioCommand::RefreshDevices => write!(f, "RefreshDevices"),
+            AudioCommand::UpdateSettings { .. } => write!(f, "UpdateSettings {{ .. }}"),
+            AudioCommand::ResetStats => write!(f, "ResetStats"),
+            AudioCommand::UpdateTxPipeline { .. } => write!(f, "UpdateTxPipeline {{ .. }}"),
+            AudioCommand::UpdateRxPipelineDefaults { .. } => write!(f, "UpdateRxPipelineDefaults {{ .. }}"),
+            AudioCommand::UpdateUserRxConfig { user_id, .. } => {
+                f.debug_struct("UpdateUserRxConfig").field("user_id", user_id).finish()
+            }
+            AudioCommand::ClearUserRxOverride { user_id } => {
+                f.debug_struct("ClearUserRxOverride").field("user_id", user_id).finish()
+            }
+            AudioCommand::SetUserVolume { user_id, volume_db } => f
+                .debug_struct("SetUserVolume")
+                .field("user_id", user_id)
+                .field("volume_db", volume_db)
+                .finish(),
+            AudioCommand::UserJoinedRoom { user_id } => {
+                f.debug_struct("UserJoinedRoom").field("user_id", user_id).finish()
+            }
+            AudioCommand::UserLeftRoom { user_id } => f.debug_struct("UserLeftRoom").field("user_id", user_id).finish(),
+            AudioCommand::RoomChanged { user_ids_in_room } => f
+                .debug_struct("RoomChanged")
+                .field("user_count", &user_ids_in_room.len())
+                .finish(),
+            AudioCommand::PeerLeft { user_id } => f.debug_struct("PeerLeft").field("user_id", user_id).finish(),
+            AudioCommand::PlaySfx { .. } => write!(f, "PlaySfx"),
+            AudioCommand::Shutdown => write!(f, "Shutdown"),
+        }
+    }
 }
 
 /// Per-user audio state for playback with jitter buffer.
@@ -430,7 +485,12 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
 
     // Audio I/O handles
     let mut audio_input: Option<AudioInput> = None;
+    // Start audio output immediately so SFX can play even when disconnected.
+    // The output is cheap when idle (just outputs silence).
     let mut audio_output: Option<AudioOutput> = None;
+
+    // Sound effects sample queue - mixed into playback output each frame
+    let mut sfx_queue: VecDeque<f32> = VecDeque::new();
 
     // Per-user decoders and jitter buffers
     let mut user_audio: HashMap<u64, UserAudioState> = HashMap::new();
@@ -538,6 +598,9 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
 
     // Interval for updating statistics in state
     let mut stats_interval = tokio::time::interval(Duration::from_millis(500));
+
+    // Start audio output at startup so SFX can play without a connection
+    audio_output = start_audio_output(&audio_system, &selected_output);
 
     info!("Audio task started");
 
@@ -1114,6 +1177,10 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
                         user_audio.remove(&user_id);
                     }
 
+                    AudioCommand::PlaySfx { samples } => {
+                        sfx_queue.extend(samples.iter());
+                    }
+
                     AudioCommand::Shutdown => {
                         info!("Audio task shutting down");
                         break;
@@ -1237,7 +1304,7 @@ async fn run_audio_task(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, c
 
             // Mix audio from all users' jitter buffers every 20ms
             _ = mix_interval.tick() => {
-                mix_and_play_audio(&mut user_audio, &audio_output, &audio_dumper);
+                mix_and_play_audio(&mut user_audio, &mut sfx_queue, &audio_output, &audio_dumper);
             }
 
             // Periodic cleanup of stale talking_users (does not destroy decoders)
@@ -1594,6 +1661,7 @@ fn handle_voice_datagram(
 /// Mix audio from all users' jitter buffers and queue for playback.
 fn mix_and_play_audio(
     user_audio: &mut HashMap<u64, UserAudioState>,
+    sfx_queue: &mut VecDeque<f32>,
     audio_output: &Option<AudioOutput>,
     audio_dumper: &AudioDumper,
 ) {
@@ -1635,6 +1703,16 @@ fn mix_and_play_audio(
                 if i < FRAME_SIZE {
                     mixed_buffer[i] = (mixed_buffer[i] + sample).clamp(-1.0, 1.0);
                 }
+            }
+        }
+    }
+
+    // Mix in sound effects from the sfx queue
+    if !sfx_queue.is_empty() {
+        has_audio = true;
+        for sample in mixed_buffer.iter_mut().take(FRAME_SIZE) {
+            if let Some(sfx_sample) = sfx_queue.pop_front() {
+                *sample = (*sample + sfx_sample).clamp(-1.0, 1.0);
             }
         }
     }

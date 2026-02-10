@@ -3,12 +3,12 @@
 //! This module contains all settings-related types that can be serialized/deserialized
 //! and are independent of the UI framework.
 
-use backend::{AudioSettings, PipelineConfig, VoiceMode};
+use backend::{AudioSettings, PipelineConfig, SfxKind, VoiceMode};
 use clap::Parser;
 use directories::ProjectDirs;
 use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
-use std::{fs, path::PathBuf};
+use std::{collections::HashSet, fs, path::PathBuf};
 use uuid::Uuid;
 
 // =============================================================================
@@ -214,6 +214,29 @@ pub fn get_file_icon(mime: &str) -> &'static str {
 }
 
 // =============================================================================
+// Sound Effects Settings
+// =============================================================================
+
+/// Persistent sound effects settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PersistentSfxSettings {
+    pub enabled: bool,
+    pub volume: f32,
+    pub disabled_sounds: HashSet<SfxKind>,
+}
+
+impl Default for PersistentSfxSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            volume: 0.5,
+            disabled_sounds: HashSet::new(),
+        }
+    }
+}
+
+// =============================================================================
 // Persistent Settings
 // =============================================================================
 
@@ -257,6 +280,9 @@ pub struct PersistentSettings {
 
     // Keyboard settings
     pub keyboard: KeyboardSettings,
+
+    // Sound effects settings
+    pub sfx: PersistentSfxSettings,
 }
 
 impl Default for PersistentSettings {
@@ -278,6 +304,7 @@ impl Default for PersistentSettings {
             chat_timestamp_format: TimestampFormat::default(),
             file_transfer: FileTransferSettings::default(),
             keyboard: KeyboardSettings::default(),
+            sfx: PersistentSfxSettings::default(),
         }
     }
 }
