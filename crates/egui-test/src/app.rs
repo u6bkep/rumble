@@ -1695,10 +1695,6 @@ impl RumbleApp {
         ui.heading("Keyboard Shortcuts");
         ui.add_space(8.0);
 
-        // Global hotkeys status and toggle
-        ui.strong("Global Hotkeys");
-        ui.add_space(4.0);
-
         // Check if we're on Wayland
         #[cfg(target_os = "linux")]
         let is_wayland = std::env::var("XDG_SESSION_TYPE")
@@ -1707,45 +1703,70 @@ impl RumbleApp {
         #[cfg(not(target_os = "linux"))]
         let is_wayland = false;
 
+        // Determine if Portal is the active global shortcut mechanism
+        let portal_active = is_wayland && self.portal_hotkeys_available;
+
+        // Determine if we should show the in-app hotkey capture UI.
+        // On Wayland with portal, users configure global shortcuts via system settings.
+        // On other platforms (or Wayland without portal), show the capture UI.
+        let show_capture_ui = !portal_active;
+
+        // --- Global Hotkeys Section ---
         if is_wayland {
-            if self.portal_hotkeys_available {
-                // Portal is available - show info about using system settings
-                ui.colored_label(
-                    egui::Color32::from_rgb(100, 200, 100),
-                    "✓ Global hotkeys available via XDG Portal (KDE/GNOME/Hyprland)",
-                );
+            if portal_active {
+                ui.strong("Global Hotkeys (via XDG Portal)");
                 ui.add_space(4.0);
+                ui.label(
+                    "These shortcuts work globally, even when Rumble isn't focused. Configure them through your \
+                     desktop environment's settings.",
+                );
+                ui.add_space(8.0);
 
                 // Show the actual bound shortcuts from the portal
                 #[cfg(target_os = "linux")]
                 {
-                    if self.portal_shortcuts.is_empty() {
-                        ui.label("Registered shortcuts (configure keys in system settings):");
-                        ui.indent("portal_shortcuts", |ui| {
-                            ui.label("• Push-to-Talk: (not configured)");
-                            ui.label("• Toggle Mute: (not configured)");
-                            ui.label("• Toggle Deafen: (not configured)");
+                    egui::Frame::new()
+                        .fill(ui.visuals().extreme_bg_color)
+                        .corner_radius(4.0)
+                        .inner_margin(8.0)
+                        .show(ui, |ui| {
+                            let shortcuts_to_show: Vec<(&str, String)> = if self.portal_shortcuts.is_empty() {
+                                vec![
+                                    ("Push-to-Talk", "(not configured)".into()),
+                                    ("Toggle Mute", "(not configured)".into()),
+                                    ("Toggle Deafen", "(not configured)".into()),
+                                ]
+                            } else {
+                                self.portal_shortcuts
+                                    .iter()
+                                    .map(|s| {
+                                        let key_display = if s.trigger_description.is_empty() {
+                                            "(not configured)".to_string()
+                                        } else {
+                                            s.trigger_description.clone()
+                                        };
+                                        // Leak-free: use description from the struct
+                                        (s.description.as_str(), key_display)
+                                    })
+                                    .collect()
+                            };
+                            egui::Grid::new("portal_shortcuts_grid")
+                                .num_columns(2)
+                                .spacing([16.0, 4.0])
+                                .show(ui, |ui| {
+                                    for (desc, key) in &shortcuts_to_show {
+                                        ui.strong(*desc);
+                                        if key == "(not configured)" {
+                                            ui.colored_label(egui::Color32::from_rgb(160, 160, 160), key.as_str());
+                                        } else {
+                                            ui.monospace(key.as_str());
+                                        }
+                                        ui.end_row();
+                                    }
+                                });
                         });
-                    } else {
-                        ui.label("Registered shortcuts:");
-                        ui.indent("portal_shortcuts", |ui| {
-                            for shortcut in &self.portal_shortcuts {
-                                let key_display = if shortcut.trigger_description.is_empty() {
-                                    "(not configured)".to_string()
-                                } else {
-                                    shortcut.trigger_description.clone()
-                                };
-                                ui.label(format!("• {}: {}", shortcut.description, key_display));
-                            }
-                        });
-                    }
-                }
+                    ui.add_space(8.0);
 
-                ui.add_space(8.0);
-
-                // Button to open system shortcut settings
-                #[cfg(target_os = "linux")]
-                {
                     if ui.button("Configure in System Settings...").clicked() {
                         let handle = self.tokio_handle.clone();
                         handle.spawn(async {
@@ -1754,25 +1775,32 @@ impl RumbleApp {
                             }
                         });
                     }
-                    ui.add_space(4.0);
-                    ui.colored_label(
-                        egui::Color32::from_rgb(150, 150, 150),
-                        "Click above to configure which keys trigger each action.",
-                    );
                 }
             } else {
-                // Portal not available - show warning
-                ui.colored_label(
-                    egui::Color32::from_rgb(255, 200, 100),
-                    "⚠ Global hotkeys not available on this Wayland compositor.",
-                );
+                ui.strong("Global Hotkeys");
                 ui.add_space(4.0);
-                ui.label("Hotkeys only work when the window is focused.");
-                ui.label("Tip: KDE Plasma, GNOME 47+, and Hyprland support global shortcuts.");
+                egui::Frame::new()
+                    .fill(egui::Color32::from_rgba_premultiplied(80, 60, 20, 180))
+                    .corner_radius(4.0)
+                    .inner_margin(8.0)
+                    .show(ui, |ui| {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(255, 200, 100),
+                            "Global shortcuts aren't available on this Wayland compositor.",
+                        );
+                        ui.add_space(2.0);
+                        ui.label("The keys below work only when Rumble's window is focused.");
+                        ui.add_space(4.0);
+                        ui.colored_label(
+                            egui::Color32::from_rgb(160, 160, 160),
+                            "Supported compositors: KDE Plasma 5.27+, GNOME 47+, Hyprland",
+                        );
+                    });
             }
-            ui.add_space(8.0);
         } else {
             // Not Wayland - show standard global hotkey controls
+            ui.strong("Global Hotkeys");
+            ui.add_space(4.0);
             let mut global_enabled = self.persistent_settings.keyboard.global_hotkeys_enabled;
             if ui
                 .checkbox(&mut global_enabled, "Enable global hotkeys")
@@ -1783,28 +1811,10 @@ impl RumbleApp {
                 self.settings_modal.dirty = true;
             }
 
-            ui.add_space(8.0);
+            ui.add_space(4.0);
             ui.colored_label(
                 egui::Color32::from_rgb(150, 150, 150),
                 "Note: Changes to global hotkeys require restarting the application.",
-            );
-        }
-
-        // Determine if we should show the in-app hotkey capture UI.
-        // On Wayland with portal, users configure shortcuts via system settings.
-        // On other platforms (or Wayland without portal), show the capture UI.
-        let show_capture_ui = !is_wayland || !self.portal_hotkeys_available;
-
-        if !show_capture_ui {
-            // Portal is handling shortcuts - show explanatory text
-            ui.add_space(8.0);
-            ui.colored_label(
-                egui::Color32::from_rgb(150, 150, 150),
-                "Shortcut keys are configured through your system settings.",
-            );
-            ui.colored_label(
-                egui::Color32::from_rgb(150, 150, 150),
-                "The bindings below are used as fallback when the window is focused.",
             );
         }
 
@@ -1812,8 +1822,22 @@ impl RumbleApp {
         ui.separator();
         ui.add_space(8.0);
 
-        // Helper: render a registration status indicator
-        let render_status_indicator = |ui: &mut egui::Ui, status: HotkeyRegistrationStatus| {
+        // --- Window-Focused Keys Section ---
+        if portal_active {
+            ui.strong("Window-Focused Keys");
+            ui.add_space(4.0);
+            ui.colored_label(
+                egui::Color32::from_rgb(160, 160, 160),
+                "Fallback bindings used when the Rumble window is focused.",
+            );
+            ui.add_space(8.0);
+        }
+
+        // Helper: render a registration status indicator (only for non-portal mode)
+        let render_status_indicator = |ui: &mut egui::Ui, status: HotkeyRegistrationStatus, show: bool| {
+            if !show {
+                return;
+            }
             let (color, tooltip) = match status {
                 HotkeyRegistrationStatus::Registered => {
                     (egui::Color32::from_rgb(80, 200, 80), "Global hotkey registered")
@@ -1861,6 +1885,10 @@ impl RumbleApp {
             None
         };
 
+        // Whether to show registration status dots (hide in Portal mode since they
+        // reflect fallback registration, not Portal binding status)
+        let show_status_dots = !portal_active;
+
         // Helper to render a hotkey binding row with capture and status indicator
         let render_hotkey_row = |ui: &mut egui::Ui,
                                  label: &str,
@@ -1869,12 +1897,13 @@ impl RumbleApp {
                                  capture_target: &mut Option<HotkeyCaptureTarget>,
                                  dirty: &mut bool,
                                  allow_edit: bool,
-                                 reg_status: HotkeyRegistrationStatus|
+                                 reg_status: HotkeyRegistrationStatus,
+                                 show_dots: bool|
          -> Option<Option<HotkeyBinding>> {
             let mut result = None;
 
             ui.horizontal(|ui| {
-                render_status_indicator(ui, reg_status);
+                render_status_indicator(ui, reg_status, show_dots);
                 ui.strong(label);
             });
             ui.add_space(4.0);
@@ -1977,13 +2006,14 @@ impl RumbleApp {
         // PTT Hotkey
         if let Some(new_binding) = render_hotkey_row(
             ui,
-            "Push-to-Talk (Window Focused)",
+            "Push-to-Talk",
             &self.persistent_settings.keyboard.ptt_hotkey,
             HotkeyCaptureTarget::Ptt,
             &mut self.settings_modal.hotkey_capture_target,
             &mut self.settings_modal.dirty,
             show_capture_ui,
             ptt_status,
+            show_status_dots,
         ) {
             self.persistent_settings.keyboard.ptt_hotkey = new_binding;
         }
@@ -1995,13 +2025,14 @@ impl RumbleApp {
         // Toggle Mute Hotkey
         if let Some(new_binding) = render_hotkey_row(
             ui,
-            "Toggle Mute (Window Focused)",
+            "Toggle Mute",
             &self.persistent_settings.keyboard.toggle_mute_hotkey,
             HotkeyCaptureTarget::ToggleMute,
             &mut self.settings_modal.hotkey_capture_target,
             &mut self.settings_modal.dirty,
             show_capture_ui,
             mute_status,
+            show_status_dots,
         ) {
             self.persistent_settings.keyboard.toggle_mute_hotkey = new_binding;
         }
@@ -2013,13 +2044,14 @@ impl RumbleApp {
         // Toggle Deafen Hotkey
         if let Some(new_binding) = render_hotkey_row(
             ui,
-            "Toggle Deafen (Window Focused)",
+            "Toggle Deafen",
             &self.persistent_settings.keyboard.toggle_deafen_hotkey,
             HotkeyCaptureTarget::ToggleDeafen,
             &mut self.settings_modal.hotkey_capture_target,
             &mut self.settings_modal.dirty,
             show_capture_ui,
             deafen_status,
+            show_status_dots,
         ) {
             self.persistent_settings.keyboard.toggle_deafen_hotkey = new_binding;
         }
@@ -2048,62 +2080,64 @@ impl RumbleApp {
             }
         }
 
-        // Show conflict warning UI if a conflict is pending
-        if let Some((target, ref binding, conflict_name)) = self.settings_modal.hotkey_conflict_pending.clone() {
-            ui.add_space(8.0);
-            egui::Frame::new()
-                .fill(egui::Color32::from_rgba_premultiplied(80, 60, 20, 200))
-                .corner_radius(4.0)
-                .inner_margin(8.0)
-                .show(ui, |ui| {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(255, 200, 80),
-                        format!(
-                            "This key is already bound to {}. Setting it here will remove the other binding.",
-                            conflict_name
-                        ),
-                    );
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("Apply anyway").clicked() {
-                            // Clear the conflicting binding
-                            if self.persistent_settings.keyboard.ptt_hotkey.as_ref() == Some(&binding)
-                                && target != HotkeyCaptureTarget::Ptt
-                            {
-                                self.persistent_settings.keyboard.ptt_hotkey = None;
-                            }
-                            if self.persistent_settings.keyboard.toggle_mute_hotkey.as_ref() == Some(&binding)
-                                && target != HotkeyCaptureTarget::ToggleMute
-                            {
-                                self.persistent_settings.keyboard.toggle_mute_hotkey = None;
-                            }
-                            if self.persistent_settings.keyboard.toggle_deafen_hotkey.as_ref() == Some(&binding)
-                                && target != HotkeyCaptureTarget::ToggleDeafen
-                            {
-                                self.persistent_settings.keyboard.toggle_deafen_hotkey = None;
-                            }
-                            // Apply the new binding
-                            match target {
-                                HotkeyCaptureTarget::Ptt => {
-                                    self.persistent_settings.keyboard.ptt_hotkey = Some(binding.clone());
+        // Show conflict warning UI if a conflict is pending (only relevant in non-portal mode)
+        if !portal_active {
+            if let Some((target, ref binding, conflict_name)) = self.settings_modal.hotkey_conflict_pending.clone() {
+                ui.add_space(8.0);
+                egui::Frame::new()
+                    .fill(egui::Color32::from_rgba_premultiplied(80, 60, 20, 200))
+                    .corner_radius(4.0)
+                    .inner_margin(8.0)
+                    .show(ui, |ui| {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(255, 200, 80),
+                            format!(
+                                "This key is already bound to {}. Setting it here will remove the other binding.",
+                                conflict_name
+                            ),
+                        );
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Apply anyway").clicked() {
+                                // Clear the conflicting binding
+                                if self.persistent_settings.keyboard.ptt_hotkey.as_ref() == Some(&binding)
+                                    && target != HotkeyCaptureTarget::Ptt
+                                {
+                                    self.persistent_settings.keyboard.ptt_hotkey = None;
                                 }
-                                HotkeyCaptureTarget::ToggleMute => {
-                                    self.persistent_settings.keyboard.toggle_mute_hotkey = Some(binding.clone());
+                                if self.persistent_settings.keyboard.toggle_mute_hotkey.as_ref() == Some(&binding)
+                                    && target != HotkeyCaptureTarget::ToggleMute
+                                {
+                                    self.persistent_settings.keyboard.toggle_mute_hotkey = None;
                                 }
-                                HotkeyCaptureTarget::ToggleDeafen => {
-                                    self.persistent_settings.keyboard.toggle_deafen_hotkey = Some(binding.clone());
+                                if self.persistent_settings.keyboard.toggle_deafen_hotkey.as_ref() == Some(&binding)
+                                    && target != HotkeyCaptureTarget::ToggleDeafen
+                                {
+                                    self.persistent_settings.keyboard.toggle_deafen_hotkey = None;
                                 }
+                                // Apply the new binding
+                                match target {
+                                    HotkeyCaptureTarget::Ptt => {
+                                        self.persistent_settings.keyboard.ptt_hotkey = Some(binding.clone());
+                                    }
+                                    HotkeyCaptureTarget::ToggleMute => {
+                                        self.persistent_settings.keyboard.toggle_mute_hotkey = Some(binding.clone());
+                                    }
+                                    HotkeyCaptureTarget::ToggleDeafen => {
+                                        self.persistent_settings.keyboard.toggle_deafen_hotkey = Some(binding.clone());
+                                    }
+                                }
+                                self.settings_modal.hotkey_capture_target = None;
+                                self.settings_modal.hotkey_conflict_pending = None;
+                                self.settings_modal.dirty = true;
                             }
-                            self.settings_modal.hotkey_capture_target = None;
-                            self.settings_modal.hotkey_conflict_pending = None;
-                            self.settings_modal.dirty = true;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            self.settings_modal.hotkey_capture_target = None;
-                            self.settings_modal.hotkey_conflict_pending = None;
-                        }
+                            if ui.button("Cancel").clicked() {
+                                self.settings_modal.hotkey_capture_target = None;
+                                self.settings_modal.hotkey_conflict_pending = None;
+                            }
+                        });
                     });
-                });
+            }
         }
 
         // Cancel capture if escape was pressed
@@ -4299,11 +4333,6 @@ impl RumbleApp {
                 // Header
                 ui.horizontal(|ui| {
                     ui.heading("Settings");
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if self.settings_modal.dirty {
-                            ui.colored_label(egui::Color32::YELLOW, "⚠ Unsaved changes");
-                        }
-                    });
                 });
                 ui.separator();
 
@@ -4314,7 +4343,7 @@ impl RumbleApp {
                         ui.add_space(4.0);
                         // Show dirty indicator
                         if self.settings_modal.dirty {
-                            ui.colored_label(egui::Color32::YELLOW, "⚠ Unsaved changes");
+                            ui.colored_label(egui::Color32::YELLOW, "Changes not yet applied");
                         }
 
                         egui::Sides::new().show(
@@ -4323,19 +4352,27 @@ impl RumbleApp {
                             |ui| {
                                 // Apply button - commits all pending changes and saves to disk
                                 let apply_enabled = self.settings_modal.dirty;
-                                if ui.add_enabled(apply_enabled, egui::Button::new("Apply")).clicked() {
+                                if ui
+                                    .add_enabled(apply_enabled, egui::Button::new("Apply"))
+                                    .on_hover_text("Apply changes and save to disk")
+                                    .clicked()
+                                {
                                     self.apply_pending_settings();
                                     self.settings_modal.dirty = false;
                                     self.save_settings();
                                     self.toast_manager.success("Settings saved");
                                 }
 
-                                if ui.button("Cancel").clicked() {
+                                if ui.button("Cancel").on_hover_text("Discard changes and close").clicked() {
                                     self.settings_modal = SettingsModalState::default();
                                     self.show_settings = false;
                                 }
 
-                                if ui.button("Close").clicked() {
+                                if ui
+                                    .button("Close")
+                                    .on_hover_text("Apply changes, save, and close")
+                                    .clicked()
+                                {
                                     // Apply changes before closing if dirty
                                     if self.settings_modal.dirty {
                                         self.apply_pending_settings();
