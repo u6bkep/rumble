@@ -72,7 +72,6 @@ struct DownloadModalState {
 }
 
 /// State for the image view modal (click-to-enlarge with zoom/pan)
-#[derive(Default)]
 struct ImageViewModalState {
     open: bool,
     image_uri: String,
@@ -81,10 +80,21 @@ struct ImageViewModalState {
     file_path: Option<PathBuf>,
     /// Current zoom level (1.0 = fit to modal)
     zoom: f32,
-    /// Pan offset for scrolling within the zoomed image
-    pan_offset: egui::Vec2,
     /// Whether the full-resolution image has been loaded into the cache
     fullsize_loaded: bool,
+}
+
+impl Default for ImageViewModalState {
+    fn default() -> Self {
+        Self {
+            open: false,
+            image_uri: String::new(),
+            image_name: String::new(),
+            file_path: None,
+            zoom: 1.0,
+            fullsize_loaded: false,
+        }
+    }
 }
 
 /// Validate a magnet link format.
@@ -3607,7 +3617,6 @@ impl RumbleApp {
                                                                         image_name: file_msg.file.name.clone(),
                                                                         file_path: Some(path.clone()),
                                                                         zoom: 1.0,
-                                                                        pan_offset: egui::Vec2::ZERO,
                                                                         fullsize_loaded: false,
                                                                     };
                                                                 }
@@ -4698,7 +4707,6 @@ impl RumbleApp {
                             .clicked()
                         {
                             self.image_view_modal.zoom = 1.0;
-                            self.image_view_modal.pan_offset = egui::Vec2::ZERO;
                         }
                         if ui.button("+").clicked() {
                             self.image_view_modal.zoom = (self.image_view_modal.zoom * 1.25).clamp(0.25, 10.0);
@@ -4736,8 +4744,9 @@ impl RumbleApp {
 
                 let zoom = self.image_view_modal.zoom;
 
-                if let Some(native_size) = image_size {
+                if let Some(native_size) = image_size.filter(|s| s.x > 0.0 && s.y > 0.0) {
                     // Compute the fitted size at zoom 1.0 (fit to viewport)
+                    let max_height = max_height.max(1.0);
                     let aspect = native_size.x / native_size.y;
                     let (fit_w, fit_h) = if max_width / max_height > aspect {
                         (max_height * aspect, max_height)
@@ -4754,6 +4763,7 @@ impl RumbleApp {
                     let scroll_h = max_height.min(zoomed_h);
 
                     egui::ScrollArea::both()
+                        .id_salt("image_zoom_scroll")
                         .max_width(scroll_w)
                         .max_height(scroll_h)
                         .auto_shrink([true, true])
@@ -4782,7 +4792,10 @@ impl RumbleApp {
                 }
             });
             if modal.should_close() {
+                // Evict the full-resolution image from cache to free memory
+                ctx.forget_image(&self.image_view_modal.image_uri);
                 self.image_view_modal.open = false;
+                self.image_view_modal.fullsize_loaded = false;
             }
         }
 
