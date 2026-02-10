@@ -389,10 +389,10 @@ impl RelayService {
                 }
 
                 // Rate limit check
-                if !dialer_limit.try_consume(n as u64).await {
+                while !dialer_limit.try_consume(n as u64).await {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
-                if !global.try_consume(n as u64).await {
+                while !global.try_consume(n as u64).await {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
 
@@ -411,10 +411,10 @@ impl RelayService {
                 }
 
                 // Rate limit check
-                if !acceptor_limit2.try_consume(n as u64).await {
+                while !acceptor_limit2.try_consume(n as u64).await {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
-                if !global2.try_consume(n as u64).await {
+                while !global2.try_consume(n as u64).await {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
 
