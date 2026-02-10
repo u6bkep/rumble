@@ -220,9 +220,6 @@ pub struct RumbleApp {
     // Pending save file dialog (returns infohash and destination path)
     pending_save_dialog: Option<tokio::task::JoinHandle<Option<(String, std::path::PathBuf)>>>,
 
-    // Clipboard for image paste support
-    clipboard: Option<arboard::Clipboard>,
-
     // Tokio runtime handle for async operations (SSH agent, file dialogs)
     tokio_handle: tokio::runtime::Handle,
 
@@ -491,7 +488,6 @@ impl RumbleApp {
             pending_agent_op: None,
             pending_file_dialog: None,
             pending_save_dialog: None,
-            clipboard: arboard::Clipboard::new().ok(),
             tokio_handle: runtime_handle,
             persistent_settings,
             autoconnect_on_launch,
@@ -544,6 +540,40 @@ impl RumbleApp {
     /// Check if the client is connected to a server.
     pub fn is_connected(&self) -> bool {
         self.backend.state().connection.is_connected()
+    }
+
+    /// Handle an image paste from the clipboard.
+    ///
+    /// Called by the eframe wrapper when it detects that the user pressed Ctrl+V
+    /// while the clipboard contains image data rather than text. The image bytes
+    /// are saved to a temporary PNG file and shared via the file transfer system.
+    ///
+    /// Returns `true` if the image was successfully queued for sharing.
+    pub fn handle_clipboard_image_paste(&mut self, img_data: arboard::ImageData) -> bool {
+        if !self.is_connected() {
+            self.toast_manager.warning("Connect to a server before pasting images");
+            return false;
+        }
+        if let Some(img) = image::RgbaImage::from_raw(
+            img_data.width as u32,
+            img_data.height as u32,
+            img_data.bytes.into_owned(),
+        ) {
+            if let Ok(temp_dir) = tempfile::tempdir() {
+                let temp_path = temp_dir.path().join("clipboard_image.png");
+                if img.save(&temp_path).is_ok() {
+                    let path = temp_path.clone();
+                    // Keep the temp dir alive (cleaned up on process exit)
+                    std::mem::forget(temp_dir);
+                    self.backend.send(Command::ShareFile { path });
+                    self.show_transfers = true;
+                    self.toast_manager.success("Sharing pasted image");
+                    return true;
+                }
+            }
+        }
+        self.toast_manager.error("Failed to process clipboard image");
+        false
     }
 
     /// Set the global hotkey registration status from the HotkeyManager.
@@ -2896,33 +2926,10 @@ impl RumbleApp {
             }
         }
 
-        // Handle Ctrl+V to paste image from clipboard
-        let ctrl_v_pressed = ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::V));
-        if ctrl_v_pressed && state.connection.is_connected() {
-            if let Some(clipboard) = &mut self.clipboard {
-                // Try to get image from clipboard
-                if let Ok(img_data) = clipboard.get_image() {
-                    // Convert to image and save to temp file
-                    if let Some(img) = image::RgbaImage::from_raw(
-                        img_data.width as u32,
-                        img_data.height as u32,
-                        img_data.bytes.into_owned(),
-                    ) {
-                        // Create a temp file with PNG extension
-                        if let Ok(temp_dir) = tempfile::tempdir() {
-                            let temp_path = temp_dir.path().join("clipboard_image.png");
-                            if img.save(&temp_path).is_ok() {
-                                // Keep the temp dir alive by leaking it (will be cleaned up on exit)
-                                let path = temp_path.clone();
-                                std::mem::forget(temp_dir);
-                                self.backend.send(Command::ShareFile { path });
-                                self.show_transfers = true;
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        // Image paste is handled via EframeWrapper::raw_input_hook which
+        // detects Ctrl+V with image data on the clipboard (egui_winit swallows
+        // the Key::V event when it attempts a text paste, so we cannot detect
+        // it through egui's normal input API). See handle_clipboard_image_paste().
 
         // Show drop target indicator when files are being dragged
         let is_dragging = ctx.input(|i| !i.raw.hovered_files.is_empty());
