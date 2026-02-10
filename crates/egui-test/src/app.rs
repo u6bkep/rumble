@@ -71,6 +71,14 @@ struct DownloadModalState {
     validation_error: Option<String>,
 }
 
+/// State for the image view modal (click-to-enlarge)
+#[derive(Default)]
+struct ImageViewModalState {
+    open: bool,
+    image_uri: String,
+    image_name: String,
+}
+
 /// Validate a magnet link format.
 fn is_valid_magnet(s: &str) -> bool {
     s.starts_with("magnet:?") && s.contains("xt=urn:btih:")
@@ -222,6 +230,9 @@ pub struct RumbleApp {
 
     // Delete room confirmation modal state
     delete_room_modal: DeleteRoomModalState,
+
+    // Image view modal state (click-to-enlarge)
+    image_view_modal: ImageViewModalState,
 
     // Settings modal state with pending changes
     settings_modal: SettingsModalState,
@@ -472,6 +483,7 @@ impl RumbleApp {
             move_room_modal: MoveRoomModalState::default(),
             download_modal: DownloadModalState::default(),
             delete_room_modal: DeleteRoomModalState::default(),
+            image_view_modal: ImageViewModalState::default(),
             settings_modal: SettingsModalState::default(),
             push_to_talk_active: false,
             hotkey_registration_status: std::collections::HashMap::new(),
@@ -3417,6 +3429,18 @@ impl RumbleApp {
                                 .auto_shrink([false; 2])
                                 .stick_to_bottom(true)
                                 .show(ui, |ui| {
+                                    if state.chat_messages.is_empty() {
+                                        ui.vertical_centered(|ui| {
+                                            ui.add_space(40.0);
+                                            let text = if state.connection.is_connected() {
+                                                "No messages yet"
+                                            } else {
+                                                "Connect to a server to start chatting"
+                                            };
+                                            ui.label(egui::RichText::new(text).italics().color(egui::Color32::GRAY));
+                                        });
+                                    }
+
                                     let show_timestamps = self.persistent_settings.show_chat_timestamps;
                                     let timestamp_format = self.persistent_settings.chat_timestamp_format;
 
@@ -3507,12 +3531,37 @@ impl RumbleApp {
                                                             };
 
                                                             if bytes_available {
-                                                                ui.add(
+                                                                let response = ui.add(
                                                                     egui::Image::new(&uri)
                                                                         .max_width(300.0)
                                                                         .max_height(200.0)
-                                                                        .corner_radius(4.0),
+                                                                        .corner_radius(4.0)
+                                                                        .sense(egui::Sense::click()),
                                                                 );
+                                                                if response.hovered() {
+                                                                    ui.ctx().set_cursor_icon(
+                                                                        egui::CursorIcon::PointingHand,
+                                                                    );
+                                                                    // Draw hover border
+                                                                    let rect = response.rect;
+                                                                    let stroke = egui::Stroke::new(
+                                                                        2.0,
+                                                                        ui.visuals().selection.stroke.color,
+                                                                    );
+                                                                    ui.painter().rect_stroke(
+                                                                        rect,
+                                                                        4.0,
+                                                                        stroke,
+                                                                        egui::StrokeKind::Outside,
+                                                                    );
+                                                                }
+                                                                if response.clicked() {
+                                                                    self.image_view_modal = ImageViewModalState {
+                                                                        open: true,
+                                                                        image_uri: uri.clone(),
+                                                                        image_name: file_msg.file.name.clone(),
+                                                                    };
+                                                                }
                                                                 image_shown = true;
                                                             }
                                                         }
@@ -4549,6 +4598,41 @@ impl RumbleApp {
             });
             if modal.should_close() {
                 self.delete_room_modal.open = false;
+            }
+        }
+
+        // Image View Modal (click-to-enlarge)
+        if self.image_view_modal.open {
+            let modal = Modal::new(egui::Id::new("image_view_modal")).show(ctx, |ui| {
+                ui.heading(&self.image_view_modal.image_name);
+                ui.add_space(4.0);
+
+                let available = ui.available_size();
+                let viewport = ctx.input(|i| {
+                    i.viewport()
+                        .inner_rect_px()
+                        .unwrap_or(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0)))
+                });
+                let ppp = ctx.pixels_per_point();
+                let viewport_width = viewport.width() / ppp;
+                let viewport_height = viewport.height() / ppp;
+                let max_width = available.x.min(viewport_width * 0.9);
+                let max_height = (viewport_height * 0.9) - 80.0; // Leave room for heading and button
+
+                ui.add(
+                    egui::Image::new(&self.image_view_modal.image_uri)
+                        .max_width(max_width)
+                        .max_height(max_height)
+                        .corner_radius(4.0),
+                );
+
+                ui.add_space(8.0);
+                if ui.button("Close").clicked() {
+                    ui.close();
+                }
+            });
+            if modal.should_close() {
+                self.image_view_modal.open = false;
             }
         }
 
