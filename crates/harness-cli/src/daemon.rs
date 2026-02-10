@@ -25,7 +25,7 @@ use tokio::{
 };
 use tracing::{debug, error, info};
 
-use egui_test::{Args, RumbleApp};
+use egui_test::{Args, HotkeyBinding, HotkeyModifiers, RumbleApp};
 
 /// A simple wrapper around AccessKitNode that implements NodeT for querying.
 #[derive(Clone)]
@@ -305,14 +305,38 @@ impl ClientInstance {
     }
 
     /// Run frames until UI settles (no pending repaints).
-    fn run_until_stable(&mut self) {
-        // Run up to 100 frames waiting for stability
-        for _ in 0..100 {
+    /// Returns the number of frames that were run.
+    fn run_until_stable(&mut self) -> u32 {
+        const MAX_FRAMES: u32 = 500;
+        const STABLE_THRESHOLD: u32 = 3; // Need this many stable frames in a row
+
+        let mut stable_count = 0u32;
+        let mut frames_run = 0u32;
+
+        for _ in 0..MAX_FRAMES {
             self.run_frame();
-            // Check if there are pending repaints
-            // egui typically requests repaint when animations are running
-            // We'll just run a fixed number of frames for simplicity
+            frames_run += 1;
+
+            // Check if UI wants to repaint soon via viewport output
+            // If repaint_delay is long (> 1 second), UI is stable
+            let wants_repaint = self
+                .last_output
+                .as_ref()
+                .and_then(|o| o.viewport_output.get(&egui::ViewportId::ROOT))
+                .map(|v| v.repaint_delay < std::time::Duration::from_secs(1))
+                .unwrap_or(true);
+
+            if !wants_repaint {
+                stable_count += 1;
+                if stable_count >= STABLE_THRESHOLD {
+                    break;
+                }
+            } else {
+                stable_count = 0;
+            }
         }
+
+        frames_run
     }
 
     fn info(&self) -> ClientInfo {
@@ -862,6 +886,11 @@ async fn process_command(cmd: Command, state: &Arc<RwLock<DaemonState>>) -> Resp
                         })
                     }).collect::<Vec<_>>(),
                     "my_user_id": backend_state.my_user_id,
+                    "audio": {
+                        "self_muted": backend_state.audio.self_muted,
+                        "self_deafened": backend_state.audio.self_deafened,
+                        "is_transmitting": backend_state.audio.is_transmitting,
+                    },
                 });
 
                 Response::ok(ResponseData::State { state: state_json })
@@ -928,8 +957,8 @@ async fn process_command(cmd: Command, state: &Arc<RwLock<DaemonState>>) -> Resp
         Command::Run { id } => {
             let mut state = state.write().await;
             if let Some(client) = state.clients.get_mut(&id) {
-                client.run_until_stable();
-                Response::ack()
+                let count = client.run_until_stable();
+                Response::ok(ResponseData::FramesRun { count })
             } else {
                 Response::error(format!("Client {} not found", id))
             }
@@ -965,6 +994,38 @@ async fn process_command(cmd: Command, state: &Arc<RwLock<DaemonState>>) -> Resp
                     auto_download_enabled: enabled,
                     auto_download_rules: rules,
                 })
+            } else {
+                Response::error(format!("Client {} not found", id))
+            }
+        }
+
+        Command::SetHotkey { id, action, key } => {
+            let mut state = state.write().await;
+            if let Some(client) = state.clients.get_mut(&id) {
+                let binding = key.map(|k| HotkeyBinding {
+                    modifiers: HotkeyModifiers::default(),
+                    key: k,
+                });
+
+                let settings = client.app.persistent_settings_mut();
+                match action.as_str() {
+                    "ptt" => {
+                        settings.keyboard.ptt_hotkey = binding;
+                        Response::ack()
+                    }
+                    "mute" => {
+                        settings.keyboard.toggle_mute_hotkey = binding;
+                        Response::ack()
+                    }
+                    "deafen" => {
+                        settings.keyboard.toggle_deafen_hotkey = binding;
+                        Response::ack()
+                    }
+                    _ => Response::error(format!(
+                        "Unknown action '{}'. Use 'ptt', 'mute', or 'deafen'.",
+                        action
+                    )),
+                }
             } else {
                 Response::error(format!("Client {} not found", id))
             }

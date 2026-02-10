@@ -5,7 +5,7 @@
 
 use clap::Parser;
 use eframe::egui;
-use egui_test::{Args, RumbleApp};
+use egui_test::{Args, HotkeyManager, PersistentSettings, RumbleApp};
 
 fn main() -> eframe::Result<()> {
     tracing_subscriber::fmt()
@@ -13,6 +13,16 @@ fn main() -> eframe::Result<()> {
         .init();
 
     let args = Args::parse();
+
+    // Load settings to get keyboard config
+    let settings = PersistentSettings::load();
+
+    // Create hotkey manager on main thread (required for macOS).
+    // This must be done before eframe::run_native which takes over the main thread.
+    let mut hotkey_manager = HotkeyManager::new();
+    if let Err(e) = hotkey_manager.register_from_settings(&settings.keyboard) {
+        tracing::error!("Failed to register global hotkeys: {}", e);
+    }
 
     // Create the tokio runtime - this will be passed to RumbleApp
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -33,7 +43,12 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(move |cc| {
             egui_extras::install_image_loaders(&cc.egui_ctx);
-            Ok(Box::new(EframeWrapper::new(cc.egui_ctx.clone(), runtime, args)))
+            Ok(Box::new(EframeWrapper::new(
+                cc.egui_ctx.clone(),
+                runtime,
+                args,
+                hotkey_manager,
+            )))
         }),
     )
 }
@@ -44,19 +59,58 @@ fn main() -> eframe::Result<()> {
 /// used with other runners like the test harness.
 struct EframeWrapper {
     app: RumbleApp,
+    /// Global hotkey manager for PTT and other shortcuts.
+    hotkey_manager: HotkeyManager,
     /// Keep the runtime alive for the lifetime of the application.
     _runtime: tokio::runtime::Runtime,
 }
 
 impl EframeWrapper {
-    fn new(ctx: egui::Context, runtime: tokio::runtime::Runtime, args: Args) -> Self {
-        let app = RumbleApp::new(ctx, runtime.handle().clone(), args);
-        Self { app, _runtime: runtime }
+    fn new(
+        ctx: egui::Context,
+        runtime: tokio::runtime::Runtime,
+        args: Args,
+        mut hotkey_manager: HotkeyManager,
+    ) -> Self {
+        // Initialize XDG Portal backend for Wayland global shortcuts
+        let handle = runtime.handle().clone();
+        runtime.block_on(async {
+            hotkey_manager.init_portal_backend(handle).await;
+        });
+
+        let mut app = RumbleApp::new(ctx, runtime.handle().clone(), args);
+
+        // Tell the app if portal hotkeys are available (for settings UI)
+        app.set_portal_hotkeys_available(hotkey_manager.has_portal_backend());
+
+        // Pass portal shortcuts and callback to the app (Linux/Wayland only)
+        #[cfg(target_os = "linux")]
+        {
+            app.set_portal_shortcuts(hotkey_manager.get_portal_shortcuts());
+        }
+
+        Self {
+            app,
+            hotkey_manager,
+            _runtime: runtime,
+        }
+    }
+
+    /// Update portal shortcuts from the hotkey manager.
+    #[cfg(target_os = "linux")]
+    fn update_portal_shortcuts(&mut self) {
+        self.app
+            .set_portal_shortcuts(self.hotkey_manager.get_portal_shortcuts());
     }
 }
 
 impl eframe::App for EframeWrapper {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Poll global hotkey events first (works even when window unfocused)
+        for event in self.hotkey_manager.poll_events() {
+            self.app.handle_hotkey_event(event);
+        }
+
         self.app.render(ctx);
     }
 }

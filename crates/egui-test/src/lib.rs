@@ -7,9 +7,13 @@
 
 pub mod app;
 pub mod harness;
+pub mod hotkeys;
 pub mod key_manager;
+#[cfg(target_os = "linux")]
+pub mod portal_hotkeys;
 pub mod settings;
 
 pub use app::RumbleApp;
 pub use harness::TestHarness;
-pub use settings::{Args, PersistentSettings};
+pub use hotkeys::{HotkeyEvent, HotkeyManager};
+pub use settings::{Args, HotkeyBinding, HotkeyModifiers, KeyboardSettings, PersistentSettings};

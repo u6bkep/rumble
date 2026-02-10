@@ -76,6 +76,43 @@ enum Commands {
 
     /// Get daemon status
     Status,
+
+    /// One-shot setup: start daemon, server, and create a connected client
+    Up {
+        /// Server port
+        #[arg(short, long, default_value = "5000")]
+        port: u16,
+
+        /// Client display name
+        #[arg(short, long, default_value = "agent")]
+        name: String,
+
+        /// Take initial screenshot (saves to specified path)
+        #[arg(short, long)]
+        screenshot: Option<String>,
+    },
+
+    /// Clean teardown: close all clients, stop server, stop daemon
+    Down,
+
+    /// Rebuild egui-test and take a new screenshot (agent iteration loop)
+    Iterate {
+        /// Client ID (default: 1)
+        #[arg(short, long, default_value = "1")]
+        client: u32,
+
+        /// Output screenshot path
+        #[arg(short, long, default_value = "/tmp/ui.png")]
+        output: String,
+
+        /// Client name for recreation
+        #[arg(short, long, default_value = "agent")]
+        name: String,
+
+        /// Server address
+        #[arg(short, long, default_value = "127.0.0.1:5000")]
+        server: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -265,6 +302,17 @@ enum ClientAction {
         id: u32,
     },
 
+    /// Set a keyboard shortcut (hotkey)
+    SetHotkey {
+        /// Client ID
+        id: u32,
+        /// Action: "ptt", "mute", or "deafen"
+        action: String,
+        /// Key name (e.g., "Space", "M", "F1") or empty to clear
+        #[arg(default_value = "")]
+        key: String,
+    },
+
     /// Share a file
     ShareFile {
         /// Client ID
@@ -298,11 +346,19 @@ async fn main() -> Result<()> {
         Commands::Daemon { action } => handle_daemon(action, &socket_path).await,
         Commands::Server { action } => handle_server(action, &socket_path).await,
         Commands::Client { action } => handle_client(action, &socket_path).await,
-        Commands::Status => {
-            let response = send_command(&socket_path, Command::Status).await?;
-            print_response(&response);
-            Ok(())
-        }
+        Commands::Status => handle_status(&socket_path).await,
+        Commands::Up {
+            port,
+            name,
+            screenshot,
+        } => handle_up(&socket_path, port, name, screenshot).await,
+        Commands::Down => handle_down(&socket_path).await,
+        Commands::Iterate {
+            client,
+            output,
+            name,
+            server,
+        } => handle_iterate(&socket_path, client, output, name, server).await,
     }
 }
 
@@ -404,6 +460,11 @@ async fn handle_client(action: ClientAction, socket_path: &PathBuf) -> Result<()
             Command::SetAutoDownloadRules { id, rules }
         }
         ClientAction::GetFileTransferSettings { id } => Command::GetFileTransferSettings { id },
+        ClientAction::SetHotkey { id, action, key } => Command::SetHotkey {
+            id,
+            action,
+            key: if key.is_empty() { None } else { Some(key) },
+        },
         ClientAction::ShareFile { id, path } => Command::ShareFile { id, path },
         ClientAction::GetFileTransfers { id } => Command::GetFileTransfers { id },
         ClientAction::ShowTransfers { id, show } => Command::ShowTransfers { id, show },
@@ -435,6 +496,332 @@ async fn send_command(socket_path: &PathBuf, cmd: Command) -> Result<Response> {
 
     let response: Response = serde_json::from_str(&line)?;
     Ok(response)
+}
+
+/// Handle the `status` command with enhanced output.
+async fn handle_status(socket_path: &PathBuf) -> Result<()> {
+    // Check if daemon is running
+    let daemon_running = send_command(socket_path, Command::Ping).await.is_ok();
+
+    if !daemon_running {
+        println!("Daemon:  not running");
+        println!("Server:  unknown (daemon not running)");
+        println!("Clients: unknown (daemon not running)");
+        println!("\nRun `rumble-harness up` to start everything.");
+        return Ok(());
+    }
+
+    // Get detailed status
+    let response = send_command(socket_path, Command::Status).await?;
+    if let Response::Ok {
+        data: ResponseData::Status {
+            server_running,
+            client_count,
+        },
+    } = &response
+    {
+        println!("Daemon:  running (socket: {})", socket_path.display());
+        println!(
+            "Server:  {}",
+            if *server_running {
+                "running"
+            } else {
+                "not running"
+            }
+        );
+        println!("Clients: {}", client_count);
+
+        // List clients if any
+        if *client_count > 0 {
+            let list_response = send_command(socket_path, Command::ClientList).await?;
+            if let Response::Ok {
+                data: ResponseData::ClientList { clients },
+            } = list_response
+            {
+                for client in clients {
+                    println!(
+                        "  [{}] {} (connected: {})",
+                        client.id, client.name, client.connected
+                    );
+                }
+            }
+        }
+
+        if !server_running {
+            println!("\nHint: Run `rumble-harness server start` to start the server.");
+        }
+    } else {
+        print_response(&response);
+    }
+
+    Ok(())
+}
+
+/// Handle the `up` command - one-shot setup.
+async fn handle_up(
+    socket_path: &PathBuf,
+    port: u16,
+    name: String,
+    screenshot: Option<String>,
+) -> Result<()> {
+    // Step 1: Start daemon if not running
+    let daemon_running = send_command(socket_path, Command::Ping).await.is_ok();
+    if !daemon_running {
+        println!("Starting daemon...");
+        let exe = std::env::current_exe()?;
+        std::process::Command::new(&exe)
+            .args(["--socket", &socket_path.to_string_lossy(), "daemon", "start"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()?;
+
+        // Wait for daemon to be ready
+        for i in 0..20 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if send_command(socket_path, Command::Ping).await.is_ok() {
+                break;
+            }
+            if i == 19 {
+                anyhow::bail!("Daemon failed to start within 2 seconds");
+            }
+        }
+        println!("  Daemon started.");
+    } else {
+        println!("Daemon already running.");
+    }
+
+    // Step 2: Start server if not running
+    let status_response = send_command(socket_path, Command::Status).await?;
+    let server_running = if let Response::Ok {
+        data: ResponseData::Status { server_running, .. },
+    } = &status_response
+    {
+        *server_running
+    } else {
+        false
+    };
+
+    if !server_running {
+        println!("Starting server on port {}...", port);
+        let response = send_command(socket_path, Command::ServerStart { port }).await?;
+        if let Response::Error { message } = response {
+            anyhow::bail!("Failed to start server: {}", message);
+        }
+        // Give server time to bind
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        println!("  Server started.");
+    } else {
+        println!("Server already running.");
+    }
+
+    // Step 3: Create client
+    println!("Creating client '{}'...", name);
+    let server_addr = format!("127.0.0.1:{}", port);
+    let response = send_command(
+        socket_path,
+        Command::ClientNew {
+            name: Some(name),
+            server: Some(server_addr),
+        },
+    )
+    .await?;
+
+    let client_id = if let Response::Ok {
+        data: ResponseData::ClientCreated { id },
+    } = &response
+    {
+        *id
+    } else {
+        print_response(&response);
+        anyhow::bail!("Failed to create client");
+    };
+    println!("  Client created (id: {}).", client_id);
+
+    // Step 4: Wait for UI to stabilize and optionally take screenshot
+    println!("Waiting for UI to stabilize...");
+    let _ = send_command(socket_path, Command::Run { id: client_id }).await?;
+
+    // Wait a bit for connection
+    for _ in 0..10 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let _ = send_command(
+            socket_path,
+            Command::RunFrames {
+                id: client_id,
+                count: 5,
+            },
+        )
+        .await;
+    }
+
+    // Check connection status
+    let conn_response = send_command(socket_path, Command::IsConnected { id: client_id }).await?;
+    let connected = if let Response::Ok {
+        data: ResponseData::Connected { connected },
+    } = &conn_response
+    {
+        *connected
+    } else {
+        false
+    };
+
+    if connected {
+        println!("  Client connected to server.");
+    } else {
+        println!("  Client not yet connected (may still be connecting).");
+    }
+
+    // Step 5: Take screenshot if requested
+    if let Some(output_path) = screenshot {
+        let response = send_command(
+            socket_path,
+            Command::Screenshot {
+                id: client_id,
+                output: Some(output_path.clone()),
+            },
+        )
+        .await?;
+        if let Response::Ok {
+            data: ResponseData::Screenshot { path, width, height },
+        } = &response
+        {
+            println!("Screenshot: {} ({}x{})", path, width, height);
+        } else {
+            print_response(&response);
+        }
+    }
+
+    println!("\nReady! Client ID: {}", client_id);
+    println!("  Take screenshot: rumble-harness client screenshot {} -o ui.png", client_id);
+    println!("  Rebuild & screenshot: rumble-harness iterate -c {}", client_id);
+
+    Ok(())
+}
+
+/// Handle the `down` command - clean teardown.
+async fn handle_down(socket_path: &PathBuf) -> Result<()> {
+    // Check if daemon is running
+    if send_command(socket_path, Command::Ping).await.is_err() {
+        println!("Daemon not running, nothing to do.");
+        return Ok(());
+    }
+
+    // Get list of clients and close them
+    let list_response = send_command(socket_path, Command::ClientList).await?;
+    if let Response::Ok {
+        data: ResponseData::ClientList { clients },
+    } = list_response
+    {
+        for client in clients {
+            println!("Closing client {}...", client.id);
+            let _ = send_command(socket_path, Command::ClientClose { id: client.id }).await;
+        }
+    }
+
+    // Stop server
+    println!("Stopping server...");
+    let _ = send_command(socket_path, Command::ServerStop).await;
+
+    // Stop daemon
+    println!("Stopping daemon...");
+    let _ = send_command(socket_path, Command::Shutdown).await;
+
+    println!("Done.");
+    Ok(())
+}
+
+/// Handle the `iterate` command - rebuild and screenshot.
+async fn handle_iterate(
+    socket_path: &PathBuf,
+    client_id: u32,
+    output: String,
+    name: String,
+    server: String,
+) -> Result<()> {
+    // Check daemon is running
+    if send_command(socket_path, Command::Ping).await.is_err() {
+        anyhow::bail!(
+            "Daemon not running. Run `rumble-harness up` first, or `rumble-harness daemon start`."
+        );
+    }
+
+    // Step 1: Close the client (ignore errors if it doesn't exist)
+    println!("Closing client {}...", client_id);
+    let _ = send_command(socket_path, Command::ClientClose { id: client_id }).await;
+
+    // Step 2: Rebuild egui-test
+    println!("Building egui-test...");
+    let build_status = std::process::Command::new("cargo")
+        .args(["build", "-p", "egui-test"])
+        .status()
+        .context("Failed to run cargo build")?;
+
+    if !build_status.success() {
+        anyhow::bail!("Build failed! Fix errors and try again.");
+    }
+    println!("  Build succeeded.");
+
+    // Step 3: Create new client
+    println!("Creating new client '{}'...", name);
+    let response = send_command(
+        socket_path,
+        Command::ClientNew {
+            name: Some(name),
+            server: Some(server),
+        },
+    )
+    .await?;
+
+    let new_client_id = if let Response::Ok {
+        data: ResponseData::ClientCreated { id },
+    } = &response
+    {
+        *id
+    } else {
+        print_response(&response);
+        anyhow::bail!("Failed to create client");
+    };
+    println!("  Client created (id: {}).", new_client_id);
+
+    // Step 4: Wait for UI to stabilize
+    println!("Waiting for UI to stabilize...");
+    let _ = send_command(socket_path, Command::Run { id: new_client_id }).await?;
+
+    // Additional frames for connection
+    for _ in 0..10 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let _ = send_command(
+            socket_path,
+            Command::RunFrames {
+                id: new_client_id,
+                count: 5,
+            },
+        )
+        .await;
+    }
+
+    // Step 5: Take screenshot
+    let response = send_command(
+        socket_path,
+        Command::Screenshot {
+            id: new_client_id,
+            output: Some(output.clone()),
+        },
+    )
+    .await?;
+
+    if let Response::Ok {
+        data: ResponseData::Screenshot { path, width, height },
+    } = &response
+    {
+        println!("\nScreenshot: {} ({}x{})", path, width, height);
+        println!("Client ID: {}", new_client_id);
+    } else {
+        print_response(&response);
+    }
+
+    Ok(())
 }
 
 /// Print a response to stdout.

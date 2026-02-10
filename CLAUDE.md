@@ -200,41 +200,49 @@ fn test_agent_can_connect() {
 
 The `harness-cli` crate provides a daemon-based CLI for automated GUI testing. Agents can use it to iteratively develop UI changes with screenshot feedback.
 
-### Quick Start
+### Quick Start (Simplified)
 
 ```bash
-# Start daemon
-cargo run -p harness-cli -- daemon start --background
+# One command to start everything (daemon + server + client)
+cargo run -p harness-cli -- up --screenshot /tmp/ui.png
 
-# Start server and create client
-cargo run -p harness-cli -- server start
-cargo run -p harness-cli -- client new --name agent --server 127.0.0.1:5000
+# After making code changes, rebuild and screenshot in one command
+cargo run -p harness-cli -- iterate -o /tmp/ui.png
 
-# Take screenshot
-cargo run -p harness-cli -- client frames 1 20
-cargo run -p harness-cli -- client screenshot 1 --output ui.png
-
-# Interact
-cargo run -p harness-cli -- client click 1 100 200
-cargo run -p harness-cli -- client type 1 "Hello"
-cargo run -p harness-cli -- client key-tap 1 enter
-
-# Get state
-cargo run -p harness-cli -- client state 1
-cargo run -p harness-cli -- client connected 1
-
-# Cleanup
-cargo run -p harness-cli -- daemon stop
+# Clean teardown
+cargo run -p harness-cli -- down
 ```
 
 ### Agent Iteration Workflow
 
 ```bash
-# After making code changes:
-rumble-harness client close 1
-cargo build -p egui-test
-rumble-harness client new --name agent --server 127.0.0.1:5000
-rumble-harness client screenshot 1 --output ui-v2.png
+# 1. Setup (one command)
+rumble-harness up --screenshot /tmp/ui.png
+
+# 2. Review screenshot, make code changes...
+
+# 3. Rebuild and screenshot (one command)
+rumble-harness iterate -o /tmp/ui.png
+
+# 4. Repeat steps 2-3 until done
+
+# 5. Cleanup
+rumble-harness down
+```
+
+### Additional Commands
+
+```bash
+# Check what's running
+rumble-harness status
+
+# Manual interaction
+rumble-harness client click 1 100 200
+rumble-harness client type 1 "Hello"
+rumble-harness client key-tap 1 enter
+
+# Get backend state as JSON
+rumble-harness client state 1
 ```
 
 See [crates/harness-cli/README.md](crates/harness-cli/README.md) for full documentation.

@@ -31,6 +31,24 @@ A command-line daemon for automated GUI testing of the Rumble voice chat applica
 # Build
 cargo build -p harness-cli
 
+# One command to start everything (daemon + server + client)
+rumble-harness up
+
+# Take a screenshot
+rumble-harness client screenshot 1 -o ui.png
+
+# After making code changes, rebuild and screenshot in one command
+rumble-harness iterate
+
+# Clean teardown
+rumble-harness down
+```
+
+## Quick Start (Manual)
+
+For more control, you can start components individually:
+
+```bash
 # Start daemon (foreground for debugging)
 rumble-harness daemon start
 
@@ -49,13 +67,29 @@ rumble-harness daemon stop
 
 ## Commands
 
+### One-Shot Commands (Recommended for Agents)
+
+```bash
+rumble-harness up [--port 5000] [--name agent] [--screenshot ui.png]
+# Start everything: daemon, server, client. Optionally take initial screenshot.
+
+rumble-harness iterate [-c 1] [-o /tmp/ui.png] [--name agent] [--server 127.0.0.1:5000]
+# Close client, rebuild egui-test, create new client, take screenshot.
+# This is the core agent iteration loop command.
+
+rumble-harness down
+# Clean teardown: close all clients, stop server, stop daemon.
+
+rumble-harness status
+# Show what's running: daemon status, server status, list of clients.
+```
+
 ### Daemon Management
 
 ```bash
 rumble-harness daemon start [--background]  # Start the daemon
 rumble-harness daemon stop                   # Stop the daemon
 rumble-harness daemon status                 # Check if daemon is running
-rumble-harness status                        # Get daemon status (server, clients)
 ```
 
 ### Server Management
@@ -110,6 +144,25 @@ rumble-harness client run <ID>                      # Run until UI settles
 
 ## Agent Iteration Workflow
 
+### Simplified (Recommended)
+
+```bash
+# 1. Setup (one command)
+rumble-harness up --screenshot /tmp/ui.png
+
+# 2. Agent reviews screenshot at /tmp/ui.png, edits code...
+
+# 3. Rebuild and screenshot (one command)
+rumble-harness iterate -o /tmp/ui.png
+
+# 4. Repeat steps 2-3 until done
+
+# 5. Cleanup (one command)
+rumble-harness down
+```
+
+### Manual (More Control)
+
 ```bash
 # 1. Setup
 rumble-harness daemon start --background
@@ -117,7 +170,7 @@ rumble-harness server start
 rumble-harness client new --name agent --server 127.0.0.1:5000
 
 # 2. Test current UI
-rumble-harness client frames 1 20           # Let UI settle
+rumble-harness client run 1                 # Wait for UI to stabilize
 rumble-harness client screenshot 1 -o ui.png
 
 # 3. Agent reviews screenshot, edits code...

@@ -47,6 +47,12 @@ base64 = "0.22"
 arboard = "3"
 image = { version = "0.25", default-features = false, features = ["avif", "bmp", "dds", "ff", "gif", "hdr", "ico", "jpeg", "png", "pnm", "qoi", "tga", "tiff", "webp"] }
 tempfile = "3"
+global-hotkey = "0.7"
+
+# XDG Desktop Portal for Wayland global shortcuts
+[target.'cfg(target_os = "linux")'.dependencies]
+ashpd = { version = "0.12", default-features = false, features = ["tokio"] }
+futures-util = "0.3"
 
 # Optional test harness dependencies
 egui_kittest = { version = "0.33", features = ["wgpu", "snapshot"], optional = true }

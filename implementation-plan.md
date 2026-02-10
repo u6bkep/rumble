@@ -161,8 +161,8 @@ Rumble is a voice chat application (similar to Discord/Mumble) written in Rust. 
 - [x] Auto-download rules for file transfers *(configurable MIME patterns and size limits in settings)*
 - [x] Image paste support in chat *(Ctrl+V to share clipboard images)*
 - [x] P2P NAT traversal for file transfers *(libp2p with DCUtR hole punching and relay fallback)*
-- [~] Keyboard shortcuts for common actions *(basic: PTT=Space, Paste=Ctrl+V, Submit=Enter; more needed)*
-- [ ] Chat history sync *(P2P catchup for late joiners, ephemeral like file sharing)*
+- [x] Keyboard shortcuts for common actions *(global hotkeys for PTT, Mute, Deafen; configurable in settings; Wayland fallback)*
+- [x] Chat history sync *(P2P catchup for late joiners, ephemeral like file sharing)*
 
 ### Medium-term
 - [ ] Access Control Lists (ACLs) for rooms *(role field exists in persistence, no enforcement)*

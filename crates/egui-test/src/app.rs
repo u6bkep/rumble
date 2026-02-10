@@ -18,6 +18,7 @@ use std::path::PathBuf;
 use uuid::Uuid;
 
 use crate::{
+    hotkeys::HotkeyEvent,
     key_manager::{
         FirstRunState, KeyInfo, KeyManager, KeySource, PendingAgentOp, SshAgentClient, connect_and_list_keys,
         generate_and_add_to_agent, parse_signing_key,
@@ -71,6 +72,7 @@ enum SettingsCategory {
     Encoder,
     Chat,
     FileTransfer,
+    Keyboard,
     Statistics,
 }
 
@@ -84,6 +86,7 @@ impl SettingsCategory {
             SettingsCategory::Encoder,
             SettingsCategory::Chat,
             SettingsCategory::FileTransfer,
+            SettingsCategory::Keyboard,
             SettingsCategory::Statistics,
         ]
     }
@@ -97,9 +100,18 @@ impl SettingsCategory {
             SettingsCategory::Encoder => "📦 Encoder",
             SettingsCategory::Chat => "💬 Chat",
             SettingsCategory::FileTransfer => "📂 File Transfer",
+            SettingsCategory::Keyboard => "⌨ Keyboard",
             SettingsCategory::Statistics => "📊 Statistics",
         }
     }
+}
+
+/// Which hotkey is being captured
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HotkeyCaptureTarget {
+    Ptt,
+    ToggleMute,
+    ToggleDeafen,
 }
 
 /// State for the settings modal with pending changes
@@ -111,7 +123,7 @@ struct SettingsModalState {
     pending_settings: Option<AudioSettings>,
     /// Pending input device selection
     pending_input_device: Option<Option<String>>,
-    /// Pending output device selection  
+    /// Pending output device selection
     pending_output_device: Option<Option<String>>,
     /// Pending voice mode
     pending_voice_mode: Option<VoiceMode>,
@@ -127,6 +139,8 @@ struct SettingsModalState {
     pending_timestamp_format: Option<TimestampFormat>,
     /// Whether any settings have been modified
     dirty: bool,
+    /// Which hotkey is currently being captured (None if not capturing)
+    hotkey_capture_target: Option<HotkeyCaptureTarget>,
 }
 
 /// The main Rumble application.
@@ -194,6 +208,17 @@ pub struct RumbleApp {
 
     /// Push-to-talk key is held
     push_to_talk_active: bool,
+
+    /// Whether XDG Portal global shortcuts are available (Wayland)
+    portal_hotkeys_available: bool,
+
+    /// Portal shortcut bindings (updated from HotkeyManager)
+    #[cfg(target_os = "linux")]
+    portal_shortcuts: Vec<crate::portal_hotkeys::ShortcutInfo>,
+
+    /// Callback to open portal settings (set by EframeWrapper)
+    #[cfg(target_os = "linux")]
+    open_portal_settings_callback: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
 
     egui_ctx: egui::Context,
 }
@@ -418,6 +443,11 @@ impl RumbleApp {
             download_modal: DownloadModalState::default(),
             settings_modal: SettingsModalState::default(),
             push_to_talk_active: false,
+            portal_hotkeys_available: false,
+            #[cfg(target_os = "linux")]
+            portal_shortcuts: Vec::new(),
+            #[cfg(target_os = "linux")]
+            open_portal_settings_callback: None,
             egui_ctx: ctx,
         };
 
@@ -447,6 +477,33 @@ impl RumbleApp {
         self.backend.state().connection.is_connected()
     }
 
+    /// Set whether XDG Portal global shortcuts are available.
+    ///
+    /// This should be called by the main app after initializing the portal backend.
+    pub fn set_portal_hotkeys_available(&mut self, available: bool) {
+        self.portal_hotkeys_available = available;
+    }
+
+    /// Check if XDG Portal global shortcuts are available.
+    pub fn is_portal_hotkeys_available(&self) -> bool {
+        self.portal_hotkeys_available
+    }
+
+    /// Set the portal shortcut bindings (Linux/Wayland only).
+    #[cfg(target_os = "linux")]
+    pub fn set_portal_shortcuts(&mut self, shortcuts: Vec<crate::portal_hotkeys::ShortcutInfo>) {
+        self.portal_shortcuts = shortcuts;
+    }
+
+    /// Set the callback for opening portal settings (Linux/Wayland only).
+    #[cfg(target_os = "linux")]
+    pub fn set_open_portal_settings_callback<F>(&mut self, callback: F)
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        self.open_portal_settings_callback = Some(std::sync::Arc::new(callback));
+    }
+
     /// Show or hide the file transfers window.
     pub fn set_show_transfers(&mut self, show: bool) {
         self.show_transfers = show;
@@ -455,6 +512,21 @@ impl RumbleApp {
     /// Check if the transfers window is visible.
     pub fn is_transfers_visible(&self) -> bool {
         self.show_transfers
+    }
+
+    /// Get read access to persistent settings (for testing).
+    pub fn persistent_settings(&self) -> &PersistentSettings {
+        &self.persistent_settings
+    }
+
+    /// Get mutable access to persistent settings (for testing).
+    pub fn persistent_settings_mut(&mut self) -> &mut PersistentSettings {
+        &mut self.persistent_settings
+    }
+
+    /// Check if push-to-talk is currently active.
+    pub fn push_to_talk_active(&self) -> bool {
+        self.push_to_talk_active
     }
 
     /// Connect to the server using current settings.
@@ -572,6 +644,54 @@ impl RumbleApp {
     /// Stop audio transmission.
     fn stop_transmit(&mut self) {
         self.backend.send(Command::StopTransmit);
+    }
+
+    /// Handle a global hotkey event.
+    ///
+    /// This is called from the eframe wrapper when a global hotkey is pressed
+    /// (works even when the window is not focused).
+    pub fn handle_hotkey_event(&mut self, event: HotkeyEvent) {
+        let state = self.backend.state();
+
+        match event {
+            HotkeyEvent::PttPressed => {
+                tracing::debug!(
+                    "Global hotkey: PTT pressed (connected={}, already_active={})",
+                    state.connection.is_connected(),
+                    self.push_to_talk_active
+                );
+                if !self.push_to_talk_active && state.connection.is_connected() {
+                    self.push_to_talk_active = true;
+                    self.start_transmit();
+                }
+            }
+            HotkeyEvent::PttReleased => {
+                tracing::debug!(
+                    "Global hotkey: PTT released (was_active={})",
+                    self.push_to_talk_active
+                );
+                if self.push_to_talk_active {
+                    self.push_to_talk_active = false;
+                    self.stop_transmit();
+                }
+            }
+            HotkeyEvent::ToggleMute => {
+                tracing::debug!("Global hotkey: Toggle mute");
+                if state.connection.is_connected() {
+                    self.backend.send(Command::SetMuted {
+                        muted: !state.audio.self_muted,
+                    });
+                }
+            }
+            HotkeyEvent::ToggleDeafen => {
+                tracing::debug!("Global hotkey: Toggle deafen");
+                if state.connection.is_connected() {
+                    self.backend.send(Command::SetDeafened {
+                        deafened: !state.audio.self_deafened,
+                    });
+                }
+            }
+        }
     }
 
     /// Apply all pending settings from the settings modal to the backend.
@@ -1521,6 +1641,358 @@ impl RumbleApp {
         }
     }
 
+    /// Render the keyboard settings panel.
+    fn render_settings_keyboard(&mut self, ui: &mut egui::Ui) {
+        use crate::hotkeys::HotkeyManager;
+        use crate::settings::{HotkeyBinding, HotkeyModifiers};
+
+        ui.heading("Keyboard Shortcuts");
+        ui.add_space(8.0);
+
+        // Global hotkeys status and toggle
+        ui.strong("Global Hotkeys");
+        ui.add_space(4.0);
+
+        // Check if we're on Wayland
+        #[cfg(target_os = "linux")]
+        let is_wayland = std::env::var("XDG_SESSION_TYPE")
+            .map(|v| v.to_lowercase() == "wayland")
+            .unwrap_or(false);
+        #[cfg(not(target_os = "linux"))]
+        let is_wayland = false;
+
+        if is_wayland {
+            if self.portal_hotkeys_available {
+                // Portal is available - show info about using system settings
+                ui.colored_label(
+                    egui::Color32::from_rgb(100, 200, 100),
+                    "✓ Global hotkeys available via XDG Portal (KDE/GNOME/Hyprland)",
+                );
+                ui.add_space(4.0);
+
+                // Show the actual bound shortcuts from the portal
+                #[cfg(target_os = "linux")]
+                {
+                    if self.portal_shortcuts.is_empty() {
+                        ui.label("Registered shortcuts (configure keys in system settings):");
+                        ui.indent("portal_shortcuts", |ui| {
+                            ui.label("• Push-to-Talk: (not configured)");
+                            ui.label("• Toggle Mute: (not configured)");
+                            ui.label("• Toggle Deafen: (not configured)");
+                        });
+                    } else {
+                        ui.label("Registered shortcuts:");
+                        ui.indent("portal_shortcuts", |ui| {
+                            for shortcut in &self.portal_shortcuts {
+                                let key_display = if shortcut.trigger_description.is_empty() {
+                                    "(not configured)".to_string()
+                                } else {
+                                    shortcut.trigger_description.clone()
+                                };
+                                ui.label(format!("• {}: {}", shortcut.description, key_display));
+                            }
+                        });
+                    }
+                }
+
+                ui.add_space(8.0);
+
+                // Button to open system shortcut settings
+                #[cfg(target_os = "linux")]
+                {
+                    if ui.button("Configure in System Settings...").clicked() {
+                        let handle = self.tokio_handle.clone();
+                        handle.spawn(async {
+                            if let Err(e) = crate::portal_hotkeys::open_shortcut_settings().await {
+                                tracing::error!("Failed to open shortcut settings: {}", e);
+                            }
+                        });
+                    }
+                    ui.add_space(4.0);
+                    ui.colored_label(
+                        egui::Color32::from_rgb(150, 150, 150),
+                        "Click above to configure which keys trigger each action.",
+                    );
+                }
+            } else {
+                // Portal not available - show warning
+                ui.colored_label(
+                    egui::Color32::from_rgb(255, 200, 100),
+                    "⚠ Global hotkeys not available on this Wayland compositor.",
+                );
+                ui.add_space(4.0);
+                ui.label("Hotkeys only work when the window is focused.");
+                ui.label("Tip: KDE Plasma, GNOME 47+, and Hyprland support global shortcuts.");
+            }
+            ui.add_space(8.0);
+        } else {
+            // Not Wayland - show standard global hotkey controls
+            let mut global_enabled = self.persistent_settings.keyboard.global_hotkeys_enabled;
+            if ui
+                .checkbox(&mut global_enabled, "Enable global hotkeys")
+                .on_hover_text("When enabled, hotkeys work even when the window is not focused")
+                .changed()
+            {
+                self.persistent_settings.keyboard.global_hotkeys_enabled = global_enabled;
+                self.settings_modal.dirty = true;
+            }
+
+            ui.add_space(8.0);
+            ui.colored_label(
+                egui::Color32::from_rgb(150, 150, 150),
+                "Note: Changes to global hotkeys require restarting the application.",
+            );
+        }
+
+        // Determine if we should show the in-app hotkey capture UI.
+        // On Wayland with portal, users configure shortcuts via system settings.
+        // On other platforms (or Wayland without portal), show the capture UI.
+        let show_capture_ui = !is_wayland || !self.portal_hotkeys_available;
+
+        if !show_capture_ui {
+            // Portal is handling shortcuts - show explanatory text
+            ui.add_space(8.0);
+            ui.colored_label(
+                egui::Color32::from_rgb(150, 150, 150),
+                "Shortcut keys are configured through your system settings.",
+            );
+            ui.colored_label(
+                egui::Color32::from_rgb(150, 150, 150),
+                "The bindings below are used as fallback when the window is focused.",
+            );
+        }
+
+        ui.add_space(16.0);
+        ui.separator();
+        ui.add_space(8.0);
+
+        // Helper to render a hotkey binding row with capture
+        let render_hotkey_row = |ui: &mut egui::Ui,
+                                  label: &str,
+                                  binding: &Option<HotkeyBinding>,
+                                  target: HotkeyCaptureTarget,
+                                  capture_target: &mut Option<HotkeyCaptureTarget>,
+                                  dirty: &mut bool,
+                                  allow_edit: bool|
+         -> Option<Option<HotkeyBinding>> {
+            let mut result = None;
+
+            ui.strong(label);
+            ui.add_space(4.0);
+
+            ui.horizontal(|ui| {
+                let is_capturing = *capture_target == Some(target);
+
+                if is_capturing {
+                    // Show capture UI
+                    ui.colored_label(
+                        egui::Color32::from_rgb(100, 200, 255),
+                        "Press any key (with optional modifiers)... [Esc to cancel]",
+                    );
+                } else {
+                    // Show current binding
+                    let binding_label = binding
+                        .as_ref()
+                        .map(|h| h.display())
+                        .unwrap_or_else(|| "Not set".to_string());
+
+                    ui.monospace(&binding_label);
+
+                    if allow_edit {
+                        if ui.button("Change").clicked() {
+                            *capture_target = Some(target);
+                        }
+
+                        if binding.is_some() && ui.button("Clear").clicked() {
+                            result = Some(None);
+                            *dirty = true;
+                        }
+                    }
+                }
+            });
+
+            result
+        };
+
+        // Capture key input if we're in capture mode
+        let mut captured_binding: Option<(HotkeyCaptureTarget, HotkeyBinding)> = None;
+        let mut cancel_capture = false;
+
+        if let Some(target) = self.settings_modal.hotkey_capture_target {
+            // Check for Escape to cancel
+            if ui.ctx().input(|i| i.key_pressed(egui::Key::Escape)) {
+                cancel_capture = true;
+            } else {
+                // Check for any other key press
+                let modifiers = ui.ctx().input(|i| i.modifiers);
+
+                // Iterate through all keys to find which one was pressed
+                for key in [
+                    egui::Key::Space,
+                    egui::Key::Enter,
+                    egui::Key::Tab,
+                    egui::Key::Backspace,
+                    egui::Key::Insert,
+                    egui::Key::Delete,
+                    egui::Key::Home,
+                    egui::Key::End,
+                    egui::Key::PageUp,
+                    egui::Key::PageDown,
+                    egui::Key::ArrowUp,
+                    egui::Key::ArrowDown,
+                    egui::Key::ArrowLeft,
+                    egui::Key::ArrowRight,
+                    egui::Key::F1,
+                    egui::Key::F2,
+                    egui::Key::F3,
+                    egui::Key::F4,
+                    egui::Key::F5,
+                    egui::Key::F6,
+                    egui::Key::F7,
+                    egui::Key::F8,
+                    egui::Key::F9,
+                    egui::Key::F10,
+                    egui::Key::F11,
+                    egui::Key::F12,
+                    egui::Key::A,
+                    egui::Key::B,
+                    egui::Key::C,
+                    egui::Key::D,
+                    egui::Key::E,
+                    egui::Key::F,
+                    egui::Key::G,
+                    egui::Key::H,
+                    egui::Key::I,
+                    egui::Key::J,
+                    egui::Key::K,
+                    egui::Key::L,
+                    egui::Key::M,
+                    egui::Key::N,
+                    egui::Key::O,
+                    egui::Key::P,
+                    egui::Key::Q,
+                    egui::Key::R,
+                    egui::Key::S,
+                    egui::Key::T,
+                    egui::Key::U,
+                    egui::Key::V,
+                    egui::Key::W,
+                    egui::Key::X,
+                    egui::Key::Y,
+                    egui::Key::Z,
+                    egui::Key::Num0,
+                    egui::Key::Num1,
+                    egui::Key::Num2,
+                    egui::Key::Num3,
+                    egui::Key::Num4,
+                    egui::Key::Num5,
+                    egui::Key::Num6,
+                    egui::Key::Num7,
+                    egui::Key::Num8,
+                    egui::Key::Num9,
+                    egui::Key::Minus,
+                    egui::Key::Equals,
+                    egui::Key::OpenBracket,
+                    egui::Key::CloseBracket,
+                    egui::Key::Backslash,
+                    egui::Key::Semicolon,
+                    egui::Key::Quote,
+                    egui::Key::Backtick,
+                    egui::Key::Comma,
+                    egui::Key::Period,
+                    egui::Key::Slash,
+                ] {
+                    if ui.ctx().input(|i| i.key_pressed(key)) {
+                        if let Some(key_str) = HotkeyManager::egui_key_to_string(key) {
+                            captured_binding = Some((
+                                target,
+                                HotkeyBinding {
+                                    modifiers: HotkeyModifiers {
+                                        ctrl: modifiers.ctrl,
+                                        shift: modifiers.shift,
+                                        alt: modifiers.alt,
+                                        super_key: modifiers.command,
+                                    },
+                                    key: key_str,
+                                },
+                            ));
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        // PTT Hotkey
+        if let Some(new_binding) = render_hotkey_row(
+            ui,
+            "Push-to-Talk (Window Focused)",
+            &self.persistent_settings.keyboard.ptt_hotkey,
+            HotkeyCaptureTarget::Ptt,
+            &mut self.settings_modal.hotkey_capture_target,
+            &mut self.settings_modal.dirty,
+            show_capture_ui,
+        ) {
+            self.persistent_settings.keyboard.ptt_hotkey = new_binding;
+        }
+
+        ui.add_space(16.0);
+        ui.separator();
+        ui.add_space(8.0);
+
+        // Toggle Mute Hotkey
+        if let Some(new_binding) = render_hotkey_row(
+            ui,
+            "Toggle Mute (Window Focused)",
+            &self.persistent_settings.keyboard.toggle_mute_hotkey,
+            HotkeyCaptureTarget::ToggleMute,
+            &mut self.settings_modal.hotkey_capture_target,
+            &mut self.settings_modal.dirty,
+            show_capture_ui,
+        ) {
+            self.persistent_settings.keyboard.toggle_mute_hotkey = new_binding;
+        }
+
+        ui.add_space(16.0);
+        ui.separator();
+        ui.add_space(8.0);
+
+        // Toggle Deafen Hotkey
+        if let Some(new_binding) = render_hotkey_row(
+            ui,
+            "Toggle Deafen (Window Focused)",
+            &self.persistent_settings.keyboard.toggle_deafen_hotkey,
+            HotkeyCaptureTarget::ToggleDeafen,
+            &mut self.settings_modal.hotkey_capture_target,
+            &mut self.settings_modal.dirty,
+            show_capture_ui,
+        ) {
+            self.persistent_settings.keyboard.toggle_deafen_hotkey = new_binding;
+        }
+
+        // Apply captured binding
+        if let Some((target, binding)) = captured_binding {
+            match target {
+                HotkeyCaptureTarget::Ptt => {
+                    self.persistent_settings.keyboard.ptt_hotkey = Some(binding);
+                }
+                HotkeyCaptureTarget::ToggleMute => {
+                    self.persistent_settings.keyboard.toggle_mute_hotkey = Some(binding);
+                }
+                HotkeyCaptureTarget::ToggleDeafen => {
+                    self.persistent_settings.keyboard.toggle_deafen_hotkey = Some(binding);
+                }
+            }
+            self.settings_modal.hotkey_capture_target = None;
+            self.settings_modal.dirty = true;
+        }
+
+        // Cancel capture if escape was pressed
+        if cancel_capture {
+            self.settings_modal.hotkey_capture_target = None;
+        }
+    }
+
     /// Render the first-run setup dialog for key configuration.
     /// Returns true if setup is complete and the dialog should close.
     fn render_first_run_dialog(&mut self, ctx: &egui::Context) {
@@ -2096,17 +2568,113 @@ impl RumbleApp {
             self.push_to_talk_active = false;
         }
 
-        // Handle push-to-talk (Space key)
-        // Always track Space key state and send commands - the backend handles
-        // mode-specific behavior (e.g., ignoring PTT in Continuous mode for
-        // start/stop, but still tracking the state for mode switches)
-        let space_pressed = ctx.input(|i| i.key_down(egui::Key::Space));
-        if space_pressed && !self.push_to_talk_active && state.connection.is_connected() {
-            self.push_to_talk_active = true;
-            self.start_transmit();
-        } else if !space_pressed && self.push_to_talk_active {
-            self.push_to_talk_active = false;
-            self.stop_transmit();
+        // Handle push-to-talk - window-focused fallback.
+        // Global hotkeys are handled in EframeWrapper::update() via handle_hotkey_event().
+        // This fallback ALWAYS runs to catch cases where global hotkeys don't work:
+        // - Wayland (no global hotkey support)
+        // - Global hotkey initialization failed
+        // - Window is focused and user presses the key
+        // The global hotkey handler runs first and sets push_to_talk_active, so this
+        // won't double-trigger.
+        //
+        // NOTE: We skip PTT activation if a text field is focused (e.g., chat input)
+        // to avoid triggering PTT while typing. We still detect key release to stop PTT.
+        let text_input_focused = ctx.wants_keyboard_input();
+        if let Some(ref binding) = self.persistent_settings.keyboard.ptt_hotkey {
+            if let Some(egui_key) = crate::hotkeys::HotkeyManager::key_string_to_egui_key(&binding.key) {
+                let key_pressed = ctx.input(|i| {
+                    let key_down = i.key_down(egui_key);
+                    // Only check modifiers if the binding has any
+                    let has_modifiers = binding.modifiers.ctrl
+                        || binding.modifiers.shift
+                        || binding.modifiers.alt
+                        || binding.modifiers.super_key;
+                    if has_modifiers {
+                        let mods_match = i.modifiers.ctrl == binding.modifiers.ctrl
+                            && i.modifiers.shift == binding.modifiers.shift
+                            && i.modifiers.alt == binding.modifiers.alt
+                            && i.modifiers.command == binding.modifiers.super_key;
+                        key_down && mods_match
+                    } else {
+                        key_down
+                    }
+                });
+                // Only start PTT if not typing in a text field
+                if key_pressed && !text_input_focused {
+                    if !self.push_to_talk_active {
+                        if state.connection.is_connected() {
+                            tracing::debug!("PTT fallback: key pressed, starting transmit");
+                            self.push_to_talk_active = true;
+                            self.start_transmit();
+                        } else {
+                            // Log once per key press when not connected
+                            tracing::trace!("PTT key detected but not connected - PTT requires server connection");
+                        }
+                    }
+                } else if !key_pressed && self.push_to_talk_active {
+                    // Always detect key release to stop PTT
+                    tracing::debug!("PTT fallback: key released, stopping transmit");
+                    self.push_to_talk_active = false;
+                    self.stop_transmit();
+                }
+            }
+        }
+
+        // Handle mute toggle hotkey - window-focused fallback (same pattern as PTT)
+        if let Some(ref binding) = self.persistent_settings.keyboard.toggle_mute_hotkey {
+            if let Some(egui_key) = crate::hotkeys::HotkeyManager::key_string_to_egui_key(&binding.key) {
+                let key_pressed = ctx.input(|i| {
+                    // Use key_pressed for toggle (one-shot), not key_down (held)
+                    let pressed = i.key_pressed(egui_key);
+                    let has_modifiers = binding.modifiers.ctrl
+                        || binding.modifiers.shift
+                        || binding.modifiers.alt
+                        || binding.modifiers.super_key;
+                    if has_modifiers {
+                        let mods_match = i.modifiers.ctrl == binding.modifiers.ctrl
+                            && i.modifiers.shift == binding.modifiers.shift
+                            && i.modifiers.alt == binding.modifiers.alt
+                            && i.modifiers.command == binding.modifiers.super_key;
+                        pressed && mods_match
+                    } else {
+                        pressed
+                    }
+                });
+                if key_pressed && !text_input_focused && state.connection.is_connected() {
+                    tracing::debug!("Mute toggle fallback: key pressed, toggling mute");
+                    self.backend.send(Command::SetMuted {
+                        muted: !state.audio.self_muted,
+                    });
+                }
+            }
+        }
+
+        // Handle deafen toggle hotkey - window-focused fallback
+        if let Some(ref binding) = self.persistent_settings.keyboard.toggle_deafen_hotkey {
+            if let Some(egui_key) = crate::hotkeys::HotkeyManager::key_string_to_egui_key(&binding.key) {
+                let key_pressed = ctx.input(|i| {
+                    let pressed = i.key_pressed(egui_key);
+                    let has_modifiers = binding.modifiers.ctrl
+                        || binding.modifiers.shift
+                        || binding.modifiers.alt
+                        || binding.modifiers.super_key;
+                    if has_modifiers {
+                        let mods_match = i.modifiers.ctrl == binding.modifiers.ctrl
+                            && i.modifiers.shift == binding.modifiers.shift
+                            && i.modifiers.alt == binding.modifiers.alt
+                            && i.modifiers.command == binding.modifiers.super_key;
+                        pressed && mods_match
+                    } else {
+                        pressed
+                    }
+                });
+                if key_pressed && !text_input_focused && state.connection.is_connected() {
+                    tracing::debug!("Deafen toggle fallback: key pressed, toggling deafen");
+                    self.backend.send(Command::SetDeafened {
+                        deafened: !state.audio.self_deafened,
+                    });
+                }
+            }
         }
 
         // Handle drag-and-drop file sharing
@@ -2455,6 +3023,7 @@ impl RumbleApp {
                             pending_show_timestamps: Some(self.persistent_settings.show_chat_timestamps),
                             pending_timestamp_format: Some(self.persistent_settings.chat_timestamp_format),
                             dirty: false,
+                            hotkey_capture_target: None,
                         };
                         self.show_settings = true;
                         ui.close();
@@ -2614,6 +3183,7 @@ impl RumbleApp {
                         pending_show_timestamps: Some(self.persistent_settings.show_chat_timestamps),
                         pending_timestamp_format: Some(self.persistent_settings.chat_timestamp_format),
                         dirty: false,
+                        hotkey_capture_target: None,
                     };
                     self.show_settings = true;
                 }
@@ -3479,6 +4049,7 @@ impl RumbleApp {
                     pending_show_timestamps: Some(self.persistent_settings.show_chat_timestamps),
                     pending_timestamp_format: Some(self.persistent_settings.chat_timestamp_format),
                     dirty: false,
+                    hotkey_capture_target: None,
                 };
             }
 
@@ -3606,6 +4177,9 @@ impl RumbleApp {
                                         }
                                         SettingsCategory::FileTransfer => {
                                             self.render_settings_file_transfer(ui);
+                                        }
+                                        SettingsCategory::Keyboard => {
+                                            self.render_settings_keyboard(ui);
                                         }
                                         SettingsCategory::Statistics => {
                                             self.render_settings_statistics(ui, &state);

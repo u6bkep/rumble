@@ -105,6 +105,15 @@ pub enum Command {
     /// Get current file transfer settings for a client.
     GetFileTransferSettings { id: u32 },
 
+    /// Set a keyboard shortcut (hotkey) for a client.
+    /// action: "ptt", "mute", or "deafen"
+    /// key: e.g., "Space", "M", "F1", or null to clear
+    SetHotkey {
+        id: u32,
+        action: String,
+        key: Option<String>,
+    },
+
     // -- File transfers --
     /// Share a file.
     ShareFile { id: u32, path: String },

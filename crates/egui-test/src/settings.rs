@@ -254,6 +254,9 @@ pub struct PersistentSettings {
 
     // File transfer settings
     pub file_transfer: FileTransferSettings,
+
+    // Keyboard settings
+    pub keyboard: KeyboardSettings,
 }
 
 impl Default for PersistentSettings {
@@ -274,6 +277,7 @@ impl Default for PersistentSettings {
             show_chat_timestamps: false,
             chat_timestamp_format: TimestampFormat::default(),
             file_transfer: FileTransferSettings::default(),
+            keyboard: KeyboardSettings::default(),
         }
     }
 }
@@ -547,4 +551,75 @@ pub struct AcceptedCertificate {
     pub fingerprint_hex: String,
     /// DER-encoded certificate as base64 string.
     pub certificate_der_base64: String,
+}
+
+// =============================================================================
+// Keyboard Settings
+// =============================================================================
+
+/// Keyboard shortcut configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct KeyboardSettings {
+    /// Push-to-talk hotkey binding.
+    pub ptt_hotkey: Option<HotkeyBinding>,
+    /// Toggle mute hotkey.
+    pub toggle_mute_hotkey: Option<HotkeyBinding>,
+    /// Toggle deafen hotkey.
+    pub toggle_deafen_hotkey: Option<HotkeyBinding>,
+    /// Whether global hotkeys are enabled (work when window unfocused).
+    pub global_hotkeys_enabled: bool,
+}
+
+impl Default for KeyboardSettings {
+    fn default() -> Self {
+        Self {
+            ptt_hotkey: Some(HotkeyBinding {
+                modifiers: HotkeyModifiers::default(),
+                key: "Space".to_string(),
+            }),
+            toggle_mute_hotkey: None,
+            toggle_deafen_hotkey: None,
+            global_hotkeys_enabled: true,
+        }
+    }
+}
+
+/// A hotkey binding with modifiers and key.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HotkeyBinding {
+    /// Modifier keys (Ctrl, Shift, Alt, Super/Meta).
+    pub modifiers: HotkeyModifiers,
+    /// The main key code (e.g., "Space", "F1", "KeyA").
+    pub key: String,
+}
+
+impl HotkeyBinding {
+    /// Format the hotkey for display (e.g., "Ctrl+Shift+Space").
+    pub fn display(&self) -> String {
+        let mut parts = Vec::new();
+        if self.modifiers.ctrl {
+            parts.push("Ctrl");
+        }
+        if self.modifiers.shift {
+            parts.push("Shift");
+        }
+        if self.modifiers.alt {
+            parts.push("Alt");
+        }
+        if self.modifiers.super_key {
+            parts.push("Super");
+        }
+        parts.push(&self.key);
+        parts.join("+")
+    }
+}
+
+/// Modifier keys for hotkey bindings.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct HotkeyModifiers {
+    pub ctrl: bool,
+    pub shift: bool,
+    pub alt: bool,
+    pub super_key: bool,
 }
