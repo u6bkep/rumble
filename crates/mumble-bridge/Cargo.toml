@@ -1,0 +1,30 @@
+[package]
+name = "mumble-bridge"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "mumble-bridge"
+path = "src/main.rs"
+
+[dependencies]
+api = { path = "../api" }
+quinn = { version = "0.11", default-features = false, features = ["ring", "runtime-tokio", "rustls-ring"] }
+tokio = { version = "1", features = ["full"] }
+prost = "0.14"
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+rcgen = "0.13"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+uuid = { version = "1", features = ["v4"] }
+ed25519-dalek = { workspace = true }
+rand = { workspace = true }
+dashmap = "6"
+bytes = "1"
+hex = "0.4"
+
+[build-dependencies]
+prost-build = "0.14"
