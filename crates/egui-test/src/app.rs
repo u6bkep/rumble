@@ -286,6 +286,9 @@ pub struct RumbleApp {
     prev_user_ids_in_room: std::collections::HashSet<u64>,
     prev_user_ids_initialized: bool,
     prev_chat_count: usize,
+
+    // RPC server (kept alive for the lifetime of the app)
+    _rpc_server: Option<backend::rpc::RpcServer>,
 }
 
 impl Drop for RumbleApp {
@@ -482,6 +485,27 @@ impl RumbleApp {
 
         let needs_first_run = !matches!(first_run_state, FirstRunState::NotNeeded);
 
+        // Start RPC server for external process control (opt-in via --rpc-server flag or --rpc-socket)
+        let rpc_server = if args.rpc_server || args.rpc_socket.is_some() {
+            let socket_path = args
+                .rpc_socket
+                .as_ref()
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(backend::rpc::default_socket_path);
+            match backend.start_rpc_server(socket_path) {
+                Ok(server) => {
+                    tracing::info!("RPC server started");
+                    Some(server)
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to start RPC server: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let mut app = Self {
             show_connect: false,
             show_settings: false,
@@ -522,6 +546,7 @@ impl RumbleApp {
             prev_user_ids_in_room: std::collections::HashSet::new(),
             prev_user_ids_initialized: false,
             prev_chat_count: 0,
+            _rpc_server: rpc_server,
         };
 
         // If server was specified on command line, connect immediately (unless first run)

@@ -16,11 +16,46 @@ use urlencoding::encode;
 use uuid::Uuid;
 
 // =============================================================================
+// Serde Helpers
+// =============================================================================
+
+fn serialize_system_time<S: serde::Serializer>(time: &std::time::SystemTime, s: S) -> Result<S::Ok, S::Error> {
+    let millis = time
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    s.serialize_u64(millis)
+}
+
+fn serialize_id_hex<S: serde::Serializer>(id: &[u8; 16], s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(&hex::encode(id))
+}
+
+fn serialize_infohash_hex<S: serde::Serializer>(id: &[u8; 20], s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(&hex::encode(id))
+}
+
+fn serialize_opt_instant<S: serde::Serializer>(_: &Option<Instant>, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_none()
+}
+
+fn serialize_session_key<S: serde::Serializer>(key: &Option<[u8; 32]>, s: S) -> Result<S::Ok, S::Error> {
+    match key {
+        Some(k) => s.serialize_some(&hex::encode(k)),
+        None => s.serialize_none(),
+    }
+}
+
+fn serialize_session_id_bytes<S: serde::Serializer>(id: &[u8; 32], s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(&hex::encode(id))
+}
+
+// =============================================================================
 // Room Tree
 // =============================================================================
 
 /// A node in the room tree hierarchy.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct RoomTreeNode {
     /// The room UUID.
     pub id: Uuid,
@@ -37,7 +72,7 @@ pub struct RoomTreeNode {
 /// This is rebuilt whenever the room list changes. The UI can use this
 /// to efficiently render the room list as a tree without rebuilding
 /// the hierarchy on each frame.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct RoomTree {
     /// All nodes indexed by room UUID.
     pub nodes: HashMap<Uuid, RoomTreeNode>,
@@ -206,7 +241,7 @@ pub type SigningCallback = Arc<dyn Fn(&[u8]) -> Result<[u8; 64], String> + Send 
 ///
 /// Note: Audio processing (denoise, VAD, etc.) is configured via the TX pipeline,
 /// not via these settings.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct AudioSettings {
     /// Opus encoder bitrate in bits per second.
     /// Common values: 24000 (low), 32000 (medium), 64000 (high), 96000 (very high).
@@ -268,7 +303,7 @@ impl AudioSettings {
 /// Runtime audio statistics for monitoring and debugging.
 ///
 /// These are read-only values updated by the audio pipeline.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct AudioStats {
     /// Number of voice packets sent.
     pub packets_sent: u64,
@@ -304,6 +339,7 @@ pub struct AudioStats {
     pub buffer_underruns: u64,
 
     /// Timestamp of last stats update.
+    #[serde(serialize_with = "serialize_opt_instant")]
     pub last_update: Option<Instant>,
 }
 
@@ -426,6 +462,37 @@ impl Default for ConnectionState {
     }
 }
 
+impl serde::Serialize for ConnectionState {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(None)?;
+        match self {
+            ConnectionState::Disconnected => {
+                map.serialize_entry("state", "disconnected")?;
+            }
+            ConnectionState::Connecting { server_addr } => {
+                map.serialize_entry("state", "connecting")?;
+                map.serialize_entry("server_addr", server_addr)?;
+            }
+            ConnectionState::Connected { server_name, user_id } => {
+                map.serialize_entry("state", "connected")?;
+                map.serialize_entry("server_name", server_name)?;
+                map.serialize_entry("user_id", user_id)?;
+            }
+            ConnectionState::ConnectionLost { error } => {
+                map.serialize_entry("state", "connection_lost")?;
+                map.serialize_entry("error", error)?;
+            }
+            ConnectionState::CertificatePending { cert_info } => {
+                map.serialize_entry("state", "certificate_pending")?;
+                map.serialize_entry("server_name", &cert_info.server_name)?;
+                map.serialize_entry("fingerprint", &cert_info.fingerprint_hex())?;
+            }
+        }
+        map.end()
+    }
+}
+
 impl ConnectionState {
     /// Check if we are currently connected.
     pub fn is_connected(&self) -> bool {
@@ -458,7 +525,8 @@ impl ConnectionState {
 /// Note: Voice Activity Detection (VAD) is not a voice mode but a pipeline
 /// processor. To achieve "voice activated" transmission, use Continuous mode
 /// with the VAD processor enabled in the TX pipeline.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum VoiceMode {
     /// Only transmit while PTT key is held.
     #[default]
@@ -486,7 +554,7 @@ pub type TransmissionMode = VoiceMode;
 // =============================================================================
 
 /// Audio subsystem state.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct AudioState {
     /// Available input (microphone) devices.
     pub input_devices: Vec<AudioDeviceInfo>,
@@ -558,13 +626,15 @@ impl AudioState {
 // =============================================================================
 
 /// A chat message.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ChatMessage {
     /// Unique message ID (16-byte UUID).
+    #[serde(serialize_with = "serialize_id_hex")]
     pub id: [u8; 16],
     pub sender: String,
     pub text: String,
     /// Wall-clock time when the message was received/created.
+    #[serde(serialize_with = "serialize_system_time")]
     pub timestamp: std::time::SystemTime,
     /// True if this is a local status message (not from the server).
     pub is_local: bool,
@@ -923,7 +993,7 @@ impl ChatHistoryContent {
 // =============================================================================
 
 /// A single auto-download rule with a MIME pattern and max file size.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct AutoDownloadRule {
     /// MIME type pattern (e.g., "image/*", "audio/*", "application/pdf").
     pub mime_pattern: String,
@@ -953,7 +1023,7 @@ impl AutoDownloadRule {
 }
 
 /// File transfer settings including auto-download configuration.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct FileTransferSettings {
     /// Auto-download files matching the rules below.
     pub auto_download_enabled: bool,
@@ -976,7 +1046,8 @@ impl FileTransferSettings {
 // =============================================================================
 
 /// State of a file transfer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TransferState {
     /// In queue, not started.
     #[default]
@@ -1011,7 +1082,8 @@ impl TransferState {
 }
 
 /// Connection type for a transfer peer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PeerConnectionType {
     /// Direct TCP connection to peer.
     #[default]
@@ -1036,7 +1108,8 @@ impl std::fmt::Display for PeerConnectionType {
 }
 
 /// State of a peer connection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PeerState {
     /// Connecting to peer.
     #[default]
@@ -1061,7 +1134,7 @@ impl std::fmt::Display for PeerState {
 }
 
 /// Information about a connected peer in a file transfer.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct TransferPeerInfo {
     /// Socket address of the peer (IP:port).
     pub address: String,
@@ -1076,9 +1149,10 @@ pub struct TransferPeerInfo {
 }
 
 /// Information about a file transfer.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct FileTransferState {
     /// Infohash (20 bytes).
+    #[serde(serialize_with = "serialize_infohash_hex")]
     pub infohash: [u8; 20],
     /// Original filename.
     pub name: String,
@@ -1113,11 +1187,12 @@ pub struct FileTransferState {
 // =============================================================================
 
 /// Information about a P2P peer announced by the server.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct PeerInfo {
     /// The user ID this peer corresponds to.
     pub user_id: u64,
     /// Session ID (32-byte hash of session public key).
+    #[serde(serialize_with = "serialize_session_id_bytes")]
     pub session_id: [u8; 32],
     /// libp2p PeerId as bytes.
     pub libp2p_peer_id: Vec<u8>,
@@ -1137,7 +1212,7 @@ pub struct PeerInfo {
 ///
 /// The UI renders based on this state. User actions result in Commands
 /// sent to the backend, which updates this state and calls the repaint callback.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct State {
     // Connection
     /// Current connection state.
@@ -1153,8 +1228,10 @@ pub struct State {
     /// Our current room ID (if in a room).
     pub my_room_id: Option<Uuid>,
     /// Ephemeral session public key for this connection (P2P identity).
+    #[serde(serialize_with = "serialize_session_key")]
     pub my_session_public_key: Option<[u8; 32]>,
     /// Stable session identifier derived from the session public key.
+    #[serde(serialize_with = "serialize_session_key")]
     pub my_session_id: Option<[u8; 32]>,
 
     // P2P state
@@ -1579,6 +1656,7 @@ mod tests {
             audio: AudioState::default(),
             chat_messages: vec![],
             file_transfers: vec![],
+            file_transfer_settings: FileTransferSettings::default(),
             room_tree: RoomTree::default(),
             p2p_peers: HashMap::new(),
         };

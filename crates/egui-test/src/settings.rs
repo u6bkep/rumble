@@ -38,6 +38,18 @@ pub struct Args {
     /// Path to a custom server certificate to trust
     #[arg(long)]
     pub cert: Option<String>,
+
+    /// Run in RPC client mode (send command to running instance)
+    #[arg(long)]
+    pub rpc: Option<String>,
+
+    /// RPC socket path override
+    #[arg(long)]
+    pub rpc_socket: Option<String>,
+
+    /// Enable the RPC server for external process control
+    #[arg(long)]
+    pub rpc_server: bool,
 }
 
 // =============================================================================

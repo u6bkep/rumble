@@ -20,6 +20,22 @@ fn main() -> eframe::Result<()> {
 
     let args = Args::parse();
 
+    // RPC client mode: send command to running instance and exit
+    if let Some(rpc_command) = &args.rpc {
+        let socket_path = args
+            .rpc_socket
+            .as_ref()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(backend::rpc::default_socket_path);
+
+        let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime for RPC");
+        if let Err(e) = rt.block_on(egui_test::rpc_client::run_rpc_command(socket_path, rpc_command)) {
+            eprintln!("RPC error: {}", e);
+            std::process::exit(1);
+        }
+        std::process::exit(0);
+    }
+
     // Load settings to get keyboard config
     let settings = PersistentSettings::load();
 
