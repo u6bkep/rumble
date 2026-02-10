@@ -542,18 +542,34 @@ impl RumbleApp {
         self.backend.state().connection.is_connected()
     }
 
-    /// Handle an image paste from the clipboard.
+    /// Try to paste an image from the system clipboard and share it.
     ///
-    /// Called by the eframe wrapper when it detects that the user pressed Ctrl+V
-    /// while the clipboard contains image data rather than text. The image bytes
-    /// are saved to a temporary PNG file and shared via the file transfer system.
+    /// Reads image data via arboard (which works independently of egui_winit's
+    /// smithay/text-only clipboard). If the clipboard contains an image, it is
+    /// saved to a temporary PNG and shared via the file transfer system.
     ///
-    /// Returns `true` if the image was successfully queued for sharing.
-    pub fn handle_clipboard_image_paste(&mut self, img_data: arboard::ImageData) -> bool {
+    /// TODO: Replace this with `egui::Event::PasteImage` once upstream egui
+    /// adds image paste support (https://github.com/emilk/egui/issues/2108).
+    /// That would also enable Ctrl+V image paste instead of needing a button.
+    pub fn paste_clipboard_image(&mut self) {
         if !self.is_connected() {
             self.toast_manager.warning("Connect to a server before pasting images");
-            return false;
+            return;
         }
+        let mut clipboard = match arboard::Clipboard::new() {
+            Ok(c) => c,
+            Err(_) => {
+                self.toast_manager.error("Could not access clipboard");
+                return;
+            }
+        };
+        let img_data = match clipboard.get_image() {
+            Ok(d) => d,
+            Err(_) => {
+                self.toast_manager.warning("No image on clipboard");
+                return;
+            }
+        };
         if let Some(img) = image::RgbaImage::from_raw(
             img_data.width as u32,
             img_data.height as u32,
@@ -568,12 +584,11 @@ impl RumbleApp {
                     self.backend.send(Command::ShareFile { path });
                     self.show_transfers = true;
                     self.toast_manager.success("Sharing pasted image");
-                    return true;
+                    return;
                 }
             }
         }
         self.toast_manager.error("Failed to process clipboard image");
-        false
     }
 
     /// Set the global hotkey registration status from the HotkeyManager.
@@ -2926,10 +2941,9 @@ impl RumbleApp {
             }
         }
 
-        // Image paste is handled via EframeWrapper::raw_input_hook which
-        // detects Ctrl+V with image data on the clipboard (egui_winit swallows
-        // the Key::V event when it attempts a text paste, so we cannot detect
-        // it through egui's normal input API). See handle_clipboard_image_paste().
+        // TODO: Ctrl+V image paste blocked by egui_winit swallowing Key::V
+        // when text clipboard read fails. Track upstream: egui#2108.
+        // For now, image paste is via the clipboard button in the chat bar.
 
         // Show drop target indicator when files are being dragged
         let is_dragging = ctx.input(|i| !i.raw.hovered_files.is_empty());
@@ -3817,6 +3831,10 @@ impl RumbleApp {
                                             self.backend.send(Command::SendChat { text: text.to_owned() });
                                             self.chat_input.clear();
                                         }
+                                    }
+
+                                    if ui.button("📋").on_hover_text("Paste image from clipboard").clicked() {
+                                        self.paste_clipboard_image();
                                     }
 
                                     if ui
