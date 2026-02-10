@@ -169,8 +169,16 @@ async fn handle_tracker_announce(
     sender: Arc<ClientHandle>,
     state: Arc<ServerState>,
 ) -> Result<()> {
-    let info_hash: [u8; 20] = msg.info_hash.clone().try_into().unwrap_or([0; 20]);
-    let peer_id: [u8; 20] = msg.peer_id.clone().try_into().unwrap_or([0; 20]);
+    let info_hash: [u8; 20] = msg
+        .info_hash
+        .clone()
+        .try_into()
+        .map_err(|v: Vec<u8>| anyhow::anyhow!("Invalid info_hash length {}, expected 20", v.len()))?;
+    let peer_id: [u8; 20] = msg
+        .peer_id
+        .clone()
+        .try_into()
+        .map_err(|v: Vec<u8>| anyhow::anyhow!("Invalid peer_id length {}, expected 20", v.len()))?;
 
     // Use the authenticated user ID from the sender, not from the message
     // This prevents spoofing
