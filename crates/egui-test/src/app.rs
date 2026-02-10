@@ -3111,6 +3111,7 @@ impl RumbleApp {
                     if ui.button("Download File...").clicked() {
                         self.download_modal.open = true;
                         self.download_modal.magnet_link.clear();
+                        self.download_modal.validation_error = None;
                         ui.close();
                     }
                     if ui.button("Show Transfers").clicked() {
