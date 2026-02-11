@@ -424,8 +424,19 @@ fn handle_state_update(
                 if Some(rumble_id) == state.bridge_user_id {
                     return;
                 }
-                // Skip events for our own virtual users
+                // Skip events for our own virtual users (already registered)
                 if state.reverse_virtual_user_map.contains_key(&rumble_id) {
+                    return;
+                }
+                // Also skip if this user matches a pending registration —
+                // the UserJoined can arrive before BridgeUserRegistered,
+                // and we don't want to broadcast the virtual user as a
+                // duplicate to Mumble clients who already have their own session.
+                if state
+                    .pending_registrations
+                    .iter()
+                    .any(|(name, _)| name == &user.username)
+                {
                     return;
                 }
 
