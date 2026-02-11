@@ -645,27 +645,23 @@ fn handle_rumble_voice(
         None => return,
     };
 
-    // If the sender is one of our own virtual users, look up the Mumble session
-    // to exclude from relay (avoid echo back to the original speaker).
-    // For normal Rumble users, exclude_session is None and we relay to all clients.
-    let exclude_session = {
+    // Resolve the sender's Mumble session and echo-exclusion in a single lock.
+    // Virtual users aren't in UserMap, so we get their session from reverse_virtual_user_map.
+    // For virtual users we also set exclude_session to prevent echoing voice back to the sender.
+    let (session, exclude_session, target_channel) = {
         let state = bridge_state.read().unwrap();
-        state.reverse_virtual_user_map.get(&sender_id).copied()
-    };
 
-    // Determine the Mumble session for this Rumble sender, and the target channel
-    let (session, target_channel) = {
-        let state = bridge_state.read().unwrap();
-        let session = state.users.get_mumble_session(sender_id);
+        let vu_session = state.reverse_virtual_user_map.get(&sender_id).copied();
+        let session = vu_session.or_else(|| state.users.get_mumble_session(sender_id));
+        let exclude_session = vu_session;
 
-        // Resolve the room_id from the datagram to a Mumble channel ID
         let target_channel = datagram
             .room_id
             .as_ref()
             .and_then(|bytes| uuid::Uuid::from_slice(bytes).ok())
             .and_then(|uuid| state.channels.get_mumble_id(&uuid));
 
-        (session, target_channel)
+        (session, exclude_session, target_channel)
     };
 
     let session = match session {
