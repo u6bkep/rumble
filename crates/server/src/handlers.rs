@@ -1371,6 +1371,13 @@ pub async fn handle_datagrams(conn: quinn::Connection, state: Arc<ServerState>, 
                             sender_user_id
                         };
 
+                        // Check if sender is muted — drop voice silently
+                        let status = state.get_user_status(effective_sender).await;
+                        if status.is_muted {
+                            debug!(sender = effective_sender, "server: dropping voice from muted user");
+                            continue;
+                        }
+
                         debug!(
                             sender = effective_sender,
                             seq = voice_dgram.sequence,
