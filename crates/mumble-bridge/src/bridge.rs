@@ -208,9 +208,13 @@ pub async fn run_bridge(
                 }
 
                 // Also broadcast to other Mumble clients
+                let sender_channel_id = {
+                    let state = bridge_state.read().unwrap();
+                    state.mumble_clients.get(&session).map(|c| c.channel_id).unwrap_or(0)
+                };
                 let text_msg = mumble::TextMessage {
                     actor: Some(session),
-                    channel_id: vec![0],
+                    channel_id: vec![sender_channel_id],
                     message: Some(message),
                     ..Default::default()
                 };
@@ -327,8 +331,32 @@ fn handle_rumble_envelope(
 
                     proto::server_event::Kind::ChatBroadcast(cb) => {
                         let text = format!("{}: {}", cb.sender, cb.text);
+
+                        // Resolve the sender username to a Mumble session ID for proper
+                        // message attribution in Mumble clients.
+                        let actor = {
+                            let state = bridge_state.read().unwrap();
+                            // Find the Rumble user_id for this sender by matching username
+                            let rumble_user_id = state.rumble_users.iter().find_map(|u| {
+                                if u.username == cb.sender {
+                                    u.user_id.as_ref().map(|id| id.value)
+                                } else {
+                                    None
+                                }
+                            });
+                            rumble_user_id.and_then(|rid| {
+                                // Check if this is one of our virtual users (Mumble client)
+                                state
+                                    .reverse_virtual_user_map
+                                    .get(&rid)
+                                    .copied()
+                                    // Otherwise look up as a remote Rumble user
+                                    .or_else(|| state.users.get_mumble_session(rid))
+                            })
+                        };
+
                         let text_msg = mumble::TextMessage {
-                            actor: None,
+                            actor,
                             channel_id: vec![0],
                             message: Some(text),
                             ..Default::default()
