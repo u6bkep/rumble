@@ -58,6 +58,19 @@ pub struct ClientHandle {
     pub public_key: Arc<RwLock<Option<[u8; 32]>>>,
     /// Whether authentication is complete.
     pub authenticated: Arc<AtomicBool>,
+    /// Whether this connection is a bridge (set after BridgeHello).
+    pub is_bridge: AtomicBool,
+}
+
+/// A virtual user managed by a bridge connection.
+#[derive(Debug, Clone)]
+pub struct VirtualUser {
+    /// Server-assigned user ID for this virtual user.
+    pub user_id: u64,
+    /// Display name.
+    pub username: String,
+    /// The bridge connection's user_id that owns this virtual user.
+    pub bridge_owner_id: u64,
 }
 
 impl ClientHandle {
@@ -77,6 +90,7 @@ impl ClientHandle {
             conn,
             public_key,
             authenticated,
+            is_bridge: AtomicBool::new(false),
         }
     }
 
@@ -229,6 +243,8 @@ pub struct ServerState {
     pub relay_tokens: Arc<RelayTokenManager>,
     /// Relay service port (set after relay service starts).
     relay_port: std::sync::atomic::AtomicU16,
+    /// Virtual users managed by bridge connections: virtual_user_id → VirtualUser.
+    virtual_users: DashMap<u64, VirtualUser>,
 }
 
 impl ServerState {
@@ -248,6 +264,7 @@ impl ServerState {
             tracker,
             relay_tokens: Arc::new(RelayTokenManager::new()),
             relay_port: std::sync::atomic::AtomicU16::new(0),
+            virtual_users: DashMap::new(),
         }
     }
 
@@ -267,6 +284,7 @@ impl ServerState {
             tracker,
             relay_tokens: Arc::new(RelayTokenManager::new()),
             relay_port: std::sync::atomic::AtomicU16::new(0),
+            virtual_users: DashMap::new(),
         }
     }
 
@@ -554,11 +572,14 @@ impl ServerState {
         self.state_data.read().await.clone()
     }
 
-    /// Build the current user list.
+    /// Build the current user list, including virtual users.
     ///
     /// This is optimized to minimize lock contention:
     /// 1. Take a snapshot of memberships and statuses
-    /// 2. Look up usernames from clients (lock-free DashMap access)
+    /// 2. Look up usernames from clients (lock-free DashMap access) or virtual users
+    ///
+    /// Bridge connections (is_bridge=true) are excluded from the user list
+    /// since they are infrastructure, not visible users.
     pub async fn build_user_list(&self) -> Vec<User> {
         let data = self.state_data.read().await;
         let memberships = data.memberships.clone();
@@ -567,22 +588,33 @@ impl ServerState {
 
         let mut users = Vec::with_capacity(memberships.len());
         for (uid, rid) in memberships {
-            if let Some(client) = self.get_client(uid) {
-                let username = client.get_username().await;
-                // Find the user's status (default to not muted/deafened)
-                let status = user_statuses
-                    .iter()
-                    .find(|(id, _)| *id == uid)
-                    .map(|(_, s)| *s)
-                    .unwrap_or_default();
-                users.push(User {
-                    user_id: Some(UserId { value: uid }),
-                    current_room: Some(room_id_from_uuid(rid)),
-                    username,
-                    is_muted: status.is_muted,
-                    is_deafened: status.is_deafened,
-                });
-            }
+            // Find the user's status (default to not muted/deafened)
+            let status = user_statuses
+                .iter()
+                .find(|(id, _)| *id == uid)
+                .map(|(_, s)| *s)
+                .unwrap_or_default();
+
+            // Try real client first, then virtual user
+            let username = if let Some(client) = self.get_client(uid) {
+                // Skip bridge connections - they are not visible users
+                if client.is_bridge.load(std::sync::atomic::Ordering::SeqCst) {
+                    continue;
+                }
+                client.get_username().await
+            } else if let Some(vu) = self.get_virtual_user(uid) {
+                vu.username
+            } else {
+                continue;
+            };
+
+            users.push(User {
+                user_id: Some(UserId { value: uid }),
+                current_room: Some(room_id_from_uuid(rid)),
+                username,
+                is_muted: status.is_muted,
+                is_deafened: status.is_deafened,
+            });
         }
         users
     }
@@ -597,6 +629,48 @@ impl ServerState {
             map.entry(*rid).or_insert_with(Vec::new).push(*uid);
         }
         map
+    }
+
+    // =========================================================================
+    // Bridge / Virtual User Methods
+    // =========================================================================
+
+    /// Register a virtual user owned by a bridge connection.
+    pub fn register_virtual_user(&self, user_id: u64, username: String, bridge_owner_id: u64) {
+        self.virtual_users.insert(
+            user_id,
+            VirtualUser {
+                user_id,
+                username,
+                bridge_owner_id,
+            },
+        );
+    }
+
+    /// Remove a virtual user.
+    pub fn remove_virtual_user(&self, user_id: u64) -> Option<VirtualUser> {
+        self.virtual_users.remove(&user_id).map(|(_, v)| v)
+    }
+
+    /// Get a virtual user by user_id.
+    pub fn get_virtual_user(&self, user_id: u64) -> Option<VirtualUser> {
+        self.virtual_users.get(&user_id).map(|r| r.value().clone())
+    }
+
+    /// Check if a given user_id is a virtual user owned by the specified bridge.
+    pub fn is_virtual_user_of(&self, user_id: u64, bridge_owner_id: u64) -> bool {
+        self.virtual_users
+            .get(&user_id)
+            .is_some_and(|vu| vu.bridge_owner_id == bridge_owner_id)
+    }
+
+    /// Get all virtual user IDs owned by a specific bridge connection.
+    pub fn get_virtual_users_for_bridge(&self, bridge_owner_id: u64) -> Vec<u64> {
+        self.virtual_users
+            .iter()
+            .filter(|entry| entry.value().bridge_owner_id == bridge_owner_id)
+            .map(|entry| *entry.key())
+            .collect()
     }
 }
 

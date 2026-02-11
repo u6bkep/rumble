@@ -147,6 +147,43 @@ pub async fn handle_envelope(
             }
             handle_p2p_voice_status(vs, sender, state).await?;
         }
+        // Bridge messages (70-79)
+        Some(Payload::BridgeHello(bh)) => {
+            if !sender.authenticated.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            handle_bridge_hello(bh, sender, state).await?;
+        }
+        Some(Payload::BridgeRegisterUser(bru)) => {
+            if !sender.authenticated.load(Ordering::SeqCst) || !sender.is_bridge.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            handle_bridge_register_user(bru, sender, state).await?;
+        }
+        Some(Payload::BridgeUnregisterUser(buu)) => {
+            if !sender.authenticated.load(Ordering::SeqCst) || !sender.is_bridge.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            handle_bridge_unregister_user(buu, sender, state).await?;
+        }
+        Some(Payload::BridgeJoinRoom(bjr)) => {
+            if !sender.authenticated.load(Ordering::SeqCst) || !sender.is_bridge.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            handle_bridge_join_room(bjr, sender, state).await?;
+        }
+        Some(Payload::BridgeSetUserStatus(bss)) => {
+            if !sender.authenticated.load(Ordering::SeqCst) || !sender.is_bridge.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            handle_bridge_set_user_status(bss, sender, state).await?;
+        }
+        Some(Payload::BridgeChatMessage(bcm)) => {
+            if !sender.authenticated.load(Ordering::SeqCst) || !sender.is_bridge.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            handle_bridge_chat_message(bcm, sender, state).await?;
+        }
         // Server-to-client messages or empty - ignore
         Some(
             Payload::ServerHello(_)
@@ -154,7 +191,8 @@ pub async fn handle_envelope(
             | Payload::AuthFailed(_)
             | Payload::CommandResult(_)
             | Payload::PeerAnnounce(_)
-            | Payload::RelayAllocation(_),
+            | Payload::RelayAllocation(_)
+            | Payload::BridgeUserRegistered(_),
         )
         | None => {}
         _ => {
@@ -1233,8 +1271,31 @@ pub async fn broadcast_state_update(state: &Arc<ServerState>, update: proto::sta
 }
 
 /// Clean up a client: remove from clients list, remove memberships, broadcast update.
+///
+/// If the client is a bridge, also cleans up all its virtual users.
 pub async fn cleanup_client(client_handle: &Arc<ClientHandle>, state: &Arc<ServerState>) {
     let user_id = client_handle.user_id;
+    let is_bridge = client_handle.is_bridge.load(Ordering::SeqCst);
+
+    // If this is a bridge, clean up all virtual users it owned
+    if is_bridge {
+        let virtual_user_ids = state.get_virtual_users_for_bridge(user_id);
+        for vu_id in virtual_user_ids {
+            state.remove_virtual_user(vu_id);
+            state.remove_user_membership(vu_id).await;
+            if let Err(e) = broadcast_state_update(
+                state,
+                proto::state_update::Update::UserLeft(proto::UserLeft {
+                    user_id: Some(proto::UserId { value: vu_id }),
+                }),
+            )
+            .await
+            {
+                error!(virtual_user_id = vu_id, "failed to broadcast virtual user leave: {e:?}");
+            }
+            debug!(bridge_id = user_id, virtual_user_id = vu_id, "cleaned up virtual user");
+        }
+    }
 
     // Broadcast peer removal before removing session data
     if client_handle.authenticated.load(Ordering::SeqCst) {
@@ -1250,8 +1311,9 @@ pub async fn cleanup_client(client_handle: &Arc<ClientHandle>, state: &Arc<Serve
 
     debug!(user_id, "server: cleaned up client");
 
-    // Only broadcast if the client was authenticated
-    if client_handle.authenticated.load(Ordering::SeqCst) {
+    // Only broadcast if the client was authenticated and not a bridge
+    // (bridge user was already removed from visible state in BridgeHello)
+    if client_handle.authenticated.load(Ordering::SeqCst) && !is_bridge {
         // Send incremental update about user leaving
         if let Err(e) = broadcast_state_update(
             state,
@@ -1284,8 +1346,33 @@ pub async fn handle_datagrams(conn: quinn::Connection, state: Arc<ServerState>, 
                 // Decode the VoiceDatagram protobuf
                 match VoiceDatagram::decode(datagram.as_ref()) {
                     Ok(mut voice_dgram) => {
+                        // Determine the effective sender for this datagram.
+                        // For bridge connections, trust the sender_id if it matches
+                        // a virtual user owned by this bridge.
+                        let is_bridge = state
+                            .get_client(sender_user_id)
+                            .is_some_and(|c| c.is_bridge.load(Ordering::SeqCst));
+
+                        let effective_sender = if is_bridge {
+                            // Bridge: use the datagram's sender_id if it's a valid virtual user
+                            match voice_dgram.sender_id {
+                                Some(claimed_id) if state.is_virtual_user_of(claimed_id, sender_user_id) => claimed_id,
+                                _ => {
+                                    debug!(
+                                        bridge_id = sender_user_id,
+                                        claimed_sender = ?voice_dgram.sender_id,
+                                        "server: bridge datagram with invalid sender_id, dropping"
+                                    );
+                                    continue;
+                                }
+                            }
+                        } else {
+                            // Normal client: always use the connection's user_id
+                            sender_user_id
+                        };
+
                         debug!(
-                            sender = sender_user_id,
+                            sender = effective_sender,
                             seq = voice_dgram.sequence,
                             data_len = voice_dgram.opus_data.len(),
                             "server: received voice datagram"
@@ -1294,9 +1381,9 @@ pub async fn handle_datagrams(conn: quinn::Connection, state: Arc<ServerState>, 
                         // Take a snapshot of room memberships to avoid holding locks during relay
                         let room_memberships = state.snapshot_room_memberships().await;
 
-                        // Find sender's room from the snapshot
+                        // Find effective sender's room from the snapshot
                         let sender_room = room_memberships.iter().find_map(|(rid, users)| {
-                            if users.contains(&sender_user_id) {
+                            if users.contains(&effective_sender) {
                                 Some(*rid)
                             } else {
                                 None
@@ -1306,14 +1393,14 @@ pub async fn handle_datagrams(conn: quinn::Connection, state: Arc<ServerState>, 
                         // Only relay if sender is actually in a room
                         let Some(actual_room) = sender_room else {
                             debug!(
-                                sender = sender_user_id,
+                                sender = effective_sender,
                                 "server: sender not in any room, dropping datagram"
                             );
                             continue;
                         };
 
-                        // Set sender_id and room_id (server-authoritative, client values ignored)
-                        voice_dgram.sender_id = Some(sender_user_id);
+                        // Set sender_id and room_id (server-authoritative)
+                        voice_dgram.sender_id = Some(effective_sender);
                         voice_dgram.room_id = Some(actual_room.as_bytes().to_vec());
 
                         // Re-encode with corrected sender_id and room_id
@@ -1322,16 +1409,35 @@ pub async fn handle_datagrams(conn: quinn::Connection, state: Arc<ServerState>, 
                         // Get recipients from the snapshot (no lock needed)
                         let recipients = room_memberships.get(&actual_room).map(|v| v.as_slice()).unwrap_or(&[]);
 
+                        // Track which connections already received this datagram to avoid
+                        // sending duplicates when multiple virtual users from the same
+                        // bridge are in the room.
+                        let mut sent_to = std::collections::HashSet::new();
+
                         // Relay to each recipient (lock-free client lookup via DashMap)
                         for &recipient_id in recipients {
-                            // Skip the sender
-                            if recipient_id == sender_user_id {
+                            // Skip the effective sender
+                            if recipient_id == effective_sender {
                                 continue;
                             }
 
-                            // Get client handle (lock-free)
-                            if let Some(client) = state.get_client(recipient_id) {
-                                // Send datagram (no lock needed, datagrams are connectionless)
+                            // Virtual users don't have their own connections;
+                            // voice for them goes through their bridge's connection.
+                            // Look up the actual client to send to.
+                            let (target_conn_id, target_client) = if let Some(vu) = state.get_virtual_user(recipient_id)
+                            {
+                                // Send to the bridge that owns this virtual user
+                                (vu.bridge_owner_id, state.get_client(vu.bridge_owner_id))
+                            } else {
+                                (recipient_id, state.get_client(recipient_id))
+                            };
+
+                            // Skip if we already sent to this connection
+                            if !sent_to.insert(target_conn_id) {
+                                continue;
+                            }
+
+                            if let Some(client) = target_client {
                                 if let Err(e) = client.conn.send_datagram(relay_bytes.clone().into()) {
                                     debug!(
                                         user_id = recipient_id,
@@ -1354,6 +1460,253 @@ pub async fn handle_datagrams(conn: quinn::Connection, state: Arc<ServerState>, 
             }
         }
     }
+}
+
+// =============================================================================
+// Bridge Handlers
+// =============================================================================
+
+/// Handle BridgeHello - mark connection as a bridge and hide its user entry.
+async fn handle_bridge_hello(bh: proto::BridgeHello, sender: Arc<ClientHandle>, state: Arc<ServerState>) -> Result<()> {
+    if sender.is_bridge.load(Ordering::SeqCst) {
+        return send_command_result(&sender, "BridgeHello", false, "Already in bridge mode").await;
+    }
+
+    info!(
+        user_id = sender.user_id,
+        bridge_name = %bh.bridge_name,
+        "BridgeHello: marking connection as bridge"
+    );
+
+    sender.is_bridge.store(true, Ordering::SeqCst);
+
+    // Remove the bridge's own user from memberships so it doesn't appear in the user list.
+    // The bridge itself is infrastructure, not a visible user.
+    state.remove_user_membership(sender.user_id).await;
+
+    // Broadcast UserLeft for the bridge user so existing clients remove it
+    broadcast_state_update(
+        &state,
+        proto::state_update::Update::UserLeft(proto::UserLeft {
+            user_id: Some(proto::UserId { value: sender.user_id }),
+        }),
+    )
+    .await?;
+
+    send_command_result(&sender, "BridgeHello", true, "Bridge mode activated").await
+}
+
+/// Handle BridgeRegisterUser - create a virtual user owned by this bridge.
+async fn handle_bridge_register_user(
+    bru: proto::BridgeRegisterUser,
+    sender: Arc<ClientHandle>,
+    state: Arc<ServerState>,
+) -> Result<()> {
+    let virtual_user_id = state.allocate_user_id();
+
+    info!(
+        bridge_id = sender.user_id,
+        virtual_user_id,
+        username = %bru.username,
+        "BridgeRegisterUser: creating virtual user"
+    );
+
+    // Register the virtual user in state
+    state.register_virtual_user(virtual_user_id, bru.username.clone(), sender.user_id);
+
+    // Place virtual user in root room by default
+    state.set_user_room(virtual_user_id, ROOT_ROOM_UUID).await;
+
+    // Broadcast UserJoined for the virtual user
+    broadcast_state_update(
+        &state,
+        proto::state_update::Update::UserJoined(proto::UserJoined {
+            user: Some(proto::User {
+                user_id: Some(proto::UserId { value: virtual_user_id }),
+                username: bru.username.clone(),
+                current_room: Some(room_id_from_uuid(ROOT_ROOM_UUID)),
+                is_muted: false,
+                is_deafened: false,
+            }),
+        }),
+    )
+    .await?;
+
+    // Send the assigned user_id back to the bridge
+    let reply = proto::Envelope {
+        state_hash: Vec::new(),
+        payload: Some(Payload::BridgeUserRegistered(proto::BridgeUserRegistered {
+            user_id: virtual_user_id,
+            username: bru.username,
+        })),
+    };
+    let frame = encode_frame(&reply);
+    let _ = sender.send_frame(&frame).await;
+
+    Ok(())
+}
+
+/// Handle BridgeUnregisterUser - remove a virtual user owned by this bridge.
+async fn handle_bridge_unregister_user(
+    buu: proto::BridgeUnregisterUser,
+    sender: Arc<ClientHandle>,
+    state: Arc<ServerState>,
+) -> Result<()> {
+    // Verify the bridge owns this virtual user
+    if !state.is_virtual_user_of(buu.user_id, sender.user_id) {
+        warn!(
+            bridge_id = sender.user_id,
+            virtual_user_id = buu.user_id,
+            "BridgeUnregisterUser: bridge does not own this virtual user"
+        );
+        return send_command_result(&sender, "BridgeUnregisterUser", false, "Not your virtual user").await;
+    }
+
+    info!(
+        bridge_id = sender.user_id,
+        virtual_user_id = buu.user_id,
+        "BridgeUnregisterUser: removing virtual user"
+    );
+
+    // Remove from state
+    state.remove_virtual_user(buu.user_id);
+    state.remove_user_membership(buu.user_id).await;
+
+    // Broadcast UserLeft
+    broadcast_state_update(
+        &state,
+        proto::state_update::Update::UserLeft(proto::UserLeft {
+            user_id: Some(proto::UserId { value: buu.user_id }),
+        }),
+    )
+    .await?;
+
+    send_command_result(&sender, "BridgeUnregisterUser", true, "Virtual user removed").await
+}
+
+/// Handle BridgeJoinRoom - move a virtual user to a room.
+async fn handle_bridge_join_room(
+    bjr: proto::BridgeJoinRoom,
+    sender: Arc<ClientHandle>,
+    state: Arc<ServerState>,
+) -> Result<()> {
+    // Verify ownership
+    if !state.is_virtual_user_of(bjr.user_id, sender.user_id) {
+        return send_command_result(&sender, "BridgeJoinRoom", false, "Not your virtual user").await;
+    }
+
+    let room_uuid = bjr
+        .room_id
+        .as_ref()
+        .and_then(uuid_from_room_id)
+        .unwrap_or(ROOT_ROOM_UUID);
+
+    // Verify room exists
+    let rooms = state.get_rooms().await;
+    if !rooms
+        .iter()
+        .any(|r| r.id.as_ref().and_then(uuid_from_room_id) == Some(room_uuid))
+    {
+        return send_command_result(&sender, "BridgeJoinRoom", false, "Room not found").await;
+    }
+
+    state.set_user_room(bjr.user_id, room_uuid).await;
+
+    // Broadcast UserMoved
+    broadcast_state_update(
+        &state,
+        proto::state_update::Update::UserMoved(proto::UserMoved {
+            user_id: Some(proto::UserId { value: bjr.user_id }),
+            to_room_id: Some(room_id_from_uuid(room_uuid)),
+        }),
+    )
+    .await?;
+
+    send_command_result(&sender, "BridgeJoinRoom", true, "Virtual user moved").await
+}
+
+/// Handle BridgeSetUserStatus - update a virtual user's mute/deaf status.
+async fn handle_bridge_set_user_status(
+    bss: proto::BridgeSetUserStatus,
+    sender: Arc<ClientHandle>,
+    state: Arc<ServerState>,
+) -> Result<()> {
+    if !state.is_virtual_user_of(bss.user_id, sender.user_id) {
+        return send_command_result(&sender, "BridgeSetUserStatus", false, "Not your virtual user").await;
+    }
+
+    let status = UserStatus {
+        is_muted: bss.is_muted,
+        is_deafened: bss.is_deafened,
+    };
+    state.set_user_status(bss.user_id, status).await;
+
+    // Broadcast UserStatusChanged
+    broadcast_state_update(
+        &state,
+        proto::state_update::Update::UserStatusChanged(proto::UserStatusChanged {
+            user_id: Some(proto::UserId { value: bss.user_id }),
+            is_muted: bss.is_muted,
+            is_deafened: bss.is_deafened,
+        }),
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// Handle BridgeChatMessage - send chat on behalf of a virtual user.
+async fn handle_bridge_chat_message(
+    bcm: proto::BridgeChatMessage,
+    sender: Arc<ClientHandle>,
+    state: Arc<ServerState>,
+) -> Result<()> {
+    if !state.is_virtual_user_of(bcm.user_id, sender.user_id) {
+        return send_command_result(&sender, "BridgeChatMessage", false, "Not your virtual user").await;
+    }
+
+    let vu = match state.get_virtual_user(bcm.user_id) {
+        Some(vu) => vu,
+        None => return Ok(()),
+    };
+
+    let sender_room = state.get_user_room(bcm.user_id).await.unwrap_or(ROOT_ROOM_UUID);
+
+    info!(
+        virtual_user_id = bcm.user_id,
+        username = %vu.username,
+        "BridgeChatMessage"
+    );
+
+    let message_id = uuid::Uuid::new_v4().into_bytes().to_vec();
+    let timestamp_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
+
+    let broadcast = proto::Envelope {
+        state_hash: Vec::new(),
+        payload: Some(Payload::ServerEvent(proto::ServerEvent {
+            kind: Some(proto::server_event::Kind::ChatBroadcast(proto::ChatBroadcast {
+                id: message_id,
+                timestamp_ms,
+                sender: vu.username,
+                text: bcm.text,
+            })),
+        })),
+    };
+    let frame = encode_frame(&broadcast);
+
+    // Send to all clients in the same room
+    let clients = state.snapshot_clients();
+    for h in clients {
+        let user_room = state.get_user_room(h.user_id).await;
+        if user_room != Some(sender_room) {
+            continue;
+        }
+        if let Err(e) = h.send_frame(&frame).await {
+            error!("broadcast write failed: {e:?}");
+        }
+    }
+
+    Ok(())
 }
 
 // =============================================================================
