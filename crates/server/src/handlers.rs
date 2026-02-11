@@ -1308,6 +1308,8 @@ pub async fn cleanup_client(client_handle: &Arc<ClientHandle>, state: &Arc<Serve
     state.remove_user_membership(user_id).await;
     // Remove session (also removes peer_capabilities)
     state.remove_session(user_id);
+    // Remove voice rate limit state
+    state.remove_voice_rate(user_id);
 
     debug!(user_id, "server: cleaned up client");
 
@@ -1370,6 +1372,17 @@ pub async fn handle_datagrams(conn: quinn::Connection, state: Arc<ServerState>, 
                             // Normal client: always use the connection's user_id
                             sender_user_id
                         };
+
+                        // Rate limit check: use sender_user_id (connection owner) so
+                        // bridge traffic is rate-limited as a whole, not per virtual user.
+                        if !state.check_voice_rate(sender_user_id, datagram.len()) {
+                            debug!(
+                                user_id = sender_user_id,
+                                bytes = datagram.len(),
+                                "server: voice datagram rate limited, dropping"
+                            );
+                            continue;
+                        }
 
                         debug!(
                             sender = effective_sender,

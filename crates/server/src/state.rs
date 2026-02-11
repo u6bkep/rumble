@@ -34,6 +34,48 @@ use std::{sync::atomic::AtomicBool, time::Instant};
 
 use crate::{relay::RelayTokenManager, tracker::Tracker};
 
+/// Per-user voice datagram rate limiter using a fixed time window.
+///
+/// Tracks bytes sent within a 1-second window. If the byte count exceeds
+/// the limit, further datagrams are dropped until the window resets.
+#[derive(Debug)]
+pub struct VoiceRateLimit {
+    /// Start of the current measurement window.
+    window_start: Instant,
+    /// Bytes counted in the current window.
+    bytes_in_window: usize,
+}
+
+/// Maximum voice bytes per second per user (32 KB/s).
+/// Generous for 64kbps Opus at 20ms frames (~8 KB/s pure opus + protobuf overhead).
+const VOICE_RATE_LIMIT_BYTES_PER_SEC: usize = 32_000;
+
+impl VoiceRateLimit {
+    fn new() -> Self {
+        Self {
+            window_start: Instant::now(),
+            bytes_in_window: 0,
+        }
+    }
+
+    /// Check if sending `bytes` is allowed. Returns true if within the limit.
+    /// Automatically resets the window if the previous one has elapsed.
+    fn check(&mut self, bytes: usize) -> bool {
+        let now = Instant::now();
+        if now.duration_since(self.window_start).as_secs() >= 1 {
+            // Window has elapsed, reset
+            self.window_start = now;
+            self.bytes_in_window = bytes;
+            return true;
+        }
+        if self.bytes_in_window + bytes > VOICE_RATE_LIMIT_BYTES_PER_SEC {
+            return false;
+        }
+        self.bytes_in_window += bytes;
+        true
+    }
+}
+
 /// Handle to a connected client's control stream.
 ///
 /// This represents a single client connection and provides access to:
@@ -245,6 +287,8 @@ pub struct ServerState {
     relay_port: std::sync::atomic::AtomicU16,
     /// Virtual users managed by bridge connections: virtual_user_id → VirtualUser.
     virtual_users: DashMap<u64, VirtualUser>,
+    /// Per-user voice datagram rate limiters: user_id → VoiceRateLimit.
+    voice_rate_limits: DashMap<u64, VoiceRateLimit>,
 }
 
 impl ServerState {
@@ -265,6 +309,7 @@ impl ServerState {
             relay_tokens: Arc::new(RelayTokenManager::new()),
             relay_port: std::sync::atomic::AtomicU16::new(0),
             virtual_users: DashMap::new(),
+            voice_rate_limits: DashMap::new(),
         }
     }
 
@@ -285,6 +330,7 @@ impl ServerState {
             relay_tokens: Arc::new(RelayTokenManager::new()),
             relay_port: std::sync::atomic::AtomicU16::new(0),
             virtual_users: DashMap::new(),
+            voice_rate_limits: DashMap::new(),
         }
     }
 
@@ -629,6 +675,25 @@ impl ServerState {
             map.entry(*rid).or_insert_with(Vec::new).push(*uid);
         }
         map
+    }
+
+    // =========================================================================
+    // Voice Rate Limiting
+    // =========================================================================
+
+    /// Check whether a voice datagram of `bytes` size is allowed for the given user.
+    /// Returns `true` if allowed, `false` if the user has exceeded the rate limit.
+    pub fn check_voice_rate(&self, user_id: u64, bytes: usize) -> bool {
+        let mut entry = self
+            .voice_rate_limits
+            .entry(user_id)
+            .or_insert_with(VoiceRateLimit::new);
+        entry.check(bytes)
+    }
+
+    /// Remove rate limit state for a user (called on disconnect).
+    pub fn remove_voice_rate(&self, user_id: u64) {
+        self.voice_rate_limits.remove(&user_id);
     }
 
     // =========================================================================
