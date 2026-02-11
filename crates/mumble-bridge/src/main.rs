@@ -65,8 +65,12 @@ async fn main() -> Result<()> {
 
     // Connect to Rumble server
     info!("Connecting to Rumble server at {}", config.rumble_addr);
-    let rumble_conn = rumble_client::connect(&config.rumble_addr, &config.bridge_name, &signing_key).await?;
+    let mut rumble_conn = rumble_client::connect(&config.rumble_addr, &config.bridge_name, &signing_key).await?;
     info!(user_id = rumble_conn.user_id, "Connected to Rumble server");
+
+    // Declare this connection as a bridge
+    rumble_client::send_bridge_hello(&mut rumble_conn.send, &config.bridge_name).await?;
+    info!("Sent BridgeHello");
 
     // Initialize bridge state with the initial Rumble state
     let bridge_state = Arc::new(RwLock::new(BridgeState::new()));

@@ -132,6 +132,85 @@ pub async fn send_chat(send: &mut quinn::SendStream, sender: &str, text: &str) -
     Ok(())
 }
 
+/// Send BridgeHello to declare this connection as a bridge.
+pub async fn send_bridge_hello(send: &mut quinn::SendStream, bridge_name: &str) -> Result<()> {
+    let msg = proto::Envelope {
+        state_hash: Vec::new(),
+        payload: Some(Payload::BridgeHello(proto::BridgeHello {
+            bridge_name: bridge_name.to_string(),
+        })),
+    };
+    send.write_all(&encode_frame(&msg)).await?;
+    Ok(())
+}
+
+/// Register a virtual user managed by the bridge.
+pub async fn send_bridge_register_user(send: &mut quinn::SendStream, username: &str) -> Result<()> {
+    let msg = proto::Envelope {
+        state_hash: Vec::new(),
+        payload: Some(Payload::BridgeRegisterUser(proto::BridgeRegisterUser {
+            username: username.to_string(),
+        })),
+    };
+    send.write_all(&encode_frame(&msg)).await?;
+    Ok(())
+}
+
+/// Unregister a virtual user managed by the bridge.
+pub async fn send_bridge_unregister_user(send: &mut quinn::SendStream, user_id: u64) -> Result<()> {
+    let msg = proto::Envelope {
+        state_hash: Vec::new(),
+        payload: Some(Payload::BridgeUnregisterUser(proto::BridgeUnregisterUser { user_id })),
+    };
+    send.write_all(&encode_frame(&msg)).await?;
+    Ok(())
+}
+
+/// Move a virtual user to a room.
+pub async fn send_bridge_join_room(send: &mut quinn::SendStream, user_id: u64, room_id: proto::RoomId) -> Result<()> {
+    let msg = proto::Envelope {
+        state_hash: Vec::new(),
+        payload: Some(Payload::BridgeJoinRoom(proto::BridgeJoinRoom {
+            user_id,
+            room_id: Some(room_id),
+        })),
+    };
+    send.write_all(&encode_frame(&msg)).await?;
+    Ok(())
+}
+
+/// Update a virtual user's mute/deaf status.
+pub async fn send_bridge_set_user_status(
+    send: &mut quinn::SendStream,
+    user_id: u64,
+    is_muted: bool,
+    is_deafened: bool,
+) -> Result<()> {
+    let msg = proto::Envelope {
+        state_hash: Vec::new(),
+        payload: Some(Payload::BridgeSetUserStatus(proto::BridgeSetUserStatus {
+            user_id,
+            is_muted,
+            is_deafened,
+        })),
+    };
+    send.write_all(&encode_frame(&msg)).await?;
+    Ok(())
+}
+
+/// Send a chat message on behalf of a virtual user.
+pub async fn send_bridge_chat_message(send: &mut quinn::SendStream, user_id: u64, text: &str) -> Result<()> {
+    let msg = proto::Envelope {
+        state_hash: Vec::new(),
+        payload: Some(Payload::BridgeChatMessage(proto::BridgeChatMessage {
+            user_id,
+            text: text.to_string(),
+        })),
+    };
+    send.write_all(&encode_frame(&msg)).await?;
+    Ok(())
+}
+
 /// Read the next Rumble envelope from the stream.
 pub async fn read_envelope(recv: &mut quinn::RecvStream, buf: &mut BytesMut) -> Result<Option<proto::Envelope>> {
     // First check if we already have a complete frame buffered
