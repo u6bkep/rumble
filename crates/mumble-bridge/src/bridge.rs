@@ -90,7 +90,7 @@ pub async fn run_bridge(
                 // Register this Mumble client as a virtual user on the Rumble server
                 {
                     let mut state = bridge_state.write().unwrap();
-                    state.pending_registrations.insert(username.clone(), session);
+                    state.pending_registrations.push((username.clone(), session));
                 }
                 if let Err(e) = rumble_client::send_bridge_register_user(rumble_send, &username).await {
                     warn!(error = %e, %username, "Failed to send BridgeRegisterUser");
@@ -109,9 +109,7 @@ pub async fn run_bridge(
                         state.reverse_virtual_user_map.remove(&vid);
                     }
                     // Also clean up any pending registration for this session
-                    if let Some(ref name) = username {
-                        state.pending_registrations.remove(name);
-                    }
+                    state.pending_registrations.retain(|(_, s)| *s != session);
                     (username, virtual_user_id)
                 };
                 info!(session, username = ?username, virtual_user_id = ?virtual_user_id, "Mumble client left bridge");
@@ -344,7 +342,11 @@ fn handle_rumble_envelope(
         }
         Some(Payload::BridgeUserRegistered(bur)) => {
             let mut state = bridge_state.write().unwrap();
-            if let Some(session) = state.pending_registrations.remove(&bur.username) {
+            let pending_idx = state
+                .pending_registrations
+                .iter()
+                .position(|(name, _)| name == &bur.username);
+            if let Some(session) = pending_idx.map(|i| state.pending_registrations.remove(i).1) {
                 state.virtual_user_map.insert(session, bur.user_id);
                 state.reverse_virtual_user_map.insert(bur.user_id, session);
                 info!(
@@ -453,7 +455,7 @@ fn handle_state_update(
 
         Some(proto::state_update::Update::UserMoved(um)) => {
             let rumble_id = um.user_id.as_ref().map(|id| id.value).unwrap_or(0);
-            let state = bridge_state.read().unwrap();
+            let mut state = bridge_state.write().unwrap();
             // Skip events for our own virtual users
             if state.reverse_virtual_user_map.contains_key(&rumble_id) {
                 return;
@@ -463,7 +465,7 @@ fn handle_state_update(
                 .to_room_id
                 .as_ref()
                 .and_then(api::uuid_from_room_id)
-                .and_then(|uuid| state.channels.get_mumble_id(&uuid));
+                .map(|uuid| state.channels.get_or_insert(uuid));
 
             if let (Some(session), Some(channel_id)) = (session, channel_id) {
                 let user_state = mumble::UserState {

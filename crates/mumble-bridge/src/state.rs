@@ -139,8 +139,9 @@ pub struct BridgeState {
     pub rumble_connected: bool,
 
     // -- Virtual user tracking for bridge protocol --
-    /// Pending registrations: username -> mumble_session (waiting for BridgeUserRegistered).
-    pub pending_registrations: HashMap<String, u32>,
+    /// Pending registrations: (username, mumble_session) pairs awaiting BridgeUserRegistered.
+    /// Uses a Vec to support multiple simultaneous registrations with the same username.
+    pub pending_registrations: Vec<(String, u32)>,
     /// Mumble session -> Rumble virtual user ID (for registered virtual users).
     pub virtual_user_map: HashMap<u32, u64>,
     /// Rumble virtual user ID -> Mumble session (reverse lookup).
@@ -158,7 +159,7 @@ impl BridgeState {
             rumble_users: Vec::new(),
             bridge_user_id: None,
             rumble_connected: false,
-            pending_registrations: HashMap::new(),
+            pending_registrations: Vec::new(),
             virtual_user_map: HashMap::new(),
             reverse_virtual_user_map: HashMap::new(),
         }
