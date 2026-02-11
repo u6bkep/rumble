@@ -120,9 +120,14 @@ impl Server {
                 }
                 // Convert parent bytes to UUID if present
                 let parent = room.parent.map(uuid::Uuid::from_bytes);
+                let description = if room.description.is_empty() {
+                    None
+                } else {
+                    Some(room.description.clone())
+                };
                 if self
                     .state
-                    .add_room_with_uuid_and_parent(uuid, room.name.clone(), parent)
+                    .add_room_with_uuid_and_parent_desc(uuid, room.name.clone(), parent, description)
                     .await
                 {
                     debug!("Loaded persisted room: {} ({})", room.name, uuid);

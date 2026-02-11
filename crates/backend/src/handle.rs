@@ -980,6 +980,7 @@ async fn run_connection_task(
                                 payload: Some(Payload::CreateRoom(proto::CreateRoom {
                                     name,
                                     parent_id: parent_id.map(room_id_from_uuid),
+                                    description: None,
                                 })),
                             };
                             let frame = encode_frame(&env);
@@ -1032,6 +1033,22 @@ async fn run_connection_task(
                             let frame = encode_frame(&env);
                             if let Err(e) = send.write_all(&frame).await {
                                 error!("Failed to send MoveRoom: {}", e);
+                            }
+                        }
+                    }
+
+                    Command::SetRoomDescription { room_id, description } => {
+                        if let Some(send) = &mut send_stream {
+                            let env = proto::Envelope {
+                                state_hash: Vec::new(),
+                                payload: Some(Payload::SetRoomDescription(proto::SetRoomDescription {
+                                    room_id: Some(room_id_from_uuid(room_id)),
+                                    description,
+                                })),
+                            };
+                            let frame = encode_frame(&env);
+                            if let Err(e) = send.write_all(&frame).await {
+                                error!("Failed to send SetRoomDescription: {}", e);
                             }
                         }
                     }
@@ -2313,6 +2330,23 @@ fn apply_state_update(
                         .find(|r| r.id.as_ref().and_then(api::uuid_from_room_id) == Some(rid))
                     {
                         room.parent_id = rm.new_parent_id;
+                    }
+                    s.rebuild_room_tree();
+                }
+            }
+            proto::state_update::Update::RoomDescriptionChanged(rdc) => {
+                if let Some(rid) = rdc.room_id.and_then(|r| api::uuid_from_room_id(&r)) {
+                    let desc = if rdc.description.is_empty() {
+                        None
+                    } else {
+                        Some(rdc.description)
+                    };
+                    if let Some(room) = s
+                        .rooms
+                        .iter_mut()
+                        .find(|r| r.id.as_ref().and_then(api::uuid_from_room_id) == Some(rid))
+                    {
+                        room.description = desc;
                     }
                     s.rebuild_room_tree();
                 }

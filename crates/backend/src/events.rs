@@ -65,6 +65,8 @@ pub struct RoomTreeNode {
     pub parent_id: Option<Uuid>,
     /// UUIDs of child rooms, in sorted order by name.
     pub children: Vec<Uuid>,
+    /// Optional description for the room.
+    pub description: Option<String>,
 }
 
 /// Hierarchical tree structure of rooms.
@@ -105,6 +107,7 @@ impl RoomTree {
                     name: room.name.clone(),
                     parent_id: parent_uuid,
                     children: Vec::new(),
+                    description: room.description.clone(),
                 },
             );
         }
@@ -1345,6 +1348,11 @@ pub enum Command {
         room_id: Uuid,
         new_parent_id: Uuid,
     },
+    /// Set a room's description.
+    SetRoomDescription {
+        room_id: Uuid,
+        description: String,
+    },
     /// Send a chat message.
     SendChat {
         text: String,
@@ -1524,6 +1532,11 @@ impl std::fmt::Debug for Command {
                 .debug_struct("MoveRoom")
                 .field("room_id", room_id)
                 .field("new_parent_id", new_parent_id)
+                .finish(),
+            Command::SetRoomDescription { room_id, description } => f
+                .debug_struct("SetRoomDescription")
+                .field("room_id", room_id)
+                .field("description", description)
                 .finish(),
             Command::SendChat { text } => f.debug_struct("SendChat").field("text", text).finish(),
             Command::LocalMessage { text } => f.debug_struct("LocalMessage").field("text", text).finish(),

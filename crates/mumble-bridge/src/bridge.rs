@@ -709,6 +709,7 @@ fn handle_state_update(
                         channel_id: Some(channel_id),
                         parent: Some(parent),
                         name: Some(room.name.clone()),
+                        description: room.description.clone(),
                         ..Default::default()
                     };
                     drop(state);
@@ -765,6 +766,44 @@ fn handle_state_update(
                     let channel_state = mumble::ChannelState {
                         channel_id: Some(channel_id),
                         parent: Some(parent_id),
+                        ..Default::default()
+                    };
+                    drop(state);
+                    broadcast_to_all_mumble(client_senders, MessageType::ChannelState, &channel_state);
+                }
+            }
+        }
+
+        Some(proto::state_update::Update::RoomDescriptionChanged(rdc)) => {
+            let uuid = rdc.room_id.as_ref().and_then(api::uuid_from_room_id);
+            if let Some(uuid) = uuid {
+                // Update cached room description
+                {
+                    let mut state = bridge_state.write().unwrap();
+                    if let Some(room) = state
+                        .rumble_rooms
+                        .iter_mut()
+                        .find(|r| r.id.as_ref().and_then(api::uuid_from_room_id) == Some(uuid))
+                    {
+                        room.description = if rdc.description.is_empty() {
+                            None
+                        } else {
+                            Some(rdc.description.clone())
+                        };
+                    }
+                }
+
+                let state = bridge_state.read().unwrap();
+                let channel_id = state.channels.get_mumble_id(&uuid);
+                if let Some(channel_id) = channel_id {
+                    let description = if rdc.description.is_empty() {
+                        None
+                    } else {
+                        Some(rdc.description.clone())
+                    };
+                    let channel_state = mumble::ChannelState {
+                        channel_id: Some(channel_id),
+                        description,
                         ..Default::default()
                     };
                     drop(state);

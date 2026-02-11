@@ -99,6 +99,12 @@ pub async fn handle_envelope(
             }
             handle_move_room(mr, sender, state, persistence).await?;
         }
+        Some(Payload::SetRoomDescription(srd)) => {
+            if !sender.authenticated.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            handle_set_room_description(srd, sender, state, persistence).await?;
+        }
         Some(Payload::RequestStateSync(rss)) => {
             if !sender.authenticated.load(Ordering::SeqCst) {
                 return Ok(());
@@ -890,19 +896,22 @@ async fn handle_create_room(
 ) -> Result<()> {
     info!("CreateRoom: {}", cr.name);
     let room_name = cr.name.clone();
+    let description = cr.description.clone();
 
     // Extract parent UUID if provided
     let parent_uuid = cr.parent_id.as_ref().and_then(uuid_from_room_id);
 
-    // Create the room with parent
-    let room_uuid = state.create_room_with_parent(cr.name.clone(), parent_uuid).await;
+    // Create the room with parent and description
+    let room_uuid = state
+        .create_room_with_parent_desc(cr.name.clone(), parent_uuid, description.clone())
+        .await;
 
     // Persist the new room
     if let Some(ref persist) = persistence {
         let room = crate::persistence::PersistedRoom {
             name: room_name.clone(),
             parent: parent_uuid.map(|u| *u.as_bytes()),
-            description: String::new(),
+            description: description.clone().unwrap_or_default(),
             permanent: true,
         };
         if let Err(e) = persist.save_room(&room_uuid.into_bytes(), &room) {
@@ -915,6 +924,7 @@ async fn handle_create_room(
         id: Some(room_id_from_uuid(room_uuid)),
         name: cr.name,
         parent_id: parent_uuid.map(room_id_from_uuid),
+        description,
     };
     broadcast_state_update(
         &state,
@@ -1119,6 +1129,52 @@ async fn handle_move_room(
         &format!("Moved '{}' into '{}'", room_name, new_parent_name),
     )
     .await?;
+    Ok(())
+}
+
+/// Handle set room description request.
+async fn handle_set_room_description(
+    srd: proto::SetRoomDescription,
+    sender: Arc<ClientHandle>,
+    state: Arc<ServerState>,
+    persistence: Option<Arc<Persistence>>,
+) -> Result<()> {
+    let room_uuid = srd
+        .room_id
+        .as_ref()
+        .and_then(uuid_from_room_id)
+        .unwrap_or(ROOT_ROOM_UUID);
+
+    info!("SetRoomDescription: {}", room_uuid);
+
+    let updated = state.set_room_description(room_uuid, srd.description.clone()).await;
+
+    if !updated {
+        return send_command_result(&sender, "SetRoomDescription", false, "Room not found").await;
+    }
+
+    // Persist the description change
+    if let Some(ref persist) = persistence {
+        let room_uuid_bytes = room_uuid.into_bytes();
+        if let Some(mut room) = persist.get_room(&room_uuid_bytes) {
+            room.description = srd.description.clone();
+            if let Err(e) = persist.save_room(&room_uuid_bytes, &room) {
+                warn!("Failed to persist room description: {e}");
+            }
+        }
+    }
+
+    // Broadcast incremental update to all clients
+    broadcast_state_update(
+        &state,
+        proto::state_update::Update::RoomDescriptionChanged(proto::RoomDescriptionChanged {
+            room_id: Some(room_id_from_uuid(room_uuid)),
+            description: srd.description.clone(),
+        }),
+    )
+    .await?;
+
+    send_command_result(&sender, "SetRoomDescription", true, "Description updated").await?;
     Ok(())
 }
 

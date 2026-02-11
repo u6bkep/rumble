@@ -293,6 +293,7 @@ fn build_channel_states(state: &mut BridgeState) -> Vec<mumble::ChannelState> {
                 channel_id: Some(channel_id),
                 parent,
                 name: Some(room.name.clone()),
+                description: room.description.clone(),
                 ..Default::default()
             });
         }

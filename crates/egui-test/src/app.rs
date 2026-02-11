@@ -63,6 +63,15 @@ struct DeleteRoomModalState {
     room_name: String,
 }
 
+/// State for the edit room description modal
+#[derive(Default)]
+struct DescriptionModalState {
+    open: bool,
+    room_uuid: Option<Uuid>,
+    room_name: String,
+    description: String,
+}
+
 /// State for the download file modal
 #[derive(Default)]
 struct DownloadModalState {
@@ -248,6 +257,9 @@ pub struct RumbleApp {
 
     // Delete room confirmation modal state
     delete_room_modal: DeleteRoomModalState,
+
+    // Edit room description modal state
+    description_modal: DescriptionModalState,
 
     // Image view modal state (click-to-enlarge)
     image_view_modal: ImageViewModalState,
@@ -530,6 +542,7 @@ impl RumbleApp {
             move_room_modal: MoveRoomModalState::default(),
             download_modal: DownloadModalState::default(),
             delete_room_modal: DeleteRoomModalState::default(),
+            description_modal: DescriptionModalState::default(),
             image_view_modal: ImageViewModalState::default(),
             settings_modal: SettingsModalState::default(),
             push_to_talk_active: false,
@@ -4066,6 +4079,7 @@ impl RumbleApp {
                 let mut pending_commands: Vec<Command> = Vec::new();
                 let mut pending_rename: Option<(Option<Uuid>, String)> = None;
                 let mut pending_delete: Option<(Uuid, String)> = None;
+                let mut pending_description: Option<(Uuid, String, String)> = None;
 
                 // Build set of rooms that have users in them or in any descendant
                 let mut rooms_with_users: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
@@ -4089,6 +4103,7 @@ impl RumbleApp {
                             pending_commands: &mut Vec<Command>,
                             pending_rename: &mut Option<(Option<Uuid>, String)>,
                             pending_delete: &mut Option<(Uuid, String)>,
+                            pending_description: &mut Option<(Uuid, String, String)>,
                             builder: &mut egui_ltreeview::TreeViewBuilder<TreeNodeId>,
                         ) {
                             let Some(tree_node) = state.room_tree.get(room_id) else {
@@ -4102,8 +4117,8 @@ impl RumbleApp {
 
                             // Capture values for context menu closure
                             let room_name = tree_node.name.clone();
+                            let room_description = tree_node.description.clone().unwrap_or_default();
                             let parent_id = tree_node.parent_id;
-                            let my_room_id = state.my_room_id;
 
                             let room_label = {
                                 let count_suffix = if user_count > 0 {
@@ -4138,8 +4153,8 @@ impl RumbleApp {
                                     } else {
                                         ui.label("Parent: None (root)");
                                     }
-                                    if let Some(my_room) = my_room_id {
-                                        ui.label(format!("Current Room: {}", my_room));
+                                    if !room_description.is_empty() {
+                                        ui.label(egui::RichText::new(&room_description).italics().weak());
                                     }
                                     ui.separator();
 
@@ -4149,6 +4164,11 @@ impl RumbleApp {
                                     }
                                     if ui.button("Rename...").clicked() {
                                         *pending_rename = Some((Some(room_id), room_name.clone()));
+                                        ui.close();
+                                    }
+                                    if ui.button("Edit Description...").clicked() {
+                                        *pending_description =
+                                            Some((room_id, room_name.clone(), room_description.clone()));
                                         ui.close();
                                     }
                                     if ui.button("Add Child Room").clicked() {
@@ -4181,6 +4201,7 @@ impl RumbleApp {
                                         pending_commands,
                                         pending_rename,
                                         pending_delete,
+                                        pending_description,
                                         builder,
                                     );
                                 }
@@ -4376,6 +4397,7 @@ impl RumbleApp {
                                 &mut pending_commands,
                                 &mut pending_rename,
                                 &mut pending_delete,
+                                &mut pending_description,
                                 builder,
                             );
                         }
@@ -4447,6 +4469,16 @@ impl RumbleApp {
                         open: true,
                         room_id: Some(room_id),
                         room_name,
+                    };
+                }
+
+                // Handle description edit modal
+                if let Some((room_uuid, room_name, description)) = pending_description {
+                    self.description_modal = DescriptionModalState {
+                        open: true,
+                        room_uuid: Some(room_uuid),
+                        room_name,
+                        description,
                     };
                 }
             });
@@ -4787,6 +4819,43 @@ impl RumbleApp {
             });
             if modal.should_close() {
                 self.rename_modal.open = false;
+            }
+        }
+
+        // Edit room description modal
+        if self.description_modal.open {
+            let modal = Modal::new(egui::Id::new("description_modal")).show(ctx, |ui| {
+                ui.set_width(350.0);
+                ui.heading(format!("Description: {}", self.description_modal.room_name));
+                ui.add_space(4.0);
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.description_modal.description)
+                        .desired_rows(4)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("Enter room description..."),
+                );
+                ui.separator();
+                egui::Sides::new().show(
+                    ui,
+                    |_l| {},
+                    |ui| {
+                        if ui.button("Save").clicked() {
+                            if let Some(uuid) = self.description_modal.room_uuid {
+                                self.backend.send(Command::SetRoomDescription {
+                                    room_id: uuid,
+                                    description: self.description_modal.description.trim().to_string(),
+                                });
+                            }
+                            ui.close();
+                        }
+                        if ui.button("Cancel").clicked() {
+                            ui.close();
+                        }
+                    },
+                );
+            });
+            if modal.should_close() {
+                self.description_modal.open = false;
             }
         }
 
