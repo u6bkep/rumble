@@ -4,10 +4,10 @@ package MumbleProto;
 
 message Version {
   optional uint32 version_v1 = 1;
-  optional uint32 version_v2 = 4;
   optional string release = 2;
   optional string os = 3;
-  optional string os_version = 5;
+  optional string os_version = 4;
+  optional uint64 version_v2 = 5;
 }
 
 message Authenticate {
@@ -105,7 +105,12 @@ message UserState {
   repeated string temporary_access_tokens = 20;
   repeated uint32 listening_channel_add = 21;
   repeated uint32 listening_channel_remove = 22;
-  optional int32 listening_volume_adjustment = 23;
+  repeated VolumeAdjustment listening_volume_adjustment = 23;
+}
+
+message VolumeAdjustment {
+  optional uint32 listening_channel = 1;
+  optional float volume_adjustment = 2;
 }
 
 message TextMessage {
