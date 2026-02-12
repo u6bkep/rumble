@@ -120,13 +120,6 @@ impl EframeWrapper {
             _runtime: runtime,
         }
     }
-
-    /// Update portal shortcuts from the hotkey manager.
-    #[cfg(target_os = "linux")]
-    fn update_portal_shortcuts(&mut self) {
-        self.app
-            .set_portal_shortcuts(self.hotkey_manager.get_portal_shortcuts());
-    }
 }
 
 impl eframe::App for EframeWrapper {

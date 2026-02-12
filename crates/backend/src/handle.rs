@@ -1793,11 +1793,11 @@ async fn run_connection_task(
 
 /// Ephemeral session identity used for libp2p PeerId binding.
 struct SessionIdentity {
-    signing_key: SigningKey,
+    _signing_key: SigningKey,
     session_public_key: [u8; 32],
     session_id: [u8; 32],
-    issued_ms: i64,
-    expires_ms: i64,
+    _issued_ms: i64,
+    _expires_ms: i64,
 }
 
 #[cfg(feature = "p2p")]
@@ -1973,11 +1973,11 @@ async fn connect_to_server(
     let (rooms, users) = wait_for_auth_result(&mut recv, &mut buf).await?;
 
     let session_identity = SessionIdentity {
-        signing_key: session_signing,
+        _signing_key: session_signing,
         session_public_key: session_public_bytes,
         session_id: compute_session_id(&session_public_bytes),
-        issued_ms: timestamp_ms,
-        expires_ms,
+        _issued_ms: timestamp_ms,
+        _expires_ms: expires_ms,
     };
 
     Ok((conn, send, recv, buf, user_id, rooms, users, session_identity))

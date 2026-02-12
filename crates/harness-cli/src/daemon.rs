@@ -1118,6 +1118,7 @@ async fn start_server(port: u16) -> Result<ServerHandle> {
         key,
         data_dir: None,
         relay: None,
+        welcome_message: None,
     };
 
     let server = Server::new(config)?;

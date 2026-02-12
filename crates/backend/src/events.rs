@@ -1679,11 +1679,13 @@ mod tests {
                     id: Some(room_id_from_uuid(room1_uuid)),
                     name: "Root".to_string(),
                     parent_id: None,
+                    description: None,
                 },
                 RoomInfo {
                     id: Some(room_id_from_uuid(room2_uuid)),
                     name: "Room2".to_string(),
                     parent_id: None,
+                    description: None,
                 },
             ],
             users: vec![
@@ -1733,6 +1735,7 @@ mod tests {
                 id: Some(room_id_from_uuid(room_uuid)),
                 name: "Root".to_string(),
                 parent_id: None,
+                description: None,
             }],
             ..Default::default()
         };
@@ -1756,21 +1759,25 @@ mod tests {
                 id: Some(room_id_from_uuid(root_uuid)),
                 name: "Root".to_string(),
                 parent_id: None,
+                description: None,
             },
             RoomInfo {
                 id: Some(room_id_from_uuid(child1_uuid)),
                 name: "Alpha Channel".to_string(),
                 parent_id: Some(room_id_from_uuid(root_uuid)),
+                description: None,
             },
             RoomInfo {
                 id: Some(room_id_from_uuid(child2_uuid)),
                 name: "Beta Channel".to_string(),
                 parent_id: Some(room_id_from_uuid(root_uuid)),
+                description: None,
             },
             RoomInfo {
                 id: Some(room_id_from_uuid(grandchild_uuid)),
                 name: "Private".to_string(),
                 parent_id: Some(room_id_from_uuid(child1_uuid)),
+                description: None,
             },
         ];
 

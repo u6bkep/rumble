@@ -3148,7 +3148,7 @@ impl RumbleApp {
                 .order(egui::Order::Foreground)
                 .show(ctx, |ui| {
                     let rect = ui.ctx().available_rect();
-                    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(rect), |ui| {
+                    ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
                         egui::Frame::new()
                             .fill(egui::Color32::from_rgba_unmultiplied(0, 100, 200, 100))
                             .show(ui, |ui| {

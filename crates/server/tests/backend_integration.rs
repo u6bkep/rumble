@@ -619,6 +619,7 @@ impl TestClient {
             payload: Some(Payload::CreateRoom(proto::CreateRoom {
                 name: name.to_string(),
                 parent_id: None,
+                description: None,
             })),
         };
         let frame = encode_frame(&env);
@@ -761,6 +762,21 @@ impl TestClient {
                             .find(|r| r.id.as_ref().and_then(uuid_from_room_id) == Some(rid))
                         {
                             room.parent_id = rm.new_parent_id;
+                        }
+                    }
+                }
+                proto::state_update::Update::RoomDescriptionChanged(rdc) => {
+                    if let Some(rid) = rdc.room_id.and_then(|r| uuid_from_room_id(&r)) {
+                        if let Some(room) = self
+                            .rooms
+                            .iter_mut()
+                            .find(|r| r.id.as_ref().and_then(uuid_from_room_id) == Some(rid))
+                        {
+                            room.description = if rdc.description.is_empty() {
+                                None
+                            } else {
+                                Some(rdc.description)
+                            };
                         }
                     }
                 }
