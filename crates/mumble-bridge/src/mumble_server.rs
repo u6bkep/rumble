@@ -11,7 +11,7 @@ use tokio_rustls::{TlsAcceptor, server::TlsStream};
 use tracing::{info, warn};
 
 use crate::{
-    bridge::BridgeEvent,
+    bridge::{BridgeEvent, read_bridge, write_bridge},
     config::BridgeConfig,
     mumble_framing::{self, write_message, write_udp_tunnel},
     mumble_proto::{MessageType, mumble},
@@ -116,7 +116,7 @@ async fn handle_mumble_client(
     bridge_tx.send(BridgeEvent::MumbleClientLeft { session })?;
 
     {
-        let mut state = bridge_state.write().unwrap();
+        let mut state = write_bridge(&bridge_state);
         state.mumble_clients.remove(&session);
     }
 
@@ -171,7 +171,7 @@ async fn mumble_auth_handshake(
     let channels;
     let users;
     {
-        let mut state = bridge_state.write().unwrap();
+        let mut state = write_bridge(&bridge_state);
         session = state.allocate_mumble_session();
         state.mumble_clients.insert(
             session,
@@ -237,7 +237,7 @@ async fn mumble_auth_handshake(
 
     // Use the Rumble server's welcome message if available, otherwise fall back to config
     let welcome_text = {
-        let state = bridge_state.read().unwrap();
+        let state = read_bridge(&bridge_state);
         state
             .welcome_message
             .clone()

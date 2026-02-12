@@ -207,7 +207,11 @@ fn make_server_endpoint(config: &Config) -> Result<Endpoint> {
 
     // Configure transport for faster disconnect detection
     let mut transport_config = quinn::TransportConfig::default();
-    transport_config.max_idle_timeout(Some(std::time::Duration::from_secs(30).try_into().unwrap()));
+    transport_config.max_idle_timeout(Some(
+        std::time::Duration::from_secs(30)
+            .try_into()
+            .expect("30s is valid for quinn idle timeout"),
+    ));
     transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
     transport_config.datagram_receive_buffer_size(Some(65536));
     server_config.transport_config(Arc::new(transport_config));

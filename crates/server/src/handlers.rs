@@ -31,6 +31,14 @@ use std::{
 };
 use tracing::{debug, error, info, warn};
 
+/// Get current time as milliseconds since UNIX epoch, with a safe fallback.
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+
 /// Handle a decoded envelope from a client.
 ///
 /// This is the main protocol handler. It processes the envelope payload
@@ -467,7 +475,7 @@ async fn handle_authenticate(
     };
 
     // 2. Check timestamp (±5 minutes)
-    let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
+    let now_ms = now_ms();
     let diff_ms = (now_ms - auth.timestamp_ms).abs();
     if diff_ms > 5 * 60 * 1000 {
         return send_auth_failed(&sender, "Timestamp out of range").await;
@@ -516,7 +524,6 @@ async fn handle_authenticate(
     if cert.expires_ms <= cert.issued_ms {
         return send_auth_failed(&sender, "Session certificate expiry invalid").await;
     }
-    let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
     if cert.expires_ms < now_ms {
         return send_auth_failed(&sender, "Session certificate expired").await;
     }
@@ -798,7 +805,7 @@ async fn handle_chat_message(
     let timestamp_ms = if msg.timestamp_ms > 0 {
         msg.timestamp_ms
     } else {
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64
+        now_ms()
     };
 
     let broadcast = proto::Envelope {
@@ -916,11 +923,7 @@ async fn handle_direct_message(
         uuid::Uuid::new_v4().into_bytes().to_vec()
     };
 
-    let timestamp_ms = if dm.timestamp_ms > 0 {
-        dm.timestamp_ms
-    } else {
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64
-    };
+    let timestamp_ms = if dm.timestamp_ms > 0 { dm.timestamp_ms } else { now_ms() };
 
     let dm_event = proto::DirectMessageReceived {
         sender_id: sender.user_id,
@@ -1900,7 +1903,7 @@ async fn handle_bridge_chat_message(
     );
 
     let message_id = uuid::Uuid::new_v4().into_bytes().to_vec();
-    let timestamp_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
+    let timestamp_ms = now_ms();
 
     let broadcast = proto::Envelope {
         state_hash: Vec::new(),

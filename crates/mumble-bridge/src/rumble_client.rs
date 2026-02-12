@@ -13,6 +13,14 @@ use quinn::Endpoint;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 
+/// Get current time as milliseconds since UNIX epoch, with a safe fallback.
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+
 /// An active connection to a Rumble server.
 pub struct RumbleConnection {
     pub conn: quinn::Connection,
@@ -67,7 +75,7 @@ pub async fn connect(addr: &str, username: &str, signing_key: &SigningKey) -> Re
     let server_cert_hash = compute_server_cert_hash(&conn);
 
     // Generate session keypair and certificate
-    let timestamp_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
+    let timestamp_ms = now_ms();
     let expires_ms = timestamp_ms + 24 * 60 * 60 * 1000; // 24h validity
     let session_secret: [u8; 32] = rand::random();
     let session_signing = SigningKey::from_bytes(&session_secret);
@@ -123,7 +131,7 @@ pub async fn send_chat(send: &mut quinn::SendStream, sender: &str, text: &str) -
         state_hash: Vec::new(),
         payload: Some(Payload::ChatMessage(proto::ChatMessage {
             id: uuid::Uuid::new_v4().as_bytes().to_vec(),
-            timestamp_ms: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64,
+            timestamp_ms: now_ms(),
             sender: sender.to_string(),
             text: text.to_string(),
             tree: None,
@@ -141,7 +149,7 @@ pub async fn send_direct_message(send: &mut quinn::SendStream, target_user_id: u
             target_user_id,
             text: text.to_string(),
             id: uuid::Uuid::new_v4().as_bytes().to_vec(),
-            timestamp_ms: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64,
+            timestamp_ms: now_ms(),
         })),
     };
     send.write_all(&encode_frame(&msg)).await?;
@@ -154,7 +162,7 @@ pub async fn send_tree_chat(send: &mut quinn::SendStream, sender: &str, text: &s
         state_hash: Vec::new(),
         payload: Some(Payload::ChatMessage(proto::ChatMessage {
             id: uuid::Uuid::new_v4().as_bytes().to_vec(),
-            timestamp_ms: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64,
+            timestamp_ms: now_ms(),
             sender: sender.to_string(),
             text: text.to_string(),
             tree: Some(true),
@@ -269,9 +277,9 @@ pub async fn read_envelope(recv: &mut quinn::RecvStream, buf: &mut BytesMut) -> 
 
 fn make_bridge_endpoint(remote_addr: std::net::SocketAddr) -> Result<Endpoint> {
     let bind_addr: std::net::SocketAddr = if remote_addr.is_ipv6() {
-        "[::]:0".parse().unwrap()
+        "[::]:0".parse().expect("valid IPv6 bind address literal")
     } else {
-        "0.0.0.0:0".parse().unwrap()
+        "0.0.0.0:0".parse().expect("valid IPv4 bind address literal")
     };
     let mut endpoint = Endpoint::client(bind_addr)?;
 
@@ -289,7 +297,11 @@ fn make_bridge_endpoint(remote_addr: std::net::SocketAddr) -> Result<Endpoint> {
     let mut client_config = quinn::ClientConfig::new(Arc::new(crypto));
 
     let mut transport = quinn::TransportConfig::default();
-    transport.max_idle_timeout(Some(std::time::Duration::from_secs(30).try_into().unwrap()));
+    transport.max_idle_timeout(Some(
+        std::time::Duration::from_secs(30)
+            .try_into()
+            .expect("30s is valid for quinn idle timeout"),
+    ));
     transport.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
     client_config.transport_config(Arc::new(transport));
 

@@ -8,7 +8,7 @@ use tokio::sync::{mpsc, watch};
 use tracing::{error, info, warn};
 
 use mumble_bridge::{
-    bridge::{self, BridgeEvent, BridgeLoopState},
+    bridge::{self, BridgeEvent, BridgeLoopState, read_bridge, write_bridge},
     config::BridgeConfig,
     mumble_server, mumble_tls, rumble_client,
     state::BridgeState,
@@ -163,7 +163,7 @@ async fn main() -> Result<()> {
 
         // Update bridge state with fresh Rumble state
         {
-            let mut state = bridge_state.write().unwrap();
+            let mut state = write_bridge(&bridge_state);
             state.bridge_user_id = Some(rumble_conn.user_id);
             state.rumble_connected = true;
             state.rumble_rooms = rumble_conn.rooms.clone();
@@ -185,7 +185,7 @@ async fn main() -> Result<()> {
 
         // Re-register all currently connected Mumble clients as virtual users
         let clients_to_reregister: Vec<(u32, String)> = {
-            let state = bridge_state.read().unwrap();
+            let state = read_bridge(&bridge_state);
             state
                 .mumble_clients
                 .values()
@@ -200,7 +200,7 @@ async fn main() -> Result<()> {
             );
             // Clear stale virtual user mappings from previous connection
             {
-                let mut state = bridge_state.write().unwrap();
+                let mut state = write_bridge(&bridge_state);
                 state.virtual_user_map.clear();
                 state.reverse_virtual_user_map.clear();
                 state.pending_registrations.clear();
@@ -208,7 +208,7 @@ async fn main() -> Result<()> {
 
             for (session, username) in &clients_to_reregister {
                 {
-                    let mut state = bridge_state.write().unwrap();
+                    let mut state = write_bridge(&bridge_state);
                     state.pending_registrations.push((username.clone(), *session));
                 }
                 if let Err(e) = rumble_client::send_bridge_register_user(&mut rumble_conn.send, username).await {
@@ -279,7 +279,7 @@ async fn main() -> Result<()> {
 
         // Mark Rumble as disconnected
         {
-            let mut state = bridge_state.write().unwrap();
+            let mut state = write_bridge(&bridge_state);
             state.rumble_connected = false;
         }
 
