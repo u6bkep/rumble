@@ -1279,6 +1279,14 @@ pub struct State {
     // Room tree (derived from rooms)
     /// Hierarchical tree structure of rooms, rebuilt when rooms change.
     pub room_tree: RoomTree,
+
+    // ACL state
+    /// Effective permissions for our current room (bitmask from PermissionsInfo).
+    pub effective_permissions: u32,
+    /// Last permission denied message (for UI toast display). Cleared after reading.
+    pub permission_denied: Option<String>,
+    /// Kick reason if we were kicked (for disconnect dialog). Cleared after reading.
+    pub kicked: Option<String>,
 }
 
 impl State {
@@ -1526,6 +1534,32 @@ pub enum Command {
     /// This is triggered by receiving a ChatHistoryRequestMessage.
     #[doc(hidden)]
     ShareChatHistory,
+
+    // ACL Commands
+    /// Kick a user from the server.
+    KickUser {
+        target_user_id: u64,
+        reason: String,
+    },
+    /// Ban a user from the server.
+    BanUser {
+        target_user_id: u64,
+        reason: String,
+        duration_secs: u64,
+    },
+    /// Set server mute on another user.
+    SetServerMute {
+        target_user_id: u64,
+        muted: bool,
+    },
+    /// Elevate to superuser (sudo).
+    Elevate {
+        password: String,
+    },
+    /// Query effective permissions for a room.
+    QueryPermissions {
+        room_id: Uuid,
+    },
 }
 
 // Implement Debug manually since SigningCallback doesn't implement Debug
@@ -1651,6 +1685,30 @@ impl std::fmt::Debug for Command {
                 .finish(),
             Command::RequestChatHistory => write!(f, "RequestChatHistory"),
             Command::ShareChatHistory => write!(f, "ShareChatHistory"),
+            Command::KickUser { target_user_id, reason } => f
+                .debug_struct("KickUser")
+                .field("target_user_id", target_user_id)
+                .field("reason", reason)
+                .finish(),
+            Command::BanUser {
+                target_user_id,
+                reason,
+                duration_secs,
+            } => f
+                .debug_struct("BanUser")
+                .field("target_user_id", target_user_id)
+                .field("reason", reason)
+                .field("duration_secs", duration_secs)
+                .finish(),
+            Command::SetServerMute { target_user_id, muted } => f
+                .debug_struct("SetServerMute")
+                .field("target_user_id", target_user_id)
+                .field("muted", muted)
+                .finish(),
+            Command::Elevate { .. } => write!(f, "Elevate {{ .. }}"),
+            Command::QueryPermissions { room_id } => {
+                f.debug_struct("QueryPermissions").field("room_id", room_id).finish()
+            }
         }
     }
 }
@@ -1723,6 +1781,9 @@ mod tests {
             file_transfer_settings: FileTransferSettings::default(),
             room_tree: RoomTree::default(),
             p2p_peers: HashMap::new(),
+            effective_permissions: 0,
+            permission_denied: None,
+            kicked: None,
         };
 
         let users_in_room1 = state.users_in_room(room1_uuid);
