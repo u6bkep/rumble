@@ -152,6 +152,151 @@ const BAN_DURATIONS: &[(&str, u64)] = &[
     ("30 days", 2592000),
 ];
 
+/// State for the admin panel in settings
+#[derive(Default)]
+struct AdminPanelState {
+    new_group_name: String,
+    new_group_permissions: u32,
+    editing_group: Option<String>,
+    editing_permissions: u32,
+}
+
+/// State for the room ACL editor modal
+struct RoomAclModalState {
+    open: bool,
+    room_id: Uuid,
+    room_name: String,
+    inherit_acl: bool,
+    entries: Vec<AclEditEntry>,
+}
+
+struct AclEditEntry {
+    group: String,
+    grant: u32,
+    deny: u32,
+    apply_here: bool,
+    apply_subs: bool,
+}
+
+impl Default for RoomAclModalState {
+    fn default() -> Self {
+        Self {
+            open: false,
+            room_id: Uuid::nil(),
+            room_name: String::new(),
+            inherit_acl: true,
+            entries: vec![],
+        }
+    }
+}
+
+/// Render permission checkboxes for group editing.
+fn render_permission_checkboxes(ui: &mut egui::Ui, permissions: &mut u32) {
+    ui.label("Room-Scoped:");
+    ui.indent("room_perms", |ui| {
+        let room_perms = [
+            (Permissions::TRAVERSE, "Traverse"),
+            (Permissions::ENTER, "Enter"),
+            (Permissions::SPEAK, "Speak"),
+            (Permissions::TEXT_MESSAGE, "Text Message"),
+            (Permissions::SHARE_FILE, "Share File"),
+            (Permissions::MUTE_DEAFEN, "Mute/Deafen Others"),
+            (Permissions::MOVE_USER, "Move User"),
+            (Permissions::MAKE_ROOM, "Make Room"),
+            (Permissions::MODIFY_ROOM, "Modify Room"),
+            (Permissions::WRITE, "Write ACLs"),
+        ];
+        for (perm, label) in &room_perms {
+            let mut checked = Permissions::from_bits_truncate(*permissions).contains(*perm);
+            if ui.checkbox(&mut checked, *label).changed() {
+                if checked {
+                    *permissions |= perm.bits();
+                } else {
+                    *permissions &= !perm.bits();
+                }
+            }
+        }
+    });
+
+    ui.add_space(4.0);
+    ui.label("Server-Scoped:");
+    ui.indent("server_perms", |ui| {
+        let server_perms = [
+            (Permissions::KICK, "Kick"),
+            (Permissions::BAN, "Ban"),
+            (Permissions::REGISTER, "Register Others"),
+            (Permissions::SELF_REGISTER, "Self Register"),
+            (Permissions::MANAGE_ACL, "Manage ACLs"),
+            (Permissions::SUDO, "Sudo"),
+        ];
+        for (perm, label) in &server_perms {
+            let mut checked = Permissions::from_bits_truncate(*permissions).contains(*perm);
+            if ui.checkbox(&mut checked, *label).changed() {
+                if checked {
+                    *permissions |= perm.bits();
+                } else {
+                    *permissions &= !perm.bits();
+                }
+            }
+        }
+    });
+}
+
+/// Render a compact row of permission checkboxes for ACL entry editing.
+fn render_permission_checkboxes_compact(ui: &mut egui::Ui, permissions: &mut u32, prefix: &str, idx: usize) {
+    let all_perms = [
+        (Permissions::TRAVERSE, "T"),
+        (Permissions::ENTER, "E"),
+        (Permissions::SPEAK, "S"),
+        (Permissions::TEXT_MESSAGE, "TM"),
+        (Permissions::SHARE_FILE, "SF"),
+        (Permissions::MUTE_DEAFEN, "MD"),
+        (Permissions::MOVE_USER, "MV"),
+        (Permissions::MAKE_ROOM, "MR"),
+        (Permissions::MODIFY_ROOM, "MoR"),
+        (Permissions::WRITE, "W"),
+    ];
+    for (perm, label) in &all_perms {
+        let mut checked = Permissions::from_bits_truncate(*permissions).contains(*perm);
+        if ui
+            .checkbox(&mut checked, *label)
+            .on_hover_text(format!("{}{}{}", prefix, idx, label))
+            .changed()
+        {
+            if checked {
+                *permissions |= perm.bits();
+            } else {
+                *permissions &= !perm.bits();
+            }
+        }
+    }
+}
+
+/// Format a brief permission summary for display.
+fn format_permission_summary(perms: Permissions) -> String {
+    let mut parts = Vec::new();
+    if perms.contains(Permissions::SPEAK) {
+        parts.push("speak");
+    }
+    if perms.contains(Permissions::KICK) {
+        parts.push("kick");
+    }
+    if perms.contains(Permissions::BAN) {
+        parts.push("ban");
+    }
+    if perms.contains(Permissions::MANAGE_ACL) {
+        parts.push("acl");
+    }
+    if perms.contains(Permissions::SUDO) {
+        parts.push("sudo");
+    }
+    if parts.is_empty() {
+        "none".to_string()
+    } else {
+        parts.join(", ")
+    }
+}
+
 /// Validate a magnet link format.
 fn is_valid_magnet(s: &str) -> bool {
     s.starts_with("magnet:?") && s.contains("xt=urn:btih:")
@@ -171,6 +316,7 @@ enum SettingsCategory {
     FileTransfer,
     Keyboard,
     Statistics,
+    Admin,
 }
 
 impl SettingsCategory {
@@ -186,6 +332,7 @@ impl SettingsCategory {
             SettingsCategory::FileTransfer,
             SettingsCategory::Keyboard,
             SettingsCategory::Statistics,
+            SettingsCategory::Admin,
         ]
     }
 
@@ -201,6 +348,7 @@ impl SettingsCategory {
             SettingsCategory::FileTransfer => "📂 File Transfer",
             SettingsCategory::Keyboard => "⌨ Keyboard",
             SettingsCategory::Statistics => "📊 Statistics",
+            SettingsCategory::Admin => "⚙ Admin",
         }
     }
 }
@@ -321,6 +469,12 @@ pub struct RumbleApp {
 
     // Settings modal state with pending changes
     settings_modal: SettingsModalState,
+
+    // Admin panel state
+    admin_panel: AdminPanelState,
+
+    // Room ACL editor modal state
+    room_acl_modal: RoomAclModalState,
 
     /// Push-to-talk key is held
     push_to_talk_active: bool,
@@ -603,6 +757,8 @@ impl RumbleApp {
             ban_modal: BanModalState::default(),
             elevate_modal: ElevateModalState::default(),
             settings_modal: SettingsModalState::default(),
+            admin_panel: AdminPanelState::default(),
+            room_acl_modal: RoomAclModalState::default(),
             push_to_talk_active: false,
             hotkey_registration_status: std::collections::HashMap::new(),
             portal_hotkeys_available: false,
@@ -2404,6 +2560,123 @@ impl RumbleApp {
         if cancel_capture {
             self.settings_modal.hotkey_capture_target = None;
             self.settings_modal.hotkey_conflict_pending = None;
+        }
+    }
+
+    fn render_settings_admin(&mut self, ui: &mut egui::Ui) {
+        let state = self.backend.state();
+
+        ui.heading("Group Management");
+        ui.add_space(8.0);
+
+        // Group list
+        let groups = state.group_definitions.clone();
+        let builtin = ["default", "admin"];
+
+        egui::Grid::new("group_list")
+            .num_columns(3)
+            .spacing([16.0, 4.0])
+            .striped(true)
+            .show(ui, |ui| {
+                ui.strong("Group");
+                ui.strong("Permissions");
+                ui.strong("Actions");
+                ui.end_row();
+
+                for group in &groups {
+                    ui.label(&group.name);
+
+                    let perms = Permissions::from_bits_truncate(group.permissions);
+                    let summary = format_permission_summary(perms);
+                    ui.label(summary);
+
+                    ui.horizontal(|ui| {
+                        if ui.small_button("Edit").clicked() {
+                            self.admin_panel.editing_group = Some(group.name.clone());
+                            self.admin_panel.editing_permissions = group.permissions;
+                        }
+                        if !builtin.contains(&group.name.as_str()) {
+                            if ui.small_button("Delete").clicked() {
+                                self.backend.send(Command::DeleteGroup {
+                                    name: group.name.clone(),
+                                });
+                            }
+                        } else {
+                            ui.label("(built-in)");
+                        }
+                    });
+                    ui.end_row();
+                }
+            });
+
+        // Edit group permissions (if editing)
+        if let Some(group_name) = self.admin_panel.editing_group.clone() {
+            ui.add_space(12.0);
+            ui.separator();
+            ui.add_space(4.0);
+            ui.heading(format!("Edit: {}", group_name));
+            ui.add_space(4.0);
+
+            render_permission_checkboxes(ui, &mut self.admin_panel.editing_permissions);
+
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("Save").clicked() {
+                    self.backend.send(Command::ModifyGroup {
+                        name: group_name.clone(),
+                        permissions: self.admin_panel.editing_permissions,
+                    });
+                    self.admin_panel.editing_group = None;
+                }
+                if ui.button("Cancel").clicked() {
+                    self.admin_panel.editing_group = None;
+                }
+            });
+        }
+
+        // Create new group
+        ui.add_space(12.0);
+        ui.separator();
+        ui.add_space(4.0);
+        ui.heading("Create Group");
+        ui.add_space(4.0);
+
+        ui.horizontal(|ui| {
+            ui.label("Name:");
+            ui.text_edit_singleline(&mut self.admin_panel.new_group_name);
+        });
+
+        render_permission_checkboxes(ui, &mut self.admin_panel.new_group_permissions);
+
+        ui.add_space(4.0);
+        if ui.button("+ Create Group").clicked() {
+            let name = self.admin_panel.new_group_name.trim().to_string();
+            if !name.is_empty() {
+                self.backend.send(Command::CreateGroup {
+                    name,
+                    permissions: self.admin_panel.new_group_permissions,
+                });
+                self.admin_panel.new_group_name.clear();
+                self.admin_panel.new_group_permissions = 0;
+            }
+        }
+
+        // User group management
+        ui.add_space(12.0);
+        ui.separator();
+        ui.add_space(4.0);
+        ui.heading("User Groups");
+        ui.add_space(4.0);
+
+        for user in &state.users {
+            let user_groups_str = if user.groups.is_empty() {
+                "(none)".to_string()
+            } else {
+                user.groups.join(", ")
+            };
+            ui.horizontal(|ui| {
+                ui.label(format!("{}: {}", user.username, user_groups_str));
+            });
         }
     }
 
@@ -4292,6 +4565,7 @@ impl RumbleApp {
                 let mut pending_description: Option<(Uuid, String, String)> = None;
                 let mut pending_kick: Option<(u64, String)> = None;
                 let mut pending_ban: Option<(u64, String)> = None;
+                let mut pending_acl_edit: Option<(Uuid, String, bool, Vec<api::proto::RoomAclEntry>)> = None;
 
                 // Build set of rooms that have users in them or in any descendant
                 let mut rooms_with_users: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
@@ -4318,6 +4592,7 @@ impl RumbleApp {
                             pending_description: &mut Option<(Uuid, String, String)>,
                             pending_kick: &mut Option<(u64, String)>,
                             pending_ban: &mut Option<(u64, String)>,
+                            pending_acl_edit: &mut Option<(Uuid, String, bool, Vec<api::proto::RoomAclEntry>)>,
                             builder: &mut egui_ltreeview::TreeViewBuilder<TreeNodeId>,
                         ) {
                             let Some(tree_node) = state.room_tree.get(room_id) else {
@@ -4403,6 +4678,20 @@ impl RumbleApp {
                                             ui.close();
                                         }
                                     }
+                                    if eff.contains(Permissions::WRITE) {
+                                        if ui.button("Edit ACLs").clicked() {
+                                            // Load current ACL data from room
+                                            if let Some(room) = state.get_room(room_id) {
+                                                *pending_acl_edit = Some((
+                                                    room_id,
+                                                    room_name.clone(),
+                                                    room.inherit_acl,
+                                                    room.acls.clone(),
+                                                ));
+                                            }
+                                            ui.close();
+                                        }
+                                    }
                                 });
 
                             let is_open = builder.node(room_node);
@@ -4433,6 +4722,7 @@ impl RumbleApp {
                                         pending_description,
                                         pending_kick,
                                         pending_ban,
+                                        pending_acl_edit,
                                         builder,
                                     );
                                 }
@@ -4551,6 +4841,9 @@ impl RumbleApp {
                                     ui.separator();
                                     ui.label(format!("User ID: {}", user_id));
                                     ui.label(format!("In Room: {}", room_id));
+                                    if !user.groups.is_empty() {
+                                        ui.label(format!("Groups: {}", user.groups.join(", ")));
+                                    }
                                     ui.separator();
 
                                     // Self actions
@@ -4688,6 +4981,7 @@ impl RumbleApp {
                                 &mut pending_description,
                                 &mut pending_kick,
                                 &mut pending_ban,
+                                &mut pending_acl_edit,
                                 builder,
                             );
                         }
@@ -4790,6 +5084,26 @@ impl RumbleApp {
                         target_username: uname,
                         reason: String::new(),
                         duration_index: 0,
+                    };
+                }
+
+                // Handle ACL edit modal
+                if let Some((room_id, room_name, inherit_acl, acls)) = pending_acl_edit {
+                    self.room_acl_modal = RoomAclModalState {
+                        open: true,
+                        room_id,
+                        room_name,
+                        inherit_acl,
+                        entries: acls
+                            .into_iter()
+                            .map(|e| AclEditEntry {
+                                group: e.group,
+                                grant: e.grant,
+                                deny: e.deny,
+                                apply_here: e.apply_here,
+                                apply_subs: e.apply_subs,
+                            })
+                            .collect(),
                     };
                 }
             });
@@ -5017,7 +5331,13 @@ impl RumbleApp {
                         egui::ScrollArea::vertical().id_salt("settings_sidebar").show(ui, |ui| {
                             ui.add_space(4.0);
                             let ctrl_held = ui.input(|i| i.modifiers.ctrl);
+                            let eff_perms = Permissions::from_bits_truncate(state.effective_permissions);
+                            let show_admin = eff_perms.contains(Permissions::MANAGE_ACL);
                             for category in SettingsCategory::all() {
+                                // Gate Admin category on MANAGE_ACL permission
+                                if matches!(category, SettingsCategory::Admin) && !show_admin {
+                                    continue;
+                                }
                                 let selected = self.settings_modal.selected_categories.contains(category);
                                 if ui.selectable_label(selected, category.label()).clicked() {
                                     if ctrl_held {
@@ -5087,6 +5407,9 @@ impl RumbleApp {
                                         }
                                         SettingsCategory::Statistics => {
                                             self.render_settings_statistics(ui, &state);
+                                        }
+                                        SettingsCategory::Admin => {
+                                            self.render_settings_admin(ui);
                                         }
                                     }
                                 }
@@ -5374,6 +5697,95 @@ impl RumbleApp {
             });
             if modal.should_close() {
                 self.elevate_modal.open = false;
+            }
+        }
+
+        // Room ACL editor modal
+        if self.room_acl_modal.open {
+            let modal = Modal::new(egui::Id::new("room_acl_modal")).show(ctx, |ui| {
+                ui.set_width(500.0);
+                ui.heading(format!("ACLs: {}", self.room_acl_modal.room_name));
+                ui.add_space(8.0);
+
+                ui.checkbox(&mut self.room_acl_modal.inherit_acl, "Inherit from parent");
+                ui.add_space(8.0);
+                ui.separator();
+
+                // ACL entries
+                let mut to_remove = None;
+                for (i, entry) in self.room_acl_modal.entries.iter_mut().enumerate() {
+                    ui.push_id(i, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("Group:");
+                            ui.text_edit_singleline(&mut entry.group);
+                            ui.checkbox(&mut entry.apply_here, "Here");
+                            ui.checkbox(&mut entry.apply_subs, "Subs");
+                            if ui.small_button("X").clicked() {
+                                to_remove = Some(i);
+                            }
+                        });
+
+                        ui.horizontal(|ui| {
+                            ui.label("Grant:");
+                            render_permission_checkboxes_compact(ui, &mut entry.grant, "grant", i);
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Deny:");
+                            render_permission_checkboxes_compact(ui, &mut entry.deny, "deny", i);
+                        });
+                        ui.separator();
+                    });
+                }
+
+                if let Some(idx) = to_remove {
+                    self.room_acl_modal.entries.remove(idx);
+                }
+
+                if ui.button("+ Add Entry").clicked() {
+                    self.room_acl_modal.entries.push(AclEditEntry {
+                        group: "default".to_string(),
+                        grant: 0,
+                        deny: 0,
+                        apply_here: true,
+                        apply_subs: true,
+                    });
+                }
+
+                ui.add_space(8.0);
+                ui.separator();
+                egui::Sides::new().show(
+                    ui,
+                    |_l| {},
+                    |ui| {
+                        ui.style_mut().spacing.item_spacing.x = 8.0;
+                        if ui.button("Save").clicked() {
+                            let entries: Vec<api::proto::RoomAclEntry> = self
+                                .room_acl_modal
+                                .entries
+                                .iter()
+                                .map(|e| api::proto::RoomAclEntry {
+                                    group: e.group.clone(),
+                                    grant: e.grant,
+                                    deny: e.deny,
+                                    apply_here: e.apply_here,
+                                    apply_subs: e.apply_subs,
+                                })
+                                .collect();
+                            self.backend.send(Command::SetRoomAcl {
+                                room_id: self.room_acl_modal.room_id,
+                                inherit_acl: self.room_acl_modal.inherit_acl,
+                                entries,
+                            });
+                            ui.close();
+                        }
+                        if ui.button("Cancel").clicked() {
+                            ui.close();
+                        }
+                    },
+                );
+            });
+            if modal.should_close() {
+                self.room_acl_modal.open = false;
             }
         }
 
