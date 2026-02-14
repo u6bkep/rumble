@@ -220,6 +220,44 @@ impl Persistence {
     }
 
     // =========================================================================
+    // Generic raw tree access (used by ACL handlers, real impl in acl-server-core)
+    // =========================================================================
+
+    /// Store raw bytes in a named tree.
+    pub fn store_raw(&self, tree_name: &str, key: &[u8], value: &[u8]) -> Result<()> {
+        let tree = self.db.open_tree(tree_name)?;
+        tree.insert(key, value)?;
+        Ok(())
+    }
+
+    /// Get raw bytes from a named tree.
+    pub fn get_raw(&self, tree_name: &str, key: &[u8]) -> Option<Vec<u8>> {
+        let tree = self.db.open_tree(tree_name).ok()?;
+        tree.get(key).ok().flatten().map(|v| v.to_vec())
+    }
+
+    /// Remove an entry from a named tree.
+    pub fn remove_raw(&self, tree_name: &str, key: &[u8]) -> Result<()> {
+        let tree = self.db.open_tree(tree_name)?;
+        tree.remove(key)?;
+        Ok(())
+    }
+
+    /// Check if a username is registered (for group name collision check).
+    pub fn is_username_registered(&self, username: &str) -> bool {
+        for result in self.registered_users.iter() {
+            if let Ok((_key, value)) = result {
+                if let Ok(user) = bincode::deserialize::<RegisteredUser>(&value) {
+                    if user.username.eq_ignore_ascii_case(username) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    // =========================================================================
     // Room persistence
     // =========================================================================
 

@@ -11,6 +11,7 @@
 //! - Client iteration is lock-free via DashMap
 
 use crate::{
+    acl,
     persistence::Persistence,
     state::{
         ClientHandle, PeerCapabilitiesEntry, PendingAuth, ServerState, SessionEntry, UserStatus,
@@ -20,6 +21,7 @@ use crate::{
 use anyhow::Result;
 use api::{
     ROOT_ROOM_UUID, build_auth_payload, build_session_cert_payload, compute_session_id, encode_frame,
+    permissions::Permissions,
     proto::{self, ServerState as ProtoServerState, VoiceDatagram, envelope::Payload},
     room_id_from_uuid, uuid_from_room_id,
 };
@@ -30,6 +32,7 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 use tracing::{debug, error, info, warn};
+use uuid::Uuid;
 
 /// Get current time as milliseconds since UNIX epoch, with a safe fallback.
 fn now_ms() -> i64 {
@@ -204,6 +207,73 @@ pub async fn handle_envelope(
             }
             handle_bridge_chat_message(bcm, sender, state).await?;
         }
+        // ACL messages (80-90)
+        Some(Payload::KickUser(ku)) => {
+            if !sender.authenticated.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            handle_kick_user(ku, sender, state, persistence).await?;
+        }
+        Some(Payload::BanUser(bu)) => {
+            if !sender.authenticated.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            handle_ban_user(bu, sender, state, persistence).await?;
+        }
+        Some(Payload::UnbanUser(uu)) => {
+            if !sender.authenticated.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            handle_unban_user(uu, sender, state, persistence).await?;
+        }
+        Some(Payload::SetServerMute(ssm)) => {
+            if !sender.authenticated.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            handle_set_server_mute(ssm, sender, state).await?;
+        }
+        Some(Payload::Elevate(elev)) => {
+            if !sender.authenticated.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            handle_elevate(elev, sender, state, persistence).await?;
+        }
+        Some(Payload::CreateGroup(cg)) => {
+            if !sender.authenticated.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            handle_create_group(cg, sender, state, persistence).await?;
+        }
+        Some(Payload::DeleteGroup(dg)) => {
+            if !sender.authenticated.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            handle_delete_group(dg, sender, state, persistence).await?;
+        }
+        Some(Payload::ModifyGroup(mg)) => {
+            if !sender.authenticated.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            handle_modify_group(mg, sender, state, persistence).await?;
+        }
+        Some(Payload::SetUserGroup(sug)) => {
+            if !sender.authenticated.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            handle_set_user_group(sug, sender, state, persistence).await?;
+        }
+        Some(Payload::SetRoomAcl(sra)) => {
+            if !sender.authenticated.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            handle_set_room_acl(sra, sender, state, persistence).await?;
+        }
+        Some(Payload::QueryPermissions(qp)) => {
+            if !sender.authenticated.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            handle_query_permissions(qp, sender, state).await?;
+        }
         // Server-to-client messages or empty - ignore
         Some(
             Payload::ServerHello(_)
@@ -212,7 +282,10 @@ pub async fn handle_envelope(
             | Payload::CommandResult(_)
             | Payload::PeerAnnounce(_)
             | Payload::RelayAllocation(_)
-            | Payload::BridgeUserRegistered(_),
+            | Payload::BridgeUserRegistered(_)
+            | Payload::PermissionDenied(_)
+            | Payload::UserKicked(_)
+            | Payload::PermissionsInfo(_),
         )
         | None => {}
         _ => {
@@ -227,6 +300,13 @@ async fn handle_tracker_announce(
     sender: Arc<ClientHandle>,
     state: Arc<ServerState>,
 ) -> Result<()> {
+    // Permission check: SHARE_FILE in sender's room
+    let sender_room = state.get_user_room(sender.user_id).await.unwrap_or(ROOT_ROOM_UUID);
+    if let Err(denied) = acl::check_permission(&state, &sender, sender_room, Permissions::SHARE_FILE).await {
+        send_permission_denied(&sender, denied).await?;
+        return Ok(());
+    }
+
     let info_hash: [u8; 20] = msg
         .info_hash
         .clone()
@@ -507,6 +587,27 @@ async fn handle_authenticate(
         return send_auth_failed(&sender, "Invalid signature").await;
     }
 
+    // 4b. Check ban list
+    if let Some(ref persist) = persistence {
+        let ban_key = ban_storage_key(&pending.public_key);
+        if let Some(ban_bytes) = persist.get_raw("bans", &ban_key) {
+            if let Ok(ban_entry) = bincode::deserialize::<BanEntry>(&ban_bytes) {
+                if let Some(expires_at) = ban_entry.expires_at {
+                    let now = now_ms as u64;
+                    if now >= expires_at {
+                        // Ban expired, remove it
+                        let _ = persist.remove_raw("bans", &ban_key);
+                    } else {
+                        return send_auth_failed(&sender, &format!("Banned: {}", ban_entry.reason)).await;
+                    }
+                } else {
+                    // Permanent ban
+                    return send_auth_failed(&sender, &format!("Banned: {}", ban_entry.reason)).await;
+                }
+            }
+        }
+    }
+
     // 5. Verify and record session certificate
     let Some(cert) = auth.session_cert else {
         return send_auth_failed(&sender, "Missing session certificate").await;
@@ -557,11 +658,32 @@ async fn handle_authenticate(
     // 6. Authentication successful
     sender.authenticated.store(true, Ordering::SeqCst);
 
-    // 6. Mark key as known (if persistence enabled)
+    // 6b. Mark key as known (if persistence enabled)
     if let Some(ref persist) = persistence {
         if let Err(e) = persist.add_known_key(&pending.public_key) {
             warn!("Failed to mark key as known: {e}");
         }
+    }
+
+    // 6c. Load user's groups from persistence
+    if let Some(ref persist) = persistence {
+        let mut groups = vec!["default".to_string()];
+        if let Some(user_groups_data) = persist.get_raw("user_groups", &pending.public_key) {
+            if let Ok(stored_groups) = bincode::deserialize::<Vec<String>>(&user_groups_data) {
+                for g in stored_groups {
+                    if !groups.contains(&g) {
+                        groups.push(g);
+                    }
+                }
+            }
+        }
+        // Add username-as-group (implicit personal group)
+        if let Some(registered) = persist.get_registered_user(&pending.public_key) {
+            if !groups.contains(&registered.username) {
+                groups.push(registered.username);
+            }
+        }
+        *sender.groups.write().await = groups;
     }
 
     // 7. Check for registered username (overrides client-provided)
@@ -671,6 +793,17 @@ async fn send_auth_failed(sender: &ClientHandle, error: &str) -> Result<()> {
     Ok(())
 }
 
+/// Send PermissionDenied message to client.
+async fn send_permission_denied(sender: &ClientHandle, denied: proto::PermissionDenied) -> Result<()> {
+    let env = proto::Envelope {
+        state_hash: Vec::new(),
+        payload: Some(Payload::PermissionDenied(denied)),
+    };
+    let frame = encode_frame(&env);
+    let _ = sender.send_frame(&frame).await;
+    Ok(())
+}
+
 /// Handle RegisterUser request.
 async fn handle_register_user(
     req: proto::RegisterUser,
@@ -684,6 +817,17 @@ async fn handle_register_user(
 
     // Extract user_id from the UserId message
     let target_user_id = req.user_id.map(|u| u.value).unwrap_or(0);
+
+    // Permission check: SELF_REGISTER if registering self, REGISTER if registering others
+    let required = if target_user_id == sender.user_id {
+        Permissions::SELF_REGISTER
+    } else {
+        Permissions::REGISTER
+    };
+    if let Err(denied) = acl::check_permission(&state, &sender, Uuid::nil(), required).await {
+        send_permission_denied(&sender, denied).await?;
+        return Ok(());
+    }
 
     // Get the target user's public key from active sessions
     let target_key = match state.get_user_public_key(target_user_id) {
@@ -735,6 +879,12 @@ async fn handle_unregister_user(
     let Some(persist) = persistence else {
         return send_command_result(&sender, "UnregisterUser", false, "Registration not enabled").await;
     };
+
+    // Permission check: REGISTER at root
+    if let Err(denied) = acl::check_permission(&state, &sender, Uuid::nil(), Permissions::REGISTER).await {
+        send_permission_denied(&sender, denied).await?;
+        return Ok(());
+    }
 
     // Extract user_id from the UserId message
     let target_user_id = req.user_id.map(|u| u.value).unwrap_or(0);
@@ -792,9 +942,15 @@ async fn handle_chat_message(
     state: Arc<ServerState>,
 ) -> Result<()> {
     let is_tree = msg.tree.unwrap_or(false);
-    info!("chat from {}: {} (tree={})", msg.sender, msg.text, is_tree);
-
     let sender_room = state.get_user_room(sender.user_id).await.unwrap_or(ROOT_ROOM_UUID);
+
+    // Permission check: TEXT_MESSAGE in sender's room
+    if let Err(denied) = acl::check_permission(&state, &sender, sender_room, Permissions::TEXT_MESSAGE).await {
+        send_permission_denied(&sender, denied).await?;
+        return Ok(());
+    }
+
+    info!("chat from {}: {} (tree={})", msg.sender, msg.text, is_tree);
 
     // Use provided message ID and timestamp, or generate new ones if not provided
     let message_id = if msg.id.len() == 16 {
@@ -966,6 +1122,12 @@ async fn handle_join_room(
         .and_then(uuid_from_room_id)
         .unwrap_or(ROOT_ROOM_UUID);
 
+    // Permission check: ENTER on the target room
+    if let Err(denied) = acl::check_permission(&state, &sender, new_room_uuid, Permissions::ENTER).await {
+        send_permission_denied(&sender, denied).await?;
+        return Ok(());
+    }
+
     // Check if room exists
     let rooms = state.get_rooms().await;
     let room = rooms
@@ -979,12 +1141,30 @@ async fn handle_join_room(
         }
     };
 
-    // let _old_room_uuid = state
-    //     .get_user_room(sender.user_id)
-    //     .await
-    //     .unwrap_or(ROOT_ROOM_UUID);
-
     state.set_user_room(sender.user_id, new_room_uuid).await;
+
+    // Evaluate SPEAK permission in the new room — auto server-mute if denied
+    let speak_perms = acl::evaluate_user_permissions(&state, &sender, new_room_uuid).await;
+    let speak_denied = !speak_perms.contains(Permissions::SPEAK);
+    let manually_muted = sender.manually_server_muted.load(Ordering::Relaxed);
+    let should_server_mute = speak_denied || manually_muted;
+    let was_server_muted = sender.server_muted.swap(should_server_mute, Ordering::Relaxed);
+
+    if should_server_mute != was_server_muted {
+        // Broadcast server-muted status change (both mute and unmute)
+        let status = state.get_user_status(sender.user_id).await;
+        broadcast_state_update(
+            &state,
+            proto::state_update::Update::UserStatusChanged(proto::UserStatusChanged {
+                user_id: Some(proto::UserId { value: sender.user_id }),
+                is_muted: status.is_muted,
+                is_deafened: status.is_deafened,
+                server_muted: should_server_mute,
+                is_elevated: sender.is_superuser.load(Ordering::Relaxed),
+            }),
+        )
+        .await?;
+    }
 
     // Save last room for registered users
     if let Some(ref persist) = persistence {
@@ -1029,11 +1209,19 @@ async fn handle_create_room(
     persistence: Option<Arc<Persistence>>,
 ) -> Result<()> {
     info!("CreateRoom: {}", cr.name);
-    let room_name = cr.name.clone();
-    let description = cr.description.clone();
 
     // Extract parent UUID if provided
     let parent_uuid = cr.parent_id.as_ref().and_then(uuid_from_room_id);
+
+    // Permission check: MAKE_ROOM on parent room
+    let check_room = parent_uuid.unwrap_or(ROOT_ROOM_UUID);
+    if let Err(denied) = acl::check_permission(&state, &sender, check_room, Permissions::MAKE_ROOM).await {
+        send_permission_denied(&sender, denied).await?;
+        return Ok(());
+    }
+
+    let room_name = cr.name.clone();
+    let description = cr.description.clone();
 
     // Create the room with parent and description
     let room_uuid = state
@@ -1083,6 +1271,12 @@ async fn handle_delete_room(
         .as_ref()
         .and_then(uuid_from_room_id)
         .unwrap_or(ROOT_ROOM_UUID);
+
+    // Permission check: MODIFY_ROOM on the room being deleted
+    if let Err(denied) = acl::check_permission(&state, &sender, room_uuid, Permissions::MODIFY_ROOM).await {
+        send_permission_denied(&sender, denied).await?;
+        return Ok(());
+    }
 
     // Cannot delete the root room
     if room_uuid == ROOT_ROOM_UUID {
@@ -1139,6 +1333,12 @@ async fn handle_rename_room(
         .as_ref()
         .and_then(uuid_from_room_id)
         .unwrap_or(ROOT_ROOM_UUID);
+
+    // Permission check: MODIFY_ROOM on the room being renamed
+    if let Err(denied) = acl::check_permission(&state, &sender, room_uuid, Permissions::MODIFY_ROOM).await {
+        send_permission_denied(&sender, denied).await?;
+        return Ok(());
+    }
 
     // Get old room name for the message
     let old_name = state
@@ -1209,6 +1409,17 @@ async fn handle_move_room(
         .and_then(uuid_from_room_id)
         .unwrap_or(ROOT_ROOM_UUID);
 
+    // Permission check: MODIFY_ROOM on the room being moved
+    if let Err(denied) = acl::check_permission(&state, &sender, room_uuid, Permissions::MODIFY_ROOM).await {
+        send_permission_denied(&sender, denied).await?;
+        return Ok(());
+    }
+    // Permission check: MAKE_ROOM on the new parent
+    if let Err(denied) = acl::check_permission(&state, &sender, new_parent_uuid, Permissions::MAKE_ROOM).await {
+        send_permission_denied(&sender, denied).await?;
+        return Ok(());
+    }
+
     // Get room name for the message
     let room_name = state
         .get_rooms()
@@ -1278,6 +1489,12 @@ async fn handle_set_room_description(
         .as_ref()
         .and_then(uuid_from_room_id)
         .unwrap_or(ROOT_ROOM_UUID);
+
+    // Permission check: MODIFY_ROOM on the room
+    if let Err(denied) = acl::check_permission(&state, &sender, room_uuid, Permissions::MODIFY_ROOM).await {
+        send_permission_denied(&sender, denied).await?;
+        return Ok(());
+    }
 
     info!("SetRoomDescription: {}", room_uuid);
 
@@ -1367,15 +1584,15 @@ async fn handle_set_user_status(
     };
     state.set_user_status(sender.user_id, status).await;
 
-    // Broadcast the status change to all clients
+    // Broadcast the status change to all clients (preserving server_muted/is_elevated)
     broadcast_state_update(
         &state,
         proto::state_update::Update::UserStatusChanged(proto::UserStatusChanged {
             user_id: Some(proto::UserId { value: sender.user_id }),
             is_muted: sus.is_muted,
             is_deafened: sus.is_deafened,
-            server_muted: false,
-            is_elevated: false,
+            server_muted: sender.server_muted.load(Ordering::Relaxed),
+            is_elevated: sender.is_superuser.load(Ordering::Relaxed),
         }),
     )
     .await?;
@@ -1584,7 +1801,16 @@ pub async fn handle_datagrams(conn: quinn::Connection, state: Arc<ServerState>, 
                             sender_user_id
                         };
 
-                        // Check if sender is muted — drop voice silently
+                        // Check if sender is server-muted — drop voice silently
+                        if !is_bridge {
+                            if let Some(client) = state.get_client(sender_user_id) {
+                                if client.server_muted.load(Ordering::Relaxed) {
+                                    continue;
+                                }
+                            }
+                        }
+
+                        // Check if sender is self-muted — drop voice silently
                         let status = state.get_user_status(effective_sender).await;
                         if status.is_muted {
                             debug!(sender = effective_sender, "server: dropping voice from muted user");
@@ -1690,6 +1916,579 @@ pub async fn handle_datagrams(conn: quinn::Connection, state: Arc<ServerState>, 
             }
         }
     }
+}
+
+// =============================================================================
+// ACL Handlers
+// =============================================================================
+
+/// Handle KickUser - kick a user from the server.
+async fn handle_kick_user(
+    ku: proto::KickUser,
+    sender: Arc<ClientHandle>,
+    state: Arc<ServerState>,
+    _persistence: Option<Arc<Persistence>>,
+) -> Result<()> {
+    // Permission check: KICK at root
+    if let Err(denied) = acl::check_permission(&state, &sender, Uuid::nil(), Permissions::KICK).await {
+        send_permission_denied(&sender, denied).await?;
+        return Ok(());
+    }
+
+    let target_user_id = ku.target_user_id;
+    let target_client = match state.get_client(target_user_id) {
+        Some(c) => c,
+        None => {
+            return send_command_result(&sender, "KickUser", false, "User not found").await;
+        }
+    };
+
+    let kicked_by = sender.get_username().await;
+    let target_username = target_client.get_username().await;
+    info!(
+        kicked_by = %kicked_by,
+        target = %target_username,
+        reason = %ku.reason,
+        "KickUser"
+    );
+
+    // Send UserKicked to the target
+    let kicked_env = proto::Envelope {
+        state_hash: Vec::new(),
+        payload: Some(Payload::UserKicked(proto::UserKicked {
+            user_id: target_user_id,
+            reason: ku.reason.clone(),
+            kicked_by: kicked_by.clone(),
+        })),
+    };
+    let frame = encode_frame(&kicked_env);
+    let _ = target_client.send_frame(&frame).await;
+
+    // Close the target's connection
+    target_client.conn.close(quinn::VarInt::from_u32(2), b"kicked");
+
+    // Clean up the kicked user (broadcasts UserLeft)
+    cleanup_client(&target_client, &state).await;
+
+    send_command_result(&sender, "KickUser", true, &format!("Kicked '{}'", target_username)).await
+}
+
+/// Handle BanUser - ban a user from the server.
+async fn handle_ban_user(
+    ban: proto::BanUser,
+    sender: Arc<ClientHandle>,
+    state: Arc<ServerState>,
+    persistence: Option<Arc<Persistence>>,
+) -> Result<()> {
+    // Permission check: BAN at root
+    if let Err(denied) = acl::check_permission(&state, &sender, Uuid::nil(), Permissions::BAN).await {
+        send_permission_denied(&sender, denied).await?;
+        return Ok(());
+    }
+
+    let Some(ref persist) = persistence else {
+        return send_command_result(&sender, "BanUser", false, "Persistence not enabled").await;
+    };
+
+    let target_user_id = ban.target_user_id;
+
+    // Get the target user's public key
+    let target_key = match state.get_user_public_key(target_user_id) {
+        Some(key) => key,
+        None => {
+            return send_command_result(&sender, "BanUser", false, "User not found").await;
+        }
+    };
+
+    let banned_by = sender.get_username().await;
+    let target_username = match state.get_client(target_user_id) {
+        Some(c) => c.get_username().await,
+        None => "user".to_string(),
+    };
+
+    // Compute expiry
+    let expires_at = if ban.duration_secs == 0 {
+        None // Permanent
+    } else {
+        Some(now_ms() as u64 + ban.duration_secs * 1000)
+    };
+
+    // Store the ban in persistence
+    // The real persistence functions come from acl-server-core branch.
+    // For now, use a stub approach: store ban data in the known_keys tree with a prefix.
+    // This will be replaced by proper ban persistence after merge.
+    let ban_data = BanEntry {
+        reason: ban.reason.clone(),
+        banned_by: banned_by.clone(),
+        expires_at,
+    };
+    let ban_key = ban_storage_key(&target_key);
+    if let Ok(data) = bincode::serialize(&ban_data) {
+        // Store ban using the raw db access
+        let _ = persist.store_raw("bans", &ban_key, &data);
+    }
+
+    info!(
+        banned_by = %banned_by,
+        target = %target_username,
+        reason = %ban.reason,
+        duration_secs = ban.duration_secs,
+        "BanUser"
+    );
+
+    // If the target is currently connected, kick them too
+    if let Some(target_client) = state.get_client(target_user_id) {
+        let kicked_env = proto::Envelope {
+            state_hash: Vec::new(),
+            payload: Some(Payload::UserKicked(proto::UserKicked {
+                user_id: target_user_id,
+                reason: format!("Banned: {}", ban.reason),
+                kicked_by: banned_by,
+            })),
+        };
+        let frame = encode_frame(&kicked_env);
+        let _ = target_client.send_frame(&frame).await;
+        target_client.conn.close(quinn::VarInt::from_u32(3), b"banned");
+        cleanup_client(&target_client, &state).await;
+    }
+
+    send_command_result(&sender, "BanUser", true, &format!("Banned '{}'", target_username)).await
+}
+
+/// Handle UnbanUser - unban a user.
+async fn handle_unban_user(
+    unban: proto::UnbanUser,
+    sender: Arc<ClientHandle>,
+    state: Arc<ServerState>,
+    persistence: Option<Arc<Persistence>>,
+) -> Result<()> {
+    // Permission check: BAN at root
+    if let Err(denied) = acl::check_permission(&state, &sender, Uuid::nil(), Permissions::BAN).await {
+        send_permission_denied(&sender, denied).await?;
+        return Ok(());
+    }
+
+    let Some(ref persist) = persistence else {
+        return send_command_result(&sender, "UnbanUser", false, "Persistence not enabled").await;
+    };
+
+    if unban.public_key.len() != 32 {
+        return send_command_result(&sender, "UnbanUser", false, "Invalid public key length").await;
+    }
+    let public_key: [u8; 32] = unban.public_key.try_into().unwrap();
+
+    let ban_key = ban_storage_key(&public_key);
+    let _ = persist.remove_raw("bans", &ban_key);
+
+    send_command_result(&sender, "UnbanUser", true, "User unbanned").await
+}
+
+/// Handle SetServerMute - set server mute on another user.
+async fn handle_set_server_mute(
+    ssm: proto::SetServerMute,
+    sender: Arc<ClientHandle>,
+    state: Arc<ServerState>,
+) -> Result<()> {
+    let target_user_id = ssm.target_user_id;
+
+    // Find target user's room for permission check
+    let target_room = state.get_user_room(target_user_id).await.unwrap_or(ROOT_ROOM_UUID);
+
+    // Permission check: MUTE_DEAFEN in target's room
+    if let Err(denied) = acl::check_permission(&state, &sender, target_room, Permissions::MUTE_DEAFEN).await {
+        send_permission_denied(&sender, denied).await?;
+        return Ok(());
+    }
+
+    let target_client = match state.get_client(target_user_id) {
+        Some(c) => c,
+        None => {
+            return send_command_result(&sender, "SetServerMute", false, "User not found").await;
+        }
+    };
+
+    // Set both flags
+    target_client.manually_server_muted.store(ssm.muted, Ordering::Relaxed);
+    target_client.server_muted.store(ssm.muted, Ordering::Relaxed);
+
+    let target_username = target_client.get_username().await;
+    info!(
+        target = %target_username,
+        muted = ssm.muted,
+        "SetServerMute"
+    );
+
+    // Broadcast UserStatusChanged
+    let status = state.get_user_status(target_user_id).await;
+    broadcast_state_update(
+        &state,
+        proto::state_update::Update::UserStatusChanged(proto::UserStatusChanged {
+            user_id: Some(proto::UserId { value: target_user_id }),
+            is_muted: status.is_muted,
+            is_deafened: status.is_deafened,
+            server_muted: ssm.muted,
+            is_elevated: target_client.is_superuser.load(Ordering::Relaxed),
+        }),
+    )
+    .await?;
+
+    send_command_result(
+        &sender,
+        "SetServerMute",
+        true,
+        &format!(
+            "{} '{}'",
+            if ssm.muted { "Server muted" } else { "Server unmuted" },
+            target_username
+        ),
+    )
+    .await
+}
+
+/// Handle Elevate - elevate to superuser via sudo password.
+async fn handle_elevate(
+    elev: proto::Elevate,
+    sender: Arc<ClientHandle>,
+    state: Arc<ServerState>,
+    persistence: Option<Arc<Persistence>>,
+) -> Result<()> {
+    // Permission check: SUDO at root
+    if let Err(denied) = acl::check_permission(&state, &sender, Uuid::nil(), Permissions::SUDO).await {
+        send_permission_denied(&sender, denied).await?;
+        return Ok(());
+    }
+
+    let Some(ref persist) = persistence else {
+        return send_command_result(&sender, "Elevate", false, "Persistence not enabled").await;
+    };
+
+    // Load sudo password hash from persistence
+    let sudo_hash = match persist.get_raw("sudo_password", b"sudo") {
+        Some(hash_bytes) => match String::from_utf8(hash_bytes) {
+            Ok(h) => h,
+            Err(_) => {
+                return send_command_result(&sender, "Elevate", false, "Sudo password not configured").await;
+            }
+        },
+        None => {
+            return send_command_result(&sender, "Elevate", false, "Sudo password not configured").await;
+        }
+    };
+
+    // Verify password (bcrypt)
+    match bcrypt::verify(&elev.password, &sudo_hash) {
+        Ok(true) => {}
+        _ => {
+            return send_command_result(&sender, "Elevate", false, "Incorrect password").await;
+        }
+    }
+
+    // Set superuser flag
+    sender.is_superuser.store(true, Ordering::SeqCst);
+
+    let username = sender.get_username().await;
+    info!(user = %username, "User elevated to superuser");
+
+    // Broadcast UserStatusChanged with is_elevated=true
+    let status = state.get_user_status(sender.user_id).await;
+    broadcast_state_update(
+        &state,
+        proto::state_update::Update::UserStatusChanged(proto::UserStatusChanged {
+            user_id: Some(proto::UserId { value: sender.user_id }),
+            is_muted: status.is_muted,
+            is_deafened: status.is_deafened,
+            server_muted: sender.server_muted.load(Ordering::Relaxed),
+            is_elevated: true,
+        }),
+    )
+    .await?;
+
+    send_command_result(&sender, "Elevate", true, "Elevated to superuser").await
+}
+
+/// Handle CreateGroup - create a new permission group.
+async fn handle_create_group(
+    cg: proto::CreateGroup,
+    sender: Arc<ClientHandle>,
+    state: Arc<ServerState>,
+    persistence: Option<Arc<Persistence>>,
+) -> Result<()> {
+    // Permission check: MANAGE_ACL at root
+    if let Err(denied) = acl::check_permission(&state, &sender, Uuid::nil(), Permissions::MANAGE_ACL).await {
+        send_permission_denied(&sender, denied).await?;
+        return Ok(());
+    }
+
+    let Some(ref persist) = persistence else {
+        return send_command_result(&sender, "CreateGroup", false, "Persistence not enabled").await;
+    };
+
+    if cg.name.is_empty() {
+        return send_command_result(&sender, "CreateGroup", false, "Group name cannot be empty").await;
+    }
+
+    // Validate group name doesn't collide with a registered username
+    // (username-as-group pattern from the spec)
+    if persist.is_username_registered(&cg.name) {
+        return send_command_result(
+            &sender,
+            "CreateGroup",
+            false,
+            "Group name conflicts with a registered username",
+        )
+        .await;
+    }
+
+    // Store group in persistence
+    let group_data = bincode::serialize(&cg.permissions).unwrap_or_default();
+    let _ = persist.store_raw("groups", cg.name.as_bytes(), &group_data);
+
+    info!(group = %cg.name, permissions = cg.permissions, "CreateGroup");
+
+    send_command_result(&sender, "CreateGroup", true, &format!("Created group '{}'", cg.name)).await
+}
+
+/// Handle DeleteGroup - delete a permission group.
+async fn handle_delete_group(
+    dg: proto::DeleteGroup,
+    sender: Arc<ClientHandle>,
+    state: Arc<ServerState>,
+    persistence: Option<Arc<Persistence>>,
+) -> Result<()> {
+    // Permission check: MANAGE_ACL at root
+    if let Err(denied) = acl::check_permission(&state, &sender, Uuid::nil(), Permissions::MANAGE_ACL).await {
+        send_permission_denied(&sender, denied).await?;
+        return Ok(());
+    }
+
+    let Some(ref persist) = persistence else {
+        return send_command_result(&sender, "DeleteGroup", false, "Persistence not enabled").await;
+    };
+
+    // Prevent deleting built-in groups
+    if dg.name == "default" || dg.name == "admin" {
+        return send_command_result(&sender, "DeleteGroup", false, "Cannot delete built-in groups").await;
+    }
+
+    let _ = persist.remove_raw("groups", dg.name.as_bytes());
+
+    info!(group = %dg.name, "DeleteGroup");
+
+    send_command_result(&sender, "DeleteGroup", true, &format!("Deleted group '{}'", dg.name)).await
+}
+
+/// Handle ModifyGroup - modify a permission group.
+async fn handle_modify_group(
+    mg: proto::ModifyGroup,
+    sender: Arc<ClientHandle>,
+    state: Arc<ServerState>,
+    persistence: Option<Arc<Persistence>>,
+) -> Result<()> {
+    // Permission check: MANAGE_ACL at root
+    if let Err(denied) = acl::check_permission(&state, &sender, Uuid::nil(), Permissions::MANAGE_ACL).await {
+        send_permission_denied(&sender, denied).await?;
+        return Ok(());
+    }
+
+    let Some(ref persist) = persistence else {
+        return send_command_result(&sender, "ModifyGroup", false, "Persistence not enabled").await;
+    };
+
+    let group_data = bincode::serialize(&mg.permissions).unwrap_or_default();
+    let _ = persist.store_raw("groups", mg.name.as_bytes(), &group_data);
+
+    info!(group = %mg.name, permissions = mg.permissions, "ModifyGroup");
+
+    send_command_result(&sender, "ModifyGroup", true, &format!("Modified group '{}'", mg.name)).await
+}
+
+/// Handle SetUserGroup - add or remove a user from a group.
+async fn handle_set_user_group(
+    sug: proto::SetUserGroup,
+    sender: Arc<ClientHandle>,
+    state: Arc<ServerState>,
+    persistence: Option<Arc<Persistence>>,
+) -> Result<()> {
+    // Permission check: MANAGE_ACL at root
+    if let Err(denied) = acl::check_permission(&state, &sender, Uuid::nil(), Permissions::MANAGE_ACL).await {
+        send_permission_denied(&sender, denied).await?;
+        return Ok(());
+    }
+
+    let Some(ref _persist) = persistence else {
+        return send_command_result(&sender, "SetUserGroup", false, "Persistence not enabled").await;
+    };
+
+    let target_user_id = sug.target_user_id;
+
+    // Update the target's cached groups if they're connected
+    if let Some(target_client) = state.get_client(target_user_id) {
+        let mut groups = target_client.groups.write().await;
+        if sug.add {
+            if !groups.contains(&sug.group) {
+                groups.push(sug.group.clone());
+            }
+        } else {
+            groups.retain(|g| g != &sug.group);
+        }
+    }
+
+    // Store in persistence (user_groups tree)
+    // The real persistence comes from acl-server-core; for now just update the in-memory state
+    let target_key = state.get_user_public_key(target_user_id);
+    if let (Some(key), Some(persist)) = (target_key, &persistence) {
+        // Load existing groups, modify, save back
+        let mut user_groups: Vec<String> = persist
+            .get_raw("user_groups", &key)
+            .and_then(|data| bincode::deserialize(&data).ok())
+            .unwrap_or_default();
+        if sug.add {
+            if !user_groups.contains(&sug.group) {
+                user_groups.push(sug.group.clone());
+            }
+        } else {
+            user_groups.retain(|g| g != &sug.group);
+        }
+        if let Ok(data) = bincode::serialize(&user_groups) {
+            let _ = persist.store_raw("user_groups", &key, &data);
+        }
+    }
+
+    let action = if sug.add { "Added" } else { "Removed" };
+    info!(
+        target_user_id,
+        group = %sug.group,
+        action,
+        "SetUserGroup"
+    );
+
+    send_command_result(
+        &sender,
+        "SetUserGroup",
+        true,
+        &format!(
+            "{} user {} group '{}'",
+            action,
+            if sug.add { "to" } else { "from" },
+            sug.group
+        ),
+    )
+    .await
+}
+
+/// Handle SetRoomAcl - set ACL entries on a room.
+async fn handle_set_room_acl(
+    sra: proto::SetRoomAcl,
+    sender: Arc<ClientHandle>,
+    state: Arc<ServerState>,
+    persistence: Option<Arc<Persistence>>,
+) -> Result<()> {
+    let room_uuid = if sra.room_id.len() == 16 {
+        Uuid::from_slice(&sra.room_id).unwrap_or(ROOT_ROOM_UUID)
+    } else {
+        ROOT_ROOM_UUID
+    };
+
+    // Permission check: WRITE on the target room
+    if let Err(denied) = acl::check_permission(&state, &sender, room_uuid, Permissions::WRITE).await {
+        send_permission_denied(&sender, denied).await?;
+        return Ok(());
+    }
+
+    let Some(ref persist) = persistence else {
+        return send_command_result(&sender, "SetRoomAcl", false, "Persistence not enabled").await;
+    };
+
+    // Serialize the ACL data using the api types
+    let acl_data = api::permissions::RoomAclData {
+        inherit_acl: sra.inherit_acl,
+        entries: sra
+            .entries
+            .iter()
+            .map(|e| api::permissions::AclEntry {
+                group: e.group.clone(),
+                grant: Permissions::from_bits_truncate(e.grant),
+                deny: Permissions::from_bits_truncate(e.deny),
+                apply_here: e.apply_here,
+                apply_subs: e.apply_subs,
+            })
+            .collect(),
+    };
+
+    if let Ok(data) = bincode::serialize(&acl_data) {
+        let _ = persist.store_raw("room_acls", room_uuid.as_bytes(), &data);
+    }
+
+    info!(room = %room_uuid, entries = sra.entries.len(), "SetRoomAcl");
+
+    // Re-evaluate SPEAK permission for all users in this room
+    let room_members = state.get_room_members(room_uuid).await;
+    for member_id in room_members {
+        if let Some(client) = state.get_client(member_id) {
+            let speak_perms = acl::evaluate_user_permissions(&state, &client, room_uuid).await;
+            let speak_denied = !speak_perms.contains(Permissions::SPEAK);
+            let manually_muted = client.manually_server_muted.load(Ordering::Relaxed);
+            let should_mute = speak_denied || manually_muted;
+            let was_muted = client.server_muted.load(Ordering::Relaxed);
+            if should_mute != was_muted {
+                client.server_muted.store(should_mute, Ordering::Relaxed);
+                let status = state.get_user_status(member_id).await;
+                let _ = broadcast_state_update(
+                    &state,
+                    proto::state_update::Update::UserStatusChanged(proto::UserStatusChanged {
+                        user_id: Some(proto::UserId { value: member_id }),
+                        is_muted: status.is_muted,
+                        is_deafened: status.is_deafened,
+                        server_muted: should_mute,
+                        is_elevated: client.is_superuser.load(Ordering::Relaxed),
+                    }),
+                )
+                .await;
+            }
+        }
+    }
+
+    send_command_result(&sender, "SetRoomAcl", true, "Room ACL updated").await
+}
+
+/// Handle QueryPermissions - evaluate effective permissions for sender in a room.
+async fn handle_query_permissions(
+    qp: proto::QueryPermissions,
+    sender: Arc<ClientHandle>,
+    state: Arc<ServerState>,
+) -> Result<()> {
+    let room_uuid = if qp.room_id.len() == 16 {
+        Uuid::from_slice(&qp.room_id).unwrap_or(ROOT_ROOM_UUID)
+    } else {
+        ROOT_ROOM_UUID
+    };
+
+    let effective = acl::evaluate_user_permissions(&state, &sender, room_uuid).await;
+
+    let reply = proto::Envelope {
+        state_hash: Vec::new(),
+        payload: Some(Payload::PermissionsInfo(proto::PermissionsInfo {
+            room_id: room_uuid.as_bytes().to_vec(),
+            effective_permissions: effective.bits(),
+        })),
+    };
+    let frame = encode_frame(&reply);
+    let _ = sender.send_frame(&frame).await;
+
+    Ok(())
+}
+
+/// Ban entry for storage.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct BanEntry {
+    reason: String,
+    banned_by: String,
+    expires_at: Option<u64>,
+}
+
+/// Generate a storage key for ban entries (prefix + public key).
+fn ban_storage_key(public_key: &[u8; 32]) -> Vec<u8> {
+    public_key.to_vec()
 }
 
 // =============================================================================

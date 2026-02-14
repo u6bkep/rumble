@@ -721,8 +721,8 @@ impl ServerState {
                     continue;
                 }
                 let name = client.get_username().await;
-                let sm = client.server_muted.load(std::sync::atomic::Ordering::SeqCst);
-                let el = client.is_superuser.load(std::sync::atomic::Ordering::SeqCst);
+                let sm = client.server_muted.load(std::sync::atomic::Ordering::Relaxed);
+                let el = client.is_superuser.load(std::sync::atomic::Ordering::Relaxed);
                 (name, sm, el)
             } else if let Some(vu) = self.get_virtual_user(uid) {
                 (vu.username, false, false)
