@@ -252,6 +252,9 @@ impl BackendHandle {
             room_tree: Default::default(),
             file_transfers: Vec::new(),
             file_transfer_settings: Default::default(),
+            effective_permissions: 0,
+            permission_denied: None,
+            kicked: None,
         };
 
         let state = Arc::new(RwLock::new(state));
@@ -302,6 +305,11 @@ impl BackendHandle {
     /// in its render loop to get the latest state.
     pub fn state(&self) -> State {
         read_state(&self.state).clone()
+    }
+
+    /// Get a mutable write guard to the state for clearing one-shot fields.
+    pub fn state_mut(&self) -> RwLockWriteGuard<'_, State> {
+        write_state(&self.state)
     }
 
     /// Get a reference to the shared state Arc (for RPC server).
@@ -969,6 +977,16 @@ async fn run_connection_task(
                             let frame = encode_frame(&env);
                             if let Err(e) = send.write_all(&frame).await {
                                 error!("Failed to send JoinRoom: {}", e);
+                            }
+                            // Auto-query permissions for the new room
+                            let qp_frame = encode_frame(&proto::Envelope {
+                                state_hash: Vec::new(),
+                                payload: Some(Payload::QueryPermissions(proto::QueryPermissions {
+                                    room_id: room_id.as_bytes().to_vec(),
+                                })),
+                            });
+                            if let Err(e) = send.write_all(&qp_frame).await {
+                                error!("Failed to send QueryPermissions: {}", e);
                             }
                         }
                     }
@@ -1783,6 +1801,79 @@ async fn run_connection_task(
                         }
                     }
 
+                    // ACL Commands
+                    Command::KickUser { target_user_id, reason } => {
+                        if let Some(send) = &mut send_stream {
+                            let frame = encode_frame(&proto::Envelope {
+                                state_hash: vec![],
+                                payload: Some(Payload::KickUser(proto::KickUser {
+                                    target_user_id,
+                                    reason,
+                                })),
+                            });
+                            if let Err(e) = send.write_all(&frame).await {
+                                error!("Failed to send KickUser: {}", e);
+                            }
+                        }
+                    }
+                    Command::BanUser {
+                        target_user_id,
+                        reason,
+                        duration_secs,
+                    } => {
+                        if let Some(send) = &mut send_stream {
+                            let frame = encode_frame(&proto::Envelope {
+                                state_hash: vec![],
+                                payload: Some(Payload::BanUser(proto::BanUser {
+                                    target_user_id,
+                                    reason,
+                                    duration_secs,
+                                })),
+                            });
+                            if let Err(e) = send.write_all(&frame).await {
+                                error!("Failed to send BanUser: {}", e);
+                            }
+                        }
+                    }
+                    Command::SetServerMute { target_user_id, muted } => {
+                        if let Some(send) = &mut send_stream {
+                            let frame = encode_frame(&proto::Envelope {
+                                state_hash: vec![],
+                                payload: Some(Payload::SetServerMute(proto::SetServerMute {
+                                    target_user_id,
+                                    muted,
+                                })),
+                            });
+                            if let Err(e) = send.write_all(&frame).await {
+                                error!("Failed to send SetServerMute: {}", e);
+                            }
+                        }
+                    }
+                    Command::Elevate { password } => {
+                        if let Some(send) = &mut send_stream {
+                            let frame = encode_frame(&proto::Envelope {
+                                state_hash: vec![],
+                                payload: Some(Payload::Elevate(proto::Elevate { password })),
+                            });
+                            if let Err(e) = send.write_all(&frame).await {
+                                error!("Failed to send Elevate: {}", e);
+                            }
+                        }
+                    }
+                    Command::QueryPermissions { room_id } => {
+                        if let Some(send) = &mut send_stream {
+                            let frame = encode_frame(&proto::Envelope {
+                                state_hash: vec![],
+                                payload: Some(Payload::QueryPermissions(proto::QueryPermissions {
+                                    room_id: room_id.as_bytes().to_vec(),
+                                })),
+                            });
+                            if let Err(e) = send.write_all(&frame).await {
+                                error!("Failed to send QueryPermissions: {}", e);
+                            }
+                        }
+                    }
+
                     // PlaySfx is intercepted in BackendHandle::send() and never reaches here
                     Command::PlaySfx { .. } => {}
                 }
@@ -2402,6 +2493,39 @@ fn handle_server_message(
         Some(Payload::RelayAllocation(ra)) => {
             handle_relay_allocation(ra, state, repaint);
         }
+        Some(Payload::PermissionDenied(pd)) => {
+            warn!("Permission denied: {}", pd.message);
+            let mut s = write_state(&state);
+            s.permission_denied = Some(pd.message);
+            drop(s);
+            repaint();
+        }
+        Some(Payload::UserKicked(uk)) => {
+            let my_user_id = read_state(&state).my_user_id;
+            if my_user_id == Some(uk.user_id) {
+                // We were kicked
+                let reason = if uk.reason.is_empty() {
+                    format!("Kicked by {}", uk.kicked_by)
+                } else {
+                    format!("Kicked by {}: {}", uk.kicked_by, uk.reason)
+                };
+                warn!("{}", reason);
+                let mut s = write_state(&state);
+                s.kicked = Some(reason);
+                drop(s);
+                // The server will close the connection, so we don't need to disconnect explicitly
+            } else {
+                // Another user was kicked - they'll get a UserLeft event too
+                info!("User {} was kicked by {}", uk.user_id, uk.kicked_by);
+            }
+            repaint();
+        }
+        Some(Payload::PermissionsInfo(pi)) => {
+            let mut s = write_state(&state);
+            s.effective_permissions = pi.effective_permissions;
+            drop(s);
+            repaint();
+        }
         _ => {}
     }
 }
@@ -2596,6 +2720,8 @@ fn apply_state_update(
                     {
                         user.is_muted = usc.is_muted;
                         user.is_deafened = usc.is_deafened;
+                        user.server_muted = usc.server_muted;
+                        user.is_elevated = usc.is_elevated;
                     }
                 }
             }

@@ -5,6 +5,7 @@
 //! allowing it to be used with different backends (eframe for desktop, test harness
 //! for automated testing).
 
+use api::permissions::Permissions;
 use backend::{
     AudioSettings, BackendHandle, Command, ConnectConfig, ConnectionState, FileMessage, P2pFileMessage, PipelineConfig,
     ProcessorRegistry, SfxKind, TransferState, VoiceMode, build_default_tx_pipeline, merge_with_default_tx_pipeline,
@@ -2905,6 +2906,28 @@ impl RumbleApp {
             self.prev_connection_state = state.connection.clone();
         }
 
+        // Check for permission denied messages and show as toast
+        {
+            let pd = {
+                let mut s = self.backend.state_mut();
+                s.permission_denied.take()
+            };
+            if let Some(msg) = pd {
+                self.toast_manager.error(format!("Permission denied: {}", msg));
+            }
+        }
+
+        // Check for kick notification
+        {
+            let kicked = {
+                let mut s = self.backend.state_mut();
+                s.kicked.take()
+            };
+            if let Some(reason) = kicked {
+                self.toast_manager.error(reason);
+            }
+        }
+
         // Detect mute/unmute transitions for SFX
         {
             let current_muted = state.audio.self_muted;
@@ -3513,8 +3536,11 @@ impl RumbleApp {
                 ui.menu_button("File Transfer", |ui| {
                     // Don't allow opening another dialog while one is pending
                     let dialog_pending = self.pending_file_dialog.is_some();
+                    let can_share =
+                        Permissions::from_bits_truncate(state.effective_permissions).contains(Permissions::SHARE_FILE);
                     if ui
-                        .add_enabled(!dialog_pending, egui::Button::new("Share File..."))
+                        .add_enabled(!dialog_pending && can_share, egui::Button::new("Share File..."))
+                        .on_disabled_hover_text("You don't have permission to share files in this room")
                         .clicked()
                     {
                         // Spawn async file dialog to avoid blocking audio
@@ -3570,23 +3596,42 @@ impl RumbleApp {
             ui.horizontal(|ui| {
                 let audio = &state.audio;
 
-                // Mute button
-                let mute_icon = if audio.self_muted { "🔇" } else { "🎤" };
-                let mute_color = if audio.self_muted {
-                    egui::Color32::RED
+                // Check if we are server muted (look up our user in the user list)
+                let self_server_muted = state
+                    .my_user_id
+                    .and_then(|my_id| {
+                        state
+                            .users
+                            .iter()
+                            .find(|u| u.user_id.as_ref().map(|id| id.value) == Some(my_id))
+                    })
+                    .map(|u| u.server_muted)
+                    .unwrap_or(false);
+
+                // Mute button - show server muted state distinctly
+                if self_server_muted {
+                    let resp = ui.add(egui::Button::new(
+                        egui::RichText::new("🔒").size(18.0).color(egui::Color32::RED),
+                    ));
+                    resp.on_hover_text("Server muted - you cannot speak in this room");
                 } else {
-                    egui::Color32::GREEN
-                };
-                if ui
-                    .add(egui::Button::new(
-                        egui::RichText::new(mute_icon).size(18.0).color(mute_color),
-                    ))
-                    .on_hover_text(if audio.self_muted { "Unmute" } else { "Mute" })
-                    .clicked()
-                {
-                    self.backend.send(Command::SetMuted {
-                        muted: !audio.self_muted,
-                    });
+                    let mute_icon = if audio.self_muted { "🔇" } else { "🎤" };
+                    let mute_color = if audio.self_muted {
+                        egui::Color32::RED
+                    } else {
+                        egui::Color32::GREEN
+                    };
+                    if ui
+                        .add(egui::Button::new(
+                            egui::RichText::new(mute_icon).size(18.0).color(mute_color),
+                        ))
+                        .on_hover_text(if audio.self_muted { "Unmute" } else { "Mute" })
+                        .clicked()
+                    {
+                        self.backend.send(Command::SetMuted {
+                            muted: !audio.self_muted,
+                        });
+                    }
                 }
 
                 // Deafen button
@@ -4041,7 +4086,9 @@ impl RumbleApp {
                         });
                         strip.cell(|ui| {
                             let connected = state.connection.is_connected();
-                            if connected {
+                            let can_chat = Permissions::from_bits_truncate(state.effective_permissions)
+                                .contains(Permissions::TEXT_MESSAGE);
+                            if connected && can_chat {
                                 ui.horizontal(|ui| {
                                     let send = {
                                         let resp = ui.text_edit_singleline(&mut self.chat_input);
@@ -4110,6 +4157,15 @@ impl RumbleApp {
                                     {
                                         self.backend.send(Command::RequestChatHistory);
                                     }
+                                });
+                            } else if connected && !can_chat {
+                                ui.horizontal(|ui| {
+                                    ui.add_enabled(
+                                        false,
+                                        egui::TextEdit::singleline(&mut self.chat_input)
+                                            .hint_text("You don't have permission to chat in this room"),
+                                    );
+                                    ui.add_enabled(false, egui::Button::new("Send"));
                                 });
                             } else {
                                 ui.horizontal(|ui| {
@@ -4215,6 +4271,7 @@ impl RumbleApp {
                                 .default_open(has_users_in_subtree)
                                 .activatable(true)
                                 .context_menu(|ui| {
+                                    let eff = Permissions::from_bits_truncate(state.effective_permissions);
                                     ui.set_min_width(200.0);
                                     ui.label(format!("Room: {}", room_name));
                                     ui.separator();
@@ -4233,25 +4290,31 @@ impl RumbleApp {
                                         pending_commands.push(Command::JoinRoom { room_id });
                                         ui.close();
                                     }
-                                    if ui.button("Rename...").clicked() {
-                                        *pending_rename = Some((Some(room_id), room_name.clone()));
-                                        ui.close();
+                                    if eff.contains(Permissions::MODIFY_ROOM) {
+                                        if ui.button("Rename...").clicked() {
+                                            *pending_rename = Some((Some(room_id), room_name.clone()));
+                                            ui.close();
+                                        }
+                                        if ui.button("Edit Description...").clicked() {
+                                            *pending_description =
+                                                Some((room_id, room_name.clone(), room_description.clone()));
+                                            ui.close();
+                                        }
                                     }
-                                    if ui.button("Edit Description...").clicked() {
-                                        *pending_description =
-                                            Some((room_id, room_name.clone(), room_description.clone()));
-                                        ui.close();
+                                    if eff.contains(Permissions::MAKE_ROOM) {
+                                        if ui.button("Add Child Room").clicked() {
+                                            pending_commands.push(Command::CreateRoom {
+                                                name: "New Room".to_string(),
+                                                parent_id: Some(room_id),
+                                            });
+                                            ui.close();
+                                        }
                                     }
-                                    if ui.button("Add Child Room").clicked() {
-                                        pending_commands.push(Command::CreateRoom {
-                                            name: "New Room".to_string(),
-                                            parent_id: Some(room_id),
-                                        });
-                                        ui.close();
-                                    }
-                                    if !is_root && ui.button("Delete Room").clicked() {
-                                        *pending_delete = Some((room_id, room_name.clone()));
-                                        ui.close();
+                                    if !is_root && eff.contains(Permissions::MODIFY_ROOM) {
+                                        if ui.button("Delete Room").clicked() {
+                                            *pending_delete = Some((room_id, room_name.clone()));
+                                            ui.close();
+                                        }
                                     }
                                 });
 
@@ -4305,9 +4368,12 @@ impl RumbleApp {
                             };
 
                             let is_locally_muted = state.audio.muted_users.contains(&user_id);
+                            let server_muted = user.server_muted;
+                            let is_elevated = user.is_elevated;
                             let username = user.username.clone();
                             let self_muted = state.audio.self_muted;
                             let self_deafened = state.audio.self_deafened;
+                            let effective_permissions = state.effective_permissions;
                             let user_volume_db = state
                                 .audio
                                 .per_user_rx
@@ -4319,7 +4385,14 @@ impl RumbleApp {
                                 .label_ui(|ui| {
                                     ui.horizontal(|ui| {
                                         // Use non-selectable labels so clicks pass through to the tree view
-                                        if is_talking {
+                                        if server_muted {
+                                            // Server mute: red lock icon, distinct from self-mute
+                                            let resp = ui.add(
+                                                egui::Label::new(egui::RichText::new("🔒").color(egui::Color32::RED))
+                                                    .selectable(false),
+                                            );
+                                            resp.on_hover_text("Server muted");
+                                        } else if is_talking {
                                             ui.add(
                                                 egui::Label::new(egui::RichText::new("🎤").color(egui::Color32::GREEN))
                                                     .selectable(false),
@@ -4356,6 +4429,17 @@ impl RumbleApp {
                                                 )
                                                 .selectable(false),
                                             );
+                                        }
+
+                                        if is_elevated {
+                                            let resp = ui.add(
+                                                egui::Label::new(
+                                                    egui::RichText::new("🛡")
+                                                        .color(egui::Color32::from_rgb(0xFF, 0xD7, 0x00)),
+                                                )
+                                                .selectable(false),
+                                            );
+                                            resp.on_hover_text("Elevated (Superuser)");
                                         }
 
                                         ui.add(egui::Label::new(&username).selectable(false));
@@ -4439,6 +4523,51 @@ impl RumbleApp {
                                         } else {
                                             if ui.button("🔕 Mute Locally").clicked() {
                                                 pending_commands.push(Command::MuteUser { user_id });
+                                                ui.close();
+                                            }
+                                        }
+
+                                        // ACL: Server mute (requires MUTE_DEAFEN permission)
+                                        let eff = Permissions::from_bits_truncate(effective_permissions);
+                                        if eff.contains(Permissions::MUTE_DEAFEN) {
+                                            if server_muted {
+                                                if ui.button("🔒 Remove Server Mute").clicked() {
+                                                    pending_commands.push(Command::SetServerMute {
+                                                        target_user_id: user_id,
+                                                        muted: false,
+                                                    });
+                                                    ui.close();
+                                                }
+                                            } else {
+                                                if ui.button("🔒 Server Mute").clicked() {
+                                                    pending_commands.push(Command::SetServerMute {
+                                                        target_user_id: user_id,
+                                                        muted: true,
+                                                    });
+                                                    ui.close();
+                                                }
+                                            }
+                                        }
+
+                                        // ACL: Kick (requires KICK permission)
+                                        if eff.contains(Permissions::KICK) {
+                                            if ui.button("⚡ Kick").clicked() {
+                                                pending_commands.push(Command::KickUser {
+                                                    target_user_id: user_id,
+                                                    reason: String::new(),
+                                                });
+                                                ui.close();
+                                            }
+                                        }
+
+                                        // ACL: Ban (requires BAN permission)
+                                        if eff.contains(Permissions::BAN) {
+                                            if ui.button("⛔ Ban").clicked() {
+                                                pending_commands.push(Command::BanUser {
+                                                    target_user_id: user_id,
+                                                    reason: String::new(),
+                                                    duration_secs: 0,
+                                                });
                                                 ui.close();
                                             }
                                         }
