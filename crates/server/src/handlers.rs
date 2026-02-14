@@ -1357,10 +1357,13 @@ async fn handle_set_user_status(
         "SetUserStatus"
     );
 
-    // Update the user's status in state
+    // Update the user's status in state (preserve existing server_muted/is_elevated)
+    let existing = state.get_user_status(sender.user_id).await;
     let status = UserStatus {
         is_muted: sus.is_muted,
         is_deafened: sus.is_deafened,
+        server_muted: existing.server_muted,
+        is_elevated: existing.is_elevated,
     };
     state.set_user_status(sender.user_id, status).await;
 
@@ -1867,6 +1870,8 @@ async fn handle_bridge_set_user_status(
     let status = UserStatus {
         is_muted: bss.is_muted,
         is_deafened: bss.is_deafened,
+        server_muted: false,
+        is_elevated: false,
     };
     state.set_user_status(bss.user_id, status).await;
 

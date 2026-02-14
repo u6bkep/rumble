@@ -67,6 +67,10 @@ impl Server {
             match Persistence::open(&db_path) {
                 Ok(p) => {
                     info!("Opened persistence database at {}", db_path);
+                    // Ensure default permission groups exist
+                    if let Err(e) = p.ensure_default_groups() {
+                        error!("Failed to create default groups: {e}");
+                    }
                     Some(Arc::new(p))
                 }
                 Err(e) => {

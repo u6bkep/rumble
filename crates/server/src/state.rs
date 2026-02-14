@@ -102,6 +102,14 @@ pub struct ClientHandle {
     pub authenticated: Arc<AtomicBool>,
     /// Whether this connection is a bridge (set after BridgeHello).
     pub is_bridge: AtomicBool,
+    /// Whether this user has been elevated to superuser (session-only).
+    pub is_superuser: AtomicBool,
+    /// Whether this user is server-muted (effective state, checked on voice relay).
+    pub server_muted: AtomicBool,
+    /// Whether a moderator manually server-muted this user.
+    pub manually_server_muted: AtomicBool,
+    /// Permission groups this user belongs to (loaded from persistence on auth).
+    pub groups: RwLock<Vec<String>>,
 }
 
 /// A virtual user managed by a bridge connection.
@@ -133,6 +141,10 @@ impl ClientHandle {
             public_key,
             authenticated,
             is_bridge: AtomicBool::new(false),
+            is_superuser: AtomicBool::new(false),
+            server_muted: AtomicBool::new(false),
+            manually_server_muted: AtomicBool::new(false),
+            groups: RwLock::new(Vec::new()),
         }
     }
 
@@ -163,6 +175,10 @@ pub struct UserStatus {
     pub is_muted: bool,
     /// User has deafened themselves (not receiving audio; implies muted).
     pub is_deafened: bool,
+    /// User is server-muted (cannot transmit voice).
+    pub server_muted: bool,
+    /// User has elevated to superuser for this session.
+    pub is_elevated: bool,
 }
 
 /// Inner state data protected by a single RwLock.
@@ -699,14 +715,17 @@ impl ServerState {
                 .unwrap_or_default();
 
             // Try real client first, then virtual user
-            let username = if let Some(client) = self.get_client(uid) {
+            let (username, srv_muted, elevated) = if let Some(client) = self.get_client(uid) {
                 // Skip bridge connections - they are not visible users
                 if client.is_bridge.load(std::sync::atomic::Ordering::SeqCst) {
                     continue;
                 }
-                client.get_username().await
+                let name = client.get_username().await;
+                let sm = client.server_muted.load(std::sync::atomic::Ordering::SeqCst);
+                let el = client.is_superuser.load(std::sync::atomic::Ordering::SeqCst);
+                (name, sm, el)
             } else if let Some(vu) = self.get_virtual_user(uid) {
-                vu.username
+                (vu.username, false, false)
             } else {
                 continue;
             };
@@ -717,8 +736,8 @@ impl ServerState {
                 username,
                 is_muted: status.is_muted,
                 is_deafened: status.is_deafened,
-                server_muted: false,
-                is_elevated: false,
+                server_muted: srv_muted,
+                is_elevated: elevated,
             });
         }
         users

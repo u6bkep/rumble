@@ -4,11 +4,18 @@
 //! - Registered users (public_key → user data)
 //! - Known keys (keys that have connected before, bypass password)
 //! - Rooms (uuid → room data)
+//! - Permission groups (group name → permissions)
+//! - User-group assignments (public_key → group names)
+//! - Room ACLs (room UUID → ACL data)
+//! - Bans (public_key → ban entry)
+//! - Sudo password (fixed key → bcrypt hash)
 
 use anyhow::Result;
+use api::permissions::{ADMIN_PERMISSIONS, DEFAULT_PERMISSIONS};
 use serde::{Deserialize, Serialize};
 use sled::Db;
 use std::path::Path;
+use tracing::info;
 
 /// User registration data stored in the database.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,8 +39,41 @@ pub struct PersistedRoom {
     pub permanent: bool,
 }
 
+/// A persisted permission group.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedGroup {
+    pub permissions: u32,
+}
+
+/// Persisted room ACL data.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedRoomAcl {
+    pub inherit_acl: bool,
+    pub entries: Vec<PersistedAclEntry>,
+}
+
+/// A single persisted ACL entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedAclEntry {
+    pub group: String,
+    pub grant: u32,
+    pub deny: u32,
+    pub apply_here: bool,
+    pub apply_subs: bool,
+}
+
+/// A ban entry stored in the database.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BanEntry {
+    pub reason: String,
+    pub banned_by: String,
+    /// Unix timestamp in seconds. None = permanent.
+    pub expires_at: Option<u64>,
+}
+
 /// Server persistence layer using sled.
 pub struct Persistence {
+    #[allow(dead_code)]
     db: Db,
     /// Tree for registered users: public_key (32 bytes) → RegisteredUser
     registered_users: sled::Tree,
@@ -41,6 +81,16 @@ pub struct Persistence {
     known_keys: sled::Tree,
     /// Tree for rooms: uuid (16 bytes) → PersistedRoom
     rooms: sled::Tree,
+    /// Tree for permission groups: group name (UTF-8) → PersistedGroup
+    groups: sled::Tree,
+    /// Tree for user-group assignments: public_key (32 bytes) → Vec<String>
+    user_groups: sled::Tree,
+    /// Tree for room ACLs: room UUID (16 bytes) → PersistedRoomAcl
+    room_acls: sled::Tree,
+    /// Tree for bans: public_key (32 bytes) → BanEntry
+    bans: sled::Tree,
+    /// Tree for sudo password: fixed key b"sudo" → bcrypt hash string
+    sudo_password: sled::Tree,
 }
 
 impl Persistence {
@@ -50,12 +100,22 @@ impl Persistence {
         let registered_users = db.open_tree("registered_users")?;
         let known_keys = db.open_tree("known_keys")?;
         let rooms = db.open_tree("rooms")?;
+        let groups = db.open_tree("groups")?;
+        let user_groups = db.open_tree("user_groups")?;
+        let room_acls = db.open_tree("room_acls")?;
+        let bans = db.open_tree("bans")?;
+        let sudo_password = db.open_tree("sudo_password")?;
 
         Ok(Self {
             db,
             registered_users,
             known_keys,
             rooms,
+            groups,
+            user_groups,
+            room_acls,
+            bans,
+            sudo_password,
         })
     }
 
@@ -65,12 +125,22 @@ impl Persistence {
         let registered_users = db.open_tree("registered_users")?;
         let known_keys = db.open_tree("known_keys")?;
         let rooms = db.open_tree("rooms")?;
+        let groups = db.open_tree("groups")?;
+        let user_groups = db.open_tree("user_groups")?;
+        let room_acls = db.open_tree("room_acls")?;
+        let bans = db.open_tree("bans")?;
+        let sudo_password = db.open_tree("sudo_password")?;
 
         Ok(Self {
             db,
             registered_users,
             known_keys,
             rooms,
+            groups,
+            user_groups,
+            room_acls,
+            bans,
+            sudo_password,
         })
     }
 
@@ -196,6 +266,216 @@ impl Persistence {
             self.register_user(public_key, user)?;
         }
         Ok(())
+    }
+
+    // =========================================================================
+    // Permission Groups
+    // =========================================================================
+
+    /// Create a permission group. Overwrites if it already exists.
+    pub fn create_group(&self, name: &str, permissions: u32) -> Result<()> {
+        let group = PersistedGroup { permissions };
+        let data = bincode::serialize(&group)?;
+        self.groups.insert(name.as_bytes(), data)?;
+        Ok(())
+    }
+
+    /// Get a permission group by name.
+    pub fn get_group(&self, name: &str) -> Option<PersistedGroup> {
+        self.groups
+            .get(name.as_bytes())
+            .ok()
+            .flatten()
+            .and_then(|data| bincode::deserialize(&data).ok())
+    }
+
+    /// Delete a permission group.
+    pub fn delete_group(&self, name: &str) -> Result<()> {
+        self.groups.remove(name.as_bytes())?;
+        Ok(())
+    }
+
+    /// Modify a group's permissions.
+    pub fn modify_group(&self, name: &str, permissions: u32) -> Result<bool> {
+        if self.groups.contains_key(name.as_bytes())? {
+            self.create_group(name, permissions)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// List all groups.
+    pub fn list_groups(&self) -> Vec<(String, PersistedGroup)> {
+        self.groups
+            .iter()
+            .filter_map(|result| {
+                result.ok().and_then(|(key, value)| {
+                    let name = String::from_utf8(key.to_vec()).ok()?;
+                    let group: PersistedGroup = bincode::deserialize(&value).ok()?;
+                    Some((name, group))
+                })
+            })
+            .collect()
+    }
+
+    /// Ensure default groups exist (called on startup).
+    /// Creates "default" and "admin" groups if the groups tree is empty.
+    pub fn ensure_default_groups(&self) -> Result<()> {
+        if self.groups.is_empty() {
+            info!("Creating default permission groups");
+            self.create_group("default", DEFAULT_PERMISSIONS.bits())?;
+            self.create_group("admin", ADMIN_PERMISSIONS.bits())?;
+        }
+        Ok(())
+    }
+
+    // =========================================================================
+    // User-Group Assignments
+    // =========================================================================
+
+    /// Set the complete group list for a user.
+    pub fn set_user_groups(&self, public_key: &[u8; 32], groups: &[String]) -> Result<()> {
+        let data = bincode::serialize(groups)?;
+        self.user_groups.insert(public_key, data)?;
+        Ok(())
+    }
+
+    /// Get the groups a user belongs to.
+    pub fn get_user_groups(&self, public_key: &[u8; 32]) -> Vec<String> {
+        self.user_groups
+            .get(public_key)
+            .ok()
+            .flatten()
+            .and_then(|data| bincode::deserialize::<Vec<String>>(&data).ok())
+            .unwrap_or_default()
+    }
+
+    /// Add a user to a group.
+    pub fn add_user_to_group(&self, public_key: &[u8; 32], group: &str) -> Result<()> {
+        let mut groups = self.get_user_groups(public_key);
+        if !groups.iter().any(|g| g == group) {
+            groups.push(group.to_string());
+            self.set_user_groups(public_key, &groups)?;
+        }
+        Ok(())
+    }
+
+    /// Remove a user from a group.
+    pub fn remove_user_from_group(&self, public_key: &[u8; 32], group: &str) -> Result<()> {
+        let mut groups = self.get_user_groups(public_key);
+        let before = groups.len();
+        groups.retain(|g| g != group);
+        if groups.len() != before {
+            self.set_user_groups(public_key, &groups)?;
+        }
+        Ok(())
+    }
+
+    // =========================================================================
+    // Room ACLs
+    // =========================================================================
+
+    /// Set room ACL data.
+    pub fn set_room_acl(&self, room_uuid: &[u8; 16], acl: &PersistedRoomAcl) -> Result<()> {
+        let data = bincode::serialize(acl)?;
+        self.room_acls.insert(room_uuid, data)?;
+        Ok(())
+    }
+
+    /// Get room ACL data.
+    pub fn get_room_acl(&self, room_uuid: &[u8; 16]) -> Option<PersistedRoomAcl> {
+        self.room_acls
+            .get(room_uuid)
+            .ok()
+            .flatten()
+            .and_then(|data| bincode::deserialize(&data).ok())
+    }
+
+    /// Delete room ACL data.
+    pub fn delete_room_acl(&self, room_uuid: &[u8; 16]) -> Result<()> {
+        self.room_acls.remove(room_uuid)?;
+        Ok(())
+    }
+
+    // =========================================================================
+    // Bans
+    // =========================================================================
+
+    /// Add a ban entry.
+    pub fn add_ban(&self, public_key: &[u8; 32], entry: &BanEntry) -> Result<()> {
+        let data = bincode::serialize(entry)?;
+        self.bans.insert(public_key, data)?;
+        Ok(())
+    }
+
+    /// Remove a ban.
+    pub fn remove_ban(&self, public_key: &[u8; 32]) -> Result<()> {
+        self.bans.remove(public_key)?;
+        Ok(())
+    }
+
+    /// Get a ban entry.
+    pub fn get_ban(&self, public_key: &[u8; 32]) -> Option<BanEntry> {
+        self.bans
+            .get(public_key)
+            .ok()
+            .flatten()
+            .and_then(|data| bincode::deserialize(&data).ok())
+    }
+
+    /// List all bans.
+    pub fn list_bans(&self) -> Vec<([u8; 32], BanEntry)> {
+        self.bans
+            .iter()
+            .filter_map(|result| {
+                result.ok().and_then(|(key, value)| {
+                    let pk: [u8; 32] = key.as_ref().try_into().ok()?;
+                    let entry: BanEntry = bincode::deserialize(&value).ok()?;
+                    Some((pk, entry))
+                })
+            })
+            .collect()
+    }
+
+    /// Check if a public key is banned (also checks expiry).
+    pub fn is_banned(&self, public_key: &[u8; 32]) -> bool {
+        match self.get_ban(public_key) {
+            Some(entry) => {
+                if let Some(expires_at) = entry.expires_at {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    if now >= expires_at {
+                        // Ban expired, remove it
+                        let _ = self.remove_ban(public_key);
+                        return false;
+                    }
+                }
+                true
+            }
+            None => false,
+        }
+    }
+
+    // =========================================================================
+    // Sudo Password
+    // =========================================================================
+
+    /// Set the sudo password (stores bcrypt hash).
+    pub fn set_sudo_password(&self, hash: &str) -> Result<()> {
+        self.sudo_password.insert(b"sudo", hash.as_bytes())?;
+        Ok(())
+    }
+
+    /// Get the sudo password hash.
+    pub fn get_sudo_password(&self) -> Option<String> {
+        self.sudo_password
+            .get(b"sudo")
+            .ok()
+            .flatten()
+            .and_then(|data| String::from_utf8(data.to_vec()).ok())
     }
 }
 
@@ -446,5 +726,167 @@ mod tests {
 
         // User should still not exist
         assert!(persistence.get_registered_user(&key).is_none());
+    }
+
+    #[test]
+    fn test_groups_crud() {
+        let persistence = Persistence::in_memory().unwrap();
+
+        // Initially no groups
+        assert!(persistence.list_groups().is_empty());
+        assert!(persistence.get_group("admin").is_none());
+
+        // Create groups
+        persistence.create_group("admin", 0x3FFFFF).unwrap();
+        persistence.create_group("default", 0x8001F).unwrap();
+
+        let admin = persistence.get_group("admin").unwrap();
+        assert_eq!(admin.permissions, 0x3FFFFF);
+
+        let groups = persistence.list_groups();
+        assert_eq!(groups.len(), 2);
+
+        // Modify
+        assert!(persistence.modify_group("admin", 0xFF).unwrap());
+        assert_eq!(persistence.get_group("admin").unwrap().permissions, 0xFF);
+
+        // Modify nonexistent
+        assert!(!persistence.modify_group("nonexistent", 0).unwrap());
+
+        // Delete
+        persistence.delete_group("admin").unwrap();
+        assert!(persistence.get_group("admin").is_none());
+    }
+
+    #[test]
+    fn test_ensure_default_groups() {
+        let persistence = Persistence::in_memory().unwrap();
+
+        // First call creates groups
+        persistence.ensure_default_groups().unwrap();
+        let groups = persistence.list_groups();
+        assert_eq!(groups.len(), 2);
+
+        // Second call is idempotent (tree not empty)
+        persistence.ensure_default_groups().unwrap();
+        let groups = persistence.list_groups();
+        assert_eq!(groups.len(), 2);
+    }
+
+    #[test]
+    fn test_user_groups() {
+        let persistence = Persistence::in_memory().unwrap();
+        let key = [10u8; 32];
+
+        // Initially empty
+        assert!(persistence.get_user_groups(&key).is_empty());
+
+        // Add to groups
+        persistence.add_user_to_group(&key, "admin").unwrap();
+        persistence.add_user_to_group(&key, "moderator").unwrap();
+
+        let groups = persistence.get_user_groups(&key);
+        assert_eq!(groups.len(), 2);
+        assert!(groups.contains(&"admin".to_string()));
+        assert!(groups.contains(&"moderator".to_string()));
+
+        // Idempotent add
+        persistence.add_user_to_group(&key, "admin").unwrap();
+        assert_eq!(persistence.get_user_groups(&key).len(), 2);
+
+        // Remove
+        persistence.remove_user_from_group(&key, "admin").unwrap();
+        let groups = persistence.get_user_groups(&key);
+        assert_eq!(groups.len(), 1);
+        assert!(!groups.contains(&"admin".to_string()));
+
+        // Set all at once
+        persistence
+            .set_user_groups(&key, &["a".to_string(), "b".to_string()])
+            .unwrap();
+        assert_eq!(persistence.get_user_groups(&key).len(), 2);
+    }
+
+    #[test]
+    fn test_room_acls() {
+        let persistence = Persistence::in_memory().unwrap();
+        let uuid = [11u8; 16];
+
+        assert!(persistence.get_room_acl(&uuid).is_none());
+
+        let acl = PersistedRoomAcl {
+            inherit_acl: false,
+            entries: vec![PersistedAclEntry {
+                group: "default".to_string(),
+                grant: 0x004,
+                deny: 0x040,
+                apply_here: true,
+                apply_subs: false,
+            }],
+        };
+        persistence.set_room_acl(&uuid, &acl).unwrap();
+
+        let retrieved = persistence.get_room_acl(&uuid).unwrap();
+        assert!(!retrieved.inherit_acl);
+        assert_eq!(retrieved.entries.len(), 1);
+        assert_eq!(retrieved.entries[0].group, "default");
+        assert_eq!(retrieved.entries[0].grant, 0x004);
+
+        persistence.delete_room_acl(&uuid).unwrap();
+        assert!(persistence.get_room_acl(&uuid).is_none());
+    }
+
+    #[test]
+    fn test_bans() {
+        let persistence = Persistence::in_memory().unwrap();
+        let key = [12u8; 32];
+
+        assert!(!persistence.is_banned(&key));
+        assert!(persistence.list_bans().is_empty());
+
+        // Permanent ban
+        let entry = BanEntry {
+            reason: "spam".to_string(),
+            banned_by: "admin".to_string(),
+            expires_at: None,
+        };
+        persistence.add_ban(&key, &entry).unwrap();
+        assert!(persistence.is_banned(&key));
+
+        let bans = persistence.list_bans();
+        assert_eq!(bans.len(), 1);
+        assert_eq!(bans[0].1.reason, "spam");
+
+        // Remove ban
+        persistence.remove_ban(&key).unwrap();
+        assert!(!persistence.is_banned(&key));
+    }
+
+    #[test]
+    fn test_expired_ban() {
+        let persistence = Persistence::in_memory().unwrap();
+        let key = [13u8; 32];
+
+        // Ban that expired in the past
+        let entry = BanEntry {
+            reason: "temp".to_string(),
+            banned_by: "admin".to_string(),
+            expires_at: Some(1), // expired long ago
+        };
+        persistence.add_ban(&key, &entry).unwrap();
+
+        // is_banned should return false and auto-remove
+        assert!(!persistence.is_banned(&key));
+        assert!(persistence.get_ban(&key).is_none());
+    }
+
+    #[test]
+    fn test_sudo_password() {
+        let persistence = Persistence::in_memory().unwrap();
+
+        assert!(persistence.get_sudo_password().is_none());
+
+        persistence.set_sudo_password("$2b$12$somehash").unwrap();
+        assert_eq!(persistence.get_sudo_password().unwrap(), "$2b$12$somehash");
     }
 }
