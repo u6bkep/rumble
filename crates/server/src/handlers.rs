@@ -622,6 +622,8 @@ async fn handle_authenticate(
                 current_room: Some(room_id_from_uuid(initial_room)),
                 is_muted: false,
                 is_deafened: false,
+                server_muted: false,
+                is_elevated: false,
             }),
         }),
     )
@@ -708,7 +710,6 @@ async fn handle_register_user(
         &target_key,
         crate::persistence::RegisteredUser {
             username: username.clone(),
-            roles: vec![],
             last_room: None,
         },
     ) {
@@ -1370,6 +1371,8 @@ async fn handle_set_user_status(
             user_id: Some(proto::UserId { value: sender.user_id }),
             is_muted: sus.is_muted,
             is_deafened: sus.is_deafened,
+            server_muted: false,
+            is_elevated: false,
         }),
     )
     .await?;
@@ -1751,6 +1754,8 @@ async fn handle_bridge_register_user(
                 current_room: Some(room_id_from_uuid(ROOT_ROOM_UUID)),
                 is_muted: false,
                 is_deafened: false,
+                server_muted: false,
+                is_elevated: false,
             }),
         }),
     )
@@ -1872,6 +1877,8 @@ async fn handle_bridge_set_user_status(
             user_id: Some(proto::UserId { value: bss.user_id }),
             is_muted: bss.is_muted,
             is_deafened: bss.is_deafened,
+            server_muted: false,
+            is_elevated: false,
         }),
     )
     .await?;

@@ -30,6 +30,8 @@ message User {
   RoomId current_room = 3;
   bool is_muted = 4;     // User has muted themselves (not transmitting)
   bool is_deafened = 5;  // User has deafened themselves (not receiving audio; implies muted)
+  bool server_muted = 6; // User has been server-muted (cannot transmit)
+  bool is_elevated = 7;  // User has elevated to superuser via sudo
 }
 
 // Room definition.
@@ -135,6 +137,25 @@ message Envelope {
     PeerCapabilities peer_capabilities = 61;
     P2PVoiceStatus p2p_voice_status = 62;
     RelayAllocation relay_allocation = 63;
+
+    // ACL Messages (80-93)
+    // Client -> Server
+    KickUser kick_user = 80;
+    BanUser ban_user = 81;
+    UnbanUser unban_user = 82;
+    SetServerMute set_server_mute = 83;
+    Elevate elevate = 84;
+    CreateGroup create_group = 85;
+    DeleteGroup delete_group = 86;
+    ModifyGroup modify_group = 87;
+    SetUserGroup set_user_group = 88;
+    SetRoomAcl set_room_acl = 89;
+    QueryPermissions query_permissions = 90;
+
+    // Server -> Client
+    PermissionDenied permission_denied = 91;
+    UserKicked user_kicked = 92;
+    PermissionsInfo permissions_info = 93;
 
     // Bridge Messages (70-79)
     BridgeHello bridge_hello = 70;
@@ -400,6 +421,8 @@ message UserStatusChanged {
   UserId user_id = 1;
   bool is_muted = 2;
   bool is_deafened = 3;
+  bool server_muted = 4;  // User has been server-muted
+  bool is_elevated = 5;   // User has elevated to superuser via sudo
 }
 
 // =============================================================================
@@ -566,6 +589,104 @@ message RelayAllocation {
   int64 expires_ms = 2;
   // Rate limit in bytes/sec for relay traffic.
   uint64 rate_limit_bytes_per_sec = 3;
+}
+
+// =============================================================================
+// ACL Messages
+// =============================================================================
+
+// Permission denied error response.
+message PermissionDenied {
+  uint32 required_permission = 1;
+  bytes room_id = 2;
+  string message = 3;
+}
+
+// Kick user from server.
+message KickUser {
+  uint64 target_user_id = 1;
+  string reason = 2;
+}
+
+// Notification that a user was kicked.
+message UserKicked {
+  uint64 user_id = 1;
+  string reason = 2;
+  string kicked_by = 3;
+}
+
+// Ban user from server.
+message BanUser {
+  uint64 target_user_id = 1;
+  string reason = 2;
+  uint64 duration_secs = 3;  // 0 = permanent
+}
+
+// Unban a user by public key.
+message UnbanUser {
+  bytes public_key = 1;
+}
+
+// Set server mute on another user.
+message SetServerMute {
+  uint64 target_user_id = 1;
+  bool muted = 2;
+}
+
+// Elevate to superuser.
+message Elevate {
+  string password = 1;
+}
+
+// Effective permissions for a room (server -> client).
+message PermissionsInfo {
+  bytes room_id = 1;
+  uint32 effective_permissions = 2;
+}
+
+// Group management: create a new permission group.
+message CreateGroup {
+  string name = 1;
+  uint32 permissions = 2;
+}
+
+// Group management: delete a permission group.
+message DeleteGroup {
+  string name = 1;
+}
+
+// Group management: modify a permission group.
+message ModifyGroup {
+  string name = 1;
+  uint32 permissions = 2;
+}
+
+// Group management: add or remove a user from a group.
+message SetUserGroup {
+  uint64 target_user_id = 1;
+  string group = 2;
+  bool add = 3;  // true = add to group, false = remove
+}
+
+// Room ACL entry (grant/deny delta for a group).
+message RoomAclEntry {
+  string group = 1;
+  uint32 grant = 2;
+  uint32 deny = 3;
+  bool apply_here = 4;
+  bool apply_subs = 5;
+}
+
+// Set room ACL entries.
+message SetRoomAcl {
+  bytes room_id = 1;
+  bool inherit_acl = 2;
+  repeated RoomAclEntry entries = 3;
+}
+
+// Query effective permissions for a room.
+message QueryPermissions {
+  bytes room_id = 1;
 }
 
 // =============================================================================

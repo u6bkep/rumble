@@ -8,6 +8,7 @@ use bytes::BytesMut;
 use prost::Message;
 pub use uuid::Uuid;
 
+pub mod permissions;
 pub mod proto {
     include!(concat!(env!("OUT_DIR"), "/rumble.api.v1.rs"));
 }

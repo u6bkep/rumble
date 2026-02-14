@@ -15,8 +15,6 @@ use std::path::Path;
 pub struct RegisteredUser {
     /// The user's registered username.
     pub username: String,
-    /// User roles for future ACL support.
-    pub roles: Vec<String>,
     /// Last room the user was in (UUID bytes).
     pub last_room: Option<[u8; 16]>,
 }
@@ -226,14 +224,12 @@ mod tests {
 
         let user = RegisteredUser {
             username: "alice".to_string(),
-            roles: vec!["user".to_string()],
             last_room: None,
         };
         persistence.register_user(&key, user.clone()).unwrap();
 
         let retrieved = persistence.get_registered_user(&key).unwrap();
         assert_eq!(retrieved.username, "alice");
-        assert_eq!(retrieved.roles, vec!["user".to_string()]);
 
         persistence.unregister_user(&key).unwrap();
         assert!(persistence.get_registered_user(&key).is_none());
@@ -247,7 +243,7 @@ mod tests {
 
         let user = RegisteredUser {
             username: "alice".to_string(),
-            roles: vec![],
+
             last_room: None,
         };
         persistence.register_user(&key1, user).unwrap();
@@ -276,7 +272,7 @@ mod tests {
         // Register key1
         let user = RegisteredUser {
             username: "alice".to_string(),
-            roles: vec![],
+
             last_room: None,
         };
         persistence.register_user(&key1, user).unwrap();
@@ -299,7 +295,7 @@ mod tests {
         // Register "alice" to registered_key
         let user = RegisteredUser {
             username: "alice".to_string(),
-            roles: vec![],
+
             last_room: None,
         };
         persistence.register_user(&registered_key, user).unwrap();
@@ -421,7 +417,7 @@ mod tests {
         // Register user without last room
         let user = RegisteredUser {
             username: "bob".to_string(),
-            roles: vec![],
+
             last_room: None,
         };
         persistence.register_user(&key, user).unwrap();

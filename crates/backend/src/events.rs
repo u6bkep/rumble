@@ -1695,6 +1695,8 @@ mod tests {
                     username: "user1".to_string(),
                     is_muted: false,
                     is_deafened: false,
+                    server_muted: false,
+                    is_elevated: false,
                 },
                 User {
                     user_id: Some(UserId { value: 2 }),
@@ -1702,6 +1704,8 @@ mod tests {
                     username: "user2".to_string(),
                     is_muted: false,
                     is_deafened: false,
+                    server_muted: false,
+                    is_elevated: false,
                 },
                 User {
                     user_id: Some(UserId { value: 3 }),
@@ -1709,6 +1713,8 @@ mod tests {
                     username: "user3".to_string(),
                     is_muted: false,
                     is_deafened: false,
+                    server_muted: false,
+                    is_elevated: false,
                 },
             ],
             audio: AudioState::default(),

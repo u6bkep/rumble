@@ -717,6 +717,8 @@ impl ServerState {
                 username,
                 is_muted: status.is_muted,
                 is_deafened: status.is_deafened,
+                server_muted: false,
+                is_elevated: false,
             });
         }
         users
