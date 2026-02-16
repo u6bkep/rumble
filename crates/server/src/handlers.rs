@@ -1314,6 +1314,10 @@ async fn handle_delete_room(
         if let Err(e) = persist.delete_room(&room_uuid.into_bytes()) {
             warn!("Failed to remove room from persistence: {e}");
         }
+        // Clean up room ACL data
+        if let Err(e) = persist.delete_room_acl(&room_uuid.into_bytes()) {
+            warn!("Failed to remove room ACL data from persistence: {e}");
+        }
     }
 
     // Send incremental update to all clients
@@ -1971,12 +1975,28 @@ async fn handle_kick_user(
     }
 
     let target_user_id = ku.target_user_id;
+
+    // Cannot kick yourself
+    if target_user_id == sender.user_id {
+        return send_command_result(&sender, "KickUser", false, "Cannot kick yourself").await;
+    }
+
     let target_client = match state.get_client(target_user_id) {
         Some(c) => c,
         None => {
             return send_command_result(&sender, "KickUser", false, "User not found").await;
         }
     };
+
+    // Cannot kick elevated superusers
+    if target_client.is_superuser.load(Ordering::Relaxed) {
+        return send_command_result(&sender, "KickUser", false, "Cannot kick a superuser").await;
+    }
+
+    // Cannot kick bridge connections (would disconnect all virtual users)
+    if target_client.is_bridge.load(Ordering::SeqCst) {
+        return send_command_result(&sender, "KickUser", false, "Cannot kick a bridge connection").await;
+    }
 
     let kicked_by = sender.get_username().await;
     let target_username = target_client.get_username().await;
@@ -2035,14 +2055,26 @@ async fn handle_set_server_mute(
         }
     };
 
-    // Set both flags
+    // Set the manual mute flag
     target_client.manually_server_muted.store(ssm.muted, Ordering::Relaxed);
-    target_client.server_muted.store(ssm.muted, Ordering::Relaxed);
+
+    // When unmuting, re-evaluate SPEAK permission — the user may be in a
+    // SPEAK-denied room which should keep them server-muted.
+    let effective_muted = if ssm.muted {
+        true
+    } else {
+        let target_room = state.get_user_room(target_user_id).await.unwrap_or(ROOT_ROOM_UUID);
+        let perms = acl::evaluate_user_permissions(&state, &target_client, target_room, &persistence).await;
+        let speak_denied = !perms.contains(Permissions::SPEAK);
+        speak_denied // manually_muted is false at this point
+    };
+    target_client.server_muted.store(effective_muted, Ordering::Relaxed);
 
     let target_username = target_client.get_username().await;
     info!(
         target = %target_username,
         muted = ssm.muted,
+        effective_muted = effective_muted,
         "SetServerMute"
     );
 
@@ -2054,7 +2086,7 @@ async fn handle_set_server_mute(
             user_id: Some(proto::UserId { value: target_user_id }),
             is_muted: status.is_muted,
             is_deafened: status.is_deafened,
-            server_muted: ssm.muted,
+            server_muted: effective_muted,
             is_elevated: target_client.is_superuser.load(Ordering::Relaxed),
         }),
     )
@@ -2157,6 +2189,16 @@ async fn handle_create_group(
         return send_command_result(&sender, "CreateGroup", false, "Group name cannot be empty").await;
     }
 
+    // Prevent creating built-in groups
+    if cg.name == "default" || cg.name == "admin" {
+        return send_command_result(&sender, "CreateGroup", false, "Cannot create built-in groups").await;
+    }
+
+    // Check if group already exists
+    if persist.get_group(&cg.name).is_some() {
+        return send_command_result(&sender, "CreateGroup", false, "Group already exists").await;
+    }
+
     // Validate group name doesn't collide with a registered username
     // (username-as-group pattern from the spec)
     if persist.is_username_registered(&cg.name) {
@@ -2217,11 +2259,40 @@ async fn handle_delete_group(
         return send_command_result(&sender, "DeleteGroup", false, "Cannot delete built-in groups").await;
     }
 
+    info!(group = %dg.name, "DeleteGroup");
+
+    // Clean up user-group references BEFORE deleting the group itself.
+    // This ordering minimizes the crash window: if the server crashes
+    // mid-operation the group still exists in sled and the delete can be retried.
+
+    // Remove group from all connected clients' in-memory group lists
+    // and broadcast UserGroupChanged for each affected user
+    let clients = state.snapshot_clients();
+    for client in &clients {
+        let mut groups = client.groups.write().await;
+        if groups.contains(&dg.name) {
+            groups.retain(|g| g != &dg.name);
+            drop(groups); // Release lock before broadcast
+            let _ = broadcast_state_update(
+                &state,
+                proto::state_update::Update::UserGroupChanged(proto::UserGroupChanged {
+                    user_id: client.user_id,
+                    group: dg.name.clone(),
+                    added: false,
+                    expires_at: 0,
+                }),
+            )
+            .await;
+        }
+    }
+
+    // Clean up persistence: remove group from all users' stored group lists
+    persist.remove_group_from_all_users(&dg.name);
+
+    // Now delete the group itself
     if let Err(e) = persist.delete_group(&dg.name) {
         return send_command_result(&sender, "DeleteGroup", false, &format!("Failed: {e}")).await;
     }
-
-    info!(group = %dg.name, "DeleteGroup");
 
     // Broadcast GroupChanged state update (deleted)
     let _ = broadcast_state_update(
@@ -2259,8 +2330,14 @@ async fn handle_modify_group(
         return send_command_result(&sender, "ModifyGroup", false, "Persistence not enabled").await;
     };
 
-    if let Err(e) = persist.modify_group(&mg.name, mg.permissions) {
-        return send_command_result(&sender, "ModifyGroup", false, &format!("Failed: {e}")).await;
+    match persist.modify_group(&mg.name, mg.permissions) {
+        Ok(false) => {
+            return send_command_result(&sender, "ModifyGroup", false, "Group not found").await;
+        }
+        Err(e) => {
+            return send_command_result(&sender, "ModifyGroup", false, &format!("Failed: {e}")).await;
+        }
+        Ok(true) => {}
     }
 
     info!(group = %mg.name, permissions = mg.permissions, "ModifyGroup");

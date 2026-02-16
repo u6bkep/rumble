@@ -394,6 +394,23 @@ impl Persistence {
         Ok(())
     }
 
+    /// Remove a group from all users' group lists (used when deleting a group).
+    pub fn remove_group_from_all_users(&self, group: &str) {
+        for entry in self.user_groups.iter() {
+            if let Ok((key, value)) = entry {
+                if let Ok(mut groups) = bincode::deserialize::<Vec<String>>(&value) {
+                    let before = groups.len();
+                    groups.retain(|g| g != group);
+                    if groups.len() != before {
+                        if let Ok(key_arr) = <[u8; 32]>::try_from(key.as_ref()) {
+                            let _ = self.set_user_groups(&key_arr, &groups);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // =========================================================================
     // Room ACLs
     // =========================================================================
