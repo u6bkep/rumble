@@ -159,6 +159,10 @@ struct AdminPanelState {
     new_group_permissions: u32,
     editing_group: Option<String>,
     editing_permissions: u32,
+    /// Per-user selected group for the add-to-group dropdown (keyed by user_id).
+    user_group_selection: std::collections::HashMap<u64, String>,
+    /// Group name pending deletion confirmation.
+    pending_delete_group: Option<String>,
 }
 
 /// State for the room ACL editor modal
@@ -204,7 +208,7 @@ fn render_permission_checkboxes(ui: &mut egui::Ui, permissions: &mut u32) {
             (Permissions::MOVE_USER, "Move User"),
             (Permissions::MAKE_ROOM, "Make Room"),
             (Permissions::MODIFY_ROOM, "Modify Room"),
-            (Permissions::WRITE, "Write ACLs"),
+            (Permissions::WRITE, "Edit ACL"),
         ];
         for (perm, label) in &room_perms {
             let mut checked = Permissions::from_bits_truncate(*permissions).contains(*perm);
@@ -243,26 +247,22 @@ fn render_permission_checkboxes(ui: &mut egui::Ui, permissions: &mut u32) {
 }
 
 /// Render a compact row of permission checkboxes for ACL entry editing.
-fn render_permission_checkboxes_compact(ui: &mut egui::Ui, permissions: &mut u32, prefix: &str, idx: usize) {
-    let all_perms = [
-        (Permissions::TRAVERSE, "T"),
-        (Permissions::ENTER, "E"),
-        (Permissions::SPEAK, "S"),
-        (Permissions::TEXT_MESSAGE, "TM"),
-        (Permissions::SHARE_FILE, "SF"),
-        (Permissions::MUTE_DEAFEN, "MD"),
-        (Permissions::MOVE_USER, "MV"),
-        (Permissions::MAKE_ROOM, "MR"),
-        (Permissions::MODIFY_ROOM, "MoR"),
-        (Permissions::WRITE, "W"),
+fn render_permission_checkboxes_compact(ui: &mut egui::Ui, permissions: &mut u32) {
+    let all_perms: &[(Permissions, &str, &str)] = &[
+        (Permissions::TRAVERSE, "Traverse", "Can see this room in the room list"),
+        (Permissions::ENTER, "Enter", "Can enter/join this room"),
+        (Permissions::SPEAK, "Speak", "Can transmit voice in this room"),
+        (Permissions::TEXT_MESSAGE, "Text", "Can send text messages in this room"),
+        (Permissions::SHARE_FILE, "Files", "Can share files in this room"),
+        (Permissions::MUTE_DEAFEN, "Mute", "Can server-mute/deafen other users"),
+        (Permissions::MOVE_USER, "Move", "Can move users between rooms"),
+        (Permissions::MAKE_ROOM, "Create Rm", "Can create sub-rooms"),
+        (Permissions::MODIFY_ROOM, "Mod Rm", "Can modify room properties"),
+        (Permissions::WRITE, "Edit ACL", "Can edit room ACL entries"),
     ];
-    for (perm, label) in &all_perms {
+    for (perm, label, description) in all_perms {
         let mut checked = Permissions::from_bits_truncate(*permissions).contains(*perm);
-        if ui
-            .checkbox(&mut checked, *label)
-            .on_hover_text(format!("{}{}{}", prefix, idx, label))
-            .changed()
-        {
+        if ui.checkbox(&mut checked, *label).on_hover_text(*description).changed() {
             if checked {
                 *permissions |= perm.bits();
             } else {
@@ -272,26 +272,51 @@ fn render_permission_checkboxes_compact(ui: &mut egui::Ui, permissions: &mut u32
     }
 }
 
+/// All permission flags with their display names, used for summary formatting.
+const ALL_PERMISSION_FLAGS: &[(Permissions, &str)] = &[
+    (Permissions::TRAVERSE, "Traverse"),
+    (Permissions::ENTER, "Enter"),
+    (Permissions::SPEAK, "Speak"),
+    (Permissions::TEXT_MESSAGE, "Text"),
+    (Permissions::SHARE_FILE, "Files"),
+    (Permissions::MUTE_DEAFEN, "Mute/Deafen"),
+    (Permissions::MOVE_USER, "Move"),
+    (Permissions::MAKE_ROOM, "Create Room"),
+    (Permissions::MODIFY_ROOM, "Modify Room"),
+    (Permissions::WRITE, "Edit ACL"),
+    (Permissions::KICK, "Kick"),
+    (Permissions::BAN, "Ban"),
+    (Permissions::REGISTER, "Register"),
+    (Permissions::SELF_REGISTER, "Self Register"),
+    (Permissions::MANAGE_ACL, "Manage ACL"),
+    (Permissions::SUDO, "Sudo"),
+];
+
 /// Format a brief permission summary for display.
 fn format_permission_summary(perms: Permissions) -> String {
-    let mut parts = Vec::new();
-    if perms.contains(Permissions::SPEAK) {
-        parts.push("speak");
-    }
-    if perms.contains(Permissions::KICK) {
-        parts.push("kick");
-    }
-    if perms.contains(Permissions::BAN) {
-        parts.push("ban");
-    }
-    if perms.contains(Permissions::MANAGE_ACL) {
-        parts.push("acl");
-    }
-    if perms.contains(Permissions::SUDO) {
-        parts.push("sudo");
-    }
+    let parts: Vec<&str> = ALL_PERMISSION_FLAGS
+        .iter()
+        .filter(|(flag, _)| perms.contains(*flag))
+        .map(|(_, name)| *name)
+        .collect();
     if parts.is_empty() {
         "none".to_string()
+    } else if parts.len() <= 4 {
+        parts.join(", ")
+    } else {
+        format!("{} permissions", parts.len())
+    }
+}
+
+/// Format a detailed permission list for hover text.
+fn format_permission_details(perms: Permissions) -> String {
+    let parts: Vec<&str> = ALL_PERMISSION_FLAGS
+        .iter()
+        .filter(|(flag, _)| perms.contains(*flag))
+        .map(|(_, name)| *name)
+        .collect();
+    if parts.is_empty() {
+        "No permissions".to_string()
     } else {
         parts.join(", ")
     }
@@ -2566,6 +2591,16 @@ impl RumbleApp {
     fn render_settings_admin(&mut self, ui: &mut egui::Ui) {
         let state = self.backend.state();
 
+        // Prune stale user_group_selection entries for disconnected users
+        let active_user_ids: std::collections::HashSet<u64> = state
+            .users
+            .iter()
+            .filter_map(|u| u.user_id.as_ref().map(|id| id.value))
+            .collect();
+        self.admin_panel
+            .user_group_selection
+            .retain(|uid, _| active_user_ids.contains(uid));
+
         ui.heading("Group Management");
         ui.add_space(8.0);
 
@@ -2588,7 +2623,8 @@ impl RumbleApp {
 
                     let perms = Permissions::from_bits_truncate(group.permissions);
                     let summary = format_permission_summary(perms);
-                    ui.label(summary);
+                    let details = format_permission_details(perms);
+                    ui.label(summary).on_hover_text(details);
 
                     ui.horizontal(|ui| {
                         if ui.small_button("Edit").clicked() {
@@ -2597,9 +2633,7 @@ impl RumbleApp {
                         }
                         if !builtin.contains(&group.name.as_str()) {
                             if ui.small_button("Delete").clicked() {
-                                self.backend.send(Command::DeleteGroup {
-                                    name: group.name.clone(),
-                                });
+                                self.admin_panel.pending_delete_group = Some(group.name.clone());
                             }
                         } else {
                             ui.label("(built-in)");
@@ -2668,7 +2702,10 @@ impl RumbleApp {
         ui.heading("User Groups");
         ui.add_space(4.0);
 
+        let group_names: Vec<String> = groups.iter().map(|g| g.name.clone()).collect();
+
         for user in &state.users {
+            let user_id = user.user_id.as_ref().map(|id| id.value).unwrap_or(0);
             let user_groups_str = if user.groups.is_empty() {
                 "(none)".to_string()
             } else {
@@ -2677,6 +2714,43 @@ impl RumbleApp {
             ui.horizontal(|ui| {
                 ui.label(format!("{}: {}", user.username, user_groups_str));
             });
+            ui.horizontal(|ui| {
+                let selected = self
+                    .admin_panel
+                    .user_group_selection
+                    .entry(user_id)
+                    .or_insert_with(|| group_names.first().cloned().unwrap_or_default());
+                egui::ComboBox::from_id_salt(format!("user_group_{}", user_id))
+                    .selected_text(selected.as_str())
+                    .show_ui(ui, |ui| {
+                        for name in &group_names {
+                            ui.selectable_value(selected, name.clone(), name);
+                        }
+                    });
+
+                let group = selected.clone();
+                let already_member = user.groups.contains(&group);
+                if !already_member {
+                    if ui.small_button("+ Add").clicked() {
+                        self.backend.send(Command::SetUserGroup {
+                            target_user_id: user_id,
+                            group: group.clone(),
+                            add: true,
+                            expires_at: 0,
+                        });
+                    }
+                } else {
+                    if ui.small_button("- Remove").clicked() {
+                        self.backend.send(Command::SetUserGroup {
+                            target_user_id: user_id,
+                            group: group.clone(),
+                            add: false,
+                            expires_at: 0,
+                        });
+                    }
+                }
+            });
+            ui.add_space(4.0);
         }
     }
 
@@ -4872,15 +4946,19 @@ impl RumbleApp {
                                             }
                                         }
 
-                                        ui.separator();
+                                        // Self-register requires SELF_REGISTER permission
+                                        let eff = Permissions::from_bits_truncate(effective_permissions);
+                                        if eff.contains(Permissions::SELF_REGISTER) {
+                                            ui.separator();
 
-                                        if ui.button("📝 Register").clicked() {
-                                            pending_commands.push(Command::RegisterUser { user_id });
-                                            ui.close();
-                                        }
-                                        if ui.button("❌ Unregister").clicked() {
-                                            pending_commands.push(Command::UnregisterUser { user_id });
-                                            ui.close();
+                                            if ui.button("📝 Register").clicked() {
+                                                pending_commands.push(Command::RegisterUser { user_id });
+                                                ui.close();
+                                            }
+                                            if ui.button("❌ Unregister").clicked() {
+                                                pending_commands.push(Command::UnregisterUser { user_id });
+                                                ui.close();
+                                            }
                                         }
                                     } else {
                                         // Other user actions
@@ -4947,21 +5025,28 @@ impl RumbleApp {
                                                 *pending_kick = Some((user_id, username.clone()));
                                                 ui.close();
                                             }
+                                        }
+
+                                        // ACL: Ban (requires BAN permission)
+                                        if eff.contains(Permissions::BAN) {
                                             if ui.button("🚫 Ban").clicked() {
                                                 *pending_ban = Some((user_id, username.clone()));
                                                 ui.close();
                                             }
                                         }
 
-                                        ui.separator();
+                                        // Registering others requires REGISTER permission
+                                        if eff.contains(Permissions::REGISTER) {
+                                            ui.separator();
 
-                                        if ui.button("📝 Register").clicked() {
-                                            pending_commands.push(Command::RegisterUser { user_id });
-                                            ui.close();
-                                        }
-                                        if ui.button("❌ Unregister").clicked() {
-                                            pending_commands.push(Command::UnregisterUser { user_id });
-                                            ui.close();
+                                            if ui.button("📝 Register").clicked() {
+                                                pending_commands.push(Command::RegisterUser { user_id });
+                                                ui.close();
+                                            }
+                                            if ui.button("❌ Unregister").clicked() {
+                                                pending_commands.push(Command::UnregisterUser { user_id });
+                                                ui.close();
+                                            }
                                         }
                                     }
                                 });
@@ -5700,8 +5785,48 @@ impl RumbleApp {
             }
         }
 
+        // Delete group confirmation modal
+        if let Some(group_name) = self.admin_panel.pending_delete_group.clone() {
+            let modal = Modal::new(egui::Id::new("delete_group_modal")).show(ctx, |ui| {
+                ui.set_width(300.0);
+                ui.heading("Delete Group");
+                ui.add_space(8.0);
+                ui.label(format!("Are you sure you want to delete group \"{}\"?", group_name));
+                ui.add_space(8.0);
+                ui.separator();
+                egui::Sides::new().show(
+                    ui,
+                    |_l| {},
+                    |ui| {
+                        ui.style_mut().spacing.item_spacing.x = 8.0;
+                        if ui.button("Delete").clicked() {
+                            self.backend.send(Command::DeleteGroup {
+                                name: group_name.clone(),
+                            });
+                            self.admin_panel.pending_delete_group = None;
+                            ui.close();
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.admin_panel.pending_delete_group = None;
+                            ui.close();
+                        }
+                    },
+                );
+            });
+            if modal.should_close() {
+                self.admin_panel.pending_delete_group = None;
+            }
+        }
+
         // Room ACL editor modal
         if self.room_acl_modal.open {
+            let acl_group_names: Vec<String> = self
+                .backend
+                .state()
+                .group_definitions
+                .iter()
+                .map(|g| g.name.clone())
+                .collect();
             let modal = Modal::new(egui::Id::new("room_acl_modal")).show(ctx, |ui| {
                 ui.set_width(500.0);
                 ui.heading(format!("ACLs: {}", self.room_acl_modal.room_name));
@@ -5717,7 +5842,13 @@ impl RumbleApp {
                     ui.push_id(i, |ui| {
                         ui.horizontal(|ui| {
                             ui.label("Group:");
-                            ui.text_edit_singleline(&mut entry.group);
+                            egui::ComboBox::from_id_salt(format!("acl_group_{}", i))
+                                .selected_text(entry.group.as_str())
+                                .show_ui(ui, |ui| {
+                                    for name in &acl_group_names {
+                                        ui.selectable_value(&mut entry.group, name.clone(), name);
+                                    }
+                                });
                             ui.checkbox(&mut entry.apply_here, "Here");
                             ui.checkbox(&mut entry.apply_subs, "Subs");
                             if ui.small_button("X").clicked() {
@@ -5727,11 +5858,11 @@ impl RumbleApp {
 
                         ui.horizontal(|ui| {
                             ui.label("Grant:");
-                            render_permission_checkboxes_compact(ui, &mut entry.grant, "grant", i);
+                            render_permission_checkboxes_compact(ui, &mut entry.grant);
                         });
                         ui.horizontal(|ui| {
                             ui.label("Deny:");
-                            render_permission_checkboxes_compact(ui, &mut entry.deny, "deny", i);
+                            render_permission_checkboxes_compact(ui, &mut entry.deny);
                         });
                         ui.separator();
                     });
