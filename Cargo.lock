@@ -4573,7 +4573,7 @@ dependencies = [
 [[package]]
 name = "librqbit"
 version = "9.0.0-beta.2"
-source = "git+https://github.com/u6bkep/rqbit.git?rev=712db330#712db33034332ace3e78e463f9505f67f7872b47"
+source = "git+https://github.com/u6bkep/rqbit.git?rev=df4e92ec#df4e92ec36e9973f8fb40407ca9e6e7cb64e5f82"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -4637,7 +4637,7 @@ dependencies = [
 [[package]]
 name = "librqbit-bencode"
 version = "3.1.0"
-source = "git+https://github.com/u6bkep/rqbit.git?rev=712db330#712db33034332ace3e78e463f9505f67f7872b47"
+source = "git+https://github.com/u6bkep/rqbit.git?rev=df4e92ec#df4e92ec36e9973f8fb40407ca9e6e7cb64e5f82"
 dependencies = [
  "anyhow",
  "arrayvec",
@@ -4653,7 +4653,7 @@ dependencies = [
 [[package]]
 name = "librqbit-buffers"
 version = "4.2.0"
-source = "git+https://github.com/u6bkep/rqbit.git?rev=712db330#712db33034332ace3e78e463f9505f67f7872b47"
+source = "git+https://github.com/u6bkep/rqbit.git?rev=df4e92ec#df4e92ec36e9973f8fb40407ca9e6e7cb64e5f82"
 dependencies = [
  "bytes",
  "librqbit-clone-to-owned",
@@ -4664,7 +4664,7 @@ dependencies = [
 [[package]]
 name = "librqbit-clone-to-owned"
 version = "3.0.1"
-source = "git+https://github.com/u6bkep/rqbit.git?rev=712db330#712db33034332ace3e78e463f9505f67f7872b47"
+source = "git+https://github.com/u6bkep/rqbit.git?rev=df4e92ec#df4e92ec36e9973f8fb40407ca9e6e7cb64e5f82"
 dependencies = [
  "bytes",
 ]
@@ -4672,7 +4672,7 @@ dependencies = [
 [[package]]
 name = "librqbit-core"
 version = "5.0.0"
-source = "git+https://github.com/u6bkep/rqbit.git?rev=712db330#712db33034332ace3e78e463f9505f67f7872b47"
+source = "git+https://github.com/u6bkep/rqbit.git?rev=df4e92ec#df4e92ec36e9973f8fb40407ca9e6e7cb64e5f82"
 dependencies = [
  "anyhow",
  "bytes",
@@ -4701,7 +4701,7 @@ dependencies = [
 [[package]]
 name = "librqbit-dht"
 version = "5.3.0"
-source = "git+https://github.com/u6bkep/rqbit.git?rev=712db330#712db33034332ace3e78e463f9505f67f7872b47"
+source = "git+https://github.com/u6bkep/rqbit.git?rev=df4e92ec#df4e92ec36e9973f8fb40407ca9e6e7cb64e5f82"
 dependencies = [
  "anyhow",
  "backon",
@@ -4748,7 +4748,7 @@ dependencies = [
 [[package]]
 name = "librqbit-lsd"
 version = "0.1.0"
-source = "git+https://github.com/u6bkep/rqbit.git?rev=712db330#712db33034332ace3e78e463f9505f67f7872b47"
+source = "git+https://github.com/u6bkep/rqbit.git?rev=df4e92ec#df4e92ec36e9973f8fb40407ca9e6e7cb64e5f82"
 dependencies = [
  "anyhow",
  "atoi",
@@ -4768,7 +4768,7 @@ dependencies = [
 [[package]]
 name = "librqbit-peer-protocol"
 version = "4.3.0"
-source = "git+https://github.com/u6bkep/rqbit.git?rev=712db330#712db33034332ace3e78e463f9505f67f7872b47"
+source = "git+https://github.com/u6bkep/rqbit.git?rev=df4e92ec#df4e92ec36e9973f8fb40407ca9e6e7cb64e5f82"
 dependencies = [
  "anyhow",
  "bitvec",
@@ -4788,7 +4788,7 @@ dependencies = [
 [[package]]
 name = "librqbit-sha1-wrapper"
 version = "4.1.0"
-source = "git+https://github.com/u6bkep/rqbit.git?rev=712db330#712db33034332ace3e78e463f9505f67f7872b47"
+source = "git+https://github.com/u6bkep/rqbit.git?rev=df4e92ec#df4e92ec36e9973f8fb40407ca9e6e7cb64e5f82"
 dependencies = [
  "assert_cfg",
  "crypto-hash",
@@ -4797,7 +4797,7 @@ dependencies = [
 [[package]]
 name = "librqbit-tracker-comms"
 version = "3.0.0"
-source = "git+https://github.com/u6bkep/rqbit.git?rev=712db330#712db33034332ace3e78e463f9505f67f7872b47"
+source = "git+https://github.com/u6bkep/rqbit.git?rev=df4e92ec#df4e92ec36e9973f8fb40407ca9e6e7cb64e5f82"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -4825,7 +4825,7 @@ dependencies = [
 [[package]]
 name = "librqbit-upnp"
 version = "1.0.0"
-source = "git+https://github.com/u6bkep/rqbit.git?rev=712db330#712db33034332ace3e78e463f9505f67f7872b47"
+source = "git+https://github.com/u6bkep/rqbit.git?rev=df4e92ec#df4e92ec36e9973f8fb40407ca9e6e7cb64e5f82"
 dependencies = [
  "anyhow",
  "bstr",
@@ -10338,6 +10338,10 @@ checksum = "d7d8a75eaf6557bb84a65ace8609883db44a29951042ada9b393151532e41fcb"
 dependencies = [
  "xml-rs",
 ]
+
+[[package]]
+name = "xtask"
+version = "0.1.0"
 
 [[package]]
 name = "y4m"

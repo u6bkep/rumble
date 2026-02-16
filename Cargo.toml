@@ -1,7 +1,8 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/*"
+    "crates/*",
+    "xtask",
 ]
 exclude = [
     "docker/p2p-test",

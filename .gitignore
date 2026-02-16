@@ -5,3 +5,4 @@ data/
 certs/
 .venv/
 chat_logs/
+client_configs/

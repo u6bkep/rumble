@@ -2312,7 +2312,7 @@ fn handle_server_message(
         }
         Some(Payload::CommandResult(cr)) => {
             // Display command results as local chat messages
-            let prefix = if cr.success { "✓" } else { "✗" };
+            let prefix = if cr.success { "✔" } else { "✖" };
             add_local_message(state, format!("{} {}", prefix, cr.message), repaint);
         }
         Some(Payload::ServerEvent(se)) => {

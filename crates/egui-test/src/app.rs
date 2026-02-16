@@ -533,10 +533,10 @@ impl RumbleApp {
     /// * `args` - Command-line arguments (or defaults for testing)
     pub fn new(ctx: egui::Context, runtime_handle: tokio::runtime::Handle, args: Args) -> Self {
         // Load persistent settings
-        let mut persistent_settings = PersistentSettings::load();
+        let mut persistent_settings = PersistentSettings::load(args.config_dir.as_ref().map(PathBuf::from));
 
         // Get config directory for key manager
-        let config_dir = PersistentSettings::config_dir().unwrap_or_else(|| PathBuf::from("."));
+        let config_dir = persistent_settings.config_dir().unwrap_or_else(|| PathBuf::from("."));
 
         // Create key manager and check for migration from old format
         let mut key_manager = KeyManager::new(config_dir);
@@ -2824,7 +2824,7 @@ impl RumbleApp {
                             let can_generate = pw.is_empty() || pw == pw_confirm;
 
                             if ui
-                                .add_enabled(can_generate, egui::Button::new("Generate Key ✓"))
+                                .add_enabled(can_generate, egui::Button::new("Generate Key ✔"))
                                 .on_disabled_hover_text("Passwords don't match")
                                 .clicked()
                             {
@@ -3760,7 +3760,7 @@ impl RumbleApp {
                                                 | TransferState::Pending
                                                 | TransferState::Paused
                                         ) {
-                                            if ui.button("✕ Cancel").clicked() {
+                                            if ui.button("✖ Cancel").clicked() {
                                                 self.backend.send(Command::CancelTransfer {
                                                     infohash: infohash.clone(),
                                                 });
@@ -3899,16 +3899,16 @@ impl RumbleApp {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     match &state.connection {
                         ConnectionState::Connected { .. } => {
-                            ui.colored_label(egui::Color32::GREEN, "● Connected");
+                            ui.colored_label(egui::Color32::GREEN, "⚫ Connected");
                         }
                         ConnectionState::Connecting { .. } => {
-                            ui.colored_label(egui::Color32::YELLOW, "● Connecting...");
+                            ui.colored_label(egui::Color32::YELLOW, "⚫ Connecting...");
                         }
                         ConnectionState::ConnectionLost { error } => {
                             if ui.button("⟳ Reconnect").clicked() {
                                 self.reconnect();
                             }
-                            ui.colored_label(egui::Color32::RED, format!("● Connection Lost: {}", error));
+                            ui.colored_label(egui::Color32::RED, format!("⚫ Connection Lost: {}", error));
                         }
                         ConnectionState::CertificatePending { .. } => {
                             ui.colored_label(egui::Color32::YELLOW, "⚠ Certificate Verification");
@@ -4295,7 +4295,7 @@ impl RumbleApp {
                                                         } else if is_downloaded {
                                                             ui.label(
                                                                 egui::RichText::new(format!(
-                                                                    "{} · {} · Downloaded ✓",
+                                                                    "{} · {} · Downloaded ✔",
                                                                     format_size(file_msg.file.size),
                                                                     &file_msg.file.mime
                                                                 ))
@@ -4348,7 +4348,7 @@ impl RumbleApp {
                                                         if ui.button("⏸ Pause").clicked() {
                                                             pause_infohash = Some(infohash_hex.clone());
                                                         }
-                                                        if ui.button("✕ Cancel").clicked() {
+                                                        if ui.button("✖ Cancel").clicked() {
                                                             cancel_infohash = Some(infohash_hex.clone());
                                                         }
                                                     } else if is_paused {
@@ -4356,7 +4356,7 @@ impl RumbleApp {
                                                         if ui.button("▶ Resume").clicked() {
                                                             resume_infohash = Some(infohash_hex.clone());
                                                         }
-                                                        if ui.button("✕ Cancel").clicked() {
+                                                        if ui.button("✖ Cancel").clicked() {
                                                             cancel_infohash = Some(infohash_hex.clone());
                                                         }
                                                     } else {

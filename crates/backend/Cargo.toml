@@ -30,8 +30,8 @@ serde_json = "1.0"
 url = "2.5.7"
 sha2 = "0.10"
 ed25519-dalek = { workspace = true }
-librqbit = { git = "https://github.com/u6bkep/rqbit.git", rev = "712db330" }
-bencode = { git = "https://github.com/u6bkep/rqbit.git", rev = "712db330", package = "librqbit-bencode" }
+librqbit = { git = "https://github.com/u6bkep/rqbit.git", rev = "df4e92ec" }
+bencode = { git = "https://github.com/u6bkep/rqbit.git", rev = "df4e92ec", package = "librqbit-bencode" }
 hex = "0.4"
 urlencoding = "2"
 rand = { workspace = true }

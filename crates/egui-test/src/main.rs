@@ -3,6 +3,8 @@
 //! This is the native desktop runner for the Rumble application.
 //! It uses eframe to create a window and run the egui-based UI.
 
+use std::path::PathBuf;
+
 use clap::Parser;
 use eframe::egui;
 use egui_test::{Args, HotkeyManager, PersistentSettings, RumbleApp};
@@ -37,7 +39,7 @@ fn main() -> eframe::Result<()> {
     }
 
     // Load settings to get keyboard config
-    let settings = PersistentSettings::load();
+    let settings = PersistentSettings::load(args.config_dir.as_ref().map(PathBuf::from));
 
     // Create hotkey manager on main thread (required for macOS).
     // This must be done before eframe::run_native which takes over the main thread.

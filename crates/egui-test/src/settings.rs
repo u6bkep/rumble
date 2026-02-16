@@ -50,6 +50,10 @@ pub struct Args {
     /// Enable the RPC server for external process control
     #[arg(long)]
     pub rpc_server: bool,
+
+    /// Override the config directory path (default: platform-specific XDG/AppData path)
+    #[arg(long)]
+    pub config_dir: Option<String>,
 }
 
 // =============================================================================
@@ -295,6 +299,10 @@ pub struct PersistentSettings {
 
     // Sound effects settings
     pub sfx: PersistentSfxSettings,
+
+    // Runtime-only: config directory override from CLI (not persisted)
+    #[serde(skip)]
+    pub config_dir_override: Option<PathBuf>,
 }
 
 impl Default for PersistentSettings {
@@ -317,29 +325,47 @@ impl Default for PersistentSettings {
             file_transfer: FileTransferSettings::default(),
             keyboard: KeyboardSettings::default(),
             sfx: PersistentSfxSettings::default(),
+            config_dir_override: None,
         }
     }
 }
 
 impl PersistentSettings {
-    /// Get the config directory path.
-    pub fn config_dir() -> Option<PathBuf> {
+    /// Get the default config directory path (platform-specific).
+    pub fn default_config_dir() -> Option<PathBuf> {
         ProjectDirs::from("com", "rumble", "Rumble").map(|dirs| dirs.config_dir().to_path_buf())
     }
 
+    /// Get the resolved config directory, using the CLI override if set.
+    pub fn config_dir(&self) -> Option<PathBuf> {
+        if let Some(ref dir) = self.config_dir_override {
+            Some(dir.clone())
+        } else {
+            Self::default_config_dir()
+        }
+    }
+
     /// Get the settings file path.
-    fn settings_path() -> Option<PathBuf> {
-        Self::config_dir().map(|dir| dir.join("settings.json"))
+    fn settings_path(&self) -> Option<PathBuf> {
+        self.config_dir().map(|dir| dir.join("settings.json"))
     }
 
     /// Load settings from disk, or return defaults if not found.
-    pub fn load() -> Self {
-        let Some(path) = Self::settings_path() else {
+    ///
+    /// If `config_dir_override` is provided, settings are loaded from that
+    /// directory instead of the platform default.
+    pub fn load(config_dir_override: Option<PathBuf>) -> Self {
+        let config_dir = config_dir_override.clone().or_else(Self::default_config_dir);
+        let path = config_dir.map(|dir| dir.join("settings.json"));
+
+        let Some(path) = path else {
             tracing::warn!("Could not determine config directory, using defaults");
-            return Self::default();
+            let mut s = Self::default();
+            s.config_dir_override = config_dir_override;
+            return s;
         };
 
-        match fs::read_to_string(&path) {
+        let mut settings = match fs::read_to_string(&path) {
             Ok(contents) => match serde_json::from_str(&contents) {
                 Ok(settings) => {
                     tracing::info!("Loaded settings from {}", path.display());
@@ -358,12 +384,14 @@ impl PersistentSettings {
                 tracing::warn!("Failed to read settings file: {}, using defaults", e);
                 Self::default()
             }
-        }
+        };
+        settings.config_dir_override = config_dir_override;
+        settings
     }
 
     /// Save settings to disk.
     pub fn save(&self) -> Result<(), String> {
-        let Some(dir) = Self::config_dir() else {
+        let Some(dir) = self.config_dir() else {
             return Err("Could not determine config directory".to_string());
         };
 
