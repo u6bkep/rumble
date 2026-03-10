@@ -333,6 +333,8 @@ dependencies = [
  "blake3",
  "bytes",
  "ed25519-dalek 3.0.0-pre.4",
+ "hex 0.4.3",
+ "pipeline",
  "prost",
  "prost-build",
  "prost-types",
@@ -341,6 +343,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "urlencoding",
  "uuid",
 ]
 

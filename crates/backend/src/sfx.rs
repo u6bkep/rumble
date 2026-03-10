@@ -6,42 +6,7 @@
 use crate::synth::{Envelope, SAMPLE_RATE, Tone, Waveform, mix_tones};
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub enum SfxKind {
-    UserJoin,
-    UserLeave,
-    Connect,
-    Disconnect,
-    Mute,
-    Unmute,
-    Message,
-}
-
-impl SfxKind {
-    pub fn all() -> &'static [SfxKind] {
-        &[
-            SfxKind::UserJoin,
-            SfxKind::UserLeave,
-            SfxKind::Connect,
-            SfxKind::Disconnect,
-            SfxKind::Mute,
-            SfxKind::Unmute,
-            SfxKind::Message,
-        ]
-    }
-
-    pub fn label(&self) -> &'static str {
-        match self {
-            SfxKind::UserJoin => "User Join",
-            SfxKind::UserLeave => "User Leave",
-            SfxKind::Connect => "Connect",
-            SfxKind::Disconnect => "Disconnect",
-            SfxKind::Mute => "Mute",
-            SfxKind::Unmute => "Unmute",
-            SfxKind::Message => "Message",
-        }
-    }
-}
+pub use api::SfxKind;
 
 pub struct SfxLibrary {
     sounds: HashMap<SfxKind, Vec<f32>>,

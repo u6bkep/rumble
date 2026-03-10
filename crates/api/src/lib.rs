@@ -9,6 +9,8 @@ use prost::Message;
 pub use uuid::Uuid;
 
 pub mod permissions;
+pub mod types;
+pub use types::*;
 pub mod proto {
     include!(concat!(env!("OUT_DIR"), "/rumble.api.v1.rs"));
 }
@@ -100,11 +102,6 @@ pub fn compute_server_state_hash(server_state: &proto::ServerState) -> Vec<u8> {
         let b_id = b.id.as_ref().map(|r| r.uuid.as_slice()).unwrap_or(&[]);
         a_id.cmp(b_id)
     });
-
-    // Zero out effective_permissions — it is per-client and must not affect the hash
-    for room in &mut canonical.rooms {
-        room.effective_permissions = 0;
-    }
 
     // Sort users by user_id for deterministic ordering
     canonical.users.sort_by(|a, b| {

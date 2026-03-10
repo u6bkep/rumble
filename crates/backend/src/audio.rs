@@ -38,17 +38,7 @@ pub const CHANNELS: u16 = 1;
 /// balance between latency and compression efficiency.
 pub const FRAME_SIZE: usize = 960;
 
-/// Information about an audio device.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
-pub struct AudioDeviceInfo {
-    /// Stable identifier for the device (used for selection).
-    /// This is the device name, which should be stable across sessions.
-    pub id: String,
-    /// Device name for display (same as id for now, but could differ).
-    pub name: String,
-    /// Whether this is the default device.
-    pub is_default: bool,
-}
+pub use api::AudioDeviceInfo;
 
 /// Get device name using the new API, falling back gracefully.
 fn get_device_name(device: &Device) -> Option<String> {
