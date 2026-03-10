@@ -32,6 +32,7 @@ clap = { version = "4", features = ["derive"] }
 toml = "0.8"
 hex = "0.4"
 bcrypt = "0.17"
+async-trait = "0.1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

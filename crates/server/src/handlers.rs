@@ -13,6 +13,7 @@
 use crate::{
     acl,
     persistence::Persistence,
+    plugin::{ServerCtx, ServerPlugin},
     state::{
         ClientHandle, PeerCapabilitiesEntry, PendingAuth, ServerState, SessionEntry, UserStatus,
         compute_server_state_hash,
@@ -45,13 +46,17 @@ fn now_ms() -> i64 {
 /// Handle a decoded envelope from a client.
 ///
 /// This is the main protocol handler. It processes the envelope payload
-/// and updates server state accordingly.
+/// and updates server state accordingly. Plugins get first look at every
+/// message; if a plugin returns `Ok(true)`, the message is considered
+/// handled and the built-in match is skipped.
 ///
 /// # Arguments
 /// * `env` - The decoded envelope
 /// * `sender` - Handle to the client that sent this message
 /// * `state` - Shared server state
 /// * `persistence` - Optional persistence layer for registered users
+/// * `plugins` - Registered server plugins
+/// * `ctx` - Plugin server context
 ///
 /// # Returns
 /// Ok(()) on success, Err on fatal errors that should close the connection.
@@ -60,7 +65,16 @@ pub async fn handle_envelope(
     sender: Arc<ClientHandle>,
     state: Arc<ServerState>,
     persistence: Option<Arc<Persistence>>,
+    plugins: &[Arc<dyn ServerPlugin>],
+    ctx: &ServerCtx,
 ) -> Result<()> {
+    // Try plugins first
+    for plugin in plugins.iter() {
+        if plugin.on_message(&env, &sender, ctx).await? {
+            return Ok(());
+        }
+    }
+
     match env.payload {
         Some(Payload::ClientHello(ch)) => {
             handle_client_hello(ch, sender, state, persistence).await?;

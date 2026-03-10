@@ -5,6 +5,7 @@
 use crate::{
     handlers::{cleanup_client, handle_datagrams, handle_envelope},
     persistence::Persistence,
+    plugin::{ServerCtx, ServerPlugin},
     relay::{RelayConfig, RelayService},
     state::{ClientHandle, ServerState},
 };
@@ -24,7 +25,6 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info};
 
 /// Configuration for the server.
-#[derive(Debug)]
 pub struct Config {
     /// Socket address to bind to (IPv4 or IPv6 with port).
     pub bind: SocketAddr,
@@ -38,6 +38,8 @@ pub struct Config {
     pub relay: Option<RelayConfig>,
     /// Welcome message (MOTD) sent to clients after authentication.
     pub welcome_message: Option<String>,
+    /// Server plugins (compile-time extensions).
+    pub plugins: Vec<Box<dyn ServerPlugin>>,
 }
 
 /// The Rumble VOIP server.
@@ -50,6 +52,8 @@ pub struct Server {
     persistence: Option<Arc<Persistence>>,
     relay_service: Option<Arc<RelayService>>,
     relay_bind: Option<SocketAddr>,
+    plugins: Vec<Arc<dyn ServerPlugin>>,
+    plugin_ctx: Arc<ServerCtx>,
 }
 
 impl Server {
@@ -92,12 +96,18 @@ impl Server {
             (None, None)
         };
 
+        // Create plugin context and wrap plugins in Arc
+        let plugin_ctx = Arc::new(ServerCtx::new(state.clone(), persistence.clone()));
+        let plugins: Vec<Arc<dyn ServerPlugin>> = config.plugins.into_iter().map(|p| Arc::from(p)).collect();
+
         Ok(Self {
             endpoint,
             state,
             persistence,
             relay_service,
             relay_bind,
+            plugins,
+            plugin_ctx,
         })
     }
 
@@ -150,6 +160,12 @@ impl Server {
         // Load persisted rooms before accepting connections
         self.load_persisted_rooms().await;
 
+        // Start plugins before accepting connections
+        for plugin in &self.plugins {
+            info!(plugin = plugin.name(), "starting plugin");
+            plugin.start(&self.plugin_ctx).await?;
+        }
+
         // Start relay service if configured
         if let (Some(relay), Some(bind_addr)) = (&self.relay_service, &self.relay_bind) {
             let relay = relay.clone();
@@ -174,8 +190,10 @@ impl Server {
                     info!("new connection from {}", new_conn.remote_address());
                     let st = self.state.clone();
                     let persist = self.persistence.clone();
+                    let plugins = self.plugins.clone();
+                    let ctx = self.plugin_ctx.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = handle_connection(new_conn, st, persist).await {
+                        if let Err(e) = handle_connection(new_conn, st, persist, plugins, ctx).await {
                             error!("connection error: {e:?}");
                         }
                     });
@@ -183,6 +201,14 @@ impl Server {
                 Err(e) => {
                     error!("incoming connection failed: {e:?}");
                 }
+            }
+        }
+
+        // Stop plugins on shutdown
+        for plugin in &self.plugins {
+            info!(plugin = plugin.name(), "stopping plugin");
+            if let Err(e) = plugin.stop().await {
+                error!(plugin = plugin.name(), "plugin stop error: {e:?}");
             }
         }
 
@@ -230,12 +256,15 @@ fn make_server_endpoint(config: &Config) -> Result<Endpoint> {
 /// 1. Assign a user ID (lock-free)
 /// 2. Spawn datagram handler
 /// 3. Accept bidirectional streams
-/// 4. Process messages on each stream
-/// 5. Clean up on disconnect
+/// 4. Process messages on each stream (first stream = control, additional = plugin streams)
+/// 5. Notify plugins on disconnect
+/// 6. Clean up on disconnect
 pub async fn handle_connection(
     conn: quinn::Connection,
     state: Arc<ServerState>,
     persistence: Option<Arc<Persistence>>,
+    plugins: Vec<Arc<dyn ServerPlugin>>,
+    plugin_ctx: Arc<ServerCtx>,
 ) -> Result<()> {
     // Assign user_id at connection level - this is the authoritative identity.
     // This is lock-free (AtomicU64).
@@ -288,8 +317,8 @@ pub async fn handle_connection(
                     is_first_stream = false;
                     handle
                 } else {
-                    // Additional stream (e.g., tracker announce) - create handle for this stream
-                    // but don't register as a new client
+                    // Additional stream (e.g., tracker announce) - create handle for
+                    // this stream but don't register as a new client
                     Arc::new(ClientHandle::new(
                         send_stream,
                         user_id,
@@ -303,6 +332,8 @@ pub async fn handle_connection(
                 let persistence = persistence.clone();
                 let state_clone = state.clone();
                 let is_primary = client_handle.as_ref().map(|h| Arc::ptr_eq(h, &handle)).unwrap_or(false);
+                let plugins_clone = plugins.clone();
+                let ctx_clone = plugin_ctx.clone();
 
                 tokio::spawn(async move {
                     let mut buf = BytesMut::new();
@@ -326,6 +357,8 @@ pub async fn handle_connection(
                                                 handle.clone(),
                                                 state_clone.clone(),
                                                 persistence.clone(),
+                                                &plugins_clone,
+                                                &ctx_clone,
                                             )
                                             .await
                                             {
@@ -363,6 +396,9 @@ pub async fn handle_connection(
 
                     // Only cleanup if this was the primary stream
                     if is_primary {
+                        for plugin in &plugins_clone {
+                            plugin.on_disconnect(&handle, &ctx_clone).await;
+                        }
                         cleanup_client(&handle, &state_clone).await;
                     }
                 });
@@ -376,6 +412,9 @@ pub async fn handle_connection(
 
     // Connection closed - ensure cleanup happens if primary stream is still active
     if let Some(handle) = client_handle {
+        for plugin in &plugins {
+            plugin.on_disconnect(&handle, &plugin_ctx).await;
+        }
         cleanup_client(&handle, &state).await;
     }
 

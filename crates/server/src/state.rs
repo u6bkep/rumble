@@ -209,6 +209,17 @@ impl StateData {
             user_statuses: Vec::new(),
         }
     }
+
+    /// Create an empty `StateData` with no rooms or memberships.
+    ///
+    /// Used as a fallback when a synchronous snapshot cannot acquire the lock.
+    pub fn empty() -> Self {
+        Self {
+            rooms: Vec::new(),
+            memberships: Vec::new(),
+            user_statuses: Vec::new(),
+        }
+    }
 }
 
 /// Compute a state hash from a ServerState message.
@@ -740,6 +751,18 @@ impl ServerState {
     /// Use this to avoid holding locks during I/O.
     pub async fn snapshot_state(&self) -> StateData {
         self.state_data.read().await.clone()
+    }
+
+    /// Synchronous best-effort snapshot of state data.
+    ///
+    /// Uses `try_read()` to avoid blocking. Returns an empty `StateData`
+    /// if the write lock is currently held. This is intended for plugin
+    /// context methods that cannot be async.
+    pub fn snapshot_state_sync(&self) -> StateData {
+        match self.state_data.try_read() {
+            Ok(data) => data.clone(),
+            Err(_) => StateData::empty(),
+        }
     }
 
     /// Build the current user list, including virtual users.

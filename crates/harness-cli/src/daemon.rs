@@ -1119,6 +1119,7 @@ async fn start_server(port: u16) -> Result<ServerHandle> {
         data_dir: None,
         relay: None,
         welcome_message: None,
+        plugins: vec![],
     };
 
     let server = Server::new(config)?;

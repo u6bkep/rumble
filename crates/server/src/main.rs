@@ -128,6 +128,7 @@ async fn main() -> Result<()> {
         data_dir,
         relay,
         welcome_message: server_config.welcome_message,
+        plugins: vec![],
     };
 
     let server = Server::new(config)?;
