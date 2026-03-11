@@ -1,0 +1,51 @@
+[package]
+name = "rumble-native"
+description = "Native desktop Platform implementation for rumble-client"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rumble-client = { path = "../rumble-client" }
+api = { path = "../api" }
+
+# Transport
+quinn = { version = "0.11", default-features = false, features = ["rustls-aws-lc-rs", "bloom", "log", "platform-verifier", "runtime-tokio"] }
+rustls = { version = "0.23", default-features = true }
+rustls-pemfile = "2"
+webpki-roots = "1.0.4"
+url = "2.5.7"
+sha2 = "0.10"
+bytes = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "io-util", "net"] }
+prost = "0.14"
+
+# Audio
+cpal = "0.17.0"
+
+# Codec
+opus = { git = "https://github.com/u6bkep/opus-rs.git", rev = "2c545dc" }
+
+# Storage
+directories = "6.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Key Management
+ed25519-dalek = { workspace = true }
+rand = { workspace = true }
+rand_core = { workspace = true }
+hex = "0.4"
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+ssh-agent-lib = "0.5"
+ssh-key = { version = "0.6", features = ["ed25519"] }
+service-binding = "3.0"
+
+# Shared
+anyhow = "1"
+async-trait = "0.1"
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
