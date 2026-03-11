@@ -172,10 +172,11 @@ impl Transport for QuinnTransport {
     }
 
     async fn send(&mut self, data: &[u8]) -> anyhow::Result<()> {
-        // Write 4-byte big-endian length prefix, then the data
-        let len = data.len() as u32;
-        self.send.write_all(&len.to_be_bytes()).await?;
-        self.send.write_all(data).await?;
+        // Use the same varint length-delimited framing as api::encode_frame /
+        // api::try_decode_frame so that QuinnTransport is wire-compatible with
+        // the existing Rumble protocol.
+        let frame = api::encode_frame_raw(data);
+        self.send.write_all(&frame).await?;
         Ok(())
     }
 

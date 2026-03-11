@@ -60,6 +60,19 @@ pub fn encode_frame<M: Message>(msg: &M) -> Vec<u8> {
     buf.to_vec()
 }
 
+/// Encode raw bytes into a varint length-prefixed frame.
+///
+/// Same wire format as `encode_frame` but takes pre-serialized bytes
+/// instead of a prost `Message`. Used by transport implementations that
+/// receive already-encoded protobuf data.
+pub fn encode_frame_raw(data: &[u8]) -> Vec<u8> {
+    let delimiter_len = prost::length_delimiter_len(data.len());
+    let mut buf = Vec::with_capacity(delimiter_len + data.len());
+    prost::encode_length_delimiter(data.len(), &mut buf).expect("encoding length delimiter cannot fail");
+    buf.extend_from_slice(data);
+    buf
+}
+
 /// Attempt to read a single length-prefixed frame from the buffer.
 ///
 /// Returns `Some(frame_bytes)` when a full frame is available, leaving any
