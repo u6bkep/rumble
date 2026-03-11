@@ -1099,7 +1099,7 @@ async fn process_command(cmd: Command, state: &Arc<RwLock<DaemonState>>) -> Resp
 
 /// Start the Rumble server.
 async fn start_server(port: u16) -> Result<ServerHandle> {
-    use server::{Config, Server, generate_self_signed_cert};
+    use server::{Config, FileTransferBittorrentPlugin, Server, generate_self_signed_cert};
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
 
@@ -1119,7 +1119,7 @@ async fn start_server(port: u16) -> Result<ServerHandle> {
         data_dir: None,
         relay: None,
         welcome_message: None,
-        plugins: vec![],
+        plugins: vec![Box::new(FileTransferBittorrentPlugin::new())],
     };
 
     let server = Server::new(config)?;

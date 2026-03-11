@@ -32,7 +32,7 @@ use uuid::Uuid;
 
 use std::{sync::atomic::AtomicBool, time::Instant};
 
-use crate::{relay::RelayTokenManager, tracker::Tracker};
+use crate::relay::RelayTokenManager;
 
 /// Per-user voice datagram rate limiter using a fixed time window.
 ///
@@ -310,8 +310,6 @@ pub struct ServerState {
     peer_capabilities: DashMap<u64, PeerCapabilitiesEntry>,
     /// Server's TLS certificate DER bytes (for computing cert hash).
     server_cert_der: Vec<u8>,
-    /// BitTorrent tracker.
-    pub tracker: Arc<Tracker>,
     /// Relay token manager for NAT traversal.
     pub relay_tokens: Arc<RelayTokenManager>,
     /// Relay service port (set after relay service starts).
@@ -327,8 +325,6 @@ pub struct ServerState {
 impl ServerState {
     /// Create a new server state with the default Root room.
     pub fn new() -> Self {
-        let tracker = Arc::new(Tracker::new());
-        tracker.spawn_cleanup_task();
         Self {
             clients: DashMap::new(),
             state_data: RwLock::new(StateData::new()),
@@ -338,7 +334,6 @@ impl ServerState {
             sessions_by_id: DashMap::new(),
             peer_capabilities: DashMap::new(),
             server_cert_der: Vec::new(),
-            tracker,
             relay_tokens: Arc::new(RelayTokenManager::new()),
             relay_port: std::sync::atomic::AtomicU16::new(0),
             virtual_users: DashMap::new(),
@@ -349,8 +344,6 @@ impl ServerState {
 
     /// Create a new server state with the given server certificate.
     pub fn with_cert(cert_der: Vec<u8>) -> Self {
-        let tracker = Arc::new(Tracker::new());
-        tracker.spawn_cleanup_task();
         Self {
             clients: DashMap::new(),
             state_data: RwLock::new(StateData::new()),
@@ -360,7 +353,6 @@ impl ServerState {
             sessions_by_id: DashMap::new(),
             peer_capabilities: DashMap::new(),
             server_cert_der: cert_der,
-            tracker,
             relay_tokens: Arc::new(RelayTokenManager::new()),
             relay_port: std::sync::atomic::AtomicU16::new(0),
             virtual_users: DashMap::new(),

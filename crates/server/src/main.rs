@@ -17,7 +17,7 @@
 //! Run with `--help` for available options.
 
 use anyhow::Result;
-use server::{Config, Persistence, RelayConfig, Server, ServerConfig};
+use server::{Config, FileTransferBittorrentPlugin, Persistence, RelayConfig, Server, ServerConfig};
 use tracing::info;
 
 /// Handle admin CLI subcommands that run against the database and then exit.
@@ -128,7 +128,7 @@ async fn main() -> Result<()> {
         data_dir,
         relay,
         welcome_message: server_config.welcome_message,
-        plugins: vec![],
+        plugins: vec![Box::new(FileTransferBittorrentPlugin::new())],
     };
 
     let server = Server::new(config)?;

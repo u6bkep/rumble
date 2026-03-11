@@ -160,18 +160,7 @@ pub async fn handle_envelope(
             }
             handle_unregister_user(uu, sender, state, persistence).await?;
         }
-        Some(Payload::TrackerAnnounce(ta)) => {
-            if !sender.authenticated.load(Ordering::SeqCst) {
-                return Ok(());
-            }
-            handle_tracker_announce(ta, sender, state, persistence.clone()).await?;
-        }
-        Some(Payload::TrackerScrape(ts)) => {
-            if !sender.authenticated.load(Ordering::SeqCst) {
-                return Ok(());
-            }
-            handle_tracker_scrape(ts, sender, state).await?;
-        }
+        // TrackerAnnounce and TrackerScrape are handled by FileTransferBittorrentPlugin
         Some(Payload::PeerCapabilities(pc)) => {
             if !sender.authenticated.load(Ordering::SeqCst) {
                 return Ok(());
@@ -287,165 +276,6 @@ pub async fn handle_envelope(
             warn!("Received unknown or unhandled message type");
         }
     }
-    Ok(())
-}
-
-async fn handle_tracker_announce(
-    msg: proto::TrackerAnnounce,
-    sender: Arc<ClientHandle>,
-    state: Arc<ServerState>,
-    persistence: Option<Arc<Persistence>>,
-) -> Result<()> {
-    // Permission check: SHARE_FILE in sender's room
-    let sender_room = state.get_user_room(sender.user_id).await.unwrap_or(ROOT_ROOM_UUID);
-    if let Err(denied) =
-        acl::check_permission(&state, &sender, sender_room, Permissions::SHARE_FILE, &persistence).await
-    {
-        send_permission_denied(&sender, denied).await?;
-        return Ok(());
-    }
-
-    let info_hash: [u8; 20] = msg
-        .info_hash
-        .clone()
-        .try_into()
-        .map_err(|v: Vec<u8>| anyhow::anyhow!("Invalid info_hash length {}, expected 20", v.len()))?;
-    let peer_id: [u8; 20] = msg
-        .peer_id
-        .clone()
-        .try_into()
-        .map_err(|v: Vec<u8>| anyhow::anyhow!("Invalid peer_id length {}, expected 20", v.len()))?;
-
-    // Use the authenticated user ID from the sender, not from the message
-    // This prevents spoofing
-    let user_id = sender.user_id;
-
-    info!(
-        "Received TrackerAnnounce from user={} info_hash={} needs_relay={}",
-        user_id,
-        hex::encode(&info_hash),
-        msg.needs_relay
-    );
-
-    // Use the client's IP address from the connection
-    let ip = sender.conn.remote_address().ip();
-
-    let event = proto::tracker_announce::Event::try_from(msg.event).ok();
-
-    // Generate relay token BEFORE announce if client needs relay
-    let relay_port = state.relay_port();
-    let relay_token = if msg.needs_relay && relay_port > 0 {
-        Some(state.relay_tokens.generate_token(user_id))
-    } else {
-        if msg.needs_relay && relay_port == 0 {
-            debug!("Client requested relay but relay service is not enabled");
-        }
-        None
-    };
-
-    let (complete, incomplete, peers) = state
-        .tracker
-        .announce(
-            info_hash,
-            peer_id,
-            user_id,
-            ip,
-            msg.port as u16,
-            msg.uploaded,
-            msg.downloaded,
-            msg.left,
-            event,
-            msg.needs_relay,
-            relay_token,
-        )
-        .await;
-
-    // Check if any peers need relay - if so, client needs to know the relay port
-    let has_relay_peers = peers.iter().any(|p| p.needs_relay && p.relay_token.is_some());
-
-    // Include relay info if:
-    // 1. Client requested relay mode (they need their own token)
-    // 2. OR there are relay peers (client needs to know relay port to reach them)
-    let relay = if relay_port > 0 && (msg.needs_relay || has_relay_peers) {
-        let token = if msg.needs_relay {
-            relay_token.map(|t| hex::encode(t)).unwrap_or_default()
-        } else {
-            // Client doesn't need a token for themselves, but we still tell them the port
-            String::new()
-        };
-        Some(proto::RelayInfo {
-            relay_token: token,
-            relay_port: relay_port as u32,
-        })
-    } else {
-        None
-    };
-
-    let response = proto::TrackerAnnounceResponse {
-        interval: 1800,
-        min_interval: 60,
-        complete,
-        incomplete,
-        peers: peers
-            .into_iter()
-            .map(|p| proto::PeerInfo {
-                peer_id: p.peer_id.to_vec(),
-                user_id: p.user_id,
-                ip: p.ip.to_string(),
-                port: p.port as u32,
-                supports_relay: p.needs_relay,
-                relay_token: p.relay_token.map(|t| hex::encode(t)),
-            })
-            .collect(),
-        request_id: msg.request_id,
-        relay,
-    };
-
-    let envelope = proto::Envelope {
-        state_hash: Vec::new(),
-        payload: Some(Payload::TrackerAnnounceResponse(response)),
-    };
-
-    let frame = api::encode_frame(&envelope);
-    sender.send_frame(&frame).await?;
-    Ok(())
-}
-
-async fn handle_tracker_scrape(
-    msg: proto::TrackerScrape,
-    sender: Arc<ClientHandle>,
-    state: Arc<ServerState>,
-) -> Result<()> {
-    let info_hashes: Vec<[u8; 20]> = msg
-        .info_hashes
-        .iter()
-        .filter_map(|h| h.clone().try_into().ok())
-        .collect();
-
-    let stats = state.tracker.scrape(info_hashes).await;
-
-    let mut files = std::collections::HashMap::new();
-    for (hash, (complete, downloaded, incomplete)) in stats {
-        let hash_hex = hex::encode(hash);
-        files.insert(
-            hash_hex,
-            proto::ScrapeStats {
-                complete,
-                downloaded,
-                incomplete,
-            },
-        );
-    }
-
-    let response = proto::TrackerScrapeResponse { files };
-
-    let envelope = proto::Envelope {
-        state_hash: Vec::new(),
-        payload: Some(Payload::TrackerScrapeResponse(response)),
-    };
-
-    let frame = api::encode_frame(&envelope);
-    sender.send_frame(&frame).await?;
     Ok(())
 }
 
@@ -803,7 +633,7 @@ async fn send_auth_failed(sender: &ClientHandle, error: &str) -> Result<()> {
 }
 
 /// Send PermissionDenied message to client.
-async fn send_permission_denied(sender: &ClientHandle, denied: proto::PermissionDenied) -> Result<()> {
+pub(crate) async fn send_permission_denied(sender: &ClientHandle, denied: proto::PermissionDenied) -> Result<()> {
     let env = proto::Envelope {
         state_hash: Vec::new(),
         payload: Some(Payload::PermissionDenied(denied)),

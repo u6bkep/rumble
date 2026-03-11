@@ -59,6 +59,7 @@ pub mod relay;
 pub mod server;
 pub mod state;
 pub mod tracker;
+pub mod tracker_plugin;
 
 // Re-export main types for convenience
 pub use config::{ServerConfig, generate_self_signed_cert, load_pem_certificates};
@@ -67,3 +68,4 @@ pub use plugin::{ServerCtx, ServerPlugin, StreamHeader};
 pub use relay::{RelayConfig, RelayService, RelayTokenManager};
 pub use server::{Config, Server};
 pub use state::{ClientHandle, PeerCapabilitiesEntry, ServerState, StateData};
+pub use tracker_plugin::FileTransferBittorrentPlugin;
