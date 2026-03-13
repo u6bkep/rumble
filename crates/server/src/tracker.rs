@@ -178,7 +178,7 @@ impl Tracker {
             .collect();
 
         // Shuffle both lists
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         seeders.shuffle(&mut rng);
         leechers.shuffle(&mut rng);
 

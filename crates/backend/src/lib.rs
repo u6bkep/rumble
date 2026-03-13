@@ -96,7 +96,6 @@ pub mod rpc;
 
 #[cfg(feature = "p2p")]
 pub mod p2p;
-pub mod torrent;
 
 // Waveform synthesizer for sound effects
 pub mod synth;

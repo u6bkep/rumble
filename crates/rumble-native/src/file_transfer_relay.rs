@@ -60,15 +60,28 @@ struct TransferEntry {
 
 impl TransferEntry {
     fn to_status(&self) -> TransferStatus {
+        let state = if self.error.is_some() {
+            rumble_client::file_transfer::PluginTransferState::Error
+        } else if self.is_complete {
+            rumble_client::file_transfer::PluginTransferState::Seeding
+        } else {
+            rumble_client::file_transfer::PluginTransferState::Downloading
+        };
         TransferStatus {
             id: self.id.clone(),
+            infohash: [0u8; 20], // relay transfers don't have infohashes
             name: self.name.clone(),
             size: self.size,
             progress: self.progress,
             download_speed: self.download_speed,
             upload_speed: self.upload_speed,
-            is_complete: self.is_complete,
+            peers: 0,
+            state,
+            is_finished: self.is_complete,
             error: self.error.clone(),
+            magnet: None,
+            local_path: self.path.clone(),
+            peer_details: Vec::new(),
         }
     }
 }
@@ -200,10 +213,10 @@ impl FileTransferPlugin for FileTransferRelayPlugin {
         })
     }
 
-    fn download(&self, offer: &FileOffer) -> Result<TransferId> {
+    fn download(&self, share_data: &str) -> Result<TransferId> {
         // Parse the share_data to get relay information.
         let relay_data: RelayShareData =
-            serde_json::from_str(&offer.share_data).map_err(|e| anyhow::anyhow!("invalid relay share_data: {e}"))?;
+            serde_json::from_str(share_data).map_err(|e| anyhow::anyhow!("invalid relay share_data: {e}"))?;
 
         let transfer_id = relay_data.transfer_id.clone();
 
@@ -234,11 +247,28 @@ impl FileTransferPlugin for FileTransferRelayPlugin {
         self.transfers.lock().unwrap().values().map(|e| e.to_status()).collect()
     }
 
-    fn cancel(&self, id: &TransferId) -> Result<()> {
+    fn pause(&self, _id: &TransferId) -> Result<()> {
+        // Relay transfers don't support pause — data streams continuously.
+        anyhow::bail!("relay transfers cannot be paused")
+    }
+
+    fn resume(&self, _id: &TransferId) -> Result<()> {
+        anyhow::bail!("relay transfers cannot be resumed")
+    }
+
+    fn cancel(&self, id: &TransferId, _delete_files: bool) -> Result<()> {
         self.cmd_tx.send(Command::Cancel {
             transfer_id: id.0.clone(),
         })?;
         Ok(())
+    }
+
+    fn get_file_path(&self, id: &TransferId) -> Result<PathBuf> {
+        let transfers = self.transfers.lock().unwrap();
+        transfers
+            .get(&id.0)
+            .and_then(|e| e.path.clone())
+            .ok_or_else(|| anyhow::anyhow!("no file path for transfer {}", id.0))
     }
 }
 
