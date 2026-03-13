@@ -20,7 +20,10 @@ pub use cert::{
     peek_captured_cert, take_captured_cert,
 };
 pub use codec::{VoiceCodec, VoiceDecoder, VoiceEncoder};
-pub use file_transfer::{FileOffer, FileTransferPlugin, TransferId, TransferStatus};
+pub use file_transfer::{
+    FileOffer, FileTransferPlugin, PluginPeerConnectionType, PluginPeerInfo, PluginPeerState, PluginTransferState,
+    TransferId, TransferStatus,
+};
 pub use keys::{KeyInfo, KeySigning, KeySource};
 pub use platform::Platform;
 pub use storage::PersistentStorage;

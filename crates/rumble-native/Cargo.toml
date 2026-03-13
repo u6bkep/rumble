@@ -41,6 +41,10 @@ ssh-agent-lib = "0.5"
 ssh-key = { version = "0.6", features = ["ed25519"] }
 service-binding = "3.0"
 
+# File Transfer (BitTorrent)
+librqbit = { git = "https://github.com/u6bkep/rqbit.git", rev = "df4e92ec" }
+tokio-util = "0.7"
+
 # Shared
 anyhow = "1"
 async-trait = "0.1"

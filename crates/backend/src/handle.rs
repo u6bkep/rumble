@@ -56,11 +56,10 @@ use ed25519_dalek::SigningKey;
 use libp2p::{Multiaddr, identity};
 use prost::Message;
 use rumble_client::{
-    AudioBackend, Platform,
+    AudioBackend, FileTransferPlugin, Platform, TransferId,
     cert::{CapturedCert, is_cert_error_message, new_captured_cert, take_captured_cert},
     transport::{TlsConfig, Transport, TransportRecvStream},
 };
-use rumble_native::QuinnTransport;
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard},
@@ -140,6 +139,49 @@ fn friendly_download_error(raw: &str) -> String {
         "Network error \u{2014} could not resolve tracker address".to_string()
     } else {
         format!("Download failed: {}", raw)
+    }
+}
+
+/// Map plugin transfer state to events TransferState.
+fn map_plugin_transfer_state(
+    state: rumble_client::PluginTransferState,
+    is_finished: bool,
+) -> crate::events::TransferState {
+    use rumble_client::PluginTransferState;
+    match state {
+        PluginTransferState::Initializing => crate::events::TransferState::Checking,
+        PluginTransferState::Paused => crate::events::TransferState::Paused,
+        PluginTransferState::Error => crate::events::TransferState::Error,
+        PluginTransferState::Downloading => crate::events::TransferState::Downloading,
+        PluginTransferState::Seeding => {
+            if is_finished {
+                crate::events::TransferState::Seeding
+            } else {
+                crate::events::TransferState::Downloading
+            }
+        }
+    }
+}
+
+/// Map plugin peer connection type to events PeerConnectionType.
+fn map_plugin_peer_connection_type(ct: rumble_client::PluginPeerConnectionType) -> crate::events::PeerConnectionType {
+    use rumble_client::PluginPeerConnectionType;
+    match ct {
+        PluginPeerConnectionType::Direct => crate::events::PeerConnectionType::Direct,
+        PluginPeerConnectionType::Relay => crate::events::PeerConnectionType::Relay,
+        PluginPeerConnectionType::Utp => crate::events::PeerConnectionType::Utp,
+        PluginPeerConnectionType::Socks => crate::events::PeerConnectionType::Socks,
+    }
+}
+
+/// Map plugin peer state to events PeerState.
+fn map_plugin_peer_state(ps: rumble_client::PluginPeerState) -> crate::events::PeerState {
+    use rumble_client::PluginPeerState;
+    match ps {
+        PluginPeerState::Connecting => crate::events::PeerState::Connecting,
+        PluginPeerState::Live => crate::events::PeerState::Live,
+        PluginPeerState::Queued => crate::events::PeerState::Queued,
+        PluginPeerState::Dead => crate::events::PeerState::Dead,
     }
 }
 
@@ -499,7 +541,7 @@ async fn run_connection_task<P: Platform>(
     // Connection state
     let mut transport: Option<P::Transport> = None;
     let mut client_name = String::new();
-    let mut torrent_manager: Option<Arc<crate::torrent::TorrentManager>> = None;
+    let mut file_transfer: Option<Arc<dyn FileTransferPlugin>> = None;
     let mut shared_infohashes: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut _session_identity: Option<SessionIdentity> = None;
     #[cfg(feature = "p2p")]
@@ -509,148 +551,39 @@ async fn run_connection_task<P: Platform>(
     loop {
         tokio::select! {
             _ = transfer_update_interval.tick() => {
-                if let Some(tm) = &torrent_manager {
-                    let transfers = tm.session().with_torrents(|iter| {
-                        let mut transfers = Vec::new();
-                        for (_id, handle) in iter {
-                            let stats = handle.stats();
-                            let name = handle.name().unwrap_or_else(|| "Unknown".to_string());
-                            let progress = if stats.total_bytes > 0 {
-                                stats.progress_bytes as f32 / stats.total_bytes as f32
-                            } else {
-                                0.0
-                            };
+                if let Some(ft) = &file_transfer {
+                    let plugin_transfers = ft.transfers();
+                    let transfers = plugin_transfers.into_iter().map(|t| {
+                        let state = map_plugin_transfer_state(t.state, t.is_finished);
+                        let error = t.error.as_deref().map(friendly_download_error);
+                        let mime = mime_from_extension(&t.name);
+                        let peer_details = t.peer_details.into_iter().map(|p| {
+                            crate::events::TransferPeerInfo {
+                                address: p.address,
+                                connection_type: map_plugin_peer_connection_type(p.connection_type),
+                                state: map_plugin_peer_state(p.state),
+                                downloaded_bytes: p.downloaded_bytes,
+                                uploaded_bytes: p.uploaded_bytes,
+                            }
+                        }).collect();
 
-                            // Map librqbit state to our TransferState
-                            let state = match stats.state {
-                                librqbit::TorrentStatsState::Initializing => crate::events::TransferState::Checking,
-                                librqbit::TorrentStatsState::Paused => crate::events::TransferState::Paused,
-                                librqbit::TorrentStatsState::Error => crate::events::TransferState::Error,
-                                librqbit::TorrentStatsState::Live => {
-                                    if stats.finished {
-                                        crate::events::TransferState::Seeding
-                                    } else {
-                                        crate::events::TransferState::Downloading
-                                    }
-                                }
-                            };
-
-                            let info_hash = handle.info_hash();
-                            let infohash_hex = hex::encode(info_hash.0);
-                            let magnet = format!("magnet:?xt=urn:btih:{}", &infohash_hex);
-
-                            // Get local file path for completed downloads
-                            let local_path = if stats.finished {
-                                tm.get_file_path(&infohash_hex).ok()
-                            } else {
-                                None
-                            };
-
-                            // Extract speed and peer info from live stats
-                            let (download_speed, upload_speed, peers) = stats.live.as_ref()
-                                .map(|l| {
-                                    let dl = l.download_speed.as_bytes();
-                                    let ul = l.upload_speed.as_bytes();
-                                    let peer_stats = &l.snapshot.peer_stats;
-                                    let peer_count = peer_stats.live + peer_stats.queued + peer_stats.connecting;
-                                    (dl, ul, peer_count)
-                                })
-                                .unwrap_or((0, 0, 0));
-
-                            // Get per-peer details from the live state
-                            let peer_details = handle.live()
-                                .map(|live| {
-                                    use librqbit::http_api_types::{PeerStatsFilter, PeerStatsSnapshot};
-                                    let filter = PeerStatsFilter::default(); // Default filters to live peers
-                                    let snapshot: PeerStatsSnapshot = live.per_peer_stats_snapshot(filter);
-
-                                    snapshot.peers.into_iter().map(|(addr_str, peer_stats)| {
-                                        // Parse the address to check if it's a relay proxy
-                                        let addr: Option<std::net::SocketAddr> = addr_str.parse().ok();
-                                        let is_relay = addr.as_ref()
-                                            .map(|a| tm.is_relay_proxy(a))
-                                            .unwrap_or(false);
-
-                                        // Determine connection type
-                                        // Note: ConnectionKind is not publicly exported from librqbit,
-                                        // so we serialize to JSON and check the string value
-                                        let connection_type = if is_relay {
-                                            crate::events::PeerConnectionType::Relay
-                                        } else if let Some(ref conn_kind) = peer_stats.conn_kind {
-                                            // ConnectionKind serializes to "tcp", "utp", or "socks"
-                                            let kind_str = serde_json::to_string(conn_kind)
-                                                .unwrap_or_default()
-                                                .trim_matches('"')
-                                                .to_string();
-                                            match kind_str.as_str() {
-                                                "tcp" => crate::events::PeerConnectionType::Direct,
-                                                "utp" => crate::events::PeerConnectionType::Utp,
-                                                "socks" => crate::events::PeerConnectionType::Socks,
-                                                _ => crate::events::PeerConnectionType::Direct,
-                                            }
-                                        } else {
-                                            crate::events::PeerConnectionType::Direct
-                                        };
-
-                                        // Map peer state
-                                        let peer_state = match peer_stats.state {
-                                            "live" => crate::events::PeerState::Live,
-                                            "connecting" => crate::events::PeerState::Connecting,
-                                            "queued" => crate::events::PeerState::Queued,
-                                            _ => crate::events::PeerState::Dead,
-                                        };
-
-                                        // Get display address - use original addr for relay, else the connected addr
-                                        let display_addr = if is_relay {
-                                            addr.and_then(|a| tm.get_relay_original_addr(&a))
-                                                .map(|a| a.to_string())
-                                                .unwrap_or(addr_str.clone())
-                                        } else {
-                                            addr_str.clone()
-                                        };
-
-                                        crate::events::TransferPeerInfo {
-                                            address: display_addr,
-                                            connection_type,
-                                            state: peer_state,
-                                            downloaded_bytes: peer_stats.counters.fetched_bytes,
-                                            uploaded_bytes: peer_stats.counters.uploaded_bytes,
-                                        }
-                                    }).collect::<Vec<_>>()
-                                })
-                                .unwrap_or_default();
-
-                            // Get error message if in error state, with user-friendly mapping
-                            let error = if matches!(state, crate::events::TransferState::Error) {
-                                stats
-                                    .error
-                                    .as_deref()
-                                    .map(friendly_download_error)
-                            } else {
-                                None
-                            };
-
-                            let mime = mime_from_extension(&name);
-
-                            transfers.push(crate::events::FileTransferState {
-                                infohash: info_hash.0,
-                                name,
-                                size: stats.total_bytes,
-                                mime,
-                                progress,
-                                download_speed,
-                                upload_speed,
-                                peers,
-                                seeders: Vec::new(), // TODO: populate from tracker responses
-                                state,
-                                error,
-                                magnet: Some(magnet),
-                                local_path,
-                                peer_details,
-                            });
+                        crate::events::FileTransferState {
+                            infohash: t.infohash,
+                            name: t.name,
+                            size: t.size,
+                            mime,
+                            progress: t.progress,
+                            download_speed: t.download_speed,
+                            upload_speed: t.upload_speed,
+                            peers: t.peers,
+                            seeders: Vec::new(),
+                            state,
+                            error,
+                            magnet: t.magnet,
+                            local_path: t.local_path,
+                            peer_details,
                         }
-                        transfers
-                    });
+                    }).collect();
 
                     {
                         let mut s = write_state(&state);
@@ -739,22 +672,21 @@ async fn run_connection_task<P: Platform>(
                                     }
                                 }
 
-                                // Initialize TorrentManager (still needs raw quinn connection — Phase 5f)
-                                // Downcast transport to QuinnTransport to get the raw connection.
+                                // Initialize file transfer plugin (needs raw quinn connection)
                                 let temp_dir = config.download_dir.clone()
                                     .unwrap_or_else(|| std::env::temp_dir().join("rumble_downloads"));
-                                if let Some(qt) = (&new_transport as &dyn std::any::Any).downcast_ref::<QuinnTransport>() {
-                                    match crate::torrent::TorrentManager::new(qt.connection().clone(), temp_dir).await {
-                                        Ok(tm) => {
-                                            tm.set_needs_relay(config.prefer_relay);
-                                            torrent_manager = Some(Arc::new(tm));
+                                if let Some(qt) = (&new_transport as &dyn std::any::Any).downcast_ref::<rumble_native::QuinnTransport>() {
+                                    match rumble_native::BitTorrentFileTransfer::new(qt.connection().clone(), temp_dir).await {
+                                        Ok(ft) => {
+                                            ft.set_needs_relay(config.prefer_relay);
+                                            file_transfer = Some(Arc::new(ft));
                                         }
                                         Err(e) => {
-                                            error!("Failed to initialize TorrentManager: {}", e);
+                                            error!("Failed to initialize file transfer plugin: {}", e);
                                         }
                                     }
                                 } else {
-                                    warn!("TorrentManager requires QuinnTransport — skipping file transfer support");
+                                    warn!("BitTorrentFileTransfer requires QuinnTransport — skipping file transfer support");
                                 }
 
                                 // Split off the receive stream for the receiver task
@@ -765,11 +697,11 @@ async fn run_connection_task<P: Platform>(
                                 let state_clone = state.clone();
                                 let repaint_clone = repaint.clone();
                                 let audio_task_clone = audio_task.clone();
-                                let torrent_manager_clone = torrent_manager.clone();
+                                let file_transfer_clone = file_transfer.clone();
                                 let command_tx_clone = command_tx.clone();
                                 let shared_infohashes_clone = shared_infohashes.clone();
                                 tokio::spawn(async move {
-                                    run_receiver_task(recv_stream, state_clone, repaint_clone, audio_task_clone, torrent_manager_clone, command_tx_clone, shared_infohashes_clone).await;
+                                    run_receiver_task(recv_stream, state_clone, repaint_clone, audio_task_clone, file_transfer_clone, command_tx_clone, shared_infohashes_clone).await;
                                 });
                             }
                             Err(e) => {
@@ -903,21 +835,21 @@ async fn run_connection_task<P: Platform>(
                                         }
                                     }
 
-                                    // Initialize TorrentManager (still needs raw quinn connection — Phase 5f)
+                                    // Initialize file transfer plugin (needs raw quinn connection)
                                     let temp_dir = new_config.download_dir.clone()
                                         .unwrap_or_else(|| std::env::temp_dir().join("rumble_downloads"));
-                                    if let Some(qt) = (&new_transport as &dyn std::any::Any).downcast_ref::<QuinnTransport>() {
-                                        match crate::torrent::TorrentManager::new(qt.connection().clone(), temp_dir).await {
-                                            Ok(tm) => {
-                                                tm.set_needs_relay(new_config.prefer_relay);
-                                                torrent_manager = Some(Arc::new(tm));
+                                    if let Some(qt) = (&new_transport as &dyn std::any::Any).downcast_ref::<rumble_native::QuinnTransport>() {
+                                        match rumble_native::BitTorrentFileTransfer::new(qt.connection().clone(), temp_dir).await {
+                                            Ok(ft) => {
+                                                ft.set_needs_relay(new_config.prefer_relay);
+                                                file_transfer = Some(Arc::new(ft));
                                             }
                                             Err(e) => {
-                                                error!("Failed to initialize TorrentManager: {}", e);
+                                                error!("Failed to initialize file transfer plugin: {}", e);
                                             }
                                         }
                                     } else {
-                                        warn!("TorrentManager requires QuinnTransport — skipping file transfer support");
+                                        warn!("BitTorrentFileTransfer requires QuinnTransport — skipping file transfer support");
                                     }
 
                                     // Split off the receive stream for the receiver task
@@ -928,11 +860,11 @@ async fn run_connection_task<P: Platform>(
                                     let state_clone = state.clone();
                                     let repaint_clone = repaint.clone();
                                     let audio_task_clone = audio_task.clone();
-                                    let torrent_manager_clone = torrent_manager.clone();
+                                    let file_transfer_clone = file_transfer.clone();
                                     let command_tx_clone = command_tx.clone();
                                     let shared_infohashes_clone = shared_infohashes.clone();
                                     tokio::spawn(async move {
-                                        run_receiver_task(recv_stream, state_clone, repaint_clone, audio_task_clone, torrent_manager_clone, command_tx_clone, shared_infohashes_clone).await;
+                                        run_receiver_task(recv_stream, state_clone, repaint_clone, audio_task_clone, file_transfer_clone, command_tx_clone, shared_infohashes_clone).await;
                                     });
                                 }
                                 Err(e) => {
@@ -971,7 +903,7 @@ async fn run_connection_task<P: Platform>(
                         if let Some(t) = transport.take() {
                             t.close().await;
                         }
-                        torrent_manager = None;
+                        file_transfer = None;
                         #[cfg(feature = "p2p")]
                         if let Some(p2p) = p2p_manager.take() {
                             p2p.shutdown().await;
@@ -1343,25 +1275,25 @@ async fn run_connection_task<P: Platform>(
                             }
                         }
 
-                        if let (Some(tm), Some(t)) = (&torrent_manager, &mut transport) {
-                            let tm = tm.clone();
+                        if let (Some(ft), Some(t)) = (&file_transfer, &mut transport) {
+                            let ft = ft.clone();
                             let path = path.clone();
                             let state = state.clone();
                             let repaint = repaint.clone();
                             let client = client_name.clone();
 
-                            // Share file and get info
-                            match tm.share_file(path).await {
-                                Ok(file_info) => {
-                                    info!("Shared file: {} ({})", file_info.name, file_info.magnet);
-                                    shared_infohashes.insert(file_info.infohash.clone());
+                            // Share file and get info via plugin
+                            match ft.share(path) {
+                                Ok(offer) => {
+                                    info!("Shared file: {} ({})", offer.name, offer.share_data);
+                                    shared_infohashes.insert(offer.id.0.clone());
 
                                     // Create file message JSON
                                     let file_message = crate::events::FileMessage::new(
-                                        file_info.name.clone(),
-                                        file_info.size,
-                                        file_info.mime.clone(),
-                                        file_info.infohash.clone(),
+                                        offer.name.clone(),
+                                        offer.size,
+                                        offer.mime.clone(),
+                                        offer.id.0.clone(),
                                     );
                                     let text = file_message.to_json();
                                     let message_id = uuid::Uuid::new_v4().into_bytes().to_vec();
@@ -1390,7 +1322,7 @@ async fn run_connection_task<P: Platform>(
                                     s.chat_messages.push(crate::events::ChatMessage {
                                         id: uuid::Uuid::new_v4().into_bytes(),
                                         sender: "System".to_string(),
-                                        text: format!("Sharing {} ({} bytes)\nMagnet: {}", file_info.name, file_info.size, file_info.magnet),
+                                        text: format!("Sharing {} ({} bytes)\nMagnet: {}", offer.name, offer.size, offer.share_data),
                                         timestamp: SystemTime::now(),
                                         is_local: true,
                                         kind: Default::default(),
@@ -1532,13 +1464,13 @@ async fn run_connection_task<P: Platform>(
                             }
                         }
 
-                        if let Some(tm) = &torrent_manager {
-                            let tm = tm.clone();
+                        if let Some(ft) = &file_transfer {
+                            let ft = ft.clone();
                             let magnet = magnet.clone();
                             let state = state.clone();
                             let repaint = repaint.clone();
                             tokio::spawn(async move {
-                                match tm.download_file(magnet).await {
+                                match ft.download(&magnet) {
                                     Ok(_) => {
                                         info!("Started download");
                                         let mut s = write_state(&state);
@@ -1572,11 +1504,11 @@ async fn run_connection_task<P: Platform>(
                     }
 
                     Command::PauseTransfer { infohash } => {
-                        if let Some(tm) = &torrent_manager {
-                            let tm = tm.clone();
+                        if let Some(ft) = &file_transfer {
+                            let ft = ft.clone();
                             let infohash = infohash.clone();
                             tokio::spawn(async move {
-                                if let Err(e) = tm.pause_transfer(&infohash).await {
+                                if let Err(e) = ft.pause(&TransferId(infohash)) {
                                     error!("Failed to pause transfer: {}", e);
                                 }
                             });
@@ -1584,11 +1516,11 @@ async fn run_connection_task<P: Platform>(
                     }
 
                     Command::ResumeTransfer { infohash } => {
-                        if let Some(tm) = &torrent_manager {
-                            let tm = tm.clone();
+                        if let Some(ft) = &file_transfer {
+                            let ft = ft.clone();
                             let infohash = infohash.clone();
                             tokio::spawn(async move {
-                                if let Err(e) = tm.resume_transfer(&infohash).await {
+                                if let Err(e) = ft.resume(&TransferId(infohash)) {
                                     error!("Failed to resume transfer: {}", e);
                                 }
                             });
@@ -1596,11 +1528,11 @@ async fn run_connection_task<P: Platform>(
                     }
 
                     Command::CancelTransfer { infohash } => {
-                        if let Some(tm) = &torrent_manager {
-                            let tm = tm.clone();
+                        if let Some(ft) = &file_transfer {
+                            let ft = ft.clone();
                             let infohash = infohash.clone();
                             tokio::spawn(async move {
-                                if let Err(e) = tm.cancel_transfer(&infohash, false).await {
+                                if let Err(e) = ft.cancel(&TransferId(infohash), false) {
                                     error!("Failed to cancel transfer: {}", e);
                                 }
                             });
@@ -1608,11 +1540,11 @@ async fn run_connection_task<P: Platform>(
                     }
 
                     Command::RemoveTransfer { infohash, delete_file } => {
-                        if let Some(tm) = &torrent_manager {
-                            let tm = tm.clone();
+                        if let Some(ft) = &file_transfer {
+                            let ft = ft.clone();
                             let infohash = infohash.clone();
                             tokio::spawn(async move {
-                                if let Err(e) = tm.cancel_transfer(&infohash, delete_file).await {
+                                if let Err(e) = ft.cancel(&TransferId(infohash), delete_file) {
                                     error!("Failed to remove transfer: {}", e);
                                 }
                             });
@@ -1620,9 +1552,8 @@ async fn run_connection_task<P: Platform>(
                     }
 
                     Command::SaveFileAs { infohash, destination } => {
-                        if let Some(tm) = &torrent_manager {
-                            // Get source path and copy to destination
-                            match tm.get_file_path(&infohash) {
+                        if let Some(ft) = &file_transfer {
+                            match ft.get_file_path(&TransferId(infohash.clone())) {
                                 Ok(source) => {
                                     let dest = destination.clone();
                                     tokio::spawn(async move {
@@ -1641,8 +1572,8 @@ async fn run_connection_task<P: Platform>(
                     }
 
                     Command::OpenFile { infohash } => {
-                        if let Some(tm) = &torrent_manager {
-                            match tm.get_file_path(&infohash) {
+                        if let Some(ft) = &file_transfer {
+                            match ft.get_file_path(&TransferId(infohash.clone())) {
                                 Ok(path) => {
                                     if let Err(e) = open::that(&path) {
                                         error!("Failed to open file: {}", e);
@@ -2191,7 +2122,7 @@ async fn run_receiver_task(
     state: Arc<RwLock<State>>,
     repaint: Arc<dyn Fn() + Send + Sync>,
     audio_task: AudioTaskHandle,
-    torrent_manager: Option<Arc<crate::torrent::TorrentManager>>,
+    file_transfer: Option<Arc<dyn FileTransferPlugin>>,
     command_tx: mpsc::UnboundedSender<Command>,
     shared_infohashes: std::collections::HashSet<String>,
 ) {
@@ -2204,7 +2135,7 @@ async fn run_receiver_task(
                         &state,
                         &repaint,
                         &audio_task,
-                        &torrent_manager,
+                        &file_transfer,
                         &command_tx,
                         &shared_infohashes,
                     );
@@ -2268,7 +2199,7 @@ fn handle_server_message(
     state: &Arc<RwLock<State>>,
     repaint: &Arc<dyn Fn() + Send + Sync>,
     audio_task: &AudioTaskHandle,
-    torrent_manager: &Option<Arc<crate::torrent::TorrentManager>>,
+    file_transfer: &Option<Arc<dyn FileTransferPlugin>>,
     command_tx: &mpsc::UnboundedSender<Command>,
     shared_infohashes: &std::collections::HashSet<String>,
 ) {
@@ -2430,12 +2361,12 @@ fn handle_server_message(
                         repaint();
 
                         // Trigger auto-download if conditions were met
-                        if let (Some(magnet), Some(tm)) = (should_auto_download, torrent_manager) {
-                            let tm = tm.clone();
+                        if let (Some(magnet), Some(ft)) = (should_auto_download, file_transfer) {
+                            let ft = ft.clone();
                             let state = state.clone();
                             let repaint = repaint.clone();
                             tokio::spawn(async move {
-                                match tm.download_file(magnet).await {
+                                match ft.download(&magnet) {
                                     Ok(_) => {
                                         info!("Auto-download started");
                                         let mut s = write_state(&state);
