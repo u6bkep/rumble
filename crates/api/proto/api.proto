@@ -172,6 +172,9 @@ message Envelope {
     BridgeSetUserStatus bridge_set_user_status = 74;
     BridgeChatMessage bridge_chat_message = 75;
     BridgeUserRegistered bridge_user_registered = 76;
+
+    // File relay (94-99)
+    RelayStatus relay_status = 94;
   }
 }
 
@@ -753,4 +756,39 @@ message BridgeSetUserStatus {
 message BridgeChatMessage {
   uint64 user_id = 1;
   string text = 2;
+}
+
+// =============================================================================
+// File Relay Messages
+// =============================================================================
+
+// Sent as StreamHeader metadata on a "file-relay" plugin stream by the sender.
+// Not an Envelope payload — encoded as protobuf bytes in the header metadata.
+message RelayRequest {
+  uint64 recipient_user_id = 1;
+  string file_name = 2;
+  uint64 file_size = 3;
+  string transfer_id = 4;
+}
+
+// Sent as StreamHeader metadata on the server-to-recipient plugin stream.
+// Not an Envelope payload — encoded as protobuf bytes in the header metadata.
+message RelayOffer {
+  uint64 sender_user_id = 1;
+  string file_name = 2;
+  uint64 file_size = 3;
+  string transfer_id = 4;
+}
+
+// Control message for relay status updates (on the main control stream).
+message RelayStatus {
+  string transfer_id = 1;
+  enum Status {
+    ACCEPTED = 0;
+    REJECTED = 1;
+    COMPLETED = 2;
+    FAILED = 3;
+  }
+  Status status = 2;
+  string error = 3;
 }

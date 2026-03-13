@@ -16,7 +16,7 @@ webpki-roots = "1.0.4"
 url = "2.5.7"
 sha2 = "0.10"
 bytes = "1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "io-util", "net"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "io-util", "net", "fs", "sync"] }
 prost = "0.14"
 
 # Audio
@@ -40,6 +40,10 @@ chacha20poly1305 = "0.10"
 ssh-agent-lib = "0.5"
 ssh-key = { version = "0.6", features = ["ed25519"] }
 service-binding = "3.0"
+
+# File transfer relay
+uuid = { version = "1.19.0", features = ["v4"] }
+mime_guess = "2"
 
 # Shared
 anyhow = "1"
