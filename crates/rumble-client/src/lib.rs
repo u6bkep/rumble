@@ -5,6 +5,7 @@
 //! injected via the `Platform` trait.
 
 pub mod audio;
+pub mod auth;
 pub mod cert;
 pub mod codec;
 pub mod file_transfer;

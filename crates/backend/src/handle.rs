@@ -57,6 +57,7 @@ use libp2p::{Multiaddr, identity};
 use prost::Message;
 use rumble_client::{
     AudioBackend, Platform,
+    auth::{send_envelope, wait_for_auth_result, wait_for_server_hello},
     cert::{CapturedCert, is_cert_error_message, new_captured_cert, take_captured_cert},
     transport::{TlsConfig, Transport, TransportRecvStream},
 };
@@ -472,12 +473,6 @@ pub(crate) fn write_state(state: &Arc<RwLock<State>>) -> RwLockWriteGuard<'_, St
             poisoned.into_inner()
         }
     }
-}
-
-/// Send a protobuf envelope via the transport.
-async fn send_envelope<T: Transport>(transport: &mut T, env: &proto::Envelope) -> anyhow::Result<()> {
-    let data = env.encode_to_vec();
-    transport.send(&data).await
 }
 
 /// The main connection task that handles QUIC communication (reliable streams only).
@@ -2124,62 +2119,6 @@ async fn connect_to_server<T: Transport>(
     };
 
     Ok((transport, user_id, rooms, users, groups, session_identity))
-}
-
-/// Wait for ServerHello message and extract nonce and user_id.
-async fn wait_for_server_hello<T: Transport>(transport: &mut T) -> anyhow::Result<([u8; 32], u64)> {
-    loop {
-        match transport.recv().await? {
-            Some(frame) => {
-                if let Ok(env) = proto::Envelope::decode(&*frame) {
-                    match env.payload {
-                        Some(Payload::ServerHello(sh)) => {
-                            if sh.nonce.len() != 32 {
-                                return Err(anyhow::anyhow!("Invalid nonce length in ServerHello"));
-                            }
-                            let nonce: [u8; 32] = sh.nonce.try_into().unwrap();
-                            return Ok((nonce, sh.user_id));
-                        }
-                        Some(Payload::AuthFailed(af)) => {
-                            return Err(anyhow::anyhow!("Authentication failed: {}", af.error));
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            None => {
-                return Err(anyhow::anyhow!("Server closed connection during handshake"));
-            }
-        }
-    }
-}
-
-/// Wait for authentication result (ServerState or AuthFailed).
-async fn wait_for_auth_result<T: Transport>(
-    transport: &mut T,
-) -> anyhow::Result<(Vec<proto::RoomInfo>, Vec<proto::User>, Vec<proto::GroupInfo>)> {
-    loop {
-        match transport.recv().await? {
-            Some(frame) => {
-                if let Ok(env) = proto::Envelope::decode(&*frame) {
-                    match env.payload {
-                        Some(Payload::AuthFailed(af)) => {
-                            return Err(anyhow::anyhow!("Authentication failed: {}", af.error));
-                        }
-                        Some(Payload::ServerEvent(se)) => {
-                            if let Some(proto::server_event::Kind::ServerState(ss)) = se.kind {
-                                return Ok((ss.rooms, ss.users, ss.groups));
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            None => {
-                return Err(anyhow::anyhow!("Server closed connection during authentication"));
-            }
-        }
-    }
 }
 
 /// Background task that receives reliable messages from the server.

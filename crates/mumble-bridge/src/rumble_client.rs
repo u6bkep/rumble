@@ -5,7 +5,10 @@ use api::{
 };
 use ed25519_dalek::{Signer, SigningKey};
 use prost::Message;
-use rumble_client::transport::{TlsConfig, Transport};
+use rumble_client::{
+    auth::{send_envelope, wait_for_auth_result, wait_for_server_hello},
+    transport::{TlsConfig, Transport},
+};
 use rumble_native::QuinnTransport;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
@@ -24,6 +27,7 @@ pub struct RumbleConnection {
     pub user_id: u64,
     pub rooms: Vec<proto::RoomInfo>,
     pub users: Vec<proto::User>,
+    pub groups: Vec<proto::GroupInfo>,
 }
 
 /// Connect to a Rumble server and perform the full auth handshake.
@@ -102,10 +106,11 @@ pub async fn connect(addr: &str, username: &str, signing_key: &SigningKey) -> Re
     debug!("Sent Authenticate");
 
     // Wait for ServerState
-    let (rooms, users) = wait_for_auth_result(&mut transport).await?;
+    let (rooms, users, groups) = wait_for_auth_result(&mut transport).await?;
     info!(
         rooms = rooms.len(),
         users = users.len(),
+        groups = groups.len(),
         "Auth complete, received state"
     );
 
@@ -114,14 +119,8 @@ pub async fn connect(addr: &str, username: &str, signing_key: &SigningKey) -> Re
         user_id,
         rooms,
         users,
+        groups,
     })
-}
-
-/// Send a protobuf envelope via the transport.
-async fn send_envelope(transport: &mut QuinnTransport, env: &proto::Envelope) -> Result<()> {
-    let data = env.encode_to_vec();
-    transport.send(&data).await?;
-    Ok(())
 }
 
 /// Send a chat message to the Rumble server.
@@ -249,53 +248,5 @@ pub async fn read_envelope(transport: &mut QuinnTransport) -> Result<Option<prot
             Ok(Some(env))
         }
         None => bail!("Rumble server closed connection"),
-    }
-}
-
-async fn wait_for_server_hello(transport: &mut QuinnTransport) -> Result<([u8; 32], u64)> {
-    loop {
-        match transport.recv().await? {
-            Some(frame) => {
-                if let Ok(env) = proto::Envelope::decode(&*frame) {
-                    match env.payload {
-                        Some(Payload::ServerHello(sh)) => {
-                            if sh.nonce.len() != 32 {
-                                bail!("Invalid nonce length in ServerHello");
-                            }
-                            let nonce: [u8; 32] = sh.nonce.try_into().unwrap();
-                            return Ok((nonce, sh.user_id));
-                        }
-                        Some(Payload::AuthFailed(af)) => {
-                            bail!("Authentication failed: {}", af.error);
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            None => bail!("Server closed connection during handshake"),
-        }
-    }
-}
-
-async fn wait_for_auth_result(transport: &mut QuinnTransport) -> Result<(Vec<proto::RoomInfo>, Vec<proto::User>)> {
-    loop {
-        match transport.recv().await? {
-            Some(frame) => {
-                if let Ok(env) = proto::Envelope::decode(&*frame) {
-                    match env.payload {
-                        Some(Payload::AuthFailed(af)) => {
-                            bail!("Authentication failed: {}", af.error);
-                        }
-                        Some(Payload::ServerEvent(se)) => {
-                            if let Some(proto::server_event::Kind::ServerState(ss)) = se.kind {
-                                return Ok((ss.rooms, ss.users));
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            None => bail!("Server closed connection during authentication"),
-        }
     }
 }
