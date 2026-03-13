@@ -56,6 +56,7 @@ pub mod handlers;
 pub mod persistence;
 pub mod plugin;
 pub mod relay;
+pub mod relay_plugin;
 pub mod server;
 pub mod state;
 pub mod tracker;
@@ -66,6 +67,7 @@ pub use config::{ServerConfig, generate_self_signed_cert, load_pem_certificates}
 pub use persistence::{PersistedGroup, PersistedRoom, PersistedRoomAcl, Persistence, RegisteredUser};
 pub use plugin::{ServerCtx, ServerPlugin, StreamHeader};
 pub use relay::{RelayConfig, RelayService, RelayTokenManager};
+pub use relay_plugin::FileTransferRelayPlugin;
 pub use server::{Config, Server};
 pub use state::{ClientHandle, PeerCapabilitiesEntry, ServerState, StateData};
 pub use tracker_plugin::FileTransferBittorrentPlugin;

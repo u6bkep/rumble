@@ -10,12 +10,14 @@
 pub mod audio;
 pub mod cert_verifier;
 pub mod codec;
+pub mod file_transfer_relay;
 pub mod keys;
 pub mod storage;
 pub mod transport;
 
 pub use audio::{CpalAudioBackend, CpalCaptureStream, CpalPlaybackStream};
 pub use codec::{NativeOpusCodec, NativeOpusDecoder, NativeOpusEncoder};
+pub use file_transfer_relay::FileTransferRelayPlugin;
 pub use keys::NativeKeySigning;
 pub use storage::FileStorage;
 pub use transport::{QuinnDatagramHandle, QuinnRecvStream, QuinnTransport};

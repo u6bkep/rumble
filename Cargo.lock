@@ -7365,6 +7365,7 @@ dependencies = [
  "directories",
  "ed25519-dalek 3.0.0-pre.4",
  "hex 0.4.3",
+ "mime_guess",
  "opus",
  "prost",
  "quinn 0.11.9",
@@ -7383,6 +7384,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+ "uuid",
  "webpki-roots",
 ]
 
@@ -7889,6 +7891,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-stream",
+ "tokio-util",
  "toml",
  "tracing",
  "tracing-subscriber",
