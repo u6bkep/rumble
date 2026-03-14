@@ -133,7 +133,7 @@ Extracted shared auth handshake helpers to `rumble-client/src/auth.rs`:
 
 - Moved `backend/torrent.rs` to `rumble-native/src/torrent.rs`
 - `BitTorrentFileTransfer` wraps `TorrentManager` implementing `FileTransferPlugin` trait
-- `BackendHandle` accepts `Option<Arc<dyn FileTransferPlugin>>` — `dyn Any` downcast hack removed
+- `BackendHandle` accepts `Option<Arc<dyn FileTransferPlugin>>` — but see bug #2 below
 - `FileTransferPlugin` trait expanded: `pause()`, `resume()`, `get_file_path()`, enriched `TransferStatus`
 - `librqbit` dependency moved from backend to rumble-native
 
@@ -149,6 +149,46 @@ Client-side (`rumble-native/src/file_transfer_relay.rs`):
 - `FileTransferRelayPlugin` implementing `FileTransferPlugin`
 - Background worker for outgoing sends, incoming stream listener for downloads
 - Progress tracking via shared `HashMap<String, TransferEntry>`
+
+---
+
+## Known Bugs
+
+### Critical
+
+**1. Path traversal in relay file download** (`rumble-native/src/file_transfer_relay.rs:487`)
+The `file_name` from the incoming `RelayOffer` (network-controlled) is joined directly to `downloads_dir` with no sanitization. A malicious sender can write files outside the download directory using names like `../../../.ssh/authorized_keys`. Fix: strip path separators, reject `..`, take only the final path component.
+
+**2. `dyn Any` downcast hack still in handle.rs** (`backend/src/handle.rs:673, 836`)
+`connect_to_server` still downcasts the generic `Transport` to `rumble_native::QuinnTransport` to get a raw `quinn::Connection` for `BitTorrentFileTransfer::new()`. This defeats the Platform abstraction — non-native transports silently get no file transfer. Fix: accept a `FileTransferPlugin` factory or pre-constructed plugin via `ConnectConfig` instead of building it inside the generic function.
+
+### Important
+
+**3. Relay cancel is a no-op** (`rumble-native/src/file_transfer_relay.rs:308-318`)
+`Command::Cancel` only sets `entry.error = Some("cancelled")` in the HashMap. It does not abort the QUIC stream, close the file handle, or signal the spawned `send_file` task. The transfer continues running in the background. Fix: give each send task a `CancellationToken` and cancel it from the `Cancel` handler.
+
+**4. Incoming stream listener steals all bi-streams** (`rumble-native/src/file_transfer_relay.rs:392-437`)
+`run_incoming_listener` calls `conn.accept_bi()` in a loop and drops non-`"file-relay"` streams. It races with the backend's own stream handling. Other server-initiated streams (future plugins, etc.) will be silently consumed and discarded. Fix: centralize stream acceptance in the backend and dispatch to plugins by header, similar to the server-side pattern.
+
+**5. Proto enum `RelayStatus::ACCEPTED = 0`** (`api/proto/api.proto`)
+The zero/default value for `relay_status::Status` is `ACCEPTED`. In protobuf, unset enum fields default to 0, so a zero-initialized or partially-parsed `RelayStatus` would be misinterpreted as acceptance. Fix: rename value 0 to `UNSPECIFIED` and shift `ACCEPTED` to 1.
+
+**6. Relay tasks outlive plugin on shutdown** (`server/src/relay_plugin.rs:235-261`)
+Spawned `relay_copy` tasks only cancel via per-relay `CancellationToken`. If the `FileTransferRelayPlugin` is dropped (server shutdown), active tasks keep running because there's no parent token. Fix: add a server-wide `CancellationToken` that is cancelled in `stop()`, make per-relay tokens children of it.
+
+**7. `std::sync::Mutex` poison silently ignored** (`rumble-native/src/file_transfer_relay.rs`)
+Multiple callsites use `if let Ok(mut t) = transfers.lock()` which silently drops progress/error updates if the mutex is poisoned. Fix: use `transfers.lock().expect("...")` consistently, or switch to `parking_lot::Mutex` which doesn't poison.
+
+### Minor
+
+**8. Zero infohash breaks auto-download dedup** (`backend/src/handle.rs` + `file_transfer_relay.rs:73`)
+Relay transfers set `infohash: [0u8; 20]`. The auto-download dedup in handle.rs compares `t.infohash == arr`, so all relay transfers match each other's zero hash, causing skipped downloads. Fix: use `TransferId` for dedup instead of infohash, or make infohash `Option<[u8; 20]>`.
+
+**9. Fragile magnet link parsing** (`rumble-native/src/file_transfer_bittorrent.rs:63-70`)
+Splits on `"xt=urn:btih:"` and `'&'` — fails on URL-encoded, uppercase, or reordered magnet links. Fix: use a proper URL query parser.
+
+**10. Duplicate MIME guessing** (`handle.rs:74`, `torrent.rs:212`, `file_transfer_relay.rs:205`)
+Three separate MIME detection approaches. Fix: consolidate into a shared helper, preferably using `mime_guess` crate everywhere.
 
 ---
 
