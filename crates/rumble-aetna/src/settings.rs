@@ -351,10 +351,10 @@ pub fn render(
     .width(Size::Fill(1.0))
     .align(Align::Center);
 
-    let panel = panel_with_size(
+    // Stock `modal_panel` is fixed at 420 px wide × Hug; the settings
+    // dialog needs a roomier 720 × 620 frame for the tab content.
+    let panel = modal_panel(
         "Settings",
-        720.0,
-        620.0,
         [
             tabs_row,
             scroll([body])
@@ -365,7 +365,9 @@ pub fn render(
             divider(),
             footer,
         ],
-    );
+    )
+    .width(Size::Fixed(720.0))
+    .height(Size::Fixed(620.0));
 
     let panel_layer = overlay([scrim(KEY_DISMISS), panel.block_pointer()]);
 
@@ -403,34 +405,6 @@ pub fn render(
     (Some(panel_layer), popover_layer)
 }
 
-/// A wider variant of [`modal_panel`]. The stock panel is fixed at
-/// 420 px which is too narrow for a tabbed settings dialog with two
-/// columns of form rows; we duplicate the styling here and pass our
-/// own width/height.
-fn panel_with_size<I, E>(title: impl Into<String>, w: f32, h: f32, body: I) -> El
-where
-    I: IntoIterator<Item = E>,
-    E: Into<El>,
-{
-    let mut children: Vec<El> = vec![h3(title)];
-    children.extend(body.into_iter().map(Into::into));
-    El::new(Kind::Modal)
-        .style_profile(StyleProfile::Surface)
-        .surface_role(SurfaceRole::Popover)
-        .children(children)
-        .fill(tokens::BG_CARD)
-        .stroke(tokens::BORDER)
-        .radius(tokens::RADIUS_LG)
-        .shadow(tokens::SHADOW_LG)
-        .padding(tokens::SPACE_LG)
-        .gap(tokens::SPACE_MD)
-        .width(Size::Fixed(w))
-        .height(Size::Fixed(h))
-        .axis(Axis::Column)
-        .align(Align::Stretch)
-        .clip()
-}
-
 // ---- per-tab views --------------------------------------------------
 
 fn render_connection(pending: &PendingSettings, identity: &Identity, selection: &Selection) -> El {
@@ -443,7 +417,7 @@ fn render_connection(pending: &PendingSettings, identity: &Identity, selection: 
             KeySource::SshAgent { .. } => "SSH agent",
         };
         vec![
-            field_row("Storage", text(storage.to_string()).font_weight(FontWeight::Semibold)),
+            field_row("Storage", text(storage.to_string()).semibold()),
             field_row(
                 "Fingerprint",
                 mono(identity.fingerprint())
@@ -629,7 +603,7 @@ fn render_processing(
         // to the switch and clip the wrapped description.
         rows.push(
             row([
-                text(display_name).font_weight(FontWeight::Semibold),
+                text(display_name).semibold(),
                 spacer(),
                 switch(proc_config.enabled).key(proc_enabled_key(idx)),
             ])
@@ -993,16 +967,6 @@ fn render_stats(audio: &AudioState) -> El {
 
 fn section_heading(label: impl Into<String>) -> El {
     text(label).semibold().font_size(tokens::FONT_BASE)
-}
-
-/// `[label .... control]` — labelled form row used throughout the
-/// dialog. Aetna doesn't ship a built-in form-row helper, so this
-/// keeps the spacing/justification consistent in one place.
-fn field_row(label: impl Into<String>, control: impl Into<El>) -> El {
-    row([text(label).label(), spacer(), control.into()])
-        .gap(tokens::SPACE_MD)
-        .align(Align::Center)
-        .width(Size::Fill(1.0))
 }
 
 fn stat_row(label: impl Into<String>, value: impl Into<String>, color: Option<Color>) -> El {

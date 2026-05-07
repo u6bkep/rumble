@@ -244,7 +244,7 @@ fn server_row(idx: usize, server: &RecentServer) -> El {
     let subtitle = subtitle_parts.join(" · ");
 
     let info = column([
-        text(title).font_weight(FontWeight::Semibold),
+        text(title).semibold(),
         text(subtitle).muted().font_size(tokens::FONT_SM),
     ])
     .gap(tokens::SPACE_XS)

@@ -1081,15 +1081,12 @@ fn cert_modal(cert_info: &PendingCertificate) -> El {
         "Untrusted certificate",
         [
             paragraph("The server presented a self-signed or unknown certificate.").text_color(tokens::WARNING),
-            row([
-                text("Server:").muted(),
-                text(cert_info.server_addr.clone()).font_weight(FontWeight::Semibold),
-            ])
-            .gap(tokens::SPACE_SM)
-            .align(Align::Center),
+            row([text("Server:").muted(), text(cert_info.server_addr.clone()).semibold()])
+                .gap(tokens::SPACE_SM)
+                .align(Align::Center),
             row([
                 text("Certificate for:").muted(),
-                text(cert_info.server_name.clone()).font_weight(FontWeight::Semibold),
+                text(cert_info.server_name.clone()).semibold(),
             ])
             .gap(tokens::SPACE_SM)
             .align(Align::Center),
@@ -1153,7 +1150,7 @@ fn identity_modal(identity: &Identity) -> El {
             mono(fingerprint).font_size(tokens::FONT_SM).wrap_text(),
             divider(),
             text("Storage").muted(),
-            text(source_label.to_string()).font_weight(FontWeight::Semibold),
+            text(source_label.to_string()).semibold(),
             paragraph(detail).muted().font_size(tokens::FONT_SM),
             text("On disk").muted(),
             mono(path.display().to_string()).font_size(tokens::FONT_SM).wrap_text(),

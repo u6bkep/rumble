@@ -490,7 +490,7 @@ fn render_room_context_menu(menu: &RoomContextMenu, app_state: &State) -> El {
     let mut items: Vec<El> = vec![
         // Header rows: not interactive, just metadata.
         text(format!("Room: {}", menu.room_name))
-            .font_weight(FontWeight::Semibold)
+            .semibold()
             .padding(Sides::xy(tokens::SPACE_MD, tokens::SPACE_XS)),
         divider(),
         menu_item("Join").key(KEY_ROOM_CTX_JOIN),
@@ -508,7 +508,7 @@ fn render_room_context_menu(menu: &RoomContextMenu, app_state: &State) -> El {
 fn render_user_context_menu(menu: &UserContextMenu) -> El {
     let mut items: Vec<El> = vec![
         text(format!("User: {}", menu.username))
-            .font_weight(FontWeight::Semibold)
+            .semibold()
             .padding(Sides::xy(tokens::SPACE_MD, tokens::SPACE_XS)),
         divider(),
     ];
