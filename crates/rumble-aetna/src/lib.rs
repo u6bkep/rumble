@@ -15,12 +15,15 @@ pub mod app;
 pub mod backend;
 pub mod identity;
 pub mod password_input;
+pub mod room_tree;
+pub mod server_picker;
 pub mod settings;
 pub mod theme;
 pub mod wizard;
 
-pub use app::{RumbleApp, ServerForm};
+pub use app::RumbleApp;
 pub use backend::{NativeUiBackend, UiBackend};
 pub use identity::Identity;
+pub use server_picker::ServerForm;
 pub use settings::{OpenSelect as SettingsOpenSelect, SettingsState, SettingsTab};
 pub use wizard::{UnlockState, WizardState};

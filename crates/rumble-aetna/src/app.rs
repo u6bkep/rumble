@@ -3,10 +3,7 @@
 //! Owns local UI state (connect form fields, modal flags, selected
 //! room) and projects `(state, ui_state) -> El` on every frame.
 
-use std::{
-    sync::LazyLock,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use aetna_core::prelude::*;
 
@@ -23,28 +20,12 @@ use tokio::runtime::Runtime;
 use crate::{
     backend::UiBackend,
     identity::Identity,
+    room_tree::{self, RoomTreeOutcome, RoomTreeState},
+    server_picker::{self, ServerForm, ServerPickerOutcome, ServerPickerState},
     settings::{self, SettingsOutcome, SettingsState},
-    theme::{self as palette},
+    theme as palette,
     wizard::{self, PendingAgentOp, UnlockState, WizardOutcome, WizardState},
 };
-
-// ---- Bundled Mumble SVG glyphs ----
-//
-// Parsed once at first use (Arc-bumped on every `icon(...)` call) and
-// shared across frames. We use `SvgIcon::parse` (not
-// `parse_current_color`) because the Mumble theme bakes its semantic
-// colors into the SVG paint — red for self-mute, blue for talking, etc.
-// — and those colors are exactly the visual signal we want to keep.
-
-static SVG_TALKING_ON: LazyLock<SvgIcon> =
-    LazyLock::new(|| SvgIcon::parse(include_str!("../assets/icons/talking_on.svg")).expect("talking_on.svg parses"));
-static SVG_TALKING_OFF: LazyLock<SvgIcon> =
-    LazyLock::new(|| SvgIcon::parse(include_str!("../assets/icons/talking_off.svg")).expect("talking_off.svg parses"));
-static SVG_MUTED_SELF: LazyLock<SvgIcon> =
-    LazyLock::new(|| SvgIcon::parse(include_str!("../assets/icons/muted_self.svg")).expect("muted_self.svg parses"));
-static SVG_MUTED_SERVER: LazyLock<SvgIcon> = LazyLock::new(|| {
-    SvgIcon::parse(include_str!("../assets/icons/muted_server.svg")).expect("muted_server.svg parses")
-});
 
 pub struct RumbleApp<B: UiBackend = crate::backend::NativeUiBackend> {
     backend: B,
@@ -67,10 +48,9 @@ pub struct RumbleApp<B: UiBackend = crate::backend::NativeUiBackend> {
     pending_agent_op: Option<PendingAgentOp>,
 
     // ---- Local UI state ----
-    /// Add/edit form for a saved server. `None` when closed; `Some`
-    /// holds either a fresh add (`editing_index = None`) or an edit
-    /// pointed at a row in `SettingsStore.recent_servers`.
-    server_form: Option<ServerForm>,
+    /// Saved-server picker (disconnected center area + add/edit form).
+    /// See [`crate::server_picker`].
+    server_picker: ServerPickerState,
     identity_modal_open: bool,
     settings_state: SettingsState,
     /// Force the unlock prompt visible regardless of `needs_unlock()`.
@@ -103,6 +83,10 @@ pub struct RumbleApp<B: UiBackend = crate::backend::NativeUiBackend> {
     /// description and JSON schema when rendering the Processing tab.
     /// Built once in [`Self::new`] from `register_builtin_processors`.
     processor_registry: ProcessorRegistry,
+
+    /// Room tree view + its ephemeral state (selection, context menus,
+    /// drag-and-drop, confirmation modals). See [`crate::room_tree`].
+    room_tree: RoomTreeState,
 }
 
 impl<B: UiBackend> RumbleApp<B> {
@@ -138,7 +122,7 @@ impl<B: UiBackend> RumbleApp<B> {
             wizard,
             unlock: UnlockState::default(),
             pending_agent_op: None,
-            server_form: None,
+            server_picker: ServerPickerState::default(),
             identity_modal_open: false,
             settings_state: SettingsState::default(),
             force_unlock_for_test: false,
@@ -148,6 +132,7 @@ impl<B: UiBackend> RumbleApp<B> {
             chat_sidebar_w: tokens::SIDEBAR_WIDTH,
             chat_sidebar_drag: ResizeDrag::default(),
             processor_registry,
+            room_tree: RoomTreeState::default(),
         }
     }
 }
@@ -158,73 +143,11 @@ fn default_username() -> String {
         .unwrap_or_else(|_| "rumble-user".to_string())
 }
 
-/// Local state for the saved-server add/edit modal.
-///
-/// `editing_index` is the position in `Settings.recent_servers` when
-/// editing an existing entry, or `None` when the form is being used
-/// to add a new server. The text fields are rendered via the global
-/// [`Selection`] held on `RumbleApp`, so this struct doesn't carry
-/// per-input selection state.
-#[derive(Debug, Clone)]
-pub struct ServerForm {
-    pub editing_index: Option<usize>,
-    pub addr: String,
-    pub label: String,
-    pub username: String,
-    /// Inline validation message (e.g. "Address is required").
-    pub error: Option<String>,
-}
-
-impl ServerForm {
-    fn for_add(default_username: &str) -> Self {
-        Self {
-            editing_index: None,
-            addr: "127.0.0.1:5000".to_string(),
-            label: String::new(),
-            username: default_username.to_string(),
-            error: None,
-        }
-    }
-
-    fn for_edit(idx: usize, server: &RecentServer) -> Self {
-        Self {
-            editing_index: Some(idx),
-            addr: server.addr.clone(),
-            label: server.label.clone(),
-            username: server.username.clone(),
-            error: None,
-        }
-    }
-}
-
 fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
-}
-
-/// Coarse "n minutes ago" / "n hours ago" / "n days ago" formatter for
-/// the server-row subtitle. Returns an empty string when `then == 0`
-/// (the sentinel for "never connected to this server").
-fn relative_time(then: u64) -> String {
-    if then == 0 {
-        return String::new();
-    }
-    let now = now_unix();
-    if now <= then {
-        return "just now".to_string();
-    }
-    let secs = now - then;
-    if secs < 60 {
-        format!("{secs}s ago")
-    } else if secs < 3600 {
-        format!("{}m ago", secs / 60)
-    } else if secs < 86_400 {
-        format!("{}h ago", secs / 3600)
-    } else {
-        format!("{}d ago", secs / 86_400)
-    }
 }
 
 impl<B: UiBackend> App for RumbleApp<B> {
@@ -241,7 +164,7 @@ impl<B: UiBackend> App for RumbleApp<B> {
             row([
                 chat_sidebar(&state, &self.chat_input, &self.selection, self.chat_sidebar_w),
                 resize_handle(Axis::Row).key(CHAT_SIDEBAR_HANDLE),
-                center_area(&state, &shell.recent_servers),
+                center_area(&state, &shell.recent_servers, &self.room_tree),
             ])
             .width(Size::Fill(1.0))
             .height(Size::Fill(1.0))
@@ -270,12 +193,8 @@ impl<B: UiBackend> App for RumbleApp<B> {
             None
         };
         // Suppress the server form whenever a higher-priority modal is up.
-        let connect_layer = if !wizard_open
-            && unlock_layer.is_none()
-            && cert_layer.is_none()
-            && let Some(form) = self.server_form.as_ref()
-        {
-            Some(server_form_modal(form, &self.selection))
+        let connect_layer = if !wizard_open && unlock_layer.is_none() && cert_layer.is_none() {
+            server_picker::render_form_modal(&self.server_picker, &self.selection)
         } else {
             None
         };
@@ -299,13 +218,22 @@ impl<B: UiBackend> App for RumbleApp<B> {
             (None, None)
         };
 
+        let lower_layers_block_room_menus =
+            wizard_open || unlock_layer.is_some() || cert_layer.is_some() || self.settings_state.open;
+        let room_tree_overlays = if lower_layers_block_room_menus {
+            room_tree::RoomTreeOverlays::default()
+        } else {
+            room_tree::render_overlays(&self.room_tree, &state)
+        };
+
         let any_layer = wizard_layer.is_some()
             || unlock_layer.is_some()
             || cert_layer.is_some()
             || connect_layer.is_some()
             || identity_layer.is_some()
             || settings_panel.is_some()
-            || settings_popover.is_some();
+            || settings_popover.is_some()
+            || room_tree_overlays.any();
         if any_layer {
             // Layer order matters: paints back-to-front. The settings
             // popover sits above its panel; the wizard sits on top of
@@ -316,6 +244,10 @@ impl<B: UiBackend> App for RumbleApp<B> {
                 [
                     identity_layer,
                     connect_layer,
+                    room_tree_overlays.room_context_menu,
+                    room_tree_overlays.user_context_menu,
+                    room_tree_overlays.move_room_modal,
+                    room_tree_overlays.delete_room_modal,
                     settings_panel,
                     settings_popover,
                     cert_layer,
@@ -389,74 +321,39 @@ impl<B: UiBackend> App for RumbleApp<B> {
             return;
         }
 
-        // Saved-server list lifecycle.
-        if event.is_click_or_activate("server:add") {
-            self.server_form = Some(ServerForm::for_add(&self.default_username));
-            return;
-        }
-        if let Some(idx) = matches!(event.kind, UiEventKind::Click | UiEventKind::Activate)
-            .then(|| event.route().and_then(|r| r.strip_prefix("server:connect:")))
-            .flatten()
-            .and_then(|s| s.parse::<usize>().ok())
-        {
-            self.connect_to_recent(idx);
-            return;
-        }
-        if let Some(idx) = matches!(event.kind, UiEventKind::Click | UiEventKind::Activate)
-            .then(|| event.route().and_then(|r| r.strip_prefix("server:edit:")))
-            .flatten()
-            .and_then(|s| s.parse::<usize>().ok())
-        {
-            self.open_edit_form(idx);
-            return;
-        }
-        if let Some(idx) = matches!(event.kind, UiEventKind::Click | UiEventKind::Activate)
-            .then(|| event.route().and_then(|r| r.strip_prefix("server:delete:")))
-            .flatten()
-            .and_then(|s| s.parse::<usize>().ok())
-        {
-            self.delete_recent(idx);
-            return;
-        }
-
-        // Add/edit server form lifecycle.
-        if event.is_click_or_activate("server_form:cancel")
-            || event.is_route("server_form:dismiss") && event.kind == UiEventKind::Click
-            || (self.server_form.is_some() && event.kind == UiEventKind::Escape)
-        {
-            self.server_form = None;
-            return;
-        }
-        if event.is_click_or_activate("server_form:save") {
-            if let Some(_saved) = self.save_server_form() {
-                self.server_form = None;
+        // Saved-server picker (list lifecycle + add/edit form).
+        match server_picker::handle_event(&mut self.server_picker, &event, &mut self.selection) {
+            ServerPickerOutcome::Ignored => {}
+            ServerPickerOutcome::Handled => return,
+            ServerPickerOutcome::BeginAdd => {
+                self.server_picker.begin_add(&self.default_username);
+                return;
             }
-            return;
-        }
-        if event.is_click_or_activate("server_form:connect") {
-            if let Some(saved) = self.save_server_form() {
-                self.server_form = None;
-                self.connect_to_server(&saved);
+            ServerPickerOutcome::ConnectRecent(idx) => {
+                self.connect_to_recent(idx);
+                return;
             }
-            return;
-        }
-        if event.target_key() == Some("server_form:addr") {
-            if let Some(form) = self.server_form.as_mut() {
-                text_input::apply_event(&mut form.addr, &mut self.selection, "server_form:addr", &event);
+            ServerPickerOutcome::BeginEdit(idx) => {
+                self.open_edit_form(idx);
+                return;
             }
-            return;
-        }
-        if event.target_key() == Some("server_form:label") {
-            if let Some(form) = self.server_form.as_mut() {
-                text_input::apply_event(&mut form.label, &mut self.selection, "server_form:label", &event);
+            ServerPickerOutcome::DeleteRecent(idx) => {
+                self.delete_recent(idx);
+                return;
             }
-            return;
-        }
-        if event.target_key() == Some("server_form:user") {
-            if let Some(form) = self.server_form.as_mut() {
-                text_input::apply_event(&mut form.username, &mut self.selection, "server_form:user", &event);
+            ServerPickerOutcome::Save => {
+                if self.save_server_form().is_some() {
+                    self.server_picker.close();
+                }
+                return;
             }
-            return;
+            ServerPickerOutcome::SaveAndConnect => {
+                if let Some(saved) = self.save_server_form() {
+                    self.server_picker.close();
+                    self.connect_to_server(&saved);
+                }
+                return;
+            }
         }
 
         // Cert acceptance prompt. The modal is rendered whenever
@@ -542,13 +439,20 @@ impl<B: UiBackend> App for RumbleApp<B> {
             return;
         }
 
-        // Click a room row to join it.
-        if matches!(event.kind, UiEventKind::Click | UiEventKind::Activate)
-            && let Some(key) = event.route()
-            && let Some(room_id) = parse_room_route_key(key)
-        {
-            self.backend.send(Command::JoinRoom { room_id });
-            self.backend.send(Command::RequestChatHistory);
+        // Room tree: selection, double-click join, right-click context
+        // menus (room + user), drag-and-drop reparenting / self-join,
+        // and the confirmation modals those drags fall into. The module
+        // owns its own state and returns commands the App fires here.
+        let room_tree_state = self.backend.state();
+        match room_tree::handle_event(&mut self.room_tree, &event, &room_tree_state) {
+            RoomTreeOutcome::Ignored => {}
+            RoomTreeOutcome::Handled => return,
+            RoomTreeOutcome::Dispatch(commands) => {
+                for cmd in commands {
+                    self.backend.send(cmd);
+                }
+                return;
+            }
         }
     }
 }
@@ -603,7 +507,7 @@ impl<B: UiBackend> RumbleApp<B> {
         let Some(server) = self.settings.settings().recent_servers.get(idx).cloned() else {
             return;
         };
-        self.server_form = Some(ServerForm::for_edit(idx, &server));
+        self.server_picker.begin_edit(idx, &server);
     }
 
     fn delete_recent(&mut self, idx: usize) {
@@ -680,7 +584,7 @@ impl<B: UiBackend> RumbleApp<B> {
     /// are overwritten and the edit's `last_used_unix` carries over to
     /// the larger of the two.
     fn save_server_form(&mut self) -> Option<RecentServer> {
-        let Some(form) = self.server_form.as_mut() else {
+        let Some(form) = self.server_picker.form.as_mut() else {
             return None;
         };
         let addr = form.addr.trim().to_string();
@@ -1022,7 +926,7 @@ impl<B: UiBackend> RumbleApp<B> {
 
     /// Test/scene-dump hook for the saved-server add/edit modal.
     pub fn set_server_form_for_test(&mut self, form: ServerForm) {
-        self.server_form = Some(form);
+        self.server_picker.form = Some(form);
     }
 
     /// Test/scene-dump hook for the timestamp-format dropdown inside
@@ -1163,259 +1067,12 @@ fn render_chat_line(msg: &rumble_protocol::ChatMessage) -> El {
     line.font_size(tokens::FONT_SM)
 }
 
-fn center_area(state: &State, recent_servers: &[RecentServer]) -> El {
+fn center_area(state: &State, recent_servers: &[RecentServer], room_tree: &RoomTreeState) -> El {
     if matches!(state.connection, ConnectionState::Connected { .. }) {
-        rooms_view(state)
+        room_tree::render(room_tree, state)
     } else {
-        servers_view(state, recent_servers)
+        server_picker::render_center(state, recent_servers)
     }
-}
-
-fn servers_view(state: &State, recent_servers: &[RecentServer]) -> El {
-    // Connection-status banner above the list. Most disconnected
-    // states have nothing to say (Disconnected idle); Connecting /
-    // ConnectionLost / CertPending get a one-line status so the
-    // center area still communicates progress while the list keeps
-    // taking up the same space.
-    let status_banner: Option<El> = match &state.connection {
-        ConnectionState::Disconnected => None,
-        ConnectionState::Connecting { server_addr } => Some(text(format!("Connecting to {server_addr}...")).muted()),
-        ConnectionState::ConnectionLost { error } => Some(
-            text(format!("Connection lost: {error}"))
-                .text_color(tokens::DESTRUCTIVE)
-                .wrap_text(),
-        ),
-        ConnectionState::CertificatePending { cert_info } => Some(
-            text(format!("Certificate pending for {}", cert_info.server_name))
-                .text_color(tokens::WARNING)
-                .wrap_text(),
-        ),
-        ConnectionState::Connected { .. } => unreachable!(),
-    };
-
-    let header = row([
-        text("Servers").title(),
-        spacer(),
-        button("Add server…").key("server:add").primary(),
-    ])
-    .gap(tokens::SPACE_SM)
-    .padding(Sides::xy(tokens::SPACE_LG, tokens::SPACE_SM))
-    .align(Align::Center)
-    .width(Size::Fill(1.0));
-
-    // Render the list sorted by last_used desc; the row's stable
-    // identifier remains the unsorted index (`server:connect:{idx}`),
-    // so settings.modify by index continues to point at the right row.
-    let body: El = if recent_servers.is_empty() {
-        column([
-            text("No saved servers yet.").muted(),
-            paragraph("Click \"Add server…\" to bookmark one.")
-                .muted()
-                .font_size(tokens::FONT_SM),
-        ])
-        .gap(tokens::SPACE_SM)
-        .align(Align::Center)
-        .justify(Justify::Center)
-        .padding(tokens::SPACE_XL)
-        .width(Size::Fill(1.0))
-        .height(Size::Fill(1.0))
-    } else {
-        let mut order: Vec<usize> = (0..recent_servers.len()).collect();
-        order.sort_by(|&a, &b| recent_servers[b].last_used_unix.cmp(&recent_servers[a].last_used_unix));
-        let rows: Vec<El> = order
-            .into_iter()
-            .map(|idx| server_row(idx, &recent_servers[idx]))
-            .collect();
-        scroll(rows)
-            .padding(Sides::xy(tokens::SPACE_LG, tokens::SPACE_SM))
-            .gap(tokens::SPACE_SM)
-            .width(Size::Fill(1.0))
-            .height(Size::Fill(1.0))
-    };
-
-    let mut children: Vec<El> = vec![header, divider()];
-    if let Some(banner) = status_banner {
-        children.push(
-            row([banner])
-                .padding(Sides::xy(tokens::SPACE_LG, tokens::SPACE_SM))
-                .width(Size::Fill(1.0)),
-        );
-        children.push(divider());
-    }
-    children.push(body);
-
-    column(children).width(Size::Fill(1.0)).height(Size::Fill(1.0))
-}
-
-fn server_row(idx: usize, server: &RecentServer) -> El {
-    let title = if server.label.is_empty() {
-        server.addr.clone()
-    } else {
-        server.label.clone()
-    };
-
-    // Subtitle holds whichever of (addr, username, last-used) we still
-    // have something to show: addr only repeats when label was the
-    // primary title; username always shows; last-used is omitted when
-    // the bookmark has never been connected to (last_used == 0).
-    let mut subtitle_parts: Vec<String> = Vec::new();
-    if !server.label.is_empty() {
-        subtitle_parts.push(server.addr.clone());
-    }
-    if !server.username.is_empty() {
-        subtitle_parts.push(server.username.clone());
-    }
-    let rel = relative_time(server.last_used_unix);
-    if !rel.is_empty() {
-        subtitle_parts.push(rel);
-    }
-    let subtitle = subtitle_parts.join(" · ");
-
-    let info = column([
-        text(title).font_weight(FontWeight::Semibold),
-        text(subtitle).muted().font_size(tokens::FONT_SM),
-    ])
-    .gap(tokens::SPACE_XS)
-    .width(Size::Fill(1.0));
-
-    row([
-        info,
-        button("Connect").key(format!("server:connect:{idx}")).primary(),
-        button("Edit").key(format!("server:edit:{idx}")).ghost(),
-        button("Remove").key(format!("server:delete:{idx}")).ghost(),
-    ])
-    .gap(tokens::SPACE_SM)
-    .padding(Sides::all(tokens::SPACE_MD))
-    .fill(tokens::BG_RAISED)
-    .stroke(tokens::BORDER)
-    .radius(tokens::RADIUS_MD)
-    .align(Align::Center)
-    .width(Size::Fill(1.0))
-}
-
-fn rooms_view(state: &State) -> El {
-    let mut entries: Vec<El> = Vec::new();
-    for &root_id in &state.room_tree.roots {
-        push_room_subtree(state, root_id, 0, &mut entries);
-    }
-
-    if entries.is_empty() {
-        entries.push(text("No rooms received yet.").muted());
-    }
-
-    column([
-        text("Rooms")
-            .title()
-            .padding(Sides::xy(tokens::SPACE_LG, tokens::SPACE_SM)),
-        divider(),
-        scroll(entries)
-            .padding(Sides::xy(tokens::SPACE_LG, tokens::SPACE_MD))
-            .gap(tokens::SPACE_XS)
-            .width(Size::Fill(1.0))
-            .height(Size::Fill(1.0)),
-    ])
-    .width(Size::Fill(1.0))
-    .height(Size::Fill(1.0))
-}
-
-fn push_room_subtree(state: &State, room_id: uuid::Uuid, depth: usize, out: &mut Vec<El>) {
-    use rumble_protocol::uuid_from_room_id;
-
-    let Some(node) = state.room_tree.nodes.get(&room_id) else {
-        return;
-    };
-
-    let user_count = state
-        .users
-        .iter()
-        .filter(|u| {
-            u.current_room
-                .as_ref()
-                .and_then(uuid_from_room_id)
-                .is_some_and(|id| id == room_id)
-        })
-        .count();
-    let is_current = state.my_room_id == Some(room_id);
-
-    let indent = depth as f32 * tokens::SPACE_LG;
-    let suffix = if user_count > 0 {
-        format!("  ({user_count})")
-    } else {
-        String::new()
-    };
-    let mut label = text(format!("{}{}", node.name, suffix)).font_size(tokens::FONT_BASE);
-    if user_count == 0 {
-        label = label.muted();
-    }
-    if is_current {
-        label = label.text_color(tokens::PRIMARY);
-    }
-
-    out.push(
-        row([
-            spacer().width(Size::Fixed(indent)),
-            icon(IconName::Folder).text_color(if is_current {
-                tokens::PRIMARY
-            } else {
-                tokens::TEXT_MUTED_FOREGROUND
-            }),
-            label,
-        ])
-        .key(room_route_key(room_id))
-        .gap(tokens::SPACE_SM)
-        .align(Align::Center)
-        .padding(Sides::xy(tokens::SPACE_XS, tokens::SPACE_XS))
-        .focusable(),
-    );
-
-    for user in state.users.iter().filter(|u| {
-        u.current_room
-            .as_ref()
-            .and_then(uuid_from_room_id)
-            .is_some_and(|id| id == room_id)
-    }) {
-        let user_id = user.user_id.as_ref().map(|u| u.value).unwrap_or(0);
-        // Mic-state glyph picks up its color from the bundled Mumble
-        // SVG itself (red self-mute, blue server-mute, blue talking,
-        // green idle), so no `.text_color(...)` override here.
-        let mic_icon: SvgIcon = if user.server_muted {
-            SVG_MUTED_SERVER.clone()
-        } else if user.is_muted {
-            SVG_MUTED_SELF.clone()
-        } else if state.audio.talking_users.contains(&user_id) {
-            SVG_TALKING_ON.clone()
-        } else {
-            SVG_TALKING_OFF.clone()
-        };
-
-        let mut name_el = text(user.username.clone()).font_size(tokens::FONT_SM);
-        if user.is_elevated {
-            name_el = name_el.text_color(palette::ELEVATED);
-        }
-
-        out.push(
-            row([
-                spacer().width(Size::Fixed(indent + tokens::SPACE_LG)),
-                icon(mic_icon).icon_size(12.0),
-                name_el,
-            ])
-            .gap(tokens::SPACE_SM)
-            .align(Align::Center)
-            .padding(Sides::xy(tokens::SPACE_XS, 2.0)),
-        );
-    }
-
-    for &child in &node.children {
-        push_room_subtree(state, child, depth + 1, out);
-    }
-}
-
-fn room_route_key(id: uuid::Uuid) -> String {
-    format!("room:{}", id)
-}
-
-fn parse_room_route_key(key: &str) -> Option<uuid::Uuid> {
-    key.strip_prefix("room:").and_then(|s| uuid::Uuid::parse_str(s).ok())
 }
 
 fn cert_modal(cert_info: &PendingCertificate) -> El {
@@ -1519,43 +1176,4 @@ fn identity_modal(identity: &Identity) -> El {
             .align(Align::Center),
         ],
     )
-}
-
-fn server_form_modal(form: &ServerForm, selection: &Selection) -> El {
-    let title = if form.editing_index.is_some() {
-        "Edit server"
-    } else {
-        "Add server"
-    };
-
-    let mut body: Vec<El> = vec![
-        text("Address").muted(),
-        text_input(&form.addr, selection, "server_form:addr"),
-        text("Label (optional)").muted(),
-        text_input(&form.label, selection, "server_form:label"),
-        text("Username").muted(),
-        text_input(&form.username, selection, "server_form:user"),
-    ];
-
-    if let Some(err) = &form.error {
-        body.push(
-            paragraph(err.clone())
-                .text_color(tokens::DESTRUCTIVE)
-                .font_size(tokens::FONT_SM),
-        );
-    }
-
-    body.push(
-        row([
-            button("Cancel").key("server_form:cancel"),
-            spacer(),
-            button("Save").key("server_form:save"),
-            button("Save & Connect").key("server_form:connect").primary(),
-        ])
-        .gap(tokens::SPACE_SM)
-        .width(Size::Fill(1.0))
-        .align(Align::Center),
-    );
-
-    modal("server_form", title, body)
 }
