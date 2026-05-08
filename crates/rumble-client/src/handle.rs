@@ -1191,8 +1191,39 @@ async fn run_connection_task<P: Platform>(
                     }
 
                     Command::ShareChatHistory => {
-                        // Chat history sharing via P2P has been removed.
-                        debug!("Chat history sharing not available (P2P removed)");
+                        if let Some(t) = &mut transport {
+                            let messages = {
+                                let s = read_state(&state);
+                                s.chat_messages.clone()
+                            };
+                            let content = crate::events::ChatHistoryContent::from_messages(&messages);
+                            if content.messages.is_empty() {
+                                debug!("ShareChatHistory: nothing to share");
+                            } else {
+                                let share = crate::events::ChatHistoryShareMessage::new(content);
+                                let message_id = uuid::Uuid::new_v4().into_bytes().to_vec();
+                                let timestamp_ms = SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_millis() as i64;
+                                let env = proto::Envelope {
+                                    state_hash: Vec::new(),
+                                    payload: Some(Payload::ChatMessage(proto::ChatMessage {
+                                        id: message_id,
+                                        timestamp_ms,
+                                        sender: client_name.clone(),
+                                        text: share.to_json(),
+                                        tree: None,
+                                        attachment: None,
+                                    })),
+                                };
+                                if let Err(e) = send_envelope(t, &env).await {
+                                    error!("Failed to send chat history response: {}", e);
+                                } else {
+                                    debug!("Shared {} chat messages", share.content.messages.len());
+                                }
+                            }
+                        }
                     }
 
                     // ACL Commands
@@ -1722,6 +1753,35 @@ fn handle_server_message(
                             // Trigger sharing our chat history
                             let _ = command_tx.send(Command::ShareChatHistory);
                             // Don't add this message to chat - it's a protocol message
+                            return;
+                        }
+
+                        // Check if this is a chat history response — merge messages
+                        if let Some(share) = crate::events::ChatHistoryShareMessage::parse(&cb.text) {
+                            debug!("Received chat history from {}: {} messages", cb.sender, share.content.messages.len());
+                            let incoming = share.content.to_messages();
+                            let mut s = write_state(&state);
+                            // Collect existing IDs to skip duplicates
+                            let existing_ids: std::collections::HashSet<[u8; 16]> =
+                                s.chat_messages.iter().map(|m| m.id).collect();
+                            let mut added = 0usize;
+                            for msg in incoming {
+                                if !existing_ids.contains(&msg.id) {
+                                    s.chat_messages.push(msg);
+                                    added += 1;
+                                }
+                            }
+                            if added > 0 {
+                                // Sort merged history by timestamp
+                                s.chat_messages.sort_by_key(|m| m.timestamp);
+                                // Trim to 100 most recent
+                                let len = s.chat_messages.len();
+                                if len > 100 {
+                                    s.chat_messages.drain(0..len - 100);
+                                }
+                                drop(s);
+                                repaint();
+                            }
                             return;
                         }
 

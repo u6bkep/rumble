@@ -42,7 +42,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let app = RumbleApp::new(backend, identity, settings, runtime);
     let viewport = Rect::new(0.0, 0.0, 1280.0, 800.0);
-    let host_config = HostConfig::default().with_redraw_interval(Duration::from_millis(33));
+    // Mailbox present so window content tracks the cursor during
+    // interactive resize on Wayland/Mesa instead of trailing in slow
+    // motion as the swapchain queue drains at vsync. The 33ms redraw
+    // cadence still bounds idle work; animation frames render at GPU
+    // speed during transitions, which is what we want here.
+    let host_config = HostConfig::default()
+        .with_redraw_interval(Duration::from_millis(33))
+        .with_low_latency_present(true);
     aetna_winit_wgpu::run_with_config("Rumble", viewport, app, host_config)?;
     Ok(())
 }

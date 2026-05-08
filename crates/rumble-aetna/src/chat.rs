@@ -30,6 +30,12 @@ pub const KEY_INPUT: &str = "chat:input";
 pub const KEY_SHARE_FILE: &str = "chat:share-file";
 pub const KEY_SYNC_HISTORY: &str = "chat:sync";
 
+/// Routed keys for the file card context menu.
+pub const KEY_FILE_CTX_DISMISS: &str = "chat:file_ctx:dismiss";
+pub const KEY_FILE_CTX_SAVE_AS: &str = "chat:file_ctx:save_as";
+pub const KEY_FILE_CTX_OPEN_FOLDER: &str = "chat:file_ctx:open_folder";
+pub const KEY_FILE_CTX_OPEN: &str = "chat:file_ctx:open";
+
 /// Routed keys for the image lightbox overlay.
 pub const KEY_LIGHTBOX_DISMISS: &str = "chat:lightbox:dismiss";
 pub const KEY_LIGHTBOX_CLOSE: &str = "chat:lightbox:close";
@@ -61,6 +67,52 @@ pub fn parse_download_key(key: &str) -> Option<&str> {
 /// Parse a `chat:preview:<transfer-id>` route back to its transfer id.
 pub fn parse_preview_key(key: &str) -> Option<&str> {
     key.strip_prefix("chat:preview:")
+}
+
+/// Parse a `chat:download:*` or `chat:preview:*` key back to its transfer id.
+/// Used by the SecondaryClick handler to detect right-clicks on either card type.
+pub fn parse_file_card_key(key: &str) -> Option<&str> {
+    parse_download_key(key).or_else(|| parse_preview_key(key))
+}
+
+/// State for the right-click file context menu.
+#[derive(Clone, Debug)]
+pub struct FileContextMenu {
+    pub transfer_id: String,
+    pub name: String,
+    /// Local path if the file has been downloaded; `None` while pending.
+    pub local_path: Option<std::path::PathBuf>,
+    /// Screen-space anchor for the context menu popover.
+    pub point: (f32, f32),
+}
+
+/// Render the file card context menu as a floating popover overlay.
+pub fn render_file_context_menu(menu: &FileContextMenu) -> El {
+    let has_file = menu.local_path.is_some();
+
+    let mut save_as = menu_item("Save As…").key(KEY_FILE_CTX_SAVE_AS);
+    let mut open_folder = menu_item("Open Containing Folder").key(KEY_FILE_CTX_OPEN_FOLDER);
+    let mut open = menu_item("Open").key(KEY_FILE_CTX_OPEN);
+    if !has_file {
+        save_as = save_as.disabled();
+        open_folder = open_folder.disabled();
+        open = open.disabled();
+    }
+
+    context_menu(
+        KEY_FILE_CTX_DISMISS,
+        menu.point,
+        [
+            text(menu.name.clone())
+                .semibold()
+                .ellipsis()
+                .padding(Sides::xy(tokens::SPACE_MD, tokens::SPACE_XS)),
+            divider(),
+            open,
+            open_folder,
+            save_as,
+        ],
+    )
 }
 
 /// Render the chat sidebar (header, history, composer).

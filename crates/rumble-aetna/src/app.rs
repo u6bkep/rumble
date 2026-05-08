@@ -143,6 +143,14 @@ pub struct RumbleApp<B: UiBackend = crate::backend::NativeUiBackend> {
     /// `lightbox_full`. Aborted (and never observed) when the
     /// lightbox closes before the decode finishes.
     pending_lightbox_decode: Option<JoinHandle<Result<Image, image::ImageError>>>,
+
+    /// Right-click context menu for a file card. `Some` while open;
+    /// cleared by any menu action, the dismiss scrim, or Escape.
+    file_context_menu: Option<chat::FileContextMenu>,
+
+    /// In-flight "Save As" dialog. When the handle completes the App
+    /// copies the source file to the user-chosen destination.
+    pending_save_as: Option<(PathBuf, JoinHandle<Option<PathBuf>>)>,
 }
 
 impl<B: UiBackend> RumbleApp<B> {
@@ -197,6 +205,8 @@ impl<B: UiBackend> RumbleApp<B> {
             image_lightbox: None,
             lightbox_full: None,
             pending_lightbox_decode: None,
+            file_context_menu: None,
+            pending_save_as: None,
         }
     }
 }
@@ -247,6 +257,7 @@ impl<B: UiBackend> App for RumbleApp<B> {
     fn before_build(&mut self) {
         self.poll_agent_op();
         self.poll_file_dialog();
+        self.poll_save_as();
         self.pump_chat_sfx();
         self.pump_image_cache();
         self.poll_lightbox_decode();
@@ -356,6 +367,16 @@ impl<B: UiBackend> App for RumbleApp<B> {
             None
         };
 
+        let file_ctx_layer = if !wizard_open
+            && unlock_layer.is_none()
+            && cert_layer.is_none()
+            && !self.settings_state.open
+        {
+            self.file_context_menu.as_ref().map(chat::render_file_context_menu)
+        } else {
+            None
+        };
+
         let any_layer = wizard_layer.is_some()
             || unlock_layer.is_some()
             || cert_layer.is_some()
@@ -364,7 +385,8 @@ impl<B: UiBackend> App for RumbleApp<B> {
             || settings_panel.is_some()
             || settings_popover.is_some()
             || room_tree_overlays.any()
-            || lightbox_layer.is_some();
+            || lightbox_layer.is_some()
+            || file_ctx_layer.is_some();
         if any_layer {
             // Layer order matters: paints back-to-front. The settings
             // popover sits above its panel; the wizard sits on top of
@@ -382,6 +404,7 @@ impl<B: UiBackend> App for RumbleApp<B> {
                     room_tree_overlays.move_room_modal,
                     room_tree_overlays.delete_room_modal,
                     lightbox_layer,
+                    file_ctx_layer,
                     settings_panel,
                     settings_popover,
                     cert_layer,
@@ -532,6 +555,38 @@ impl<B: UiBackend> App for RumbleApp<B> {
             self.backend.send(Command::RequestChatHistory);
             return;
         }
+        // File card right-click → open context menu.
+        if event.kind == UiEventKind::SecondaryClick
+            && let Some(route) = event.route()
+            && let Some(transfer_id) = chat::parse_file_card_key(route)
+            && let Some(point) = event.pointer_pos()
+        {
+            self.open_file_context_menu(transfer_id, point);
+            return;
+        }
+
+        // File context menu actions.
+        if self.file_context_menu.is_some() {
+            if event.is_click_or_activate(chat::KEY_FILE_CTX_OPEN) {
+                self.file_ctx_open();
+                return;
+            }
+            if event.is_click_or_activate(chat::KEY_FILE_CTX_OPEN_FOLDER) {
+                self.file_ctx_open_folder();
+                return;
+            }
+            if event.is_click_or_activate(chat::KEY_FILE_CTX_SAVE_AS) {
+                self.file_ctx_save_as();
+                return;
+            }
+            if event.is_route(chat::KEY_FILE_CTX_DISMISS) && event.kind == UiEventKind::Click
+                || event.kind == UiEventKind::Escape
+            {
+                self.file_context_menu = None;
+                return;
+            }
+        }
+
         if event.kind == UiEventKind::Click
             && let Some(route) = event.route()
             && let Some(transfer_id) = chat::parse_download_key(route)
@@ -663,7 +718,17 @@ impl<B: UiBackend> App for RumbleApp<B> {
             RoomTreeOutcome::Ignored => {}
             RoomTreeOutcome::Handled => return,
             RoomTreeOutcome::Dispatch(commands) => {
+                let auto_sync = self.settings.settings().chat.auto_sync_history;
+                let has_join = commands.iter().any(|c| matches!(c, Command::JoinRoom { .. }));
                 for cmd in commands {
+                    // Skip the auto-triggered RequestChatHistory when the
+                    // setting is off (manual sync button bypasses this gate).
+                    if has_join
+                        && !auto_sync
+                        && matches!(cmd, Command::RequestChatHistory)
+                    {
+                        continue;
+                    }
                     self.backend.send(cmd);
                 }
                 return;
@@ -974,6 +1039,89 @@ impl<B: UiBackend> RumbleApp<B> {
         }
     }
 
+    // ---------- file context menu ----------
+
+    /// Open the right-click context menu for a file card. Looks up the
+    /// transfer's local_path so menu items can be enabled/disabled.
+    fn open_file_context_menu(&mut self, transfer_id: &str, point: (f32, f32)) {
+        // Find name and local_path from the offer in chat history.
+        let snapshot = self.backend.state();
+        let offer = snapshot.chat_messages.iter().find_map(|m| {
+            if let Some(rumble_protocol::ChatAttachment::FileOffer(o)) = &m.attachment {
+                if o.transfer_id == transfer_id { Some(o.clone()) } else { None }
+            } else {
+                None
+            }
+        });
+        let name = offer.map(|o| o.name).unwrap_or_else(|| transfer_id.to_string());
+        let local_path = self.backend.transfers().into_iter()
+            .find(|t| t.id.0 == transfer_id)
+            .and_then(|t| t.local_path);
+        self.file_context_menu = Some(chat::FileContextMenu {
+            transfer_id: transfer_id.to_string(),
+            name,
+            local_path,
+            point,
+        });
+    }
+
+    /// Open the file with the OS default application.
+    fn file_ctx_open(&mut self) {
+        if let Some(menu) = self.file_context_menu.take()
+            && let Some(path) = &menu.local_path
+        {
+            open_path(path);
+        }
+    }
+
+    /// Open the folder containing the downloaded file.
+    fn file_ctx_open_folder(&mut self) {
+        if let Some(menu) = self.file_context_menu.take()
+            && let Some(path) = &menu.local_path
+        {
+            let folder = path.parent().unwrap_or(path);
+            open_path(folder);
+        }
+    }
+
+    /// Spawn a "Save As" dialog. The copy is performed when the dialog
+    /// resolves via [`Self::poll_save_as`].
+    fn file_ctx_save_as(&mut self) {
+        let Some(menu) = self.file_context_menu.take() else { return };
+        let Some(src) = menu.local_path else { return };
+        if self.pending_save_as.is_some() {
+            return;
+        }
+        let name = menu.name.clone();
+        let handle = self.runtime.spawn(async move {
+            rfd::AsyncFileDialog::new()
+                .set_file_name(&name)
+                .save_file()
+                .await
+                .map(|f| f.path().to_path_buf())
+        });
+        self.pending_save_as = Some((src, handle));
+    }
+
+    /// Poll the in-flight "Save As" dialog and copy the file when done.
+    fn poll_save_as(&mut self) {
+        let Some((_, handle)) = self.pending_save_as.as_ref() else { return };
+        if !handle.is_finished() { return; }
+        let (src, handle) = self.pending_save_as.take().unwrap();
+        match self.runtime.block_on(handle) {
+            Ok(Some(dest)) => {
+                if let Err(e) = std::fs::copy(&src, &dest) {
+                    tracing::error!("Save As copy failed: {e}");
+                    self.backend.send(Command::LocalMessage {
+                        text: format!("Save As failed: {e}"),
+                    });
+                }
+            }
+            Ok(None) => {}
+            Err(e) => tracing::error!("Save As dialog panicked: {e}"),
+        }
+    }
+
     /// Look up the offer matching `transfer_id` in the visible chat
     /// history and dispatch `Command::DownloadFile` with its
     /// `share_data`. Track the id in `auto_handled_offers` so a
@@ -1146,20 +1294,6 @@ impl<B: UiBackend> RumbleApp<B> {
     fn pump_image_cache(&mut self) {
         let snapshot = self.backend.state();
         if !snapshot.connection.is_connected() {
-            if !self.image_cache.is_empty() {
-                self.image_cache.clear();
-            }
-            if !self.image_failed.is_empty() {
-                self.image_failed.clear();
-            }
-            // An open lightbox depends on a live cache entry — if we
-            // just cleared the cache, dismiss the overlay so it doesn't
-            // briefly paint as an empty panel before the next frame's
-            // `render_lightbox` returns `None`. Also drop the full-res
-            // image and abort any in-flight decode for the same reason.
-            if self.image_lightbox.is_some() {
-                self.close_lightbox();
-            }
             return;
         }
         let transfers = self.backend.transfers();
@@ -1694,4 +1828,19 @@ fn identity_modal(identity: &Identity) -> El {
             .align(Align::Center),
         ],
     )
+}
+
+/// Open `path` with the OS default application. Fires and forgets;
+/// errors are logged but not surfaced in the UI.
+fn open_path(path: &Path) {
+    #[cfg(target_os = "linux")]
+    let (bin, args): (&str, &[&std::ffi::OsStr]) = ("xdg-open", &[path.as_os_str()]);
+    #[cfg(target_os = "macos")]
+    let (bin, args): (&str, &[&std::ffi::OsStr]) = ("open", &[path.as_os_str()]);
+    #[cfg(target_os = "windows")]
+    let (bin, args): (&str, &[&std::ffi::OsStr]) = ("explorer", &[path.as_os_str()]);
+
+    if let Err(e) = std::process::Command::new(bin).args(args).spawn() {
+        tracing::error!("open_path {:?}: {e}", path);
+    }
 }

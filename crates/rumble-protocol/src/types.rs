@@ -680,7 +680,7 @@ pub enum ChatMessageKind {
 /// File-offer payload mirrored from `proto::FileOffer` so the UI doesn't depend
 /// on prost-generated types. Populated when a chat message carries an
 /// attachment of kind `FileOffer`.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FileOfferInfo {
     pub schema_version: u32,
     pub transfer_id: String,
@@ -693,7 +693,7 @@ pub struct FileOfferInfo {
 /// Typed sidecar attached to a chat message. New variants can be added without
 /// breaking older clients — they will simply ignore the `attachment` field and
 /// render the message's `text` summary.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ChatAttachment {
     FileOffer(FileOfferInfo),
@@ -820,6 +820,9 @@ pub struct ChatHistoryEntry {
     pub text: String,
     /// Unix timestamp in milliseconds.
     pub timestamp: u64,
+    /// Optional attachment (file offer, etc.).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attachment: Option<ChatAttachment>,
 }
 
 /// Chat history file content.
@@ -853,6 +856,7 @@ impl ChatHistoryContent {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis() as u64)
                     .unwrap_or(0),
+                attachment: m.attachment.clone(),
             })
             .collect();
 
@@ -893,10 +897,43 @@ impl ChatHistoryContent {
                     timestamp,
                     is_local: false,
                     kind: ChatMessageKind::default(),
-                    attachment: None,
+                    attachment: e.attachment.clone(),
                 })
             })
             .collect()
+    }
+}
+
+/// A chat history response message — sent in-band over the room chat
+/// channel in reply to a [`ChatHistoryRequestMessage`]. The payload is
+/// the sender's recent non-local message history; receivers merge it
+/// into their local log and suppress the raw JSON from display.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ChatHistoryShareMessage {
+    #[serde(rename = "type")]
+    pub msg_type: String,
+    pub content: ChatHistoryContent,
+}
+
+impl ChatHistoryShareMessage {
+    pub fn new(content: ChatHistoryContent) -> Self {
+        Self {
+            msg_type: "chat-history-response".to_string(),
+            content,
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        let value: serde_json::Value = serde_json::from_str(text).ok()?;
+        let obj = value.as_object()?;
+        if obj.get("type")?.as_str()? != "chat-history-response" {
+            return None;
+        }
+        serde_json::from_value(value).ok()
+    }
+
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
     }
 }
 
