@@ -150,7 +150,7 @@ fn agent_warning(available: bool) -> El {
     } else {
         text("SSH_AUTH_SOCK is not set — ssh-agent isn't reachable.")
             .text_color(tokens::WARNING)
-            .font_size(tokens::FONT_SM)
+            .font_size(tokens::TEXT_XS.size)
     }
 }
 
@@ -174,14 +174,14 @@ fn render_generate_local(password: &str, confirm: &str, error: Option<&str>, sel
         body.push(
             text("Passwords don't match")
                 .text_color(tokens::WARNING)
-                .font_size(tokens::FONT_SM),
+                .font_size(tokens::TEXT_XS.size),
         );
     }
     if let Some(err) = error {
         body.push(
             text(err.to_string())
                 .text_color(tokens::DESTRUCTIVE)
-                .font_size(tokens::FONT_SM),
+                .font_size(tokens::TEXT_XS.size),
         );
     }
 
@@ -229,7 +229,7 @@ fn render_select_agent_key(keys: &[KeyInfo], selected: Option<usize>, error: Opt
         body.push(
             text(err.to_string())
                 .text_color(tokens::DESTRUCTIVE)
-                .font_size(tokens::FONT_SM),
+                .font_size(tokens::TEXT_XS.size),
         );
     }
 
@@ -260,7 +260,7 @@ fn agent_key_row(idx: usize, key: &KeyInfo, selected: bool) -> El {
     } else {
         format!("{}  ·  {}", key.comment, key.fingerprint)
     };
-    let row_el = column([paragraph(label).font_size(tokens::FONT_SM)])
+    let row_el = column([paragraph(label).font_size(tokens::TEXT_XS.size)])
         .key(agent_row_key(idx))
         .padding(Sides::xy(tokens::SPACE_MD, tokens::SPACE_SM))
         .width(Size::Fill(1.0))
@@ -314,7 +314,7 @@ pub fn render_unlock(state: &UnlockState, selection: &Selection) -> El {
         body.push(
             text(err.clone())
                 .text_color(tokens::DESTRUCTIVE)
-                .font_size(tokens::FONT_SM),
+                .font_size(tokens::TEXT_XS.size),
         );
     }
     let submit = if state.password.is_empty() {

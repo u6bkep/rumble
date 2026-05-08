@@ -59,13 +59,91 @@ impl TimestampFormat {
 
     pub fn label(self) -> &'static str {
         match self {
-            TimestampFormat::Time24h => "24-hour (14:30)",
-            TimestampFormat::Time12h => "12-hour (2:30 PM)",
-            TimestampFormat::DateTime24h => "Date + 24h",
-            TimestampFormat::DateTime12h => "Date + 12h",
+            TimestampFormat::Time24h => "24-hour (14:30:05)",
+            TimestampFormat::Time12h => "12-hour (2:30:05 PM)",
+            TimestampFormat::DateTime24h => "Date + 24-hour",
+            TimestampFormat::DateTime12h => "Date + 12-hour",
             TimestampFormat::Relative => "Relative (5m ago)",
         }
     }
+
+    /// Format `time` as a human-readable string per the selected
+    /// `TimestampFormat`. Times are rendered in UTC since the rumble
+    /// shell does not depend on a timezone crate; the variant labels
+    /// already advertise this (e.g. *"24-hour (14:30:05)"*).
+    pub fn format(self, time: std::time::SystemTime) -> String {
+        use std::time::{Duration, UNIX_EPOCH};
+
+        let duration = time.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO);
+        let secs = duration.as_secs();
+        let days_since_epoch = secs / 86_400;
+        let time_of_day = secs % 86_400;
+        let hours = (time_of_day / 3_600) as u32;
+        let minutes = ((time_of_day % 3_600) / 60) as u32;
+        let seconds = (time_of_day % 60) as u32;
+
+        let to_12h = |h: u32| -> (u32, &'static str) {
+            if h == 0 {
+                (12, "AM")
+            } else if h < 12 {
+                (h, "AM")
+            } else if h == 12 {
+                (12, "PM")
+            } else {
+                (h - 12, "PM")
+            }
+        };
+
+        match self {
+            TimestampFormat::Time24h => format!("{hours:02}:{minutes:02}:{seconds:02}"),
+            TimestampFormat::Time12h => {
+                let (h12, ampm) = to_12h(hours);
+                format!("{h12}:{minutes:02}:{seconds:02} {ampm}")
+            }
+            TimestampFormat::DateTime24h | TimestampFormat::DateTime12h => {
+                let (year, month, day) = days_to_ymd(days_since_epoch);
+                let time_str = if matches!(self, TimestampFormat::DateTime24h) {
+                    format!("{hours:02}:{minutes:02}:{seconds:02}")
+                } else {
+                    let (h12, ampm) = to_12h(hours);
+                    format!("{h12}:{minutes:02}:{seconds:02} {ampm}")
+                };
+                format!("{year:04}-{month:02}-{day:02} {time_str}")
+            }
+            TimestampFormat::Relative => {
+                let now = std::time::SystemTime::now();
+                let elapsed = now.duration_since(time).unwrap_or(Duration::ZERO).as_secs();
+                if elapsed < 60 {
+                    "just now".to_string()
+                } else if elapsed < 3_600 {
+                    format!("{}m ago", elapsed / 60)
+                } else if elapsed < 86_400 {
+                    format!("{}h ago", elapsed / 3_600)
+                } else {
+                    format!("{}d ago", elapsed / 86_400)
+                }
+            }
+        }
+    }
+}
+
+/// Convert days since the UNIX epoch (1970-01-01) to `(year, month, day)`
+/// in the proleptic Gregorian calendar (UTC). Implementation is the
+/// standard "days_from_civil" inverse from Howard Hinnant's date
+/// algorithms — matches the egui client byte-for-byte.
+fn days_to_ymd(days: u64) -> (i32, u32, u32) {
+    let days = days as i64;
+    let z = days + 719_468;
+    let era = if z >= 0 { z / 146_097 } else { (z - 146_096) / 146_097 };
+    let doe = (z - era * 146_097) as u32;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y as i32, m, d)
 }
 
 /// Sound-effect playback preferences. Volume applies on top of the

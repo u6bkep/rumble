@@ -3,22 +3,27 @@
 //! Owns local UI state (connect form fields, modal flags, selected
 //! room) and projects `(state, ui_state) -> El` on every frame.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    collections::{HashMap, HashSet},
+    path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use aetna_core::prelude::*;
 
 use rumble_client::{
-    ProcessorRegistry, build_default_tx_pipeline, merge_with_default_tx_pipeline, register_builtin_processors,
+    ProcessorRegistry, SfxKind, build_default_tx_pipeline, merge_with_default_tx_pipeline, register_builtin_processors,
 };
 use rumble_desktop_shell::{
     AcceptedCertificate, RecentServer, SettingsStore,
     identity::{connect_and_list_keys, generate_and_add_to_agent},
 };
 use rumble_protocol::{Command, ConnectionState, PendingCertificate, State, VoiceMode};
-use tokio::runtime::Runtime;
+use tokio::{runtime::Runtime, task::JoinHandle};
 
 use crate::{
     backend::UiBackend,
+    chat,
     identity::Identity,
     room_tree::{self, RoomTreeOutcome, RoomTreeState},
     server_picker::{self, ServerForm, ServerPickerOutcome, ServerPickerState},
@@ -58,10 +63,12 @@ pub struct RumbleApp<B: UiBackend = crate::backend::NativeUiBackend> {
     /// the prompt against a fresh on-disk identity that isn't actually
     /// encrypted.
     force_unlock_for_test: bool,
-    /// Default username pre-filled when adding a brand-new server entry.
-    /// Sourced from `$USER` at startup; updated by the settings dialog.
-    /// Per-server usernames live on each `RecentServer` and override
-    /// this on connect.
+    /// Username pre-filled when adding a brand-new server entry.
+    /// Sourced from `$USER` at startup, then refreshed to the most
+    /// recently saved server form's username so adding a sequence of
+    /// servers carries the same name. Per-server usernames live on each
+    /// `RecentServer` (edited via the server form) and are authoritative
+    /// at connect time; this is purely a form-prefill convenience.
     default_username: String,
     /// Global text-selection slot. Every `text_input` reads its caret /
     /// selection band through `selection.within(key)`; `apply_event`
@@ -87,6 +94,55 @@ pub struct RumbleApp<B: UiBackend = crate::backend::NativeUiBackend> {
     /// Room tree view + its ephemeral state (selection, context menus,
     /// drag-and-drop, confirmation modals). See [`crate::room_tree`].
     room_tree: RoomTreeState,
+
+    /// `state.chat_messages.len()` at the previous frame. Used to detect
+    /// new arrivals so we can fire `SfxKind::Message` once per batch.
+    prev_chat_count: usize,
+
+    /// In-flight OS file picker, spawned on `runtime` when the user
+    /// clicks the share-file button. `Some(handle)` while the dialog is
+    /// open; `before_build` polls and dispatches `Command::ShareFile`
+    /// once the user picks a path (or drops the result on cancel).
+    pending_file_dialog: Option<JoinHandle<Option<PathBuf>>>,
+
+    /// `transfer_id`s for incoming `FileOffer` attachments we have
+    /// already routed through the auto-download flow this session.
+    /// Mid-session reconnects (or `RequestChatHistory`) re-emit the
+    /// same offers; without this guard each replay would kick off
+    /// another download. Cleared on disconnect.
+    auto_handled_offers: HashSet<String>,
+
+    /// Decoded RGBA8 thumbnails keyed by `transfer_id`. Populated in
+    /// `before_build` once a file transfer reports `is_finished` with
+    /// a `local_path`; the chat module reads from this map to swap an
+    /// inline preview in for the file card.
+    image_cache: chat::ImageCache,
+
+    /// `transfer_id`s we have tried to decode and failed (corrupt,
+    /// truncated, unsupported codec). Recorded so the next frame
+    /// doesn't keep re-attempting the same decode.
+    image_failed: HashSet<String>,
+
+    /// Click-to-enlarge image viewer state. `Some` when a chat image
+    /// preview was clicked; cleared by Close / Escape / scrim click.
+    /// The image itself comes from [`Self::lightbox_full`] (a
+    /// dedicated full-resolution decode) or, until that decode lands,
+    /// the thumbnail in [`Self::image_cache`].
+    image_lightbox: Option<chat::Lightbox>,
+
+    /// Full-resolution image for the active lightbox. Decoded
+    /// off-thread on lightbox open and dropped on close, so the
+    /// 1024-capped thumbnail in `image_cache` no longer caps lightbox
+    /// quality. `None` until the decode completes (the lightbox falls
+    /// back to the thumbnail in the meantime), or when the source
+    /// failed to decode.
+    lightbox_full: Option<Image>,
+
+    /// In-flight full-resolution decode spawned on `runtime`. Polled
+    /// each frame in `poll_lightbox_decode`; the result lands in
+    /// `lightbox_full`. Aborted (and never observed) when the
+    /// lightbox closes before the decode finishes.
+    pending_lightbox_decode: Option<JoinHandle<Result<Image, image::ImageError>>>,
 }
 
 impl<B: UiBackend> RumbleApp<B> {
@@ -133,6 +189,14 @@ impl<B: UiBackend> RumbleApp<B> {
             chat_sidebar_drag: ResizeDrag::default(),
             processor_registry,
             room_tree: RoomTreeState::default(),
+            prev_chat_count: 0,
+            pending_file_dialog: None,
+            auto_handled_offers: HashSet::new(),
+            image_cache: HashMap::new(),
+            image_failed: HashSet::new(),
+            image_lightbox: None,
+            lightbox_full: None,
+            pending_lightbox_decode: None,
         }
     }
 }
@@ -150,19 +214,59 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+/// Cap on the longest edge of a cached chat thumbnail, in pixels.
+/// ~1024 keeps the 220px-tall preview rect sharp on a 2× display
+/// without burning RAM on phone-camera-sized sources.
+const MAX_PREVIEW_PX: u32 = 1024;
+
+/// Cap on the longest edge of a lightbox full-resolution decode, in
+/// pixels. Generous enough that real-world photos go through
+/// untouched but defensive against pathological inputs (and well
+/// under the typical 8192 GPU texture limit).
+const MAX_LIGHTBOX_PX: u32 = 4096;
+
+/// Decode `path` into an aetna `Image`. `max_px` caps the longest
+/// edge — `Some(n)` runs `image::thumbnail` for downsampling, `None`
+/// loads the source at its natural resolution.
+fn decode_image(path: &Path, max_px: Option<u32>) -> Result<Image, image::ImageError> {
+    let img = image::ImageReader::open(path)?.with_guessed_format()?.decode()?;
+    let img = match max_px {
+        Some(cap) if img.width().max(img.height()) > cap => img.thumbnail(cap, cap),
+        _ => img,
+    };
+    let rgba = img.to_rgba8();
+    Ok(Image::from_rgba8(rgba.width(), rgba.height(), rgba.into_raw()))
+}
+
+/// Backwards-compat wrapper for the chat thumbnail cache decode.
+fn decode_thumbnail(path: &Path) -> Result<Image, image::ImageError> {
+    decode_image(path, Some(MAX_PREVIEW_PX))
+}
+
 impl<B: UiBackend> App for RumbleApp<B> {
     fn before_build(&mut self) {
         self.poll_agent_op();
+        self.poll_file_dialog();
+        self.pump_chat_sfx();
+        self.pump_image_cache();
+        self.poll_lightbox_decode();
     }
 
-    fn build(&self) -> El {
+    fn build(&self, _cx: &BuildCx) -> El {
         let state = self.backend.state();
         let shell = self.settings.settings();
 
         let main = column([
             top_toolbar(&state),
             row([
-                chat_sidebar(&state, &self.chat_input, &self.selection, self.chat_sidebar_w),
+                chat::render(
+                    &state,
+                    &shell.chat,
+                    &self.image_cache,
+                    &self.chat_input,
+                    &self.selection,
+                    self.chat_sidebar_w,
+                ),
                 resize_handle(Axis::Row).key(CHAT_SIDEBAR_HANDLE),
                 center_area(&state, &shell.recent_servers, &self.room_tree),
             ])
@@ -226,6 +330,32 @@ impl<B: UiBackend> App for RumbleApp<B> {
             room_tree::render_overlays(&self.room_tree, &state)
         };
 
+        // Lightbox is suppressed whenever a higher-priority modal is
+        // up: a settings dialog or wizard would otherwise paint behind
+        // the lightbox while still being interactive, which is
+        // confusing. Cert/unlock/wizard already gate the chat itself,
+        // so anyone with a pending lightbox should have it cleared by
+        // those flows — this is just defense in depth.
+        //
+        // Image source priority: the full-resolution decode is shown
+        // when ready; until then we fall back to the chat thumbnail
+        // so the panel opens instantly and just gets sharper a frame
+        // later.
+        let lightbox_layer = if !wizard_open
+            && unlock_layer.is_none()
+            && cert_layer.is_none()
+            && !self.settings_state.open
+            && let Some(state) = self.image_lightbox.as_ref()
+            && let Some(img) = self
+                .lightbox_full
+                .as_ref()
+                .or_else(|| self.image_cache.get(&state.transfer_id))
+        {
+            Some(chat::render_lightbox(state, img))
+        } else {
+            None
+        };
+
         let any_layer = wizard_layer.is_some()
             || unlock_layer.is_some()
             || cert_layer.is_some()
@@ -233,12 +363,15 @@ impl<B: UiBackend> App for RumbleApp<B> {
             || identity_layer.is_some()
             || settings_panel.is_some()
             || settings_popover.is_some()
-            || room_tree_overlays.any();
+            || room_tree_overlays.any()
+            || lightbox_layer.is_some();
         if any_layer {
             // Layer order matters: paints back-to-front. The settings
             // popover sits above its panel; the wizard sits on top of
             // everything because nothing else is allowed to interact
-            // while it's open.
+            // while it's open. The lightbox sits above content/menus
+            // but below the protective modals (cert/unlock/wizard) so
+            // those still take precedence if they appear simultaneously.
             overlays(
                 main,
                 [
@@ -248,6 +381,7 @@ impl<B: UiBackend> App for RumbleApp<B> {
                     room_tree_overlays.user_context_menu,
                     room_tree_overlays.move_room_modal,
                     room_tree_overlays.delete_room_modal,
+                    lightbox_layer,
                     settings_panel,
                     settings_popover,
                     cert_layer,
@@ -370,8 +504,10 @@ impl<B: UiBackend> App for RumbleApp<B> {
         }
 
         // Chat composer.
-        if event.target_key() == Some("chat:input") {
-            // Send on Enter when not Shift-held.
+        if event.target_key() == Some(chat::KEY_INPUT) {
+            // Send on Enter when not Shift-held. Slash commands route
+            // through `parse_and_send_chat`; plain text falls through
+            // to a `Command::SendChat`.
             if let UiEventKind::KeyDown = event.kind
                 && let Some(kp) = event.key_press.as_ref()
                 && matches!(kp.key, UiKey::Enter)
@@ -379,14 +515,94 @@ impl<B: UiBackend> App for RumbleApp<B> {
             {
                 let trimmed = self.chat_input.trim().to_string();
                 if !trimmed.is_empty() {
-                    self.backend.send(Command::SendChat { text: trimmed });
+                    self.parse_and_send_chat(&trimmed);
                     self.chat_input.clear();
                     self.selection = Selection::default();
                 }
                 return;
             }
-            text_input::apply_event(&mut self.chat_input, &mut self.selection, "chat:input", &event);
+            text_input::apply_event(&mut self.chat_input, &mut self.selection, chat::KEY_INPUT, &event);
             return;
+        }
+        if event.is_click_or_activate(chat::KEY_SHARE_FILE) {
+            self.spawn_share_file_dialog();
+            return;
+        }
+        if event.is_click_or_activate(chat::KEY_SYNC_HISTORY) {
+            self.backend.send(Command::RequestChatHistory);
+            return;
+        }
+        if event.kind == UiEventKind::Click
+            && let Some(route) = event.route()
+            && let Some(transfer_id) = chat::parse_download_key(route)
+        {
+            self.download_offer(transfer_id);
+            return;
+        }
+
+        // Image lightbox. Open by clicking (or keyboard-activating) an
+        // inline image preview; close via the panel's Close button, the
+        // scrim, or Escape. Open/close are stateless beyond toggling
+        // `image_lightbox` — the panel re-reads the image from
+        // `image_cache` each frame so a transfer evicted out from under
+        // an open lightbox dismisses it cleanly.
+        if event.kind == UiEventKind::Click
+            && let Some(route) = event.route()
+            && let Some(transfer_id) = chat::parse_preview_key(route)
+        {
+            self.open_lightbox(transfer_id);
+            return;
+        }
+        if self.image_lightbox.is_some()
+            && (event.is_click_or_activate(chat::KEY_LIGHTBOX_CLOSE)
+                || (event.is_route(chat::KEY_LIGHTBOX_DISMISS) && event.kind == UiEventKind::Click)
+                || event.kind == UiEventKind::Escape)
+        {
+            self.close_lightbox();
+            return;
+        }
+        if let Some(lightbox) = self.image_lightbox.as_mut() {
+            if event.is_click_or_activate(chat::KEY_LIGHTBOX_ZOOM_IN) {
+                lightbox.zoom_in();
+                return;
+            }
+            if event.is_click_or_activate(chat::KEY_LIGHTBOX_ZOOM_OUT) {
+                lightbox.zoom_out();
+                return;
+            }
+            if event.is_click_or_activate(chat::KEY_LIGHTBOX_ZOOM_FIT) {
+                lightbox.fit();
+                return;
+            }
+            // Drag-to-pan on the image surface. Disabled at zoom <= 1.0
+            // since there's nothing to pan to — the image is centred
+            // and the body already shows everything.
+            if event.route() == Some(chat::KEY_LIGHTBOX_IMAGE) && lightbox.zoom > 1.0 {
+                match event.kind {
+                    UiEventKind::PointerDown => {
+                        if let Some(pos) = event.pointer {
+                            lightbox.drag.anchor = Some((pos, lightbox.pan));
+                        }
+                        return;
+                    }
+                    UiEventKind::Drag => {
+                        if let Some((anchor_pos, start_pan)) = lightbox.drag.anchor
+                            && let Some(pos) = event.pointer
+                        {
+                            lightbox.pan = (
+                                start_pan.0 + (pos.0 - anchor_pos.0),
+                                start_pan.1 + (pos.1 - anchor_pos.1),
+                            );
+                        }
+                        return;
+                    }
+                    UiEventKind::PointerUp => {
+                        lightbox.drag.anchor = None;
+                        return;
+                    }
+                    _ => {}
+                }
+            }
         }
 
         // Top toolbar.
@@ -419,8 +635,7 @@ impl<B: UiBackend> App for RumbleApp<B> {
         }
         if event.is_click_or_activate("toolbar:settings") {
             let snapshot = self.backend.state();
-            self.settings_state
-                .open_with(&snapshot.audio, self.settings.settings(), &self.default_username);
+            self.settings_state.open_with(&snapshot.audio, self.settings.settings());
             return;
         }
         if event.is_click_or_activate("identity:close")
@@ -630,7 +845,358 @@ impl<B: UiBackend> RumbleApp<B> {
             };
             saved = Some(entry);
         });
+        // Carry the just-used username forward as the default for the
+        // next add-server flow. Per-server usernames are still the
+        // authoritative value at connect time; this only seeds new forms.
+        if let Some(saved) = saved.as_ref()
+            && !saved.username.is_empty()
+        {
+            self.default_username = saved.username.clone();
+        }
         saved
+    }
+
+    // ---------- chat ----------
+
+    /// Parse the composer line. Slash commands (`/msg`, `/tree`)
+    /// dispatch their dedicated `Command` variants; usage errors land
+    /// in the local chat log via `Command::LocalMessage`. Plain text
+    /// goes out as a `Command::SendChat` to the current room.
+    fn parse_and_send_chat(&mut self, raw: &str) {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        if trimmed == "/msg" || trimmed.starts_with("/msg ") {
+            let rest = trimmed.strip_prefix("/msg").unwrap().trim_start();
+            match rest.split_once(' ') {
+                Some((target_name, body)) => {
+                    let body = body.trim();
+                    if body.is_empty() {
+                        self.backend.send(Command::LocalMessage {
+                            text: "Usage: /msg <username> <message>".to_string(),
+                        });
+                        return;
+                    }
+                    let snapshot = self.backend.state();
+                    let target = snapshot.users.iter().find(|u| u.username == target_name);
+                    match target {
+                        Some(user) => {
+                            let uid = user.user_id.as_ref().map(|id| id.value).unwrap_or(0);
+                            self.backend.send(Command::SendDirectMessage {
+                                target_user_id: uid,
+                                target_username: target_name.to_string(),
+                                text: body.to_string(),
+                            });
+                        }
+                        None => {
+                            self.backend.send(Command::LocalMessage {
+                                text: format!("User '{target_name}' not found"),
+                            });
+                        }
+                    }
+                }
+                None => {
+                    self.backend.send(Command::LocalMessage {
+                        text: "Usage: /msg <username> <message>".to_string(),
+                    });
+                }
+            }
+            return;
+        }
+        if trimmed == "/tree" || trimmed.starts_with("/tree ") {
+            let rest = trimmed.strip_prefix("/tree").unwrap().trim_start();
+            if rest.is_empty() {
+                self.backend.send(Command::LocalMessage {
+                    text: "Usage: /tree <message>".to_string(),
+                });
+            } else {
+                self.backend.send(Command::SendTreeChat { text: rest.to_string() });
+            }
+            return;
+        }
+        self.backend.send(Command::SendChat {
+            text: trimmed.to_string(),
+        });
+    }
+
+    /// Spawn the OS file picker on `runtime`. The result is consumed
+    /// by [`Self::poll_file_dialog`] on the next frame so we don't
+    /// block the render loop while the (potentially slow) portal
+    /// dialog is open.
+    fn spawn_share_file_dialog(&mut self) {
+        if !self.backend.state().connection.is_connected() {
+            self.backend.send(Command::LocalMessage {
+                text: "Connect to a server before sharing files".to_string(),
+            });
+            return;
+        }
+        if self.pending_file_dialog.is_some() {
+            // Already showing — ignore the click rather than stack
+            // multiple dialogs on top of each other.
+            return;
+        }
+        let handle = self.runtime.spawn(async {
+            rfd::AsyncFileDialog::new()
+                .pick_file()
+                .await
+                .map(|f| f.path().to_path_buf())
+        });
+        self.pending_file_dialog = Some(handle);
+    }
+
+    /// Drain a finished file-picker task, dispatching `Command::ShareFile`
+    /// when the user picked a path. Cancel (None) is silent.
+    fn poll_file_dialog(&mut self) {
+        let Some(handle) = self.pending_file_dialog.as_ref() else {
+            return;
+        };
+        if !handle.is_finished() {
+            return;
+        }
+        let handle = self.pending_file_dialog.take().unwrap();
+        match self.runtime.block_on(handle) {
+            Ok(Some(path)) => {
+                self.backend.send(Command::LocalMessage {
+                    text: format!("Sharing {}", path.display()),
+                });
+                self.backend.send(Command::ShareFile { path });
+            }
+            Ok(None) => {
+                // User dismissed the picker.
+            }
+            Err(e) => {
+                tracing::error!("file dialog task panicked: {e}");
+                self.backend.send(Command::LocalMessage {
+                    text: "File picker failed — see logs".to_string(),
+                });
+            }
+        }
+    }
+
+    /// Look up the offer matching `transfer_id` in the visible chat
+    /// history and dispatch `Command::DownloadFile` with its
+    /// `share_data`. Track the id in `auto_handled_offers` so a
+    /// history-replay doesn't re-prompt or re-trigger the download.
+    fn download_offer(&mut self, transfer_id: &str) {
+        let snapshot = self.backend.state();
+        let offer = snapshot
+            .chat_messages
+            .iter()
+            .rev()
+            .find_map(|m| match m.attachment.as_ref() {
+                Some(rumble_protocol::ChatAttachment::FileOffer(o)) if o.transfer_id == transfer_id => Some(o.clone()),
+                _ => None,
+            });
+        let Some(offer) = offer else {
+            tracing::warn!("download_offer: offer {transfer_id} no longer in history");
+            return;
+        };
+        self.auto_handled_offers.insert(offer.transfer_id.clone());
+        self.backend.send(Command::DownloadFile {
+            share_data: offer.share_data,
+        });
+    }
+
+    /// Open the click-to-enlarge lightbox for the chat message whose
+    /// `FileOffer` matches `transfer_id`. No-op if the offer is no
+    /// longer in history (chat truncated mid-frame) or if the image
+    /// hasn't been decoded yet — the latter shouldn't happen because
+    /// the preview only renders once the cache entry exists.
+    ///
+    /// Spawns a full-resolution decode of the underlying file on the
+    /// app's runtime so the lightbox can show the source at native
+    /// quality once it lands. Until then the panel renders the same
+    /// 1024-capped thumbnail as the inline preview, so the open is
+    /// always immediate.
+    fn open_lightbox(&mut self, transfer_id: &str) {
+        if !self.image_cache.contains_key(transfer_id) {
+            return;
+        }
+        let snapshot = self.backend.state();
+        let name = snapshot
+            .chat_messages
+            .iter()
+            .rev()
+            .find_map(|m| match m.attachment.as_ref() {
+                Some(rumble_protocol::ChatAttachment::FileOffer(o)) if o.transfer_id == transfer_id => {
+                    Some(o.name.clone())
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| transfer_id.to_string());
+        self.image_lightbox = Some(chat::Lightbox::new(transfer_id, name));
+
+        // Cancel any previous in-flight full-res decode and reset
+        // the slot — opening a new lightbox shouldn't leak the prior
+        // image or fold in a stale decode that lands later.
+        if let Some(prev) = self.pending_lightbox_decode.take() {
+            prev.abort();
+        }
+        self.lightbox_full = None;
+
+        // Look up the local file path from the live transfer set; if
+        // it's missing (e.g., the transfer plugin GC'd a finished
+        // entry) the lightbox just keeps showing the thumbnail.
+        let path = self
+            .backend
+            .transfers()
+            .into_iter()
+            .find(|t| t.id.0 == transfer_id)
+            .and_then(|t| t.local_path);
+        let Some(path) = path else {
+            return;
+        };
+        self.pending_lightbox_decode = Some(
+            self.runtime
+                .spawn_blocking(move || decode_image(&path, Some(MAX_LIGHTBOX_PX))),
+        );
+    }
+
+    /// Close the lightbox: clear the active state, drop the
+    /// full-resolution image to free GPU memory, and abort any
+    /// in-flight decode so it can't deliver a result we'd just throw
+    /// away.
+    fn close_lightbox(&mut self) {
+        self.image_lightbox = None;
+        self.lightbox_full = None;
+        if let Some(handle) = self.pending_lightbox_decode.take() {
+            handle.abort();
+        }
+    }
+
+    /// Drain a finished full-resolution lightbox decode. Discard the
+    /// result if the lightbox has been closed in the meantime — the
+    /// user moved on, no point uploading the texture.
+    fn poll_lightbox_decode(&mut self) {
+        let Some(handle) = self.pending_lightbox_decode.as_ref() else {
+            return;
+        };
+        if !handle.is_finished() {
+            return;
+        }
+        let handle = self.pending_lightbox_decode.take().unwrap();
+        if self.image_lightbox.is_none() {
+            // User closed the lightbox before decode landed — drop.
+            return;
+        }
+        match self.runtime.block_on(handle) {
+            Ok(Ok(img)) => {
+                self.lightbox_full = Some(img);
+            }
+            Ok(Err(e)) => {
+                tracing::debug!("lightbox full-res decode failed: {e}");
+            }
+            Err(e) if e.is_cancelled() => {}
+            Err(e) => {
+                tracing::error!("lightbox decode task panicked: {e}");
+            }
+        }
+    }
+
+    /// Track `state.chat_messages.len()` between frames and play
+    /// `SfxKind::Message` once when the count grows by at least one
+    /// remote message. The first observation seeds `prev_chat_count`
+    /// without firing — connecting to a server with chat history
+    /// shouldn't dump a flurry of beeps.
+    fn pump_chat_sfx(&mut self) {
+        let snapshot = self.backend.state();
+        let count = snapshot.chat_messages.len();
+        if count > self.prev_chat_count
+            && self.prev_chat_count > 0
+            && snapshot.chat_messages[self.prev_chat_count..]
+                .iter()
+                .any(|m| !m.is_local)
+        {
+            self.play_sfx(SfxKind::Message);
+        }
+        self.prev_chat_count = count;
+        // Drop accepted-offer ids when the connection drops so a
+        // fresh session re-runs auto-download evaluation.
+        if !snapshot.connection.is_connected() && !self.auto_handled_offers.is_empty() {
+            self.auto_handled_offers.clear();
+        }
+    }
+
+    fn play_sfx(&self, kind: SfxKind) {
+        let sfx = &self.settings.settings().sfx;
+        if !sfx.is_kind_enabled(kind) || sfx.volume <= 0.0 {
+            return;
+        }
+        self.backend.send(Command::PlaySfx {
+            kind,
+            volume: sfx.volume.clamp(0.0, 1.0),
+        });
+    }
+
+    /// Walk the live transfer list each frame and decode any newly-
+    /// completed image transfers into the chat-module image cache.
+    /// Decoding runs synchronously on the UI thread because:
+    ///
+    /// * thumbnails are small (we cap at MAX_PREVIEW_PIXELS) and PNG /
+    ///   JPEG decode at that size finishes in a millisecond or two on
+    ///   modern hardware,
+    /// * we only do it once per `transfer_id` per session (cached in
+    ///   `image_cache`; failures are recorded in `image_failed`),
+    /// * doing it asynchronously would require a separate `Arc<Mutex>`
+    ///   pump and would not noticeably improve perceived latency.
+    ///
+    /// On disconnect the cache is cleared so a reconnect re-decodes
+    /// against whatever the new session's local paths are.
+    fn pump_image_cache(&mut self) {
+        let snapshot = self.backend.state();
+        if !snapshot.connection.is_connected() {
+            if !self.image_cache.is_empty() {
+                self.image_cache.clear();
+            }
+            if !self.image_failed.is_empty() {
+                self.image_failed.clear();
+            }
+            // An open lightbox depends on a live cache entry — if we
+            // just cleared the cache, dismiss the overlay so it doesn't
+            // briefly paint as an empty panel before the next frame's
+            // `render_lightbox` returns `None`. Also drop the full-res
+            // image and abort any in-flight decode for the same reason.
+            if self.image_lightbox.is_some() {
+                self.close_lightbox();
+            }
+            return;
+        }
+        let transfers = self.backend.transfers();
+        if transfers.is_empty() {
+            return;
+        }
+        for status in transfers {
+            if !status.is_finished {
+                continue;
+            }
+            let Some(path) = status.local_path.as_ref() else {
+                continue;
+            };
+            let id = &status.id.0;
+            if self.image_cache.contains_key(id) || self.image_failed.contains(id) {
+                continue;
+            }
+            if !chat::is_image_name(&status.name) {
+                // Mark as "not an image" so we don't re-check the
+                // extension every frame.
+                self.image_failed.insert(id.clone());
+                continue;
+            }
+            match decode_thumbnail(path) {
+                Ok(img) => {
+                    self.image_cache.insert(id.clone(), img);
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        "image preview decode failed for {} ({}): {e}",
+                        status.name,
+                        path.display()
+                    );
+                    self.image_failed.insert(id.clone());
+                }
+            }
+        }
     }
 
     // ---------- wizard plumbing ----------
@@ -782,16 +1348,8 @@ impl<B: UiBackend> RumbleApp<B> {
     /// Persist a [`PendingSettings`] snapshot: write the shared shell
     /// fields through `SettingsStore.modify`, dispatch backend commands
     /// for the runtime-mutating fields (audio settings, voice mode,
-    /// device selection), and update App-owned state (username).
+    /// device selection).
     fn apply_settings(&mut self, pending: settings::PendingSettings) {
-        // App-owned: the global default is applied to brand-new server
-        // entries created from the add-form. Per-server usernames live
-        // on each `RecentServer` and aren't touched by this dialog.
-        let trimmed = pending.username.trim();
-        if !trimmed.is_empty() {
-            self.default_username = trimmed.to_string();
-        }
-
         // Backend: audio + voice mode + device selection. These all
         // hit the audio task immediately rather than going through the
         // settings store, so we send them even when the value didn't
@@ -910,8 +1468,7 @@ impl<B: UiBackend> RumbleApp<B> {
     /// settings UI state and forces the requested tab to active.
     pub fn open_settings_for_test(&mut self, tab: settings::SettingsTab) {
         let snapshot = self.backend.state();
-        self.settings_state
-            .open_with(&snapshot.audio, self.settings.settings(), &self.default_username);
+        self.settings_state.open_with(&snapshot.audio, self.settings.settings());
         self.settings_state.tab = Some(tab);
     }
 
@@ -934,6 +1491,33 @@ impl<B: UiBackend> RumbleApp<B> {
     /// dropdown menu open.
     pub fn open_settings_dropdown_for_test(&mut self, which: settings::OpenSelect) {
         self.settings_state.open_select = which;
+    }
+
+    /// Test/scene-dump hook to seed the chat image-preview cache. The
+    /// runtime path goes through `pump_image_cache`, but bundle dumps
+    /// don't have a real file-transfer plugin behind them — so let the
+    /// scene-builder push a synthetic decoded image directly.
+    pub fn insert_image_preview_for_test(&mut self, transfer_id: impl Into<String>, img: Image) {
+        self.image_cache.insert(transfer_id.into(), img);
+    }
+
+    /// Test/scene-dump hook to open the lightbox without a click event.
+    /// Mirrors `open_lightbox` but skips the chat-history lookup so the
+    /// scene can target a synthetic offer directly.
+    pub fn open_lightbox_for_test(&mut self, transfer_id: impl Into<String>, name: impl Into<String>) {
+        self.image_lightbox = Some(chat::Lightbox::new(transfer_id, name));
+    }
+
+    /// Test/scene-dump hook to set the lightbox's zoom + pan directly,
+    /// for snapshotting the controls in non-default state. Caller is
+    /// responsible for setting them to plausible values; the runtime
+    /// path goes through `Lightbox::set_zoom` / drag handlers and so
+    /// always stays in range.
+    pub fn set_lightbox_zoom_for_test(&mut self, zoom: f32, pan: (f32, f32)) {
+        if let Some(lb) = self.image_lightbox.as_mut() {
+            lb.zoom = zoom;
+            lb.pan = pan;
+        }
     }
 }
 
@@ -996,75 +1580,8 @@ fn top_toolbar(state: &State) -> El {
         .padding(Sides::xy(tokens::SPACE_LG, tokens::SPACE_SM))
         .height(Size::Fixed(56.0))
         .width(Size::Fill(1.0))
-        .fill(tokens::BG_RAISED)
+        .fill(tokens::ACCENT)
         .align(Align::Center)
-}
-
-fn chat_sidebar(state: &State, chat_input: &str, selection: &Selection, width: f32) -> El {
-    let messages: Vec<El> = if state.chat_messages.is_empty() {
-        vec![
-            // wrap_text() so the longer placeholder fits inside narrow
-            // sidebar widths (~256 px = SIDEBAR_WIDTH minus padding) —
-            // without it, "Connect to a server to start chatting"
-            // overflows by a few pixels on the default sidebar.
-            text(if matches!(state.connection, ConnectionState::Connected { .. }) {
-                "No messages yet"
-            } else {
-                "Connect to a server to start chatting"
-            })
-            .muted()
-            .wrap_text(),
-        ]
-    } else {
-        state.chat_messages.iter().map(render_chat_line).collect()
-    };
-
-    column([
-        text("Chat")
-            .title()
-            .padding(Sides::xy(tokens::SPACE_LG, tokens::SPACE_SM)),
-        divider(),
-        scroll(messages)
-            .padding(Sides::xy(tokens::SPACE_LG, tokens::SPACE_SM))
-            .gap(tokens::SPACE_XS)
-            .width(Size::Fill(1.0))
-            .height(Size::Fill(1.0)),
-        divider(),
-        text_input(chat_input, selection, "chat:input")
-            .padding(Sides::xy(tokens::SPACE_LG, tokens::SPACE_SM))
-            .width(Size::Fill(1.0)),
-    ])
-    .width(Size::Fixed(width))
-    .height(Size::Fill(1.0))
-    .fill(tokens::BG_CARD)
-}
-
-fn render_chat_line(msg: &rumble_protocol::ChatMessage) -> El {
-    use rumble_protocol::ChatMessageKind;
-
-    let prefix = if msg.is_local {
-        msg.text.clone()
-    } else {
-        match &msg.kind {
-            ChatMessageKind::Room => format!("{}: {}", msg.sender, msg.text),
-            ChatMessageKind::DirectMessage { .. } => {
-                format!("[DM] {}: {}", msg.sender, msg.text)
-            }
-            ChatMessageKind::Tree => format!("[Tree] {}: {}", msg.sender, msg.text),
-        }
-    };
-
-    let line = paragraph(prefix);
-    let line = if msg.is_local {
-        line.text_color(palette::CHAT_SYS)
-    } else {
-        match &msg.kind {
-            ChatMessageKind::Room => line,
-            ChatMessageKind::DirectMessage { .. } => line.text_color(palette::CHAT_DM),
-            ChatMessageKind::Tree => line.text_color(palette::CHAT_TREE),
-        }
-    };
-    line.font_size(tokens::FONT_SM)
 }
 
 fn center_area(state: &State, recent_servers: &[RecentServer], room_tree: &RoomTreeState) -> El {
@@ -1095,13 +1612,15 @@ fn cert_modal(cert_info: &PendingCertificate) -> El {
             // wrap_text() so it flows across two lines instead of
             // overflowing the modal. The user needs to read the full
             // hash, so .ellipsis() would be wrong here.
-            mono(cert_info.fingerprint_hex()).font_size(tokens::FONT_SM).wrap_text(),
+            mono(cert_info.fingerprint_hex())
+                .font_size(tokens::TEXT_XS.size)
+                .wrap_text(),
             paragraph(
                 "Only accept if this fingerprint matches what the server administrator gave you. Once accepted, the \
                  certificate is saved for future connections.",
             )
             .muted()
-            .font_size(tokens::FONT_SM),
+            .font_size(tokens::TEXT_XS.size),
             row([
                 button("Reject").key("cert:reject"),
                 spacer(),
@@ -1147,20 +1666,22 @@ fn identity_modal(identity: &Identity) -> El {
         "Rumble identity",
         [
             text("Fingerprint (SHA-256)").muted(),
-            mono(fingerprint).font_size(tokens::FONT_SM).wrap_text(),
+            mono(fingerprint).font_size(tokens::TEXT_XS.size).wrap_text(),
             divider(),
             text("Storage").muted(),
             text(source_label.to_string()).semibold(),
-            paragraph(detail).muted().font_size(tokens::FONT_SM),
+            paragraph(detail).muted().font_size(tokens::TEXT_XS.size),
             text("On disk").muted(),
-            mono(path.display().to_string()).font_size(tokens::FONT_SM).wrap_text(),
+            mono(path.display().to_string())
+                .font_size(tokens::TEXT_XS.size)
+                .wrap_text(),
             divider(),
             paragraph(
                 "Generating a new identity overwrites identity.json. Servers that knew the old key won't recognise \
                  the new one — you'll have to re-register or be re-approved.",
             )
             .text_color(tokens::WARNING)
-            .font_size(tokens::FONT_SM),
+            .font_size(tokens::TEXT_XS.size),
             row([
                 button("Close").key("identity:close"),
                 spacer(),

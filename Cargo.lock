@@ -136,7 +136,7 @@ dependencies = [
 
 [[package]]
 name = "aetna-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "aetna-fonts",
  "bytemuck",
@@ -155,15 +155,20 @@ dependencies = [
 
 [[package]]
 name = "aetna-fonts"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "aetna-fonts-emoji",
+ "aetna-fonts-inter",
  "aetna-fonts-roboto",
  "aetna-fonts-symbols",
 ]
 
 [[package]]
 name = "aetna-fonts-emoji"
+version = "0.1.0"
+
+[[package]]
+name = "aetna-fonts-inter"
 version = "0.1.0"
 
 [[package]]
@@ -176,7 +181,7 @@ version = "0.1.0"
 
 [[package]]
 name = "aetna-wgpu"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "aetna-core",
  "bytemuck",
@@ -188,7 +193,7 @@ dependencies = [
 
 [[package]]
 name = "aetna-winit-wgpu"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "aetna-core",
  "aetna-wgpu",
@@ -5613,7 +5618,9 @@ dependencies = [
  "anyhow",
  "directories",
  "ed25519-dalek 3.0.0-pre.6",
+ "image",
  "rand 0.10.0",
+ "rfd",
  "rumble-client",
  "rumble-client-traits",
  "rumble-desktop",

@@ -1,7 +1,7 @@
 //! Mumble-dark inspired palette.
 //!
-//! Aetna ships its own dark theme tokens (`tokens::BG_APP`,
-//! `tokens::TEXT_FOREGROUND`, etc.) which already lean dark-slate. This
+//! Aetna ships its own dark theme tokens (`tokens::BACKGROUND`,
+//! `tokens::FOREGROUND`, etc.) which already lean dark-slate. This
 //! module adds a few semantic colors specific to the Rumble UI — the
 //! green "talking" indicator, the red "muted" indicator, the gold
 //! "elevated" badge, and a chat-message-kind palette — sourced from

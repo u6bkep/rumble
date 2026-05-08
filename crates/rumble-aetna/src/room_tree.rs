@@ -370,7 +370,7 @@ fn push_room_subtree(
     } else {
         String::new()
     };
-    let mut label = text(format!("{}{}", node.name, suffix)).font_size(tokens::FONT_BASE);
+    let mut label = text(format!("{}{}", node.name, suffix)).font_size(tokens::TEXT_SM.size);
     if user_count == 0 {
         label = label.muted();
     }
@@ -383,7 +383,7 @@ fn push_room_subtree(
         icon(IconName::Folder).text_color(if is_current {
             tokens::PRIMARY
         } else {
-            tokens::TEXT_MUTED_FOREGROUND
+            tokens::MUTED_FOREGROUND
         }),
         label,
     ])
@@ -396,7 +396,7 @@ fn push_room_subtree(
     if is_selected {
         // Subtle pill so single-click selection is visible without
         // looking like the active-room indicator.
-        row_el = row_el.fill(tokens::BG_RAISED);
+        row_el = row_el.fill(tokens::ACCENT);
     }
     out.push(row_el);
     hit_rows.push((room_route_key(room_id), room_id));
@@ -421,7 +421,7 @@ fn push_room_subtree(
             SVG_TALKING_OFF.clone()
         };
 
-        let mut name_el = text(user.username.clone()).font_size(tokens::FONT_SM);
+        let mut name_el = text(user.username.clone()).font_size(tokens::TEXT_XS.size);
         if user.is_elevated {
             name_el = name_el.text_color(palette::ELEVATED);
         }

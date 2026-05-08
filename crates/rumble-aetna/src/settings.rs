@@ -102,7 +102,6 @@ impl Default for OpenSelect {
 #[derive(Debug, Clone)]
 pub struct PendingSettings {
     // Connection
-    pub username: String,
     pub autoconnect: bool,
 
     // Devices — `None` means "system default"; the outer Option tracks
@@ -138,13 +137,12 @@ pub struct PendingSettings {
 }
 
 impl PendingSettings {
-    fn from_live(audio: &AudioState, settings: &Settings, username: &str) -> Self {
+    fn from_live(audio: &AudioState, settings: &Settings) -> Self {
         let sfx_kind_enabled: Vec<bool> = SfxKind::all()
             .iter()
             .map(|k| !settings.sfx.disabled_sounds.contains(k))
             .collect();
         Self {
-            username: username.to_string(),
             autoconnect: settings.auto_connect_addr.is_some(),
             input_device: audio.selected_input.clone(),
             output_device: audio.selected_output.clone(),
@@ -177,11 +175,11 @@ pub struct SettingsState {
 impl SettingsState {
     /// Snapshot the live settings into pending state and show the
     /// dialog. Defaults the active tab to Connection.
-    pub fn open_with(&mut self, audio: &AudioState, settings: &Settings, username: &str) {
+    pub fn open_with(&mut self, audio: &AudioState, settings: &Settings) {
         self.open = true;
         self.tab = Some(SettingsTab::Connection);
         self.open_select = OpenSelect::None;
-        self.pending = Some(PendingSettings::from_live(audio, settings, username));
+        self.pending = Some(PendingSettings::from_live(audio, settings));
     }
 
     pub fn close(&mut self) {
@@ -223,7 +221,6 @@ const KEY_DISMISS: &str = "settings:dismiss";
 const KEY_CLOSE: &str = "settings:close";
 const KEY_SAVE: &str = "settings:save";
 
-const KEY_USERNAME: &str = "settings:conn:username";
 const KEY_AUTOCONNECT: &str = "settings:conn:autoconnect";
 const KEY_REGENERATE: &str = "settings:conn:regenerate";
 
@@ -326,7 +323,7 @@ pub fn render(
     let tab = state.tab.unwrap_or(SettingsTab::Connection);
 
     let body = match tab {
-        SettingsTab::Connection => render_connection(pending, identity, selection),
+        SettingsTab::Connection => render_connection(pending, identity),
         SettingsTab::Devices => render_devices(pending, &app_state.audio),
         SettingsTab::Voice => render_voice(pending),
         SettingsTab::Processing => render_processing(pending, &app_state.audio, processor_registry, selection),
@@ -352,7 +349,8 @@ pub fn render(
     .align(Align::Center);
 
     // Stock `modal_panel` is fixed at 420 px wide × Hug; the settings
-    // dialog needs a roomier 720 × 620 frame for the tab content.
+    // dialog needs a roomier 840 × 620 frame so the eight-tab segmented
+    // control fits "Connection" and "Processing" without truncation.
     let panel = modal_panel(
         "Settings",
         [
@@ -366,7 +364,7 @@ pub fn render(
             footer,
         ],
     )
-    .width(Size::Fixed(720.0))
+    .width(Size::Fixed(840.0))
     .height(Size::Fixed(620.0));
 
     let panel_layer = overlay([scrim(KEY_DISMISS), panel.block_pointer()]);
@@ -407,7 +405,7 @@ pub fn render(
 
 // ---- per-tab views --------------------------------------------------
 
-fn render_connection(pending: &PendingSettings, identity: &Identity, selection: &Selection) -> El {
+fn render_connection(pending: &PendingSettings, identity: &Identity) -> El {
     use rumble_desktop_shell::KeySource;
 
     let identity_lines: Vec<El> = if let Some(config) = identity.manager().config() {
@@ -421,7 +419,7 @@ fn render_connection(pending: &PendingSettings, identity: &Identity, selection: 
             field_row(
                 "Fingerprint",
                 mono(identity.fingerprint())
-                    .font_size(tokens::FONT_SM)
+                    .font_size(tokens::TEXT_XS.size)
                     .ellipsis()
                     .width(Size::Fill(1.0)),
             ),
@@ -441,14 +439,6 @@ fn render_connection(pending: &PendingSettings, identity: &Identity, selection: 
         .width(Size::Fill(1.0)),
     );
     children.push(divider());
-    children.push(section_heading("Username"));
-    children.push(text_input(&pending.username, selection, KEY_USERNAME));
-    children.push(
-        paragraph("Display name shown to other users on a server.")
-            .muted()
-            .font_size(tokens::FONT_SM),
-    );
-    children.push(divider());
     children.push(field_row(
         "Autoconnect on launch",
         switch(pending.autoconnect).key(KEY_AUTOCONNECT),
@@ -459,7 +449,7 @@ fn render_connection(pending: &PendingSettings, identity: &Identity, selection: 
              server.",
         )
         .muted()
-        .font_size(tokens::FONT_SM),
+        .font_size(tokens::TEXT_XS.size),
     );
 
     column(children).gap(tokens::SPACE_MD).width(Size::Fill(1.0))
@@ -482,7 +472,7 @@ fn render_devices(pending: &PendingSettings, audio: &AudioState) -> El {
             "Device changes apply when you click Save. Switching devices while connected may briefly drop audio.",
         )
         .muted()
-        .font_size(tokens::FONT_SM),
+        .font_size(tokens::TEXT_XS.size),
     ])
     .gap(tokens::SPACE_SM)
     .width(Size::Fill(1.0))
@@ -507,7 +497,7 @@ fn render_voice(pending: &PendingSettings) -> El {
             PersistentVoiceMode::Continuous => "Always transmitting. Add a VAD processor to gate on voice activity.",
         })
         .muted()
-        .font_size(tokens::FONT_SM),
+        .font_size(tokens::TEXT_XS.size),
         divider(),
         section_heading("Encoder"),
         field_row(
@@ -532,7 +522,7 @@ fn render_voice(pending: &PendingSettings) -> El {
         ),
         paragraph("Higher complexity = better quality, more CPU. Range 0–10.")
             .muted()
-            .font_size(tokens::FONT_SM),
+            .font_size(tokens::TEXT_XS.size),
         divider(),
         section_heading("Network"),
         field_row(
@@ -576,7 +566,7 @@ fn render_processing(
              on/off.",
         )
         .muted()
-        .font_size(tokens::FONT_SM),
+        .font_size(tokens::TEXT_XS.size),
     );
 
     if pending.tx_pipeline.processors.is_empty() {
@@ -612,7 +602,7 @@ fn render_processing(
             .width(Size::Fill(1.0)),
         );
         if !description.is_empty() {
-            rows.push(paragraph(description).muted().font_size(tokens::FONT_SM));
+            rows.push(paragraph(description).muted().font_size(tokens::TEXT_XS.size));
         }
 
         // Per-processor schema fields (only when the processor is on).
@@ -756,7 +746,7 @@ fn input_level_meter(pipeline: &PipelineConfig, audio: &AudioState) -> El {
                 Some(db) if db > -3.0 => tokens::DESTRUCTIVE,
                 Some(db) if db > -12.0 => tokens::WARNING,
                 Some(_) => tokens::SUCCESS,
-                None => tokens::BG_MUTED,
+                None => tokens::MUTED,
             };
             progress(value_n, color)
                 .width(Size::Fixed(BAR_W))
@@ -765,10 +755,10 @@ fn input_level_meter(pipeline: &PipelineConfig, audio: &AudioState) -> El {
     };
 
     column([
-        row([bar.into(), text(level_label).mono().font_size(tokens::FONT_SM)])
+        row([bar.into(), text(level_label).mono().font_size(tokens::TEXT_XS.size)])
             .gap(tokens::SPACE_SM)
             .align(Align::Center),
-        text(threshold_label).muted().font_size(tokens::FONT_SM),
+        text(threshold_label).muted().font_size(tokens::TEXT_XS.size),
     ])
     .gap(tokens::SPACE_XS)
     .width(Size::Fill(1.0))
@@ -866,7 +856,7 @@ fn render_chat(pending: &PendingSettings) -> El {
         ),
         paragraph("Asks peers for backlog when joining a room so you can read what was said before you arrived.")
             .muted()
-            .font_size(tokens::FONT_SM),
+            .font_size(tokens::TEXT_XS.size),
     ])
     .gap(tokens::SPACE_SM)
     .width(Size::Fill(1.0))
@@ -884,7 +874,7 @@ fn render_files(pending: &PendingSettings) -> El {
              edit the rule list; this client honours whatever rules are stored.",
         )
         .muted()
-        .font_size(tokens::FONT_SM),
+        .font_size(tokens::TEXT_XS.size),
         divider(),
         section_heading("Bandwidth limits"),
         field_row(
@@ -966,11 +956,11 @@ fn render_stats(audio: &AudioState) -> El {
 // ---- view helpers ---------------------------------------------------
 
 fn section_heading(label: impl Into<String>) -> El {
-    text(label).semibold().font_size(tokens::FONT_BASE)
+    text(label).semibold().font_size(tokens::TEXT_SM.size)
 }
 
 fn stat_row(label: impl Into<String>, value: impl Into<String>, color: Option<Color>) -> El {
-    let value_text = text(value).mono().font_size(tokens::FONT_SM);
+    let value_text = text(value).mono().font_size(tokens::TEXT_XS.size);
     let value_text = if let Some(c) = color {
         value_text.text_color(c)
     } else {
@@ -1087,12 +1077,6 @@ pub fn handle_event(
     };
 
     // ---------- per-tab pending edits ----------
-
-    // Username text input.
-    if event.target_key() == Some(KEY_USERNAME) {
-        text_input::apply_event(&mut pending.username, selection, KEY_USERNAME, event);
-        return SettingsOutcome::Handled;
-    }
 
     // Switches.
     if switch::apply_event(&mut pending.autoconnect, event, KEY_AUTOCONNECT)

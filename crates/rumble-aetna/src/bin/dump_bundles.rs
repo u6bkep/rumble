@@ -24,8 +24,9 @@ use rumble_aetna::{
 };
 use rumble_desktop_shell::{KeyInfo, RecentServer, SettingsStore};
 use rumble_protocol::{
-    AudioDeviceInfo, AudioState, AudioStats, ChatMessage, ChatMessageKind, Command, ConnectionState,
-    PendingCertificate, State, Uuid, VoiceMode,
+    AudioDeviceInfo, AudioState, AudioStats, ChatAttachment, ChatMessage, ChatMessageKind, Command, ConnectionState,
+    FileOfferInfo, PendingCertificate, State, Uuid, VoiceMode,
+    permissions::Permissions,
     proto::{RoomInfo, User, UserId},
     room_id_from_uuid,
 };
@@ -68,6 +69,15 @@ enum Scene {
     Connecting,
     /// Live session: rooms, users, chat — exercises the full shell.
     Connected,
+    /// Live session with a completed image transfer rendered as an
+    /// inline preview in the chat sidebar.
+    ConnectedImagePreview,
+    /// Live session with the click-to-enlarge image lightbox open.
+    ImageLightbox,
+    /// Lightbox at 200% zoom with a non-zero pan, exercising the
+    /// `−` / `+` / Fit buttons + zoom-percent label in their
+    /// "non-default" state and showing the zoomed paint transform.
+    ImageLightboxZoomed,
     /// Connection lost with an error message in the toolbar.
     ConnectionLost,
     /// Cert acceptance modal up over the disconnected backdrop.
@@ -110,6 +120,9 @@ impl Scene {
         Scene::EditServerModal,
         Scene::Connecting,
         Scene::Connected,
+        Scene::ConnectedImagePreview,
+        Scene::ImageLightbox,
+        Scene::ImageLightboxZoomed,
         Scene::ConnectionLost,
         Scene::CertPending,
         Scene::WizardSelectMethod,
@@ -136,6 +149,9 @@ impl Scene {
             Scene::EditServerModal => "edit_server_modal",
             Scene::Connecting => "connecting",
             Scene::Connected => "connected",
+            Scene::ConnectedImagePreview => "connected_image_preview",
+            Scene::ImageLightbox => "image_lightbox",
+            Scene::ImageLightboxZoomed => "image_lightbox_zoomed",
             Scene::ConnectionLost => "connection_lost",
             Scene::CertPending => "cert_pending",
             Scene::WizardSelectMethod => "wizard_select_method",
@@ -166,7 +182,9 @@ impl Scene {
                 },
                 ..State::default()
             },
-            Scene::Connected => connected_state(),
+            Scene::Connected | Scene::ConnectedImagePreview | Scene::ImageLightbox | Scene::ImageLightboxZoomed => {
+                connected_state()
+            }
             Scene::ConnectionLost => State {
                 connection: ConnectionState::ConnectionLost {
                     error: "stream closed by peer".into(),
@@ -291,6 +309,29 @@ impl Scene {
             }
             Scene::SettingsFiles => app.open_settings_for_test(SettingsTab::Files),
             Scene::SettingsStats => app.open_settings_for_test(SettingsTab::Stats),
+            Scene::ConnectedImagePreview => {
+                // Pre-decoded image so the preview path renders without
+                // a real file-transfer plugin underneath. The fixture
+                // is a 64×40 gradient — small enough to fit inline as
+                // a tree-dump constant but big enough to read as a
+                // proper raster, not a single-pixel swatch.
+                app.insert_image_preview_for_test("demo-offer", demo_preview_image());
+            }
+            Scene::ImageLightbox => {
+                // Same fixture as the inline-preview scene, plus the
+                // lightbox toggled open over it. The connected backdrop
+                // makes the modal scrim's contrast visible.
+                app.insert_image_preview_for_test("demo-offer", demo_preview_image());
+                app.open_lightbox_for_test("demo-offer", "deploy_notes.md");
+            }
+            Scene::ImageLightboxZoomed => {
+                // 200% zoom + a small downward-right pan, so the
+                // header zoom controls render with `+` / `−` / Fit
+                // all enabled and the percentage label reads "200%".
+                app.insert_image_preview_for_test("demo-offer", demo_preview_image());
+                app.open_lightbox_for_test("demo-offer", "deploy_notes.md");
+                app.set_lightbox_zoom_for_test(2.0, (40.0, 30.0));
+            }
             _ => {}
         }
     }
@@ -344,6 +385,17 @@ fn make_user(id: u64, name: &str, room: u128, mut tweak: impl FnMut(&mut User)) 
 }
 
 fn make_chat(id: u8, sender: &str, text: &str, kind: ChatMessageKind) -> ChatMessage {
+    make_chat_full(id, sender, text, kind, false, None)
+}
+
+fn make_chat_full(
+    id: u8,
+    sender: &str,
+    text: &str,
+    kind: ChatMessageKind,
+    is_local: bool,
+    attachment: Option<ChatAttachment>,
+) -> ChatMessage {
     let mut bytes = [0u8; 16];
     bytes[15] = id;
     ChatMessage {
@@ -351,9 +403,9 @@ fn make_chat(id: u8, sender: &str, text: &str, kind: ChatMessageKind) -> ChatMes
         sender: sender.into(),
         text: text.into(),
         timestamp: SystemTime::UNIX_EPOCH,
-        is_local: false,
+        is_local,
         kind,
-        attachment: None,
+        attachment,
     }
 }
 
@@ -387,7 +439,38 @@ fn connected_state() -> State {
                 "(announcement) maintenance window 14:00 UTC",
                 ChatMessageKind::Tree,
             ),
+            make_chat_full(
+                4,
+                "diana",
+                "ping me when you're free",
+                ChatMessageKind::DirectMessage {
+                    other_user_id: 4,
+                    other_username: "diana".into(),
+                },
+                false,
+                None,
+            ),
+            make_chat_full(
+                5,
+                "bob",
+                "shared file: deploy_notes.md (12.3 KB)",
+                ChatMessageKind::Room,
+                false,
+                Some(ChatAttachment::FileOffer(FileOfferInfo {
+                    schema_version: 1,
+                    transfer_id: "demo-offer".into(),
+                    name: "deploy_notes.md".into(),
+                    size: 12_345,
+                    mime: "text/markdown".into(),
+                    share_data: "demo".into(),
+                })),
+            ),
         ],
+        // The chat composer enables itself only when the local user has
+        // TEXT_MESSAGE in the current room, so seed the bit so the
+        // connected scene shows the active composer (not the disabled
+        // hint variant).
+        effective_permissions: Permissions::TEXT_MESSAGE.bits(),
         ..State::default()
     };
     state.rebuild_room_tree();
@@ -521,6 +604,25 @@ fn demo_agent_keys() -> Vec<KeyInfo> {
     ]
 }
 
+/// Tiny synthetic gradient used as the inline-preview fixture in
+/// `Scene::ConnectedImagePreview`. 64×40 RGBA8 with a horizontal red
+/// channel ramp + vertical blue ramp so the rendered preview is
+/// visually distinguishable from a placeholder rectangle in tree
+/// dumps and SVG snapshots alike.
+fn demo_preview_image() -> Image {
+    let (w, h) = (64u32, 40u32);
+    let mut pixels = Vec::with_capacity((w * h * 4) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            let r = ((x * 255) / w.max(1)) as u8;
+            let g = 80u8;
+            let b = ((y * 255) / h.max(1)) as u8;
+            pixels.extend_from_slice(&[r, g, b, 0xff]);
+        }
+    }
+    Image::from_rgba8(w, h, pixels)
+}
+
 fn demo_pending_cert() -> PendingCertificate {
     let no_op_signer: rumble_client::SigningCallback =
         Arc::new(|_payload: &[u8]| Err("fixture identity is not signing".to_string()));
@@ -581,7 +683,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         scene.drive_setup(&mut app);
 
-        let mut tree = app.build();
+        let theme = app.theme();
+        let cx = BuildCx::new(&theme);
+        let mut tree = app.build(&cx);
         let bundle = render_bundle(&mut tree, viewport, Some("crates/rumble-aetna/src"));
 
         let basename = format!("rumble_{}", scene.slug());

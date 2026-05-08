@@ -183,7 +183,7 @@ pub fn render_center(state: &State, recent_servers: &[RecentServer]) -> El {
             text("No saved servers yet.").muted(),
             paragraph("Click \"Add server…\" to bookmark one.")
                 .muted()
-                .font_size(tokens::FONT_SM),
+                .font_size(tokens::TEXT_XS.size),
         ])
         .gap(tokens::SPACE_SM)
         .align(Align::Center)
@@ -245,7 +245,7 @@ fn server_row(idx: usize, server: &RecentServer) -> El {
 
     let info = column([
         text(title).semibold(),
-        text(subtitle).muted().font_size(tokens::FONT_SM),
+        text(subtitle).muted().font_size(tokens::TEXT_XS.size),
     ])
     .gap(tokens::SPACE_XS)
     .width(Size::Fill(1.0));
@@ -258,7 +258,7 @@ fn server_row(idx: usize, server: &RecentServer) -> El {
     ])
     .gap(tokens::SPACE_SM)
     .padding(Sides::all(tokens::SPACE_MD))
-    .fill(tokens::BG_RAISED)
+    .fill(tokens::ACCENT)
     .stroke(tokens::BORDER)
     .radius(tokens::RADIUS_MD)
     .align(Align::Center)
@@ -287,7 +287,7 @@ pub fn render_form_modal(state: &ServerPickerState, selection: &Selection) -> Op
         body.push(
             paragraph(err.clone())
                 .text_color(tokens::DESTRUCTIVE)
-                .font_size(tokens::FONT_SM),
+                .font_size(tokens::TEXT_XS.size),
         );
     }
 

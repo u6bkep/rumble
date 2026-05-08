@@ -13,6 +13,7 @@
 
 pub mod app;
 pub mod backend;
+pub mod chat;
 pub mod identity;
 pub mod password_input;
 pub mod room_tree;
