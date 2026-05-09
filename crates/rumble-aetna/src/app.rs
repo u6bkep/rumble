@@ -5,8 +5,9 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    io::BufReader,
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use aetna_core::prelude::*;
@@ -112,16 +113,24 @@ pub struct RumbleApp<B: UiBackend = crate::backend::NativeUiBackend> {
     /// another download. Cleared on disconnect.
     auto_handled_offers: HashSet<String>,
 
-    /// Decoded RGBA8 thumbnails keyed by `transfer_id`. Populated in
+    /// Decoded image cache keyed by `transfer_id`. Populated in
     /// `before_build` once a file transfer reports `is_finished` with
     /// a `local_path`; the chat module reads from this map to swap an
-    /// inline preview in for the file card.
+    /// inline preview in for the file card. Static images are a single
+    /// frame; GIFs decode their full frame sequence so playback
+    /// doesn't re-decode.
     image_cache: chat::ImageCache,
 
     /// `transfer_id`s we have tried to decode and failed (corrupt,
     /// truncated, unsupported codec). Recorded so the next frame
     /// doesn't keep re-attempting the same decode.
     image_failed: HashSet<String>,
+
+    /// Per-message GIF playback state keyed by `transfer_id`. One
+    /// entry per animated cache entry; the inline preview and the
+    /// lightbox both read from this so they stay in lockstep. Seeded
+    /// when [`Self::pump_image_cache`] inserts an animated entry.
+    gif_playback: HashMap<String, chat::GifPlayback>,
 
     /// Click-to-enlarge image viewer state. `Some` when a chat image
     /// preview was clicked; cleared by Close / Escape / scrim click.
@@ -130,19 +139,20 @@ pub struct RumbleApp<B: UiBackend = crate::backend::NativeUiBackend> {
     /// the thumbnail in [`Self::image_cache`].
     image_lightbox: Option<chat::Lightbox>,
 
-    /// Full-resolution image for the active lightbox. Decoded
-    /// off-thread on lightbox open and dropped on close, so the
-    /// 1024-capped thumbnail in `image_cache` no longer caps lightbox
-    /// quality. `None` until the decode completes (the lightbox falls
-    /// back to the thumbnail in the meantime), or when the source
-    /// failed to decode.
-    lightbox_full: Option<Image>,
+    /// Full-resolution image (or animated frame sequence) for the
+    /// active lightbox. Decoded off-thread on lightbox open and
+    /// dropped on close, so the 1024-capped thumbnail in
+    /// `image_cache` no longer caps lightbox quality. `None` until
+    /// the decode completes (the lightbox falls back to the
+    /// thumbnail in the meantime), or when the source failed to
+    /// decode.
+    lightbox_full: Option<chat::CachedImage>,
 
     /// In-flight full-resolution decode spawned on `runtime`. Polled
     /// each frame in `poll_lightbox_decode`; the result lands in
     /// `lightbox_full`. Aborted (and never observed) when the
     /// lightbox closes before the decode finishes.
-    pending_lightbox_decode: Option<JoinHandle<Result<Image, image::ImageError>>>,
+    pending_lightbox_decode: Option<JoinHandle<Result<chat::CachedImage, image::ImageError>>>,
 
     /// Right-click context menu for a file card. `Some` while open;
     /// cleared by any menu action, the dismiss scrim, or Escape.
@@ -202,6 +212,7 @@ impl<B: UiBackend> RumbleApp<B> {
             auto_handled_offers: HashSet::new(),
             image_cache: HashMap::new(),
             image_failed: HashSet::new(),
+            gif_playback: HashMap::new(),
             image_lightbox: None,
             lightbox_full: None,
             pending_lightbox_decode: None,
@@ -235,22 +246,109 @@ const MAX_PREVIEW_PX: u32 = 1024;
 /// under the typical 8192 GPU texture limit).
 const MAX_LIGHTBOX_PX: u32 = 4096;
 
-/// Decode `path` into an aetna `Image`. `max_px` caps the longest
-/// edge — `Some(n)` runs `image::thumbnail` for downsampling, `None`
+/// Decode `path` into a [`chat::CachedImage`]. `max_px` caps the
+/// longest edge of every emitted frame — `Some(n)` downsamples, `None`
 /// loads the source at its natural resolution.
-fn decode_image(path: &Path, max_px: Option<u32>) -> Result<Image, image::ImageError> {
-    let img = image::ImageReader::open(path)?.with_guessed_format()?.decode()?;
+///
+/// Animated GIFs decode every frame and produce
+/// [`chat::CachedImage::Animated`]; single-frame GIFs collapse back to
+/// `Static`. Everything else is a single decode.
+fn decode_image(path: &Path, max_px: Option<u32>) -> Result<chat::CachedImage, image::ImageError> {
+    use image::ImageFormat;
+
+    let reader = image::ImageReader::open(path)?.with_guessed_format()?;
+    if reader.format() == Some(ImageFormat::Gif) {
+        return decode_animated_gif(path, max_px);
+    }
+
+    let img = reader.decode()?;
     let img = match max_px {
         Some(cap) if img.width().max(img.height()) > cap => img.thumbnail(cap, cap),
         _ => img,
     };
     let rgba = img.to_rgba8();
-    Ok(Image::from_rgba8(rgba.width(), rgba.height(), rgba.into_raw()))
+    Ok(chat::CachedImage::Static(Image::from_rgba8(
+        rgba.width(),
+        rgba.height(),
+        rgba.into_raw(),
+    )))
+}
+
+/// Decode every frame of a GIF, downsample each by `max_px`, and pack
+/// them into a [`chat::CachedImage::Animated`]. A delay floor of 20ms
+/// per frame keeps a 0/1-ms pathological file from pegging the playback
+/// pump (browsers do the same — Chrome and Firefox both clamp tiny
+/// delays). Single-frame GIFs collapse to `Static`.
+fn decode_animated_gif(path: &Path, max_px: Option<u32>) -> Result<chat::CachedImage, image::ImageError> {
+    use image::{AnimationDecoder, DynamicImage};
+
+    let file = std::fs::File::open(path)?;
+    let decoder = image::codecs::gif::GifDecoder::new(BufReader::new(file))?;
+    let frames = decoder.into_frames();
+
+    let mut out: Vec<(Image, Duration)> = Vec::new();
+    for frame in frames {
+        let frame = frame?;
+        let (numer, denom) = frame.delay().numer_denom_ms();
+        let micros = (numer as u64).saturating_mul(1000) / (denom.max(1) as u64);
+        let delay = Duration::from_micros(micros).max(Duration::from_millis(20));
+
+        let mut dynimg = DynamicImage::ImageRgba8(frame.into_buffer());
+        if let Some(cap) = max_px
+            && dynimg.width().max(dynimg.height()) > cap
+        {
+            dynimg = dynimg.thumbnail(cap, cap);
+        }
+        let rgba = dynimg.to_rgba8();
+        let img = Image::from_rgba8(rgba.width(), rgba.height(), rgba.into_raw());
+        out.push((img, delay));
+    }
+
+    if out.len() <= 1 {
+        // Single-frame GIF (rare but legal). The animated UI overhead —
+        // playback state, controls overlay — adds nothing here, so
+        // collapse to Static. An empty file would have been refused by
+        // the decoder; the unwrap_or is a paranoid fallback.
+        return Ok(chat::CachedImage::Static(
+            out.into_iter()
+                .next()
+                .map(|(img, _)| img)
+                .unwrap_or_else(|| Image::from_rgba8(1, 1, vec![0, 0, 0, 0])),
+        ));
+    }
+
+    Ok(chat::CachedImage::Animated { frames: out })
 }
 
 /// Backwards-compat wrapper for the chat thumbnail cache decode.
-fn decode_thumbnail(path: &Path) -> Result<Image, image::ImageError> {
+fn decode_thumbnail(path: &Path) -> Result<chat::CachedImage, image::ImageError> {
     decode_image(path, Some(MAX_PREVIEW_PX))
+}
+
+/// Advance an animated cache entry's playhead given elapsed wall-clock
+/// time. Skips through any number of frames whose accumulated delay is
+/// already in the past, so a long idle window resumes at the visually-
+/// correct frame in one update rather than fast-forwarding through
+/// every frame for one tick each.
+fn advance_gif_frame(pb: &mut chat::GifPlayback, frames: &[(Image, Duration)], now: Instant) {
+    let mut elapsed = now.saturating_duration_since(pb.last_advance);
+    let mut idx = pb.frame_idx.min(frames.len() - 1);
+    let mut advanced = false;
+    loop {
+        let cur_delay = frames[idx].1;
+        if elapsed < cur_delay {
+            break;
+        }
+        elapsed -= cur_delay;
+        idx = (idx + 1) % frames.len();
+        advanced = true;
+    }
+    if advanced {
+        pb.frame_idx = idx;
+        // Anchor `last_advance` at the frame boundary we landed on, so
+        // residual sub-frame elapsed time doesn't accumulate drift.
+        pb.last_advance = now - elapsed;
+    }
 }
 
 impl<B: UiBackend> App for RumbleApp<B> {
@@ -261,6 +359,7 @@ impl<B: UiBackend> App for RumbleApp<B> {
         self.pump_chat_sfx();
         self.pump_image_cache();
         self.poll_lightbox_decode();
+        self.pump_gif_animations();
     }
 
     fn build(&self, _cx: &BuildCx) -> El {
@@ -274,6 +373,7 @@ impl<B: UiBackend> App for RumbleApp<B> {
                     &state,
                     &shell.chat,
                     &self.image_cache,
+                    &self.gif_playback,
                     &self.chat_input,
                     &self.selection,
                     self.chat_sidebar_w,
@@ -356,26 +456,24 @@ impl<B: UiBackend> App for RumbleApp<B> {
             && unlock_layer.is_none()
             && cert_layer.is_none()
             && !self.settings_state.open
-            && let Some(state) = self.image_lightbox.as_ref()
-            && let Some(img) = self
+            && let Some(lightbox_state) = self.image_lightbox.as_ref()
+            && let Some(cached) = self
                 .lightbox_full
                 .as_ref()
-                .or_else(|| self.image_cache.get(&state.transfer_id))
+                .or_else(|| self.image_cache.get(&lightbox_state.transfer_id))
         {
-            Some(chat::render_lightbox(state, img))
+            let playback = self.gif_playback.get(&lightbox_state.transfer_id);
+            Some(chat::render_lightbox(lightbox_state, cached, playback))
         } else {
             None
         };
 
-        let file_ctx_layer = if !wizard_open
-            && unlock_layer.is_none()
-            && cert_layer.is_none()
-            && !self.settings_state.open
-        {
-            self.file_context_menu.as_ref().map(chat::render_file_context_menu)
-        } else {
-            None
-        };
+        let file_ctx_layer =
+            if !wizard_open && unlock_layer.is_none() && cert_layer.is_none() && !self.settings_state.open {
+                self.file_context_menu.as_ref().map(chat::render_file_context_menu)
+            } else {
+                None
+            };
 
         let any_layer = wizard_layer.is_some()
             || unlock_layer.is_some()
@@ -472,6 +570,7 @@ impl<B: UiBackend> App for RumbleApp<B> {
                 &event,
                 CHAT_SIDEBAR_HANDLE,
                 Axis::Row,
+                resize_handle::Side::Start,
                 tokens::SIDEBAR_WIDTH_MIN,
                 tokens::SIDEBAR_WIDTH_MAX,
             );
@@ -593,6 +692,23 @@ impl<B: UiBackend> App for RumbleApp<B> {
         {
             self.download_offer(transfer_id);
             return;
+        }
+
+        // Per-GIF play/pause and explicit-open-lightbox icons live on
+        // top of the preview card (`stack([preview, controls])`), so
+        // their routes win over the underlying `chat:preview:*` route.
+        // Handle them before the body click below.
+        if matches!(event.kind, UiEventKind::Click | UiEventKind::Activate)
+            && let Some(route) = event.route()
+        {
+            if let Some(transfer_id) = chat::parse_gif_play_key(route) {
+                self.toggle_gif_playback(transfer_id);
+                return;
+            }
+            if let Some(transfer_id) = chat::parse_gif_lightbox_key(route) {
+                self.open_lightbox(transfer_id);
+                return;
+            }
         }
 
         // Image lightbox. Open by clicking (or keyboard-activating) an
@@ -723,10 +839,7 @@ impl<B: UiBackend> App for RumbleApp<B> {
                 for cmd in commands {
                     // Skip the auto-triggered RequestChatHistory when the
                     // setting is off (manual sync button bypasses this gate).
-                    if has_join
-                        && !auto_sync
-                        && matches!(cmd, Command::RequestChatHistory)
-                    {
+                    if has_join && !auto_sync && matches!(cmd, Command::RequestChatHistory) {
                         continue;
                     }
                     self.backend.send(cmd);
@@ -1048,13 +1161,20 @@ impl<B: UiBackend> RumbleApp<B> {
         let snapshot = self.backend.state();
         let offer = snapshot.chat_messages.iter().find_map(|m| {
             if let Some(rumble_protocol::ChatAttachment::FileOffer(o)) = &m.attachment {
-                if o.transfer_id == transfer_id { Some(o.clone()) } else { None }
+                if o.transfer_id == transfer_id {
+                    Some(o.clone())
+                } else {
+                    None
+                }
             } else {
                 None
             }
         });
         let name = offer.map(|o| o.name).unwrap_or_else(|| transfer_id.to_string());
-        let local_path = self.backend.transfers().into_iter()
+        let local_path = self
+            .backend
+            .transfers()
+            .into_iter()
             .find(|t| t.id.0 == transfer_id)
             .and_then(|t| t.local_path);
         self.file_context_menu = Some(chat::FileContextMenu {
@@ -1087,7 +1207,9 @@ impl<B: UiBackend> RumbleApp<B> {
     /// Spawn a "Save As" dialog. The copy is performed when the dialog
     /// resolves via [`Self::poll_save_as`].
     fn file_ctx_save_as(&mut self) {
-        let Some(menu) = self.file_context_menu.take() else { return };
+        let Some(menu) = self.file_context_menu.take() else {
+            return;
+        };
         let Some(src) = menu.local_path else { return };
         if self.pending_save_as.is_some() {
             return;
@@ -1105,8 +1227,12 @@ impl<B: UiBackend> RumbleApp<B> {
 
     /// Poll the in-flight "Save As" dialog and copy the file when done.
     fn poll_save_as(&mut self) {
-        let Some((_, handle)) = self.pending_save_as.as_ref() else { return };
-        if !handle.is_finished() { return; }
+        let Some((_, handle)) = self.pending_save_as.as_ref() else {
+            return;
+        };
+        if !handle.is_finished() {
+            return;
+        }
         let (src, handle) = self.pending_save_as.take().unwrap();
         match self.runtime.block_on(handle) {
             Ok(Some(dest)) => {
@@ -1175,6 +1301,17 @@ impl<B: UiBackend> RumbleApp<B> {
             .unwrap_or_else(|| transfer_id.to_string());
         self.image_lightbox = Some(chat::Lightbox::new(transfer_id, name));
 
+        // Force-resume an animated entry on lightbox open: the user
+        // explicitly chose to view it, so the chat-settings autoplay
+        // gate doesn't apply here. Static entries simply have no
+        // playback record.
+        if let Some(pb) = self.gif_playback.get_mut(transfer_id)
+            && !pb.playing
+        {
+            pb.playing = true;
+            pb.last_advance = Instant::now();
+        }
+
         // Cancel any previous in-flight full-res decode and reset
         // the slot — opening a new lightbox shouldn't leak the prior
         // image or fold in a stale decode that lands later.
@@ -1210,6 +1347,22 @@ impl<B: UiBackend> RumbleApp<B> {
         self.lightbox_full = None;
         if let Some(handle) = self.pending_lightbox_decode.take() {
             handle.abort();
+        }
+    }
+
+    /// Flip play/pause on an animated entry's playhead. No-op for static
+    /// entries (their `gif_playback` slot doesn't exist) — the icon
+    /// overlay is only rendered for animated cache entries, so this is
+    /// reachable defensively at most.
+    fn toggle_gif_playback(&mut self, transfer_id: &str) {
+        if let Some(pb) = self.gif_playback.get_mut(transfer_id) {
+            pb.playing = !pb.playing;
+            // Reset the wall-clock anchor whenever play resumes so the
+            // current frame still shows for its full delay rather than
+            // immediately advancing if the entry sat paused for a while.
+            if pb.playing {
+                pb.last_advance = Instant::now();
+            }
         }
     }
 
@@ -1318,8 +1471,19 @@ impl<B: UiBackend> RumbleApp<B> {
                 continue;
             }
             match decode_thumbnail(path) {
-                Ok(img) => {
-                    self.image_cache.insert(id.clone(), img);
+                Ok(cached) => {
+                    if cached.is_animated() {
+                        // Seed playback state once so the inline preview
+                        // and lightbox observe a stable playhead. Honour
+                        // the chat-settings autoplay default for the
+                        // initial state; play/pause clicks toggle from
+                        // there.
+                        let autoplay = self.settings.settings().chat.gif_autoplay;
+                        self.gif_playback
+                            .entry(id.clone())
+                            .or_insert_with(|| chat::GifPlayback::new(autoplay));
+                    }
+                    self.image_cache.insert(id.clone(), cached);
                 }
                 Err(e) => {
                     tracing::debug!(
@@ -1329,6 +1493,49 @@ impl<B: UiBackend> RumbleApp<B> {
                     );
                     self.image_failed.insert(id.clone());
                 }
+            }
+        }
+    }
+
+    /// Advance every active GIF playhead by the elapsed wall-clock
+    /// time. Each frame's display delay is treated as the dwell time
+    /// before the next frame appears — multi-frame skips are folded
+    /// into a single update so a tab the user backgrounded for a few
+    /// seconds resumes at the right frame instead of catching up frame
+    /// by frame.
+    ///
+    /// Drops `gif_playback` entries whose underlying cache entry has
+    /// gone away (e.g. because the transfer was evicted), so the map
+    /// can't outgrow the cache it shadows.
+    fn pump_gif_animations(&mut self) {
+        let now = Instant::now();
+        // Walk by key first so the borrow on `image_cache` is dropped
+        // before we mutate playback. Avoids a double-borrow on `self`.
+        let keys: Vec<String> = self.gif_playback.keys().cloned().collect();
+        for id in keys {
+            let drop_entry = match self.image_cache.get(&id) {
+                Some(chat::CachedImage::Animated { frames, .. }) => {
+                    if let Some(pb) = self.gif_playback.get_mut(&id) {
+                        if !pb.playing || frames.is_empty() {
+                            // Paused: keep the entry, don't burn cycles.
+                            // Empty frames is impossible by construction
+                            // (decode collapses to Static) but guard
+                            // anyway so the loop can't divide by zero.
+                            false
+                        } else {
+                            advance_gif_frame(pb, frames, now);
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                }
+                // Cache entry vanished or is Static — drop the playback
+                // record so the map stays bounded.
+                _ => true,
+            };
+            if drop_entry {
+                self.gif_playback.remove(&id);
             }
         }
     }
@@ -1532,10 +1739,19 @@ impl<B: UiBackend> RumbleApp<B> {
             s.chat.show_timestamps = pending.show_timestamps;
             s.chat.timestamp_format = pending.timestamp_format;
             s.chat.auto_sync_history = pending.auto_sync_history;
+            s.chat.gif_autoplay = pending.gif_autoplay;
 
-            // Files (auto-download flag + bandwidth + flags only;
-            // per-MIME rules aren't editable in this client yet).
+            // Files. Rule rows whose pattern is blank get dropped on
+            // save — they could only have been left empty as scratch
+            // space while the user was editing, and a rule with no
+            // pattern can never match an offer anyway.
             s.file_transfer.auto_download_enabled = pending.auto_download_enabled;
+            s.file_transfer.auto_download_rules = pending
+                .auto_download_rules
+                .iter()
+                .map(|r| r.to_rule())
+                .filter(|r| !r.mime_pattern.is_empty())
+                .collect();
             s.file_transfer.download_speed_limit = (pending.download_speed_kbps as u64) * 1024;
             s.file_transfer.upload_speed_limit = (pending.upload_speed_kbps as u64) * 1024;
             s.file_transfer.seed_after_download = pending.seed_after_download;
@@ -1632,7 +1848,8 @@ impl<B: UiBackend> RumbleApp<B> {
     /// don't have a real file-transfer plugin behind them — so let the
     /// scene-builder push a synthetic decoded image directly.
     pub fn insert_image_preview_for_test(&mut self, transfer_id: impl Into<String>, img: Image) {
-        self.image_cache.insert(transfer_id.into(), img);
+        self.image_cache
+            .insert(transfer_id.into(), chat::CachedImage::Static(img));
     }
 
     /// Test/scene-dump hook to open the lightbox without a click event.
@@ -1710,8 +1927,8 @@ fn top_toolbar(state: &State) -> El {
     children.push(button("Settings").key("toolbar:settings").ghost());
 
     row(children)
-        .gap(tokens::SPACE_SM)
-        .padding(Sides::xy(tokens::SPACE_LG, tokens::SPACE_SM))
+        .gap(tokens::SPACE_2)
+        .padding(Sides::xy(tokens::SPACE_4, tokens::SPACE_2))
         .height(Size::Fixed(56.0))
         .width(Size::Fill(1.0))
         .fill(tokens::ACCENT)
@@ -1731,16 +1948,16 @@ fn cert_modal(cert_info: &PendingCertificate) -> El {
         "cert",
         "Untrusted certificate",
         [
-            paragraph("The server presented a self-signed or unknown certificate.").text_color(tokens::WARNING),
-            row([text("Server:").muted(), text(cert_info.server_addr.clone()).semibold()])
-                .gap(tokens::SPACE_SM)
-                .align(Align::Center),
-            row([
-                text("Certificate for:").muted(),
-                text(cert_info.server_name.clone()).semibold(),
+            alert([
+                alert_title("Self-signed or unknown certificate"),
+                alert_description(
+                    "Only accept if this fingerprint matches what the server administrator gave you. Once accepted, \
+                     the certificate is saved for future connections.",
+                ),
             ])
-            .gap(tokens::SPACE_SM)
-            .align(Align::Center),
+            .warning(),
+            field_row("Server", text(cert_info.server_addr.clone()).semibold()),
+            field_row("Certificate for", text(cert_info.server_name.clone()).semibold()),
             text("Fingerprint (SHA-256)").muted(),
             // SHA-256 hex with colon separators is 79 chars wide —
             // wrap_text() so it flows across two lines instead of
@@ -1749,18 +1966,12 @@ fn cert_modal(cert_info: &PendingCertificate) -> El {
             mono(cert_info.fingerprint_hex())
                 .font_size(tokens::TEXT_XS.size)
                 .wrap_text(),
-            paragraph(
-                "Only accept if this fingerprint matches what the server administrator gave you. Once accepted, the \
-                 certificate is saved for future connections.",
-            )
-            .muted()
-            .font_size(tokens::TEXT_XS.size),
             row([
                 button("Reject").key("cert:reject"),
                 spacer(),
                 button("Trust and connect").key("cert:accept").primary(),
             ])
-            .gap(tokens::SPACE_SM)
+            .gap(tokens::SPACE_2)
             .width(Size::Fill(1.0))
             .align(Align::Center),
         ],
@@ -1809,13 +2020,14 @@ fn identity_modal(identity: &Identity) -> El {
             mono(path.display().to_string())
                 .font_size(tokens::TEXT_XS.size)
                 .wrap_text(),
-            divider(),
-            paragraph(
-                "Generating a new identity overwrites identity.json. Servers that knew the old key won't recognise \
-                 the new one — you'll have to re-register or be re-approved.",
-            )
-            .text_color(tokens::WARNING)
-            .font_size(tokens::TEXT_XS.size),
+            alert([
+                alert_title("Regenerating overwrites your identity"),
+                alert_description(
+                    "Servers that knew the old key won't recognise the new one — you'll have to re-register or be \
+                     re-approved.",
+                ),
+            ])
+            .warning(),
             row([
                 button("Close").key("identity:close"),
                 spacer(),
@@ -1823,7 +2035,7 @@ fn identity_modal(identity: &Identity) -> El {
                     .key("identity:regenerate")
                     .destructive(),
             ])
-            .gap(tokens::SPACE_SM)
+            .gap(tokens::SPACE_2)
             .width(Size::Fill(1.0))
             .align(Align::Center),
         ],

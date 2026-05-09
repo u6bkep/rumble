@@ -14,7 +14,7 @@
 use aetna_core::prelude::*;
 
 use rumble_client::{PipelineConfig, ProcessorRegistry, SfxKind};
-use rumble_desktop_shell::{PersistentVoiceMode, Settings, TimestampFormat};
+use rumble_desktop_shell::{AutoDownloadRule, PersistentVoiceMode, Settings, TimestampFormat};
 use rumble_protocol::{AudioSettings, AudioState, State};
 use serde_json::Value as JsonValue;
 
@@ -127,13 +127,58 @@ pub struct PendingSettings {
     pub show_timestamps: bool,
     pub timestamp_format: TimestampFormat,
     pub auto_sync_history: bool,
+    pub gif_autoplay: bool,
 
     // Files
     pub auto_download_enabled: bool,
+    /// Editable rule list. The size column is held as a string
+    /// (megabytes) so the user can clear the field while typing without
+    /// it snapping back to `0`; we parse on Save.
+    pub auto_download_rules: Vec<PendingAutoDownloadRule>,
     pub download_speed_kbps: u32,
     pub upload_speed_kbps: u32,
     pub seed_after_download: bool,
     pub cleanup_on_exit: bool,
+}
+
+/// One row of the auto-download rules editor.
+#[derive(Debug, Clone, Default)]
+pub struct PendingAutoDownloadRule {
+    pub mime_pattern: String,
+    /// Megabytes as user-typed text. Parsed back to `u64` bytes on Save;
+    /// non-numeric / empty values become `0`, which matches
+    /// [`AutoDownloadRule`]'s "rule disabled" sentinel.
+    pub size_mb_text: String,
+}
+
+const MB: u64 = 1024 * 1024;
+/// Default size for a freshly-added rule, mirroring the egui client's
+/// 10 MB starting point.
+const DEFAULT_RULE_SIZE_MB: u64 = 10;
+/// Cap "Add Rule" can produce per click. The egui client lets users
+/// type up to 1000 MB; we accept anything they paste here, but new
+/// rules start under that.
+const MAX_RULE_SIZE_MB: u64 = 1000;
+
+impl PendingAutoDownloadRule {
+    fn from_rule(rule: &AutoDownloadRule) -> Self {
+        Self {
+            mime_pattern: rule.mime_pattern.clone(),
+            size_mb_text: (rule.max_size_bytes / MB).to_string(),
+        }
+    }
+
+    /// Convert the editable row back to an [`AutoDownloadRule`]. An
+    /// unparseable / empty size field becomes `0`, which the rule
+    /// engine treats as "disabled" — preferable to dropping the row
+    /// entirely, since the user can clear the field while editing.
+    pub fn to_rule(&self) -> AutoDownloadRule {
+        let mb: u64 = self.size_mb_text.trim().parse().unwrap_or(0);
+        AutoDownloadRule {
+            mime_pattern: self.mime_pattern.trim().to_string(),
+            max_size_bytes: mb.saturating_mul(MB),
+        }
+    }
 }
 
 impl PendingSettings {
@@ -155,7 +200,14 @@ impl PendingSettings {
             show_timestamps: settings.chat.show_timestamps,
             timestamp_format: settings.chat.timestamp_format,
             auto_sync_history: settings.chat.auto_sync_history,
+            gif_autoplay: settings.chat.gif_autoplay,
             auto_download_enabled: settings.file_transfer.auto_download_enabled,
+            auto_download_rules: settings
+                .file_transfer
+                .auto_download_rules
+                .iter()
+                .map(PendingAutoDownloadRule::from_rule)
+                .collect(),
             download_speed_kbps: (settings.file_transfer.download_speed_limit / 1024) as u32,
             upload_speed_kbps: (settings.file_transfer.upload_speed_limit / 1024) as u32,
             seed_after_download: settings.file_transfer.seed_after_download,
@@ -241,12 +293,39 @@ const KEY_SFX_VOLUME: &str = "settings:sfx:volume";
 const KEY_CHAT_SHOW_TIMESTAMPS: &str = "settings:chat:show-timestamps";
 const KEY_CHAT_FORMAT: &str = "settings:chat:format";
 const KEY_CHAT_AUTO_SYNC: &str = "settings:chat:auto-sync";
+const KEY_CHAT_GIF_AUTOPLAY: &str = "settings:chat:gif-autoplay";
 
 const KEY_FILES_AUTO_DOWNLOAD: &str = "settings:files:auto-download";
 const KEY_FILES_DL_LIMIT: &str = "settings:files:download-limit";
 const KEY_FILES_UL_LIMIT: &str = "settings:files:upload-limit";
 const KEY_FILES_SEED: &str = "settings:files:seed";
 const KEY_FILES_CLEANUP: &str = "settings:files:cleanup";
+
+/// Auto-download rules editor. Rule rows use `<prefix>:<idx>:<field>`;
+/// the shared prefix lets [`handle_event`] cheaply early-out for
+/// unrelated routes.
+const RULE_PREFIX: &str = "settings:files:rule:";
+const KEY_FILES_RULE_ADD: &str = "settings:files:rule:add";
+
+fn rule_mime_key(idx: usize) -> String {
+    format!("{RULE_PREFIX}{idx}:mime")
+}
+fn rule_size_key(idx: usize) -> String {
+    format!("{RULE_PREFIX}{idx}:size")
+}
+fn rule_remove_key(idx: usize) -> String {
+    format!("{RULE_PREFIX}{idx}:remove")
+}
+
+/// Inverse of the rule key constructors. Returns (idx, field) for any
+/// `settings:files:rule:<idx>:<field>` route, or `None` for unrelated
+/// routes (including `:add`, which is matched separately).
+fn parse_rule_route(route: &str) -> Option<(usize, &str)> {
+    let rest = route.strip_prefix(RULE_PREFIX)?;
+    let (idx_str, field) = rest.split_once(':')?;
+    let idx: usize = idx_str.parse().ok()?;
+    Some((idx, field))
+}
 
 const KEY_STATS_RESET: &str = "settings:stats:reset";
 
@@ -329,7 +408,7 @@ pub fn render(
         SettingsTab::Processing => render_processing(pending, &app_state.audio, processor_registry, selection),
         SettingsTab::Sounds => render_sounds(pending),
         SettingsTab::Chat => render_chat(pending),
-        SettingsTab::Files => render_files(pending),
+        SettingsTab::Files => render_files(pending, selection),
         SettingsTab::Stats => render_stats(&app_state.audio),
     };
 
@@ -344,7 +423,7 @@ pub fn render(
         spacer(),
         button("Save").key(KEY_SAVE).primary(),
     ])
-    .gap(tokens::SPACE_SM)
+    .gap(tokens::SPACE_2)
     .width(Size::Fill(1.0))
     .align(Align::Center);
 
@@ -356,8 +435,8 @@ pub fn render(
         [
             tabs_row,
             scroll([body])
-                .padding(Sides::xy(0.0, tokens::SPACE_SM))
-                .gap(tokens::SPACE_MD)
+                .padding(Sides::xy(0.0, tokens::SPACE_2))
+                .gap(tokens::SPACE_3)
                 .width(Size::Fill(1.0))
                 .height(Size::Fill(1.0)),
             divider(),
@@ -452,7 +531,7 @@ fn render_connection(pending: &PendingSettings, identity: &Identity) -> El {
         .font_size(tokens::TEXT_XS.size),
     );
 
-    column(children).gap(tokens::SPACE_MD).width(Size::Fill(1.0))
+    column(children).gap(tokens::SPACE_3).width(Size::Fill(1.0))
 }
 
 fn render_devices(pending: &PendingSettings, audio: &AudioState) -> El {
@@ -462,10 +541,10 @@ fn render_devices(pending: &PendingSettings, audio: &AudioState) -> El {
     column([
         section_heading("Input device"),
         select_trigger(KEY_INPUT_DEVICE, input_label),
-        spacer().height(Size::Fixed(tokens::SPACE_XS)),
+        spacer().height(Size::Fixed(tokens::SPACE_1)),
         section_heading("Output device"),
         select_trigger(KEY_OUTPUT_DEVICE, output_label),
-        spacer().height(Size::Fixed(tokens::SPACE_SM)),
+        spacer().height(Size::Fixed(tokens::SPACE_2)),
         row([button("Refresh devices").key(KEY_REFRESH_DEVICES).secondary(), spacer()]).width(Size::Fill(1.0)),
         divider(),
         paragraph(
@@ -474,7 +553,7 @@ fn render_devices(pending: &PendingSettings, audio: &AudioState) -> El {
         .muted()
         .font_size(tokens::TEXT_XS.size),
     ])
-    .gap(tokens::SPACE_SM)
+    .gap(tokens::SPACE_2)
     .width(Size::Fill(1.0))
 }
 
@@ -549,7 +628,7 @@ fn render_voice(pending: &PendingSettings) -> El {
                 .width(Size::Fixed(280.0)),
         ),
     ])
-    .gap(tokens::SPACE_SM)
+    .gap(tokens::SPACE_2)
     .width(Size::Fill(1.0))
 }
 
@@ -597,7 +676,7 @@ fn render_processing(
                 spacer(),
                 switch(proc_config.enabled).key(proc_enabled_key(idx)),
             ])
-            .gap(tokens::SPACE_MD)
+            .gap(tokens::SPACE_3)
             .align(Align::Center)
             .width(Size::Fill(1.0)),
         );
@@ -621,14 +700,14 @@ fn render_processing(
                 }
             }
         }
-        rows.push(spacer().height(Size::Fixed(tokens::SPACE_XS)));
+        rows.push(spacer().height(Size::Fixed(tokens::SPACE_1)));
     }
 
     rows.push(divider());
     rows.push(section_heading("Input level"));
     rows.push(input_level_meter(&pending.tx_pipeline, audio));
 
-    column(rows).gap(tokens::SPACE_SM).width(Size::Fill(1.0))
+    column(rows).gap(tokens::SPACE_2).width(Size::Fill(1.0))
 }
 
 /// Render one schema-defined property as a labelled control. `number` /
@@ -756,11 +835,11 @@ fn input_level_meter(pipeline: &PipelineConfig, audio: &AudioState) -> El {
 
     column([
         row([bar.into(), text(level_label).mono().font_size(tokens::TEXT_XS.size)])
-            .gap(tokens::SPACE_SM)
+            .gap(tokens::SPACE_2)
             .align(Align::Center),
         text(threshold_label).muted().font_size(tokens::TEXT_XS.size),
     ])
-    .gap(tokens::SPACE_XS)
+    .gap(tokens::SPACE_1)
     .width(Size::Fill(1.0))
 }
 
@@ -831,12 +910,12 @@ fn render_sounds(pending: &PendingSettings) -> El {
                 button("Preview").key(sfx_preview_key(idx)).secondary(),
                 switch(enabled).key(sfx_kind_key(idx)),
             ])
-            .gap(tokens::SPACE_SM)
+            .gap(tokens::SPACE_2)
             .align(Align::Center)
             .width(Size::Fill(1.0)),
         );
     }
-    column(rows).gap(tokens::SPACE_SM).width(Size::Fill(1.0))
+    column(rows).gap(tokens::SPACE_2).width(Size::Fill(1.0))
 }
 
 fn render_chat(pending: &PendingSettings) -> El {
@@ -857,57 +936,136 @@ fn render_chat(pending: &PendingSettings) -> El {
         paragraph("Asks peers for backlog when joining a room so you can read what was said before you arrived.")
             .muted()
             .font_size(tokens::TEXT_XS.size),
+        divider(),
+        field_row(
+            "Auto-play animated images",
+            switch(pending.gif_autoplay).key(KEY_CHAT_GIF_AUTOPLAY),
+        ),
+        paragraph("Off shows the first frame with a play button overlay until you start it.")
+            .muted()
+            .font_size(tokens::TEXT_XS.size),
     ])
-    .gap(tokens::SPACE_SM)
+    .gap(tokens::SPACE_2)
     .width(Size::Fill(1.0))
 }
 
-fn render_files(pending: &PendingSettings) -> El {
-    column([
-        section_heading("Auto-download"),
-        field_row(
-            "Enable auto-download",
-            switch(pending.auto_download_enabled).key(KEY_FILES_AUTO_DOWNLOAD),
-        ),
+fn render_files(pending: &PendingSettings, selection: &Selection) -> El {
+    let mut children: Vec<El> = Vec::new();
+    children.push(section_heading("Auto-download"));
+    children.push(field_row(
+        "Enable auto-download",
+        switch(pending.auto_download_enabled).key(KEY_FILES_AUTO_DOWNLOAD),
+    ));
+    children.push(
         paragraph(
-            "Auto-download rules (per-MIME size limits) are not yet editable in the aetna client. Use rumble-egui to \
-             edit the rule list; this client honours whatever rules are stored.",
+            "Auto-download offers whose MIME type matches a rule below, up to the per-rule size limit. Set a size of \
+             `0` to keep a pattern around without it firing.",
         )
         .muted()
         .font_size(tokens::TEXT_XS.size),
-        divider(),
-        section_heading("Bandwidth limits"),
-        field_row(
-            format!("Download limit ({})", speed_label(pending.download_speed_kbps)),
-            slider(
-                pending.download_speed_kbps as f32 / MAX_SPEED_KBPS as f32,
-                tokens::PRIMARY,
-            )
-            .key(KEY_FILES_DL_LIMIT)
-            .width(Size::Fixed(280.0)),
-        ),
-        field_row(
-            format!("Upload limit ({})", speed_label(pending.upload_speed_kbps)),
-            slider(
-                pending.upload_speed_kbps as f32 / MAX_SPEED_KBPS as f32,
-                tokens::PRIMARY,
-            )
-            .key(KEY_FILES_UL_LIMIT)
-            .width(Size::Fixed(280.0)),
-        ),
-        divider(),
-        section_heading("Seeding"),
-        field_row(
-            "Continue seeding after download",
-            switch(pending.seed_after_download).key(KEY_FILES_SEED),
-        ),
-        field_row(
-            "Clean up downloads on exit",
-            switch(pending.cleanup_on_exit).key(KEY_FILES_CLEANUP),
-        ),
-    ])
-    .gap(tokens::SPACE_SM)
-    .width(Size::Fill(1.0))
+    );
+
+    // Header row aligns with the inputs underneath. Width budgets:
+    // mime grows to fill, size column is fixed (~80 px), trailing
+    // remove icon is square.
+    children.push(
+        row([
+            text("MIME pattern").muted().font_size(tokens::TEXT_XS.size),
+            spacer(),
+            text("Max size (MB)")
+                .muted()
+                .font_size(tokens::TEXT_XS.size)
+                .width(Size::Fixed(110.0)),
+            spacer().width(Size::Fixed(28.0)),
+        ])
+        .gap(tokens::SPACE_2)
+        .align(Align::Center)
+        .width(Size::Fill(1.0)),
+    );
+
+    if pending.auto_download_rules.is_empty() {
+        children.push(
+            paragraph("No rules — add one below to start auto-downloading matching files.")
+                .muted()
+                .font_size(tokens::TEXT_XS.size),
+        );
+    } else {
+        for (idx, rule) in pending.auto_download_rules.iter().enumerate() {
+            children.push(rule_row(idx, rule, selection, pending.auto_download_enabled));
+        }
+    }
+
+    let add_rule = button_with_icon(IconName::Plus, "Add rule")
+        .key(KEY_FILES_RULE_ADD)
+        .secondary();
+    children.push(row([add_rule, spacer()]).width(Size::Fill(1.0)));
+
+    children.push(divider());
+    children.push(section_heading("Bandwidth limits"));
+    children.push(field_row(
+        format!("Download limit ({})", speed_label(pending.download_speed_kbps)),
+        slider(
+            pending.download_speed_kbps as f32 / MAX_SPEED_KBPS as f32,
+            tokens::PRIMARY,
+        )
+        .key(KEY_FILES_DL_LIMIT)
+        .width(Size::Fixed(280.0)),
+    ));
+    children.push(field_row(
+        format!("Upload limit ({})", speed_label(pending.upload_speed_kbps)),
+        slider(
+            pending.upload_speed_kbps as f32 / MAX_SPEED_KBPS as f32,
+            tokens::PRIMARY,
+        )
+        .key(KEY_FILES_UL_LIMIT)
+        .width(Size::Fixed(280.0)),
+    ));
+    children.push(divider());
+    children.push(section_heading("Seeding"));
+    children.push(field_row(
+        "Continue seeding after download",
+        switch(pending.seed_after_download).key(KEY_FILES_SEED),
+    ));
+    children.push(field_row(
+        "Clean up downloads on exit",
+        switch(pending.cleanup_on_exit).key(KEY_FILES_CLEANUP),
+    ));
+
+    column(children).gap(tokens::SPACE_2).width(Size::Fill(1.0))
+}
+
+/// One editable rule row: MIME pattern (fill width), size in MB
+/// (fixed-width input), remove button. The whole row dims when
+/// auto-download is off so the user gets a clear visual cue that the
+/// rule list is currently inert.
+fn rule_row(idx: usize, rule: &PendingAutoDownloadRule, selection: &Selection, enabled: bool) -> El {
+    let mime_input = text_input_with(
+        &rule.mime_pattern,
+        selection,
+        &rule_mime_key(idx),
+        TextInputOpts::default().placeholder("e.g. image/*"),
+    )
+    .width(Size::Fill(1.0));
+    let size_input = text_input_with(
+        &rule.size_mb_text,
+        selection,
+        &rule_size_key(idx),
+        TextInputOpts::default().placeholder("0"),
+    )
+    .width(Size::Fixed(110.0));
+    let remove = icon_button(IconName::X)
+        .key(rule_remove_key(idx))
+        .ghost()
+        .tooltip("Remove rule");
+
+    let mut r = row([mime_input, size_input, remove])
+        .gap(tokens::SPACE_2)
+        .align(Align::Center)
+        .width(Size::Fill(1.0));
+    if !enabled {
+        r = r.disabled();
+    }
+    r
 }
 
 fn render_stats(audio: &AudioState) -> El {
@@ -946,10 +1104,10 @@ fn render_stats(audio: &AudioState) -> El {
             format!("{} packets", stats.playback_buffer_packets),
             None,
         ),
-        spacer().height(Size::Fixed(tokens::SPACE_SM)),
+        spacer().height(Size::Fixed(tokens::SPACE_2)),
         row([spacer(), button("Reset statistics").key(KEY_STATS_RESET).secondary()]).width(Size::Fill(1.0)),
     ])
-    .gap(tokens::SPACE_XS)
+    .gap(tokens::SPACE_1)
     .width(Size::Fill(1.0))
 }
 
@@ -967,7 +1125,7 @@ fn stat_row(label: impl Into<String>, value: impl Into<String>, color: Option<Co
         value_text
     };
     row([text(label).muted(), spacer(), value_text])
-        .gap(tokens::SPACE_MD)
+        .gap(tokens::SPACE_3)
         .align(Align::Center)
         .width(Size::Fill(1.0))
 }
@@ -1078,12 +1236,53 @@ pub fn handle_event(
 
     // ---------- per-tab pending edits ----------
 
+    // Auto-download rules editor. Add / remove buttons fire on
+    // Click/Activate; the text inputs land on `target_key`, so check
+    // those first to keep the per-row update before any of the
+    // free-form text-input handlers further down.
+    if event.is_click_or_activate(KEY_FILES_RULE_ADD) {
+        // 10 MB matches the egui client's "Add Rule" default. New
+        // rows start with an empty pattern so the user types theirs
+        // before the rule actually fires.
+        pending.auto_download_rules.push(PendingAutoDownloadRule {
+            mime_pattern: String::new(),
+            size_mb_text: DEFAULT_RULE_SIZE_MB.min(MAX_RULE_SIZE_MB).to_string(),
+        });
+        return SettingsOutcome::Handled;
+    }
+    if let Some(target) = event.target_key()
+        && let Some((idx, field)) = parse_rule_route(target)
+        && let Some(rule) = pending.auto_download_rules.get_mut(idx)
+    {
+        match field {
+            "mime" => {
+                text_input::apply_event(&mut rule.mime_pattern, selection, &rule_mime_key(idx), event);
+                return SettingsOutcome::Handled;
+            }
+            "size" => {
+                let key = rule_size_key(idx);
+                text_input::apply_event(&mut rule.size_mb_text, selection, &key, event);
+                return SettingsOutcome::Handled;
+            }
+            _ => {}
+        }
+    }
+    if let Some(route) = event.route()
+        && matches!(event.kind, UiEventKind::Click | UiEventKind::Activate)
+        && let Some((idx, "remove")) = parse_rule_route(route)
+        && idx < pending.auto_download_rules.len()
+    {
+        pending.auto_download_rules.remove(idx);
+        return SettingsOutcome::Handled;
+    }
+
     // Switches.
     if switch::apply_event(&mut pending.autoconnect, event, KEY_AUTOCONNECT)
         || switch::apply_event(&mut pending.audio.fec_enabled, event, KEY_VOICE_FEC)
         || switch::apply_event(&mut pending.sfx_enabled, event, KEY_SFX_ENABLED)
         || switch::apply_event(&mut pending.show_timestamps, event, KEY_CHAT_SHOW_TIMESTAMPS)
         || switch::apply_event(&mut pending.auto_sync_history, event, KEY_CHAT_AUTO_SYNC)
+        || switch::apply_event(&mut pending.gif_autoplay, event, KEY_CHAT_GIF_AUTOPLAY)
         || switch::apply_event(&mut pending.auto_download_enabled, event, KEY_FILES_AUTO_DOWNLOAD)
         || switch::apply_event(&mut pending.seed_after_download, event, KEY_FILES_SEED)
         || switch::apply_event(&mut pending.cleanup_on_exit, event, KEY_FILES_CLEANUP)

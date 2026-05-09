@@ -170,8 +170,8 @@ pub fn render_center(state: &State, recent_servers: &[RecentServer]) -> El {
         spacer(),
         button("Add server…").key(KEY_ADD).primary(),
     ])
-    .gap(tokens::SPACE_SM)
-    .padding(Sides::xy(tokens::SPACE_LG, tokens::SPACE_SM))
+    .gap(tokens::SPACE_2)
+    .padding(Sides::xy(tokens::SPACE_4, tokens::SPACE_2))
     .align(Align::Center)
     .width(Size::Fill(1.0));
 
@@ -185,10 +185,10 @@ pub fn render_center(state: &State, recent_servers: &[RecentServer]) -> El {
                 .muted()
                 .font_size(tokens::TEXT_XS.size),
         ])
-        .gap(tokens::SPACE_SM)
+        .gap(tokens::SPACE_2)
         .align(Align::Center)
         .justify(Justify::Center)
-        .padding(tokens::SPACE_XL)
+        .padding(tokens::SPACE_7)
         .width(Size::Fill(1.0))
         .height(Size::Fill(1.0))
     } else {
@@ -198,9 +198,8 @@ pub fn render_center(state: &State, recent_servers: &[RecentServer]) -> El {
             .into_iter()
             .map(|idx| server_row(idx, &recent_servers[idx]))
             .collect();
-        scroll(rows)
-            .padding(Sides::xy(tokens::SPACE_LG, tokens::SPACE_SM))
-            .gap(tokens::SPACE_SM)
+        scroll([item_group(rows)])
+            .padding(Sides::xy(tokens::SPACE_4, tokens::SPACE_2))
             .width(Size::Fill(1.0))
             .height(Size::Fill(1.0))
     };
@@ -209,7 +208,7 @@ pub fn render_center(state: &State, recent_servers: &[RecentServer]) -> El {
     if let Some(banner) = status_banner {
         children.push(
             row([banner])
-                .padding(Sides::xy(tokens::SPACE_LG, tokens::SPACE_SM))
+                .padding(Sides::xy(tokens::SPACE_4, tokens::SPACE_2))
                 .width(Size::Fill(1.0)),
         );
         children.push(divider());
@@ -243,65 +242,56 @@ fn server_row(idx: usize, server: &RecentServer) -> El {
     }
     let subtitle = subtitle_parts.join(" · ");
 
-    let info = column([
-        text(title).semibold(),
-        text(subtitle).muted().font_size(tokens::TEXT_XS.size),
+    item([
+        item_content([item_title(title), item_description(subtitle)]),
+        item_actions([
+            button("Connect").key(format!("{KEY_CONNECT_PREFIX}{idx}")).primary(),
+            button("Edit").key(format!("{KEY_EDIT_PREFIX}{idx}")).ghost(),
+            button("Remove").key(format!("{KEY_DELETE_PREFIX}{idx}")).ghost(),
+        ]),
     ])
-    .gap(tokens::SPACE_XS)
-    .width(Size::Fill(1.0));
-
-    row([
-        info,
-        button("Connect").key(format!("{KEY_CONNECT_PREFIX}{idx}")).primary(),
-        button("Edit").key(format!("{KEY_EDIT_PREFIX}{idx}")).ghost(),
-        button("Remove").key(format!("{KEY_DELETE_PREFIX}{idx}")).ghost(),
-    ])
-    .gap(tokens::SPACE_SM)
-    .padding(Sides::all(tokens::SPACE_MD))
-    .fill(tokens::ACCENT)
-    .stroke(tokens::BORDER)
-    .radius(tokens::RADIUS_MD)
-    .align(Align::Center)
-    .width(Size::Fill(1.0))
 }
 
 /// Render the add/edit form modal. Returns `None` when no form is open.
 pub fn render_form_modal(state: &ServerPickerState, selection: &Selection) -> Option<El> {
-    let form = state.form.as_ref()?;
-    let title = if form.editing_index.is_some() {
+    let state_form = state.form.as_ref()?;
+    let title = if state_form.editing_index.is_some() {
         "Edit server"
     } else {
         "Add server"
     };
 
-    let mut body: Vec<El> = vec![
-        text("Address").muted(),
-        text_input(&form.addr, selection, KEY_FORM_ADDR),
-        text("Label (optional)").muted(),
-        text_input(&form.label, selection, KEY_FORM_LABEL),
-        text("Username").muted(),
-        text_input(&form.username, selection, KEY_FORM_USER),
+    let mut fields: Vec<El> = vec![
+        form_item([
+            form_label("Address"),
+            form_control(text_input(&state_form.addr, selection, KEY_FORM_ADDR).width(Size::Fill(1.0))),
+            form_description("host:port — e.g. 127.0.0.1:5000"),
+        ]),
+        form_item([
+            form_label("Label (optional)"),
+            form_control(text_input(&state_form.label, selection, KEY_FORM_LABEL).width(Size::Fill(1.0))),
+        ]),
+        form_item([
+            form_label("Username"),
+            form_control(text_input(&state_form.username, selection, KEY_FORM_USER).width(Size::Fill(1.0))),
+        ]),
     ];
-
-    if let Some(err) = &form.error {
-        body.push(
-            paragraph(err.clone())
-                .text_color(tokens::DESTRUCTIVE)
-                .font_size(tokens::TEXT_XS.size),
-        );
+    if let Some(err) = &state_form.error {
+        fields.push(form_message(err.clone()));
     }
 
-    body.push(
+    let body: Vec<El> = vec![
+        form(fields),
         row([
             button("Cancel").key(KEY_FORM_CANCEL),
             spacer(),
             button("Save").key(KEY_FORM_SAVE),
             button("Save & Connect").key(KEY_FORM_CONNECT).primary(),
         ])
-        .gap(tokens::SPACE_SM)
+        .gap(tokens::SPACE_2)
         .width(Size::Fill(1.0))
         .align(Align::Center),
-    );
+    ];
 
     Some(modal("server_form", title, body))
 }

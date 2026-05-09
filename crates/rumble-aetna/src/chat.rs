@@ -10,7 +10,11 @@
 //! selection)` and returns an `El`. The App owns event handling, slash
 //! command parsing, and the async file-picker pump.
 
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    sync::LazyLock,
+    time::{Duration, Instant},
+};
 
 use aetna_core::prelude::*;
 use rumble_desktop_shell::ChatSettings;
@@ -21,7 +25,87 @@ use crate::theme as palette;
 /// Decoded image cache, keyed by `transfer_id`. The App maintains this
 /// map and passes it through on render so the chat can swap a file
 /// card for an inline preview when the underlying transfer is complete.
-pub type ImageCache = HashMap<String, Image>;
+///
+/// Static images carry a single decoded [`Image`]. Animated GIFs carry
+/// the full sequence of frames so playback runs without re-decoding.
+pub type ImageCache = HashMap<String, CachedImage>;
+
+/// Per-message GIF playback state, keyed by `transfer_id`. Lives on the
+/// App separate from the cache so a re-decode (e.g. cache eviction +
+/// repopulation) doesn't reset playback position. Static images don't
+/// need an entry — the absence of a key is "n/a".
+#[derive(Clone, Debug)]
+pub struct GifPlayback {
+    /// Index into the animated cache entry's `frames` vec.
+    pub frame_idx: usize,
+    /// Wall-clock instant when `frame_idx` was last advanced. The pump
+    /// computes `now - last_advance` against the current frame's delay
+    /// to decide whether to advance.
+    pub last_advance: Instant,
+    /// Whether the animation is currently advancing. The play/pause
+    /// icon flips this; the chat-settings auto-play default seeds it
+    /// at first observation.
+    pub playing: bool,
+}
+
+impl GifPlayback {
+    pub fn new(playing: bool) -> Self {
+        Self {
+            frame_idx: 0,
+            last_advance: Instant::now(),
+            playing,
+        }
+    }
+}
+
+/// One entry in the chat image cache. `Static` is a single decoded
+/// frame; `Animated` carries every frame of a GIF along with the
+/// per-frame display delay so the App's pump can advance an
+/// independent playhead per message.
+#[derive(Clone, Debug)]
+pub enum CachedImage {
+    Static(Image),
+    Animated {
+        /// Decoded frames in source order, paired with each frame's
+        /// display duration. Always at least 2 entries — single-frame
+        /// GIFs collapse to `Static` at decode time.
+        frames: Vec<(Image, Duration)>,
+    },
+}
+
+impl CachedImage {
+    /// True when the entry has more than one frame and so warrants
+    /// playback state + the play/pause overlay.
+    pub fn is_animated(&self) -> bool {
+        matches!(self, Self::Animated { .. })
+    }
+
+    /// Pick the frame to render. For `Static`, returns the only frame
+    /// regardless of `playback`. For `Animated`, returns the frame at
+    /// `playback.frame_idx` if supplied, otherwise the first frame.
+    pub fn current_frame(&self, playback: Option<&GifPlayback>) -> &Image {
+        match self {
+            Self::Static(img) => img,
+            Self::Animated { frames, .. } => {
+                let idx = playback.map(|p| p.frame_idx).unwrap_or(0);
+                &frames[idx.min(frames.len() - 1)].0
+            }
+        }
+    }
+}
+
+// Player-control SVG icons. Loaded once via `parse_current_color` so
+// `.text_color(...)` tints them — these are monochrome glyphs, unlike
+// the room-tree status icons (`talking_on`, `muted_self`, etc.) which
+// bake their semantic colours into the SVG.
+static SVG_PLAY: LazyLock<SvgIcon> =
+    LazyLock::new(|| SvgIcon::parse_current_color(include_str!("../assets/icons/play.svg")).expect("play.svg parses"));
+static SVG_PAUSE: LazyLock<SvgIcon> = LazyLock::new(|| {
+    SvgIcon::parse_current_color(include_str!("../assets/icons/pause.svg")).expect("pause.svg parses")
+});
+static SVG_LIGHTBOX_OPEN: LazyLock<SvgIcon> = LazyLock::new(|| {
+    SvgIcon::parse_current_color(include_str!("../assets/icons/lightbox_open.svg")).expect("lightbox_open.svg parses")
+});
 
 /// Routed-key constants for the composer's auxiliary buttons. Send-on-
 /// Enter is keyed off the input itself (`KEY_INPUT`); the buttons each
@@ -59,6 +143,26 @@ pub fn preview_key(transfer_id: &str) -> String {
     format!("chat:preview:{transfer_id}")
 }
 
+/// Routed key for the play/pause icon overlaid on an animated preview.
+pub fn gif_play_key(transfer_id: &str) -> String {
+    format!("chat:gif:play:{transfer_id}")
+}
+
+/// Routed key for the explicit "open lightbox" icon overlaid on a
+/// preview. Mirrors the click-through behaviour of `preview_key`, but
+/// surfaces it as a discoverable affordance alongside play/pause.
+pub fn gif_lightbox_key(transfer_id: &str) -> String {
+    format!("chat:gif:lightbox:{transfer_id}")
+}
+
+pub fn parse_gif_play_key(key: &str) -> Option<&str> {
+    key.strip_prefix("chat:gif:play:")
+}
+
+pub fn parse_gif_lightbox_key(key: &str) -> Option<&str> {
+    key.strip_prefix("chat:gif:lightbox:")
+}
+
 /// Parse a `chat:download:<transfer-id>` route back to its transfer id.
 pub fn parse_download_key(key: &str) -> Option<&str> {
     key.strip_prefix("chat:download:")
@@ -71,6 +175,8 @@ pub fn parse_preview_key(key: &str) -> Option<&str> {
 
 /// Parse a `chat:download:*` or `chat:preview:*` key back to its transfer id.
 /// Used by the SecondaryClick handler to detect right-clicks on either card type.
+/// The icon-overlay routes (`chat:gif:*`) intentionally don't right-click —
+/// they are point actions, not surfaces.
 pub fn parse_file_card_key(key: &str) -> Option<&str> {
     parse_download_key(key).or_else(|| parse_preview_key(key))
 }
@@ -106,7 +212,7 @@ pub fn render_file_context_menu(menu: &FileContextMenu) -> El {
             text(menu.name.clone())
                 .semibold()
                 .ellipsis()
-                .padding(Sides::xy(tokens::SPACE_MD, tokens::SPACE_XS)),
+                .padding(Sides::xy(tokens::SPACE_3, tokens::SPACE_1)),
             divider(),
             open,
             open_folder,
@@ -120,6 +226,7 @@ pub fn render(
     state: &State,
     chat_settings: &ChatSettings,
     image_cache: &ImageCache,
+    gif_playback: &HashMap<String, GifPlayback>,
     chat_input: &str,
     selection: &Selection,
     width: f32,
@@ -127,9 +234,9 @@ pub fn render(
     column([
         text("Chat")
             .title()
-            .padding(Sides::xy(tokens::SPACE_LG, tokens::SPACE_SM)),
+            .padding(Sides::xy(tokens::SPACE_4, tokens::SPACE_2)),
         divider(),
-        history(state, chat_settings, image_cache),
+        history(state, chat_settings, image_cache, gif_playback),
         divider(),
         composer(state, chat_input, selection),
     ])
@@ -138,7 +245,12 @@ pub fn render(
     .fill(tokens::CARD)
 }
 
-fn history(state: &State, chat_settings: &ChatSettings, image_cache: &ImageCache) -> El {
+fn history(
+    state: &State,
+    chat_settings: &ChatSettings,
+    image_cache: &ImageCache,
+    gif_playback: &HashMap<String, GifPlayback>,
+) -> El {
     if state.chat_messages.is_empty() {
         let placeholder = text(if state.connection.is_connected() {
             "No messages yet"
@@ -148,8 +260,8 @@ fn history(state: &State, chat_settings: &ChatSettings, image_cache: &ImageCache
         .muted()
         .wrap_text();
         return scroll([placeholder])
-            .padding(Sides::xy(tokens::SPACE_LG, tokens::SPACE_SM))
-            .gap(tokens::SPACE_XS)
+            .padding(Sides::xy(tokens::SPACE_4, tokens::SPACE_2))
+            .gap(tokens::SPACE_1)
             .width(Size::Fill(1.0))
             .height(Size::Fill(1.0));
     }
@@ -157,17 +269,22 @@ fn history(state: &State, chat_settings: &ChatSettings, image_cache: &ImageCache
     let lines: Vec<El> = state
         .chat_messages
         .iter()
-        .map(|msg| render_message(msg, chat_settings, image_cache))
+        .map(|msg| render_message(msg, chat_settings, image_cache, gif_playback))
         .collect();
 
     scroll(lines)
-        .padding(Sides::xy(tokens::SPACE_LG, tokens::SPACE_SM))
-        .gap(tokens::SPACE_XS)
+        .padding(Sides::xy(tokens::SPACE_4, tokens::SPACE_2))
+        .gap(tokens::SPACE_1)
         .width(Size::Fill(1.0))
         .height(Size::Fill(1.0))
 }
 
-fn render_message(msg: &ChatMessage, chat_settings: &ChatSettings, image_cache: &ImageCache) -> El {
+fn render_message(
+    msg: &ChatMessage,
+    chat_settings: &ChatSettings,
+    image_cache: &ImageCache,
+    gif_playback: &HashMap<String, GifPlayback>,
+) -> El {
     let prefix = if chat_settings.show_timestamps {
         format!("[{}] ", chat_settings.timestamp_format.format(msg.timestamp))
     } else {
@@ -203,10 +320,13 @@ fn render_message(msg: &ChatMessage, chat_settings: &ChatSettings, image_cache: 
     match msg.attachment.as_ref() {
         Some(ChatAttachment::FileOffer(offer)) => {
             let attachment = match image_cache.get(&offer.transfer_id) {
-                Some(img) => image_preview(offer, img),
+                Some(cached) => {
+                    let playback = gif_playback.get(&offer.transfer_id);
+                    image_preview(offer, cached, playback)
+                }
                 None => file_offer_card(offer),
             };
-            column([line, attachment]).gap(tokens::SPACE_XS).width(Size::Fill(1.0))
+            column([line, attachment]).gap(tokens::SPACE_1).width(Size::Fill(1.0))
         }
         None => line,
     }
@@ -217,7 +337,7 @@ fn file_offer_card(offer: &FileOfferInfo) -> El {
         icon(IconName::FileText).text_color(tokens::MUTED_FOREGROUND),
         text(offer.name.clone()).semibold().ellipsis(),
     ])
-    .gap(tokens::SPACE_XS)
+    .gap(tokens::SPACE_1)
     .align(Align::Center)
     .width(Size::Fill(1.0));
 
@@ -240,8 +360,8 @@ fn file_offer_card(offer: &FileOfferInfo) -> El {
     .align(Align::Center);
 
     column([header, meta, actions])
-        .gap(tokens::SPACE_XS)
-        .padding(Sides::all(tokens::SPACE_SM))
+        .gap(tokens::SPACE_1)
+        .padding(Sides::all(tokens::SPACE_2))
         .fill(tokens::SECONDARY)
         .stroke(tokens::BORDER)
         .stroke_width(1.0)
@@ -259,31 +379,116 @@ fn file_offer_card(offer: &FileOfferInfo) -> El {
 /// click anywhere on it opens the lightbox at full size. `focusable`
 /// + the pointer cursor surface the affordance to keyboard and mouse
 /// users alike.
-fn image_preview(offer: &FileOfferInfo, img: &Image) -> El {
+///
+/// Animated entries get a YouTube-style icon pill in the bottom-right
+/// of the preview area: play/pause toggle and an explicit "open
+/// lightbox" icon. These nest above the card so their click events
+/// route to `chat:gif:*` rather than the underlying preview key.
+fn image_preview(offer: &FileOfferInfo, cached: &CachedImage, playback: Option<&GifPlayback>) -> El {
     const PREVIEW_HEIGHT: f32 = 220.0;
 
-    let preview = image(img.clone())
+    let frame = cached.current_frame(playback);
+    let preview = image(frame.clone())
         .image_fit(ImageFit::Contain)
         .radius(tokens::RADIUS_SM)
         .width(Size::Fill(1.0))
         .height(Size::Fixed(PREVIEW_HEIGHT));
+
+    let preview_layer: El = if cached.is_animated() {
+        let is_playing = playback.map(|p| p.playing).unwrap_or(false);
+        let mut layers: Vec<El> = vec![preview, gif_controls_overlay(&offer.transfer_id, is_playing)];
+        if is_playing {
+            // aetna's idle loop only re-fires when an event lands or
+            // when a `samples_time` shader is in the resolved op list.
+            // We need the second to keep our `pump_gif_animations`
+            // ticking while the user is otherwise idle. A zero-size
+            // transparent spinner has the right effect — its stock
+            // shader is registered with `samples_time=true` — and adds
+            // no visual weight. See `vendor/aetna/.../widgets/spinner.rs`.
+            layers.push(redraw_tick_keeper());
+        }
+        stack(layers).width(Size::Fill(1.0)).height(Size::Fixed(PREVIEW_HEIGHT))
+    } else {
+        preview
+    };
 
     let caption = text(format!("{} · {}", offer.name, format_size(offer.size)))
         .muted()
         .font_size(tokens::TEXT_XS.size)
         .ellipsis();
 
-    column([preview, caption])
+    column([preview_layer, caption])
         .key(preview_key(&offer.transfer_id))
         .focusable()
         .cursor(Cursor::Pointer)
-        .gap(tokens::SPACE_XS)
-        .padding(Sides::all(tokens::SPACE_SM))
+        .gap(tokens::SPACE_1)
+        .padding(Sides::all(tokens::SPACE_2))
         .fill(tokens::SECONDARY)
         .stroke(tokens::BORDER)
         .stroke_width(1.0)
         .radius(tokens::RADIUS_MD)
         .width(Size::Fill(1.0))
+}
+
+/// Zero-size transparent spinner. Used as a marker that pulls the
+/// stock spinner shader (which the runtime treats as `samples_time`)
+/// into the resolved op list, keeping the idle redraw loop alive while
+/// at least one GIF is playing.
+fn redraw_tick_keeper() -> El {
+    spinner_with_color(Color::rgba(0, 0, 0, 0))
+        .width(Size::Fixed(1.0))
+        .height(Size::Fixed(1.0))
+}
+
+/// Bottom-right pill of icon buttons overlaid on an animated image
+/// preview. Pushed to the corner with leading spacers in both axes so
+/// the pill keeps its shape regardless of image aspect ratio. The
+/// translucent dark backplate keeps the icons readable against any
+/// frame contents.
+fn gif_controls_overlay(transfer_id: &str, is_playing: bool) -> El {
+    let play_icon: IconSource = if is_playing {
+        SVG_PAUSE.clone().into()
+    } else {
+        SVG_PLAY.clone().into()
+    };
+    let play_btn = icon_button(play_icon)
+        .key(gif_play_key(transfer_id))
+        .ghost()
+        .tooltip(if is_playing { "Pause" } else { "Play" });
+    let lightbox_btn = icon_button(SVG_LIGHTBOX_OPEN.clone())
+        .key(gif_lightbox_key(transfer_id))
+        .ghost()
+        .tooltip("Open lightbox");
+
+    let mut pill = row([play_btn, lightbox_btn])
+        .gap(tokens::SPACE_1)
+        .padding(Sides::all(tokens::SPACE_1))
+        .fill(tokens::OVERLAY_SCRIM)
+        .radius(tokens::RADIUS_SM);
+
+    // While playing the pill hides at rest and fades in on hover (of
+    // the parent card or the pill itself) — `reveal_on_hover` reads
+    // the hover envelope of the nearest focusable ancestor (the card
+    // column below) plus the node's own hover. While paused the pill
+    // stays visible so the play-button affordance is always
+    // discoverable.
+    if is_playing {
+        pill = pill.reveal_on_hover(0.0);
+    }
+
+    // Push to bottom-right inside the parent stack: leading vertical
+    // and horizontal spacers consume excess space, parking the pill in
+    // the corner. Outer padding keeps the pill off the rounded edge of
+    // the image rect.
+    column([
+        spacer().height(Size::Fill(1.0)),
+        row([spacer().width(Size::Fill(1.0)), pill])
+            .align(Align::End)
+            .width(Size::Fill(1.0)),
+    ])
+    .padding(Sides::all(tokens::SPACE_2))
+    .width(Size::Fill(1.0))
+    .height(Size::Fill(1.0))
 }
 
 /// Returns true if `name`'s extension is one we can decode for inline
@@ -318,8 +523,14 @@ fn composer(state: &State, chat_input: &str, selection: &Selection) -> El {
         input = input.disabled();
     }
 
-    let mut share = icon_button(IconName::Upload).key(KEY_SHARE_FILE).ghost();
-    let mut sync = icon_button(IconName::RefreshCw).key(KEY_SYNC_HISTORY).ghost();
+    let mut share = icon_button(IconName::Upload)
+        .key(KEY_SHARE_FILE)
+        .ghost()
+        .tooltip("Share a file");
+    let mut sync = icon_button(IconName::RefreshCw)
+        .key(KEY_SYNC_HISTORY)
+        .ghost()
+        .tooltip("Sync chat history");
     if !connected {
         share = share.disabled();
         sync = sync.disabled();
@@ -327,15 +538,15 @@ fn composer(state: &State, chat_input: &str, selection: &Selection) -> El {
 
     column([
         row([input])
-            .padding(Sides::xy(tokens::SPACE_LG, tokens::SPACE_SM))
+            .padding(Sides::xy(tokens::SPACE_4, tokens::SPACE_2))
             .width(Size::Fill(1.0)),
         row([share, sync, spacer()])
-            .gap(tokens::SPACE_XS)
+            .gap(tokens::SPACE_1)
             .padding(Sides {
-                left: tokens::SPACE_LG,
-                right: tokens::SPACE_LG,
+                left: tokens::SPACE_4,
+                right: tokens::SPACE_4,
                 top: 0.0,
-                bottom: tokens::SPACE_SM,
+                bottom: tokens::SPACE_2,
             })
             .width(Size::Fill(1.0))
             .align(Align::Center),
@@ -411,8 +622,11 @@ pub struct PanDrag {
 /// Build the click-to-enlarge image viewer overlay. The caller picks
 /// the most-detailed image available (full-resolution lightbox decode
 /// when ready, otherwise the thumbnail from [`ImageCache`]) and
-/// passes it through.
-pub fn render_lightbox(lightbox: &Lightbox, img: &Image) -> El {
+/// passes it through. For animated entries `playback` selects the
+/// current frame so the lightbox stays in lockstep with the inline
+/// preview's playhead.
+pub fn render_lightbox(lightbox: &Lightbox, cached: &CachedImage, playback: Option<&GifPlayback>) -> El {
+    let img = cached.current_frame(playback);
     let header = lightbox_header(lightbox);
     let body = lightbox_body(lightbox, img);
 
@@ -423,8 +637,8 @@ pub fn render_lightbox(lightbox: &Lightbox, img: &Image) -> El {
         .stroke(tokens::BORDER)
         .stroke_width(1.0)
         .radius(tokens::RADIUS_LG)
-        .padding(Sides::all(tokens::SPACE_LG))
-        .gap(tokens::SPACE_MD)
+        .padding(Sides::all(tokens::SPACE_4))
+        .gap(tokens::SPACE_3)
         .width(Size::Fill(1.0))
         .height(Size::Fill(1.0))
         .block_pointer();
@@ -434,7 +648,7 @@ pub fn render_lightbox(lightbox: &Lightbox, img: &Image) -> El {
     // clicks land on the scrim sibling underneath, dismissing the
     // overlay, while clicks on the panel itself are absorbed by
     // `block_pointer()`.
-    let centered = stack([panel]).fill_size().padding(Sides::all(tokens::SPACE_XL));
+    let centered = stack([panel]).fill_size().padding(Sides::all(tokens::SPACE_7));
 
     overlay([scrim(KEY_LIGHTBOX_DISMISS), centered])
 }
@@ -468,7 +682,7 @@ fn lightbox_header(lightbox: &Lightbox) -> El {
         fit,
         button("Close").key(KEY_LIGHTBOX_CLOSE),
     ])
-    .gap(tokens::SPACE_SM)
+    .gap(tokens::SPACE_2)
     .align(Align::Center)
     .width(Size::Fill(1.0))
 }

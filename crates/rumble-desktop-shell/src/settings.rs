@@ -260,7 +260,7 @@ impl From<&PersistentAudioSettings> for AudioSettings {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ChatSettings {
     /// Whether to render `[hh:mm]` style timestamps next to messages.
@@ -270,6 +270,25 @@ pub struct ChatSettings {
     /// On joining a room, ask peers for their backlog so the user
     /// sees what was said before they arrived.
     pub auto_sync_history: bool,
+    /// Auto-play animated images (GIFs) inline in the chat log.
+    /// Off shows the first frame only, with a play overlay.
+    #[serde(default = "default_gif_autoplay")]
+    pub gif_autoplay: bool,
+}
+
+fn default_gif_autoplay() -> bool {
+    true
+}
+
+impl Default for ChatSettings {
+    fn default() -> Self {
+        Self {
+            show_timestamps: false,
+            timestamp_format: TimestampFormat::default(),
+            auto_sync_history: false,
+            gif_autoplay: default_gif_autoplay(),
+        }
+    }
 }
 
 /// One auto-download rule: files matching `mime_pattern` are pulled

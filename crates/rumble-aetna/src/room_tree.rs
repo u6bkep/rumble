@@ -293,11 +293,11 @@ fn rooms_view(state: &State, selected_room_id: Option<Uuid>, room_rects: &Arc<Mu
     column([
         text("Rooms")
             .title()
-            .padding(Sides::xy(tokens::SPACE_LG, tokens::SPACE_SM)),
+            .padding(Sides::xy(tokens::SPACE_4, tokens::SPACE_2)),
         divider(),
         scroll(entries)
-            .padding(Sides::xy(tokens::SPACE_LG, tokens::SPACE_MD))
-            .gap(tokens::SPACE_XS)
+            .padding(Sides::xy(tokens::SPACE_4, tokens::SPACE_3))
+            .gap(tokens::SPACE_1)
             .width(Size::Fill(1.0))
             .height(Size::Fill(1.0)),
         tracker,
@@ -364,7 +364,7 @@ fn push_room_subtree(
     let is_current = state.my_room_id == Some(room_id);
     let is_selected = selected_room_id == Some(room_id);
 
-    let indent = depth as f32 * tokens::SPACE_LG;
+    let indent = depth as f32 * tokens::SPACE_4;
     let suffix = if user_count > 0 {
         format!("  ({user_count})")
     } else {
@@ -388,9 +388,9 @@ fn push_room_subtree(
         label,
     ])
     .key(room_route_key(room_id))
-    .gap(tokens::SPACE_SM)
+    .gap(tokens::SPACE_2)
     .align(Align::Center)
-    .padding(Sides::xy(tokens::SPACE_XS, tokens::SPACE_XS))
+    .padding(Sides::xy(tokens::SPACE_1, tokens::SPACE_1))
     .radius(tokens::RADIUS_SM)
     .focusable();
     if is_selected {
@@ -429,14 +429,14 @@ fn push_room_subtree(
         let user_key = user_route_key(user_id, room_id);
         out.push(
             row([
-                spacer().width(Size::Fixed(indent + tokens::SPACE_LG)),
+                spacer().width(Size::Fixed(indent + tokens::SPACE_4)),
                 icon(mic_icon).icon_size(12.0),
                 name_el,
             ])
             .key(user_key.clone())
-            .gap(tokens::SPACE_SM)
+            .gap(tokens::SPACE_2)
             .align(Align::Center)
-            .padding(Sides::xy(tokens::SPACE_XS, 2.0))
+            .padding(Sides::xy(tokens::SPACE_1, 2.0))
             .focusable(),
         );
         // User row drops into its parent room.
@@ -491,7 +491,7 @@ fn render_room_context_menu(menu: &RoomContextMenu, app_state: &State) -> El {
         // Header rows: not interactive, just metadata.
         text(format!("Room: {}", menu.room_name))
             .semibold()
-            .padding(Sides::xy(tokens::SPACE_MD, tokens::SPACE_XS)),
+            .padding(Sides::xy(tokens::SPACE_3, tokens::SPACE_1)),
         divider(),
         menu_item("Join").key(KEY_ROOM_CTX_JOIN),
     ];
@@ -509,7 +509,7 @@ fn render_user_context_menu(menu: &UserContextMenu) -> El {
     let mut items: Vec<El> = vec![
         text(format!("User: {}", menu.username))
             .semibold()
-            .padding(Sides::xy(tokens::SPACE_MD, tokens::SPACE_XS)),
+            .padding(Sides::xy(tokens::SPACE_3, tokens::SPACE_1)),
         divider(),
     ];
 
@@ -576,7 +576,7 @@ fn render_move_room_modal(state: &MoveRoomModal) -> El {
                 spacer(),
                 button("Move").key(KEY_MOVE_CONFIRM).primary(),
             ])
-            .gap(tokens::SPACE_SM)
+            .gap(tokens::SPACE_2)
             .width(Size::Fill(1.0))
             .align(Align::Center),
         ],
@@ -598,7 +598,7 @@ fn render_delete_room_modal(state: &DeleteRoomModal) -> El {
                 spacer(),
                 button("Delete").key(KEY_DELETE_CONFIRM).destructive(),
             ])
-            .gap(tokens::SPACE_SM)
+            .gap(tokens::SPACE_2)
             .width(Size::Fill(1.0))
             .align(Align::Center),
         ],

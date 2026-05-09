@@ -124,34 +124,28 @@ fn render_select_method() -> El {
         button("Choose SSH agent key").key(KEY_USE_AGENT).disabled()
     };
 
-    modal(
-        "wizard",
-        "Set up your Rumble identity",
-        [
-            paragraph(
-                "Rumble uses an Ed25519 key as your server identity. Pick where this client should keep that key.",
-            ),
-            divider(),
-            text("Generate a local key").semibold(),
-            paragraph("Store a new key on this computer, optionally password-protected.").muted(),
-            row([button("Generate local key").key(KEY_GEN_LOCAL).primary()]).align(Align::Start),
-            divider(),
-            text("Use an SSH agent key").semibold(),
-            paragraph("Use an Ed25519 key already loaded in ssh-agent.").muted(),
-            agent_warning(agent_available),
-            row([agent_button]).align(Align::Start),
-        ],
-    )
-}
-
-fn agent_warning(available: bool) -> El {
-    if available {
-        spacer().height(Size::Fixed(0.0))
-    } else {
-        text("SSH_AUTH_SOCK is not set — ssh-agent isn't reachable.")
-            .text_color(tokens::WARNING)
-            .font_size(tokens::TEXT_XS.size)
+    let mut body: Vec<El> = vec![
+        paragraph("Rumble uses an Ed25519 key as your server identity. Pick where this client should keep that key."),
+        divider(),
+        text("Generate a local key").semibold(),
+        paragraph("Store a new key on this computer, optionally password-protected.").muted(),
+        row([button("Generate local key").key(KEY_GEN_LOCAL).primary()]).align(Align::Start),
+        divider(),
+        text("Use an SSH agent key").semibold(),
+        paragraph("Use an Ed25519 key already loaded in ssh-agent.").muted(),
+    ];
+    if !agent_available {
+        body.push(
+            alert([
+                alert_title("ssh-agent isn't reachable"),
+                alert_description("SSH_AUTH_SOCK is not set in this environment."),
+            ])
+            .warning(),
+        );
     }
+    body.push(row([agent_button]).align(Align::Start));
+
+    modal("wizard", "Set up your Rumble identity", body)
 }
 
 fn render_generate_local(password: &str, confirm: &str, error: Option<&str>, selection: &Selection) -> El {
@@ -171,18 +165,10 @@ fn render_generate_local(password: &str, confirm: &str, error: Option<&str>, sel
     ];
 
     if mismatch {
-        body.push(
-            text("Passwords don't match")
-                .text_color(tokens::WARNING)
-                .font_size(tokens::TEXT_XS.size),
-        );
+        body.push(form_message("Passwords don't match"));
     }
     if let Some(err) = error {
-        body.push(
-            text(err.to_string())
-                .text_color(tokens::DESTRUCTIVE)
-                .font_size(tokens::TEXT_XS.size),
-        );
+        body.push(form_message(err.to_string()));
     }
 
     let submit = if can_generate {
@@ -192,7 +178,7 @@ fn render_generate_local(password: &str, confirm: &str, error: Option<&str>, sel
     };
     body.push(
         row([button("Back").key(KEY_BACK), spacer(), submit])
-            .gap(tokens::SPACE_SM)
+            .gap(tokens::SPACE_2)
             .width(Size::Fill(1.0))
             .align(Align::Center),
     );
@@ -205,7 +191,9 @@ fn render_connecting_agent() -> El {
         "wizard",
         "Connecting to SSH agent",
         [
-            paragraph("Fetching Ed25519 keys from ssh-agent...").muted(),
+            row([spinner(), paragraph("Fetching Ed25519 keys from ssh-agent…").muted()])
+                .gap(tokens::SPACE_2)
+                .align(Align::Center),
             row([spacer(), button("Cancel").key(KEY_CANCEL_AGENT)])
                 .width(Size::Fill(1.0))
                 .align(Align::Center),
@@ -220,17 +208,15 @@ fn render_select_agent_key(keys: &[KeyInfo], selected: Option<usize>, error: Opt
         body.push(paragraph("No Ed25519 keys are loaded in your SSH agent.").muted());
     } else {
         body.push(paragraph("Pick a key, or generate a new one and add it to the agent.").muted());
-        for (idx, key) in keys.iter().enumerate() {
-            body.push(agent_key_row(idx, key, selected == Some(idx)));
-        }
+        body.push(item_group(
+            keys.iter()
+                .enumerate()
+                .map(|(idx, key)| agent_key_row(idx, key, selected == Some(idx))),
+        ));
     }
 
     if let Some(err) = error {
-        body.push(
-            text(err.to_string())
-                .text_color(tokens::DESTRUCTIVE)
-                .font_size(tokens::TEXT_XS.size),
-        );
+        body.push(form_message(err.to_string()));
     }
 
     let use_btn = if selected.is_some() {
@@ -246,7 +232,7 @@ fn render_select_agent_key(keys: &[KeyInfo], selected: Option<usize>, error: Opt
             button("Generate new agent key").key(KEY_GEN_AGENT_KEY),
             use_btn,
         ])
-        .gap(tokens::SPACE_SM)
+        .gap(tokens::SPACE_2)
         .width(Size::Fill(1.0))
         .align(Align::Center),
     );
@@ -255,18 +241,16 @@ fn render_select_agent_key(keys: &[KeyInfo], selected: Option<usize>, error: Opt
 }
 
 fn agent_key_row(idx: usize, key: &KeyInfo, selected: bool) -> El {
-    let label = if key.comment.is_empty() {
-        key.fingerprint.clone()
+    let title = if key.comment.is_empty() {
+        "Ed25519 key".to_string()
     } else {
-        format!("{}  ·  {}", key.comment, key.fingerprint)
+        key.comment.clone()
     };
-    let row_el = column([paragraph(label).font_size(tokens::TEXT_XS.size)])
-        .key(agent_row_key(idx))
-        .padding(Sides::xy(tokens::SPACE_MD, tokens::SPACE_SM))
-        .width(Size::Fill(1.0))
-        .height(Size::Hug)
-        .radius(tokens::RADIUS_SM)
-        .focusable();
+    let row_el = item([item_content([
+        item_title(title),
+        item_description(key.fingerprint.clone()),
+    ])])
+    .key(agent_row_key(idx));
     if selected { row_el.selected() } else { row_el }
 }
 
@@ -276,20 +260,30 @@ fn render_generate_agent_key(comment: &str, busy: bool, selection: &Selection) -
     } else {
         button("Generate and add").key(KEY_SUBMIT).primary()
     };
+    let busy_indicator: Option<El> = busy.then(|| {
+        row([spinner(), text("Adding key to ssh-agent…").muted()])
+            .gap(tokens::SPACE_2)
+            .align(Align::Center)
+    });
 
-    modal(
-        "wizard",
-        "Generate SSH agent key",
-        [
-            paragraph("A new Ed25519 key will be generated and added to your ssh-agent.").muted(),
-            text("Comment").muted(),
-            text_input(comment, selection, KEY_AGENT_COMMENT),
-            row([button("Back").key(KEY_BACK), spacer(), submit])
-                .gap(tokens::SPACE_SM)
-                .width(Size::Fill(1.0))
-                .align(Align::Center),
-        ],
-    )
+    let mut body: Vec<El> = vec![
+        paragraph("A new Ed25519 key will be generated and added to your ssh-agent.").muted(),
+        form_item([
+            form_label("Comment"),
+            form_control(text_input(comment, selection, KEY_AGENT_COMMENT)),
+        ]),
+    ];
+    if let Some(busy_row) = busy_indicator {
+        body.push(busy_row);
+    }
+    body.push(
+        row([button("Back").key(KEY_BACK), spacer(), submit])
+            .gap(tokens::SPACE_2)
+            .width(Size::Fill(1.0))
+            .align(Align::Center),
+    );
+
+    modal("wizard", "Generate SSH agent key", body)
 }
 
 fn render_error(message: &str) -> El {
@@ -297,7 +291,11 @@ fn render_error(message: &str) -> El {
         "wizard",
         "Identity setup failed",
         [
-            text(message.to_string()).text_color(tokens::DESTRUCTIVE).wrap_text(),
+            alert([
+                alert_title("Could not set up identity"),
+                alert_description(message.to_string()),
+            ])
+            .destructive(),
             row([spacer(), button("Back").key(KEY_BACK).primary()])
                 .width(Size::Fill(1.0))
                 .align(Align::Center),
@@ -311,11 +309,7 @@ pub fn render_unlock(state: &UnlockState, selection: &Selection) -> El {
         password_input::password_input(&state.password, selection, KEY_UNLOCK_PWD),
     ];
     if let Some(err) = &state.error {
-        body.push(
-            text(err.clone())
-                .text_color(tokens::DESTRUCTIVE)
-                .font_size(tokens::TEXT_XS.size),
-        );
+        body.push(form_message(err.clone()));
     }
     let submit = if state.password.is_empty() {
         button("Unlock").key(KEY_UNLOCK_SUBMIT).disabled()
