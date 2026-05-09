@@ -73,6 +73,24 @@ impl GifPlayback {
     }
 }
 
+/// Time until the currently-displayed animated frame should be replaced
+/// by the next one. Fed to aetna's `redraw_within` on animated
+/// `surface()` Els so the host schedules a wake-up at exactly the
+/// moment the GIF wants to advance — no global polling cadence
+/// required, and off-screen previews stop driving the loop entirely
+/// (visibility filter is layout-rect ∩ viewport).
+///
+/// Returns `None` for paused playbacks: nothing to redraw for.
+fn next_frame_deadline(frames: &[(Image, Duration)], pb: &GifPlayback) -> Option<Duration> {
+    if !pb.playing || frames.is_empty() {
+        return None;
+    }
+    let idx = pb.frame_idx.min(frames.len() - 1);
+    let cur_delay = frames[idx].1;
+    let elapsed = Instant::now().saturating_duration_since(pb.last_advance);
+    Some(cur_delay.saturating_sub(elapsed))
+}
+
 /// One entry in the chat image cache. `Static` is a single decoded
 /// frame; `Animated` carries every frame of a GIF along with the
 /// per-frame display delay so the App's pump can advance an
@@ -544,9 +562,10 @@ fn image_preview(
     const PREVIEW_HEIGHT: f32 = 220.0;
 
     let preview_layer: El = match (cached, gpu) {
-        (CachedImage::Animated { .. }, Some(gpu)) => {
+        (CachedImage::Animated { frames, .. }, Some(gpu)) => {
             let is_playing = playback.map(|p| p.playing).unwrap_or(false);
-            animated_surface_preview(&offer.transfer_id, gpu, is_playing, PREVIEW_HEIGHT)
+            let deadline = playback.and_then(|pb| next_frame_deadline(frames, pb));
+            animated_surface_preview(&offer.transfer_id, gpu, is_playing, deadline, PREVIEW_HEIGHT)
         }
         _ => {
             let frame = cached.current_frame(playback);
@@ -596,7 +615,13 @@ fn image_preview(
 /// `ImageFit::Contain` with no letterbox bands. The controls overlay
 /// stacks above the surface so its bottom-right corner sits on the
 /// image, not on empty card padding.
-fn animated_surface_preview(transfer_id: &str, gpu: &AnimatedGpu, is_playing: bool, preview_height: f32) -> El {
+fn animated_surface_preview(
+    transfer_id: &str,
+    gpu: &AnimatedGpu,
+    is_playing: bool,
+    next_frame_in: Option<Duration>,
+    preview_height: f32,
+) -> El {
     /// Cap on the inscribed surface width. Beyond this the preview
     /// would dominate narrow chat panels; very wide images
     /// downsample to fit.
@@ -611,11 +636,18 @@ fn animated_surface_preview(transfer_id: &str, gpu: &AnimatedGpu, is_playing: bo
         h = w / aspect;
     }
 
-    let surface_el = surface(gpu.app_texture().clone())
+    let mut surface_el = surface(gpu.app_texture().clone())
         .surface_alpha(SurfaceAlpha::Straight)
         .width(Size::Fixed(w))
         .height(Size::Fixed(h))
         .radius(tokens::RADIUS_SM);
+    if let Some(deadline) = next_frame_in {
+        // Aetna's runtime aggregates this with every other visible
+        // widget's deadline and schedules a single host wake-up for
+        // the tightest one. Off-screen previews drop out of the
+        // aggregate automatically and stop driving redraws.
+        surface_el = surface_el.redraw_within(deadline);
+    }
 
     let inscribed = stack([surface_el, gif_controls_overlay(transfer_id, is_playing)])
         .width(Size::Fixed(w))
@@ -817,10 +849,14 @@ pub struct PanDrag {
 /// passes it through. For animated entries `playback` selects the
 /// current frame so the lightbox stays in lockstep with the inline
 /// preview's playhead.
-pub fn render_lightbox(lightbox: &Lightbox, cached: &CachedImage, playback: Option<&GifPlayback>) -> El {
-    let img = cached.current_frame(playback);
+pub fn render_lightbox(
+    lightbox: &Lightbox,
+    cached: &CachedImage,
+    playback: Option<&GifPlayback>,
+    gpu: Option<&AnimatedGpu>,
+) -> El {
     let header = lightbox_header(lightbox);
-    let body = lightbox_body(lightbox, img);
+    let body = lightbox_body(lightbox, cached, playback, gpu);
 
     let panel = column([header, body])
         .style_profile(StyleProfile::Surface)
@@ -879,46 +915,53 @@ fn lightbox_header(lightbox: &Lightbox) -> El {
     .width(Size::Fill(1.0))
 }
 
-fn lightbox_body(lightbox: &Lightbox, img: &Image) -> El {
-    // Inner image: `Contain` fit at base size; `.scale(zoom)` zooms
+fn lightbox_body(
+    lightbox: &Lightbox,
+    cached: &CachedImage,
+    playback: Option<&GifPlayback>,
+    gpu: Option<&AnimatedGpu>,
+) -> El {
+    // Inner element: `Contain` fit at base size; `.scale(zoom)` zooms
     // around its centre, `.translate(pan)` then offsets the result.
     // Both transforms are paint-time so layout stays stable as the
     // user drags / zooms — no re-layout cost per frame, and the
-    // image's allocated rect stays the lightbox body so subsequent
+    // body's allocated rect stays the lightbox body so subsequent
     // pointer events still target the same region.
     //
-    // TODO(upstream surface): when aetna's `surface()` widget gains
-    // ImageFit-style modes (currently fill-the-rect only — see the
-    // sizing contract in `aetna_core::surface` and `aetna_core::tree::
-    // surface`), animated entries should switch to:
-    //
-    //     surface(animated_gpu.app_texture().clone())
-    //         .surface_alpha(SurfaceAlpha::Straight)
-    //         .surface_fit(SurfaceFit::Contain) // upstream-pending
-    //         .radius(tokens::RADIUS_MD)
-    //         .width(Size::Fill(1.0))
-    //         .height(Size::Fill(1.0))
-    //         .scale(lightbox.zoom)
-    //         .translate(lightbox.pan.0, lightbox.pan.1)
-    //
-    // i.e. add a `gpu: Option<&AnimatedGpu>` arg to this fn, branch on
-    // (cached, gpu) like `image_preview` does, and reuse the same
-    // per-message texture the inline preview is already updating in
-    // `before_paint`. Today the lightbox uses `image()` per frame —
-    // bounded cost (one open at a time, one re-upload per frame
-    // transition through aetna's image cache) but redundant with the
-    // inline preview's texture write when both are visible. The
-    // dynamic Fill×Fill body rect is the reason we can't ship this
-    // without `ImageFit` on `surface`: a manual letterbox would
-    // either ship a one-frame stretch on every window resize or burn
-    // the wgpu allocator re-creating the texture per resize tick.
-    let inner = image(img.clone())
-        .image_fit(ImageFit::Contain)
-        .radius(tokens::RADIUS_MD)
-        .width(Size::Fill(1.0))
-        .height(Size::Fill(1.0))
-        .scale(lightbox.zoom)
-        .translate(lightbox.pan.0, lightbox.pan.1);
+    // For animated entries with a live GPU mirror we re-use the same
+    // `surface()` texture the inline preview is already updating in
+    // `before_paint`, with `surface_fit(Contain)` doing the
+    // letterbox into the dynamic Fill×Fill body rect. Avoids a
+    // second copy through aetna's image content-hash cache and keeps
+    // the lightbox in lockstep with the inline playhead at zero
+    // additional GPU cost. Static images and the one-frame race
+    // before the GPU mirror is allocated fall through to `image()`.
+    let inner = match (cached, gpu) {
+        (CachedImage::Animated { frames, .. }, Some(gpu)) => {
+            let mut el = surface(gpu.app_texture().clone())
+                .surface_alpha(SurfaceAlpha::Straight)
+                .surface_fit(ImageFit::Contain)
+                .radius(tokens::RADIUS_MD)
+                .width(Size::Fill(1.0))
+                .height(Size::Fill(1.0))
+                .scale(lightbox.zoom)
+                .translate(lightbox.pan.0, lightbox.pan.1);
+            if let Some(deadline) = playback.and_then(|pb| next_frame_deadline(frames, pb)) {
+                el = el.redraw_within(deadline);
+            }
+            el
+        }
+        _ => {
+            let img = cached.current_frame(playback);
+            image(img.clone())
+                .image_fit(ImageFit::Contain)
+                .radius(tokens::RADIUS_MD)
+                .width(Size::Fill(1.0))
+                .height(Size::Fill(1.0))
+                .scale(lightbox.zoom)
+                .translate(lightbox.pan.0, lightbox.pan.1)
+        }
+    };
 
     // The body is the drag surface. `clip()` so the panned/zoomed
     // image doesn't bleed past the panel; `.key(...)` captures the

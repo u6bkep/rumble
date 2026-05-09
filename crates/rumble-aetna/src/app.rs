@@ -524,7 +524,8 @@ impl<B: UiBackend> App for RumbleApp<B> {
                 .or_else(|| self.image_cache.get(&lightbox_state.transfer_id))
         {
             let playback = self.gif_playback.get(&lightbox_state.transfer_id);
-            Some(chat::render_lightbox(lightbox_state, cached, playback))
+            let gpu = self.animated_gpu.get(&lightbox_state.transfer_id);
+            Some(chat::render_lightbox(lightbox_state, cached, playback, gpu))
         } else {
             None
         };
