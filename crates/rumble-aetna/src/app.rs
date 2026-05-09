@@ -250,15 +250,34 @@ const MAX_LIGHTBOX_PX: u32 = 4096;
 /// longest edge of every emitted frame — `Some(n)` downsamples, `None`
 /// loads the source at its natural resolution.
 ///
-/// Animated GIFs decode every frame and produce
-/// [`chat::CachedImage::Animated`]; single-frame GIFs collapse back to
-/// `Static`. Everything else is a single decode.
+/// Animated GIF, animated WebP, and APNG decode every frame and produce
+/// [`chat::CachedImage::Animated`]; single-frame animations and all
+/// other formats collapse to `Static`.
 fn decode_image(path: &Path, max_px: Option<u32>) -> Result<chat::CachedImage, image::ImageError> {
-    use image::ImageFormat;
+    use image::{
+        AnimationDecoder, ImageFormat,
+        codecs::{gif::GifDecoder, png::PngDecoder, webp::WebPDecoder},
+    };
 
     let reader = image::ImageReader::open(path)?.with_guessed_format()?;
-    if reader.format() == Some(ImageFormat::Gif) {
-        return decode_animated_gif(path, max_px);
+    match reader.format() {
+        Some(ImageFormat::Gif) => {
+            let decoder = GifDecoder::new(BufReader::new(std::fs::File::open(path)?))?;
+            return collect_animated_frames(decoder.into_frames(), max_px);
+        }
+        Some(ImageFormat::WebP) => {
+            let decoder = WebPDecoder::new(BufReader::new(std::fs::File::open(path)?))?;
+            if decoder.has_animation() {
+                return collect_animated_frames(decoder.into_frames(), max_px);
+            }
+        }
+        Some(ImageFormat::Png) => {
+            let decoder = PngDecoder::new(BufReader::new(std::fs::File::open(path)?))?;
+            if decoder.is_apng()? {
+                return collect_animated_frames(decoder.apng()?.into_frames(), max_px);
+            }
+        }
+        _ => {}
     }
 
     let img = reader.decode()?;
@@ -274,17 +293,17 @@ fn decode_image(path: &Path, max_px: Option<u32>) -> Result<chat::CachedImage, i
     )))
 }
 
-/// Decode every frame of a GIF, downsample each by `max_px`, and pack
-/// them into a [`chat::CachedImage::Animated`]. A delay floor of 20ms
-/// per frame keeps a 0/1-ms pathological file from pegging the playback
-/// pump (browsers do the same — Chrome and Firefox both clamp tiny
-/// delays). Single-frame GIFs collapse to `Static`.
-fn decode_animated_gif(path: &Path, max_px: Option<u32>) -> Result<chat::CachedImage, image::ImageError> {
-    use image::{AnimationDecoder, DynamicImage};
-
-    let file = std::fs::File::open(path)?;
-    let decoder = image::codecs::gif::GifDecoder::new(BufReader::new(file))?;
-    let frames = decoder.into_frames();
+/// Drain an animation decoder's [`image::Frames`] iterator, downsample
+/// each by `max_px`, and pack the result into a
+/// [`chat::CachedImage::Animated`]. A delay floor of 20ms per frame
+/// keeps a 0/1-ms pathological file from pegging the playback pump
+/// (browsers do the same — Chrome and Firefox both clamp tiny delays).
+/// Single-frame inputs collapse to `Static`.
+fn collect_animated_frames(
+    frames: image::Frames<'_>,
+    max_px: Option<u32>,
+) -> Result<chat::CachedImage, image::ImageError> {
+    use image::DynamicImage;
 
     let mut out: Vec<(Image, Duration)> = Vec::new();
     for frame in frames {
@@ -305,10 +324,11 @@ fn decode_animated_gif(path: &Path, max_px: Option<u32>) -> Result<chat::CachedI
     }
 
     if out.len() <= 1 {
-        // Single-frame GIF (rare but legal). The animated UI overhead —
-        // playback state, controls overlay — adds nothing here, so
-        // collapse to Static. An empty file would have been refused by
-        // the decoder; the unwrap_or is a paranoid fallback.
+        // Single-frame source (rare but legal for any of these formats).
+        // The animated UI overhead — playback state, controls overlay —
+        // adds nothing here, so collapse to Static. An empty file would
+        // have been refused by the decoder; the unwrap_or is a paranoid
+        // fallback.
         return Ok(chat::CachedImage::Static(
             out.into_iter()
                 .next()
@@ -475,44 +495,35 @@ impl<B: UiBackend> App for RumbleApp<B> {
                 None
             };
 
-        let any_layer = wizard_layer.is_some()
-            || unlock_layer.is_some()
-            || cert_layer.is_some()
-            || connect_layer.is_some()
-            || identity_layer.is_some()
-            || settings_panel.is_some()
-            || settings_popover.is_some()
-            || room_tree_overlays.any()
-            || lightbox_layer.is_some()
-            || file_ctx_layer.is_some();
-        if any_layer {
-            // Layer order matters: paints back-to-front. The settings
-            // popover sits above its panel; the wizard sits on top of
-            // everything because nothing else is allowed to interact
-            // while it's open. The lightbox sits above content/menus
-            // but below the protective modals (cert/unlock/wizard) so
-            // those still take precedence if they appear simultaneously.
-            overlays(
-                main,
-                [
-                    identity_layer,
-                    connect_layer,
-                    room_tree_overlays.room_context_menu,
-                    room_tree_overlays.user_context_menu,
-                    room_tree_overlays.move_room_modal,
-                    room_tree_overlays.delete_room_modal,
-                    lightbox_layer,
-                    file_ctx_layer,
-                    settings_panel,
-                    settings_popover,
-                    cert_layer,
-                    unlock_layer,
-                    wizard_layer,
-                ],
-            )
-        } else {
-            main
-        }
+        // Always wrap in `overlays(...)` — even with no app layers, the
+        // root must be an `Axis::Overlay` container so aetna's runtime
+        // tooltip layer overlays the main view instead of competing for
+        // flex space (see vendor/aetna/.../tooltip.rs root precondition).
+        //
+        // Layer order matters: paints back-to-front. The settings
+        // popover sits above its panel; the wizard sits on top of
+        // everything because nothing else is allowed to interact
+        // while it's open. The lightbox sits above content/menus
+        // but below the protective modals (cert/unlock/wizard) so
+        // those still take precedence if they appear simultaneously.
+        overlays(
+            main,
+            [
+                identity_layer,
+                connect_layer,
+                room_tree_overlays.room_context_menu,
+                room_tree_overlays.user_context_menu,
+                room_tree_overlays.move_room_modal,
+                room_tree_overlays.delete_room_modal,
+                lightbox_layer,
+                file_ctx_layer,
+                settings_panel,
+                settings_popover,
+                cert_layer,
+                unlock_layer,
+                wizard_layer,
+            ],
+        )
     }
 
     fn selection(&self) -> Selection {
