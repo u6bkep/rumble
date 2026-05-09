@@ -225,11 +225,15 @@ fn render_select_agent_key(keys: &[KeyInfo], selected: Option<usize>, error: Opt
         button("Use selected key").key(KEY_SUBMIT).disabled()
     };
 
+    // "Generate new agent key" overflows the 420 px modal when placed
+    // alongside Back + Use selected key — drop the redundant "agent"
+    // word (the modal title already establishes the context) so the
+    // row fits inside the panel.
     body.push(
         row([
             button("Back").key(KEY_BACK),
             spacer(),
-            button("Generate new agent key").key(KEY_GEN_AGENT_KEY),
+            button("Generate new key").key(KEY_GEN_AGENT_KEY),
             use_btn,
         ])
         .gap(tokens::SPACE_2)

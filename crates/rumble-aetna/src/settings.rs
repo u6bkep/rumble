@@ -474,8 +474,10 @@ pub fn render(
     .align(Align::Center);
 
     // Stock `modal_panel` is fixed at 420 px wide × Hug; the settings
-    // dialog needs a roomier 840 × 620 frame so the eight-tab segmented
+    // dialog needs a roomier 880 × 620 frame so the eight-tab segmented
     // control fits "Connection" and "Processing" without truncation.
+    // 840 was 1–2 px short for "Connection" at the default label size
+    // (caught by the layout-lint pass).
     let panel = modal_panel(
         "Settings",
         [
@@ -489,7 +491,7 @@ pub fn render(
             footer,
         ],
     )
-    .width(Size::Fixed(840.0))
+    .width(Size::Fixed(880.0))
     .height(Size::Fixed(620.0));
 
     let panel_layer = overlay([scrim(KEY_DISMISS), panel.block_pointer()]);
