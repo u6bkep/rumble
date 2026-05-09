@@ -578,6 +578,41 @@ impl<B: UiBackend> App for RumbleApp<B> {
             return;
         }
 
+        // File drag-drop. Routed before modal guards so a drop landing
+        // while the wizard / unlock / cert layer is up still reaches
+        // the share-file flow — the overlay hint is the only thing
+        // suppressed under modals (see drop_target_layer above).
+        // Upstream fires one event per file and does NOT auto-cancel
+        // the hover on drop, so we clear `file_drop_hover` ourselves.
+        match event.kind {
+            UiEventKind::FileHovered => {
+                self.file_drop_hover = true;
+                return;
+            }
+            UiEventKind::FileHoverCancelled => {
+                self.file_drop_hover = false;
+                return;
+            }
+            UiEventKind::FileDropped => {
+                self.file_drop_hover = false;
+                let Some(path) = event.path.clone() else {
+                    return;
+                };
+                if !self.backend.state().connection.is_connected() {
+                    self.backend.send(Command::LocalMessage {
+                        text: "Connect to a server before sharing files".to_string(),
+                    });
+                    return;
+                }
+                self.backend.send(Command::LocalMessage {
+                    text: format!("Sharing {}", path.display()),
+                });
+                self.backend.send(Command::ShareFile { path });
+                return;
+            }
+            _ => {}
+        }
+
         // Wizard / unlock layers swallow everything until they're done.
         // The wizard scrim is intentionally a no-op (no "click outside
         // to dismiss") so the user can't end up with a half-configured
@@ -908,28 +943,6 @@ impl<B: UiBackend> App for RumbleApp<B> {
                 return;
             }
         }
-    }
-
-    fn on_file_drop(&mut self, paths: Vec<PathBuf>) {
-        // Drop is only meaningful while connected — fall back to the
-        // share-file path's local-message warning otherwise so the
-        // user gets the same feedback as the paperclip button.
-        if !self.backend.state().connection.is_connected() {
-            self.backend.send(Command::LocalMessage {
-                text: "Connect to a server before sharing files".to_string(),
-            });
-            return;
-        }
-        for path in paths {
-            self.backend.send(Command::LocalMessage {
-                text: format!("Sharing {}", path.display()),
-            });
-            self.backend.send(Command::ShareFile { path });
-        }
-    }
-
-    fn on_file_hover(&mut self, hovered: bool) {
-        self.file_drop_hover = hovered;
     }
 }
 

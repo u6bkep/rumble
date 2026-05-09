@@ -581,14 +581,11 @@ fn gif_controls_overlay(transfer_id: &str, is_playing: bool) -> El {
         .fill(tokens::OVERLAY_SCRIM)
         .radius(tokens::RADIUS_SM);
 
-    // While playing the pill hides at rest and fades in on hover (of
-    // the parent card or the pill itself) — `reveal_on_hover` reads
-    // the hover envelope of the nearest focusable ancestor (the card
-    // column below) plus the node's own hover. While paused the pill
-    // stays visible so the play-button affordance is always
-    // discoverable.
+    // While playing the pill hides at rest and fades in on hover of
+    // the parent card or the pill itself. While paused the pill stays
+    // visible so the play-button affordance is always discoverable.
     if is_playing {
-        pill = pill.reveal_on_hover(0.0);
+        pill = pill.hover_alpha(0.0, 1.0);
     }
 
     // Push to bottom-right inside the parent stack: leading vertical

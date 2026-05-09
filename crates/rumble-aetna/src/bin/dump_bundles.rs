@@ -686,7 +686,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let theme = app.theme();
         let cx = BuildCx::new(&theme);
         let mut tree = app.build(&cx);
-        let bundle = render_bundle(&mut tree, viewport, Some("crates/rumble-aetna/src"));
+        let bundle = render_bundle(&mut tree, viewport);
 
         let basename = format!("rumble_{}", scene.slug());
         let written = write_bundle(&bundle, &out_dir, &basename)?;
