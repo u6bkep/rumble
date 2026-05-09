@@ -1150,6 +1150,15 @@ async fn run_connection_task<P: Platform>(
                         }
                     }
 
+                    Command::CancelTransfer { transfer_id } => {
+                        if let Some(ref ft) = file_transfer {
+                            let id = rumble_client_traits::file_transfer::TransferId(transfer_id);
+                            if let Err(e) = ft.cancel(&id, false) {
+                                warn!("Cancel failed for {}: {}", id.0, e);
+                            }
+                        }
+                    }
+
                     Command::RequestChatHistory => {
                         // Send a chat history request to the room
                         if let Some(t) = &mut transport {
@@ -1758,7 +1767,11 @@ fn handle_server_message(
 
                         // Check if this is a chat history response — merge messages
                         if let Some(share) = crate::events::ChatHistoryShareMessage::parse(&cb.text) {
-                            debug!("Received chat history from {}: {} messages", cb.sender, share.content.messages.len());
+                            debug!(
+                                "Received chat history from {}: {} messages",
+                                cb.sender,
+                                share.content.messages.len()
+                            );
                             let incoming = share.content.to_messages();
                             let mut s = write_state(&state);
                             // Collect existing IDs to skip duplicates

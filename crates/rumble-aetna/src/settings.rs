@@ -11,6 +11,8 @@
 //! identity) fire immediately because they're side-effecting actions
 //! rather than persisted state.
 
+use std::path::PathBuf;
+
 use aetna_core::prelude::*;
 
 use rumble_client::{PipelineConfig, ProcessorRegistry, SfxKind};
@@ -137,8 +139,10 @@ pub struct PendingSettings {
     pub auto_download_rules: Vec<PendingAutoDownloadRule>,
     pub download_speed_kbps: u32,
     pub upload_speed_kbps: u32,
-    pub seed_after_download: bool,
-    pub cleanup_on_exit: bool,
+    /// Override for the downloads destination. `None` = platform
+    /// default (system temp dir + `rumble_downloads`). Applied on
+    /// next connect.
+    pub download_dir: Option<PathBuf>,
 }
 
 /// One row of the auto-download rules editor.
@@ -210,8 +214,7 @@ impl PendingSettings {
                 .collect(),
             download_speed_kbps: (settings.file_transfer.download_speed_limit / 1024) as u32,
             upload_speed_kbps: (settings.file_transfer.upload_speed_limit / 1024) as u32,
-            seed_after_download: settings.file_transfer.seed_after_download,
-            cleanup_on_exit: settings.file_transfer.cleanup_on_exit,
+            download_dir: settings.file_transfer.download_dir.clone(),
         }
     }
 }
@@ -240,6 +243,25 @@ impl SettingsState {
         self.open_select = OpenSelect::None;
         self.pending = None;
     }
+
+    /// Update the download-dir value while the dialog is still open.
+    /// Called by the App after the async folder picker resolves; the
+    /// dialog stays open with the new value waiting in pending state.
+    pub fn set_pending_download_dir(&mut self, dir: Option<PathBuf>) {
+        if let Some(pending) = self.pending.as_mut() {
+            pending.download_dir = dir;
+        }
+    }
+}
+
+/// Resolve the effective download directory for a pending value.
+/// `None` falls back to the same default the relay plugin would pick
+/// at connect time, so an "Open" button always has somewhere to go.
+pub fn effective_download_dir(pending: &PendingSettings) -> PathBuf {
+    pending
+        .download_dir
+        .clone()
+        .unwrap_or_else(|| std::env::temp_dir().join("rumble_downloads"))
 }
 
 /// Outcome of routing a single event into the settings dialog.
@@ -262,6 +284,13 @@ pub enum SettingsOutcome {
     },
     RefreshDevices,
     ResetStats,
+    /// Spawn the OS folder picker and update `download_dir` when
+    /// the user picks a destination. Async; the App keeps the
+    /// dialog open while the picker is showing.
+    PickDownloadDir,
+    /// Open `path` in the system file manager. Path is the
+    /// effective destination (pending override, or platform default).
+    OpenDownloadDir(PathBuf),
 }
 
 // ============================================================
@@ -295,11 +324,28 @@ const KEY_CHAT_FORMAT: &str = "settings:chat:format";
 const KEY_CHAT_AUTO_SYNC: &str = "settings:chat:auto-sync";
 const KEY_CHAT_GIF_AUTOPLAY: &str = "settings:chat:gif-autoplay";
 
+/// Built-in auto-download rule presets shown next to "Add rule".
+/// Order is the render order; pattern matches `mime_pattern_matches`
+/// (suffix `/*` for top-level types, exact otherwise).
+const RULE_PRESETS: &[(&str, &str, u64)] = &[
+    ("Images", "image/*", 10),
+    ("Audio", "audio/*", 25),
+    ("Documents", "application/pdf", 5),
+];
+const KEY_FILES_PRESET_PREFIX: &str = "settings:files:preset:";
+fn preset_key(idx: usize) -> String {
+    format!("{KEY_FILES_PRESET_PREFIX}{idx}")
+}
+fn parse_preset_route(route: &str) -> Option<usize> {
+    route.strip_prefix(KEY_FILES_PRESET_PREFIX).and_then(|s| s.parse().ok())
+}
+
 const KEY_FILES_AUTO_DOWNLOAD: &str = "settings:files:auto-download";
 const KEY_FILES_DL_LIMIT: &str = "settings:files:download-limit";
 const KEY_FILES_UL_LIMIT: &str = "settings:files:upload-limit";
-const KEY_FILES_SEED: &str = "settings:files:seed";
-const KEY_FILES_CLEANUP: &str = "settings:files:cleanup";
+const KEY_FILES_DIR_BROWSE: &str = "settings:files:dir:browse";
+const KEY_FILES_DIR_OPEN: &str = "settings:files:dir:open";
+const KEY_FILES_DIR_RESET: &str = "settings:files:dir:reset";
 
 /// Auto-download rules editor. Rule rows use `<prefix>:<idx>:<field>`;
 /// the shared prefix lets [`handle_event`] cheaply early-out for
@@ -998,7 +1044,12 @@ fn render_files(pending: &PendingSettings, selection: &Selection) -> El {
     let add_rule = button_with_icon(IconName::Plus, "Add rule")
         .key(KEY_FILES_RULE_ADD)
         .secondary();
-    children.push(row([add_rule, spacer()]).width(Size::Fill(1.0)));
+    let mut action_row: Vec<El> = vec![add_rule];
+    for (idx, (label, _, _)) in RULE_PRESETS.iter().enumerate() {
+        action_row.push(button(format!("+ {label}")).key(preset_key(idx)).ghost());
+    }
+    action_row.push(spacer());
+    children.push(row(action_row).gap(tokens::SPACE_2).width(Size::Fill(1.0)));
 
     children.push(divider());
     children.push(section_heading("Bandwidth limits"));
@@ -1021,17 +1072,48 @@ fn render_files(pending: &PendingSettings, selection: &Selection) -> El {
         .width(Size::Fixed(280.0)),
     ));
     children.push(divider());
-    children.push(section_heading("Seeding"));
-    children.push(field_row(
-        "Continue seeding after download",
-        switch(pending.seed_after_download).key(KEY_FILES_SEED),
-    ));
-    children.push(field_row(
-        "Clean up downloads on exit",
-        switch(pending.cleanup_on_exit).key(KEY_FILES_CLEANUP),
-    ));
+    children.push(section_heading("Download location"));
+    children.push(download_dir_row(pending));
+    children.push(
+        paragraph(
+            "Where downloaded files are saved. Changes apply on the next connect — active transfers keep using the \
+             directory that was set when they started.",
+        )
+        .muted()
+        .font_size(tokens::TEXT_XS.size),
+    );
 
     column(children).gap(tokens::SPACE_2).width(Size::Fill(1.0))
+}
+
+/// Render the download-location row: path display (or a placeholder
+/// for the platform default) plus the action buttons. The path text is
+/// allowed to wrap so long paths don't push the buttons offscreen.
+fn download_dir_row(pending: &PendingSettings) -> El {
+    let (label, is_custom) = match pending.download_dir.as_ref() {
+        Some(p) => (p.display().to_string(), true),
+        None => ("System default (temp folder)".to_string(), false),
+    };
+    let path_label = mono(label)
+        .font_size(tokens::TEXT_XS.size)
+        .ellipsis()
+        .width(Size::Fill(1.0));
+    let path_label = if is_custom { path_label } else { path_label.muted() };
+
+    let mut buttons: Vec<El> = vec![
+        button("Browse…").key(KEY_FILES_DIR_BROWSE).secondary(),
+        button("Open").key(KEY_FILES_DIR_OPEN).secondary(),
+    ];
+    if is_custom {
+        buttons.push(button("Use default").key(KEY_FILES_DIR_RESET).ghost());
+    }
+
+    column([
+        row([path_label]).width(Size::Fill(1.0)),
+        row(buttons).gap(tokens::SPACE_2).align(Align::Center),
+    ])
+    .gap(tokens::SPACE_1)
+    .width(Size::Fill(1.0))
 }
 
 /// One editable rule row: MIME pattern (fill width), size in MB
@@ -1250,6 +1332,17 @@ pub fn handle_event(
         });
         return SettingsOutcome::Handled;
     }
+    if let Some(route) = event.route()
+        && matches!(event.kind, UiEventKind::Click | UiEventKind::Activate)
+        && let Some(idx) = parse_preset_route(route)
+        && let Some((_, pattern, size_mb)) = RULE_PRESETS.get(idx)
+    {
+        pending.auto_download_rules.push(PendingAutoDownloadRule {
+            mime_pattern: (*pattern).to_string(),
+            size_mb_text: size_mb.to_string(),
+        });
+        return SettingsOutcome::Handled;
+    }
     if let Some(target) = event.target_key()
         && let Some((idx, field)) = parse_rule_route(target)
         && let Some(rule) = pending.auto_download_rules.get_mut(idx)
@@ -1284,9 +1377,21 @@ pub fn handle_event(
         || switch::apply_event(&mut pending.auto_sync_history, event, KEY_CHAT_AUTO_SYNC)
         || switch::apply_event(&mut pending.gif_autoplay, event, KEY_CHAT_GIF_AUTOPLAY)
         || switch::apply_event(&mut pending.auto_download_enabled, event, KEY_FILES_AUTO_DOWNLOAD)
-        || switch::apply_event(&mut pending.seed_after_download, event, KEY_FILES_SEED)
-        || switch::apply_event(&mut pending.cleanup_on_exit, event, KEY_FILES_CLEANUP)
     {
+        return SettingsOutcome::Handled;
+    }
+
+    // Download-location buttons. Browse fires the OS picker (handled
+    // by the App), Open reveals the current effective dir, Reset
+    // clears the override so we fall back to the platform default.
+    if event.is_click_or_activate(KEY_FILES_DIR_BROWSE) {
+        return SettingsOutcome::PickDownloadDir;
+    }
+    if event.is_click_or_activate(KEY_FILES_DIR_OPEN) {
+        return SettingsOutcome::OpenDownloadDir(effective_download_dir(pending));
+    }
+    if event.is_click_or_activate(KEY_FILES_DIR_RESET) {
+        pending.download_dir = None;
         return SettingsOutcome::Handled;
     }
 

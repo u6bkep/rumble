@@ -17,6 +17,7 @@ use std::{
 };
 
 use aetna_core::prelude::*;
+use rumble_client_traits::file_transfer::{PluginTransferState, TransferStatus};
 use rumble_desktop_shell::ChatSettings;
 use rumble_protocol::{ChatAttachment, ChatMessage, ChatMessageKind, FileOfferInfo, State, permissions::Permissions};
 
@@ -29,6 +30,12 @@ use crate::theme as palette;
 /// Static images carry a single decoded [`Image`]. Animated GIFs carry
 /// the full sequence of frames so playback runs without re-decoding.
 pub type ImageCache = HashMap<String, CachedImage>;
+
+/// Active file-transfer status keyed by `transfer_id`. Built once per
+/// frame from `BackendHandle::transfers()` and threaded through the
+/// chat renderer so an in-flight FileOffer card can show progress
+/// without each `file_offer_card` call doing its own linear search.
+pub type TransferMap = HashMap<String, TransferStatus>;
 
 /// Per-message GIF playback state, keyed by `transfer_id`. Lives on the
 /// App separate from the cache so a re-decode (e.g. cache eviction +
@@ -103,6 +110,9 @@ static SVG_PLAY: LazyLock<SvgIcon> =
 static SVG_PAUSE: LazyLock<SvgIcon> = LazyLock::new(|| {
     SvgIcon::parse_current_color(include_str!("../assets/icons/pause.svg")).expect("pause.svg parses")
 });
+static SVG_CLIPBOARD: LazyLock<SvgIcon> = LazyLock::new(|| {
+    SvgIcon::parse_current_color(include_str!("../assets/icons/clipboard.svg")).expect("clipboard.svg parses")
+});
 static SVG_LIGHTBOX_OPEN: LazyLock<SvgIcon> = LazyLock::new(|| {
     SvgIcon::parse_current_color(include_str!("../assets/icons/lightbox_open.svg")).expect("lightbox_open.svg parses")
 });
@@ -112,6 +122,7 @@ static SVG_LIGHTBOX_OPEN: LazyLock<SvgIcon> = LazyLock::new(|| {
 /// own their own route.
 pub const KEY_INPUT: &str = "chat:input";
 pub const KEY_SHARE_FILE: &str = "chat:share-file";
+pub const KEY_PASTE_IMAGE: &str = "chat:paste-image";
 pub const KEY_SYNC_HISTORY: &str = "chat:sync";
 
 /// Routed keys for the file card context menu.
@@ -141,6 +152,16 @@ pub fn download_key(transfer_id: &str) -> String {
 
 pub fn preview_key(transfer_id: &str) -> String {
     format!("chat:preview:{transfer_id}")
+}
+
+/// Route for the in-flight transfer's cancel button.
+pub fn cancel_key(transfer_id: &str) -> String {
+    format!("chat:cancel:{transfer_id}")
+}
+
+/// Inverse of [`cancel_key`].
+pub fn parse_cancel_key(key: &str) -> Option<&str> {
+    key.strip_prefix("chat:cancel:")
 }
 
 /// Routed key for the play/pause icon overlaid on an animated preview.
@@ -227,6 +248,7 @@ pub fn render(
     chat_settings: &ChatSettings,
     image_cache: &ImageCache,
     gif_playback: &HashMap<String, GifPlayback>,
+    transfers: &TransferMap,
     chat_input: &str,
     selection: &Selection,
     width: f32,
@@ -236,7 +258,7 @@ pub fn render(
             .title()
             .padding(Sides::xy(tokens::SPACE_4, tokens::SPACE_2)),
         divider(),
-        history(state, chat_settings, image_cache, gif_playback),
+        history(state, chat_settings, image_cache, gif_playback, transfers),
         divider(),
         composer(state, chat_input, selection),
     ])
@@ -250,6 +272,7 @@ fn history(
     chat_settings: &ChatSettings,
     image_cache: &ImageCache,
     gif_playback: &HashMap<String, GifPlayback>,
+    transfers: &TransferMap,
 ) -> El {
     if state.chat_messages.is_empty() {
         let placeholder = text(if state.connection.is_connected() {
@@ -269,7 +292,7 @@ fn history(
     let lines: Vec<El> = state
         .chat_messages
         .iter()
-        .map(|msg| render_message(msg, chat_settings, image_cache, gif_playback))
+        .map(|msg| render_message(msg, chat_settings, image_cache, gif_playback, transfers))
         .collect();
 
     scroll(lines)
@@ -284,6 +307,7 @@ fn render_message(
     chat_settings: &ChatSettings,
     image_cache: &ImageCache,
     gif_playback: &HashMap<String, GifPlayback>,
+    transfers: &TransferMap,
 ) -> El {
     let prefix = if chat_settings.show_timestamps {
         format!("[{}] ", chat_settings.timestamp_format.format(msg.timestamp))
@@ -324,7 +348,7 @@ fn render_message(
                     let playback = gif_playback.get(&offer.transfer_id);
                     image_preview(offer, cached, playback)
                 }
-                None => file_offer_card(offer),
+                None => file_offer_card(offer, transfers.get(&offer.transfer_id)),
             };
             column([line, attachment]).gap(tokens::SPACE_1).width(Size::Fill(1.0))
         }
@@ -332,7 +356,7 @@ fn render_message(
     }
 }
 
-fn file_offer_card(offer: &FileOfferInfo) -> El {
+fn file_offer_card(offer: &FileOfferInfo, status: Option<&TransferStatus>) -> El {
     let header = row([
         icon(IconName::FileText).text_color(tokens::MUTED_FOREGROUND),
         text(offer.name.clone()).semibold().ellipsis(),
@@ -350,16 +374,16 @@ fn file_offer_card(offer: &FileOfferInfo) -> El {
         .muted()
         .font_size(tokens::TEXT_XS.size);
 
-    let actions = row([
-        spacer(),
-        button_with_icon(IconName::Download, "Download")
-            .key(download_key(&offer.transfer_id))
-            .primary(),
-    ])
-    .width(Size::Fill(1.0))
-    .align(Align::Center);
+    // Active transfer (downloading or uploading and not yet finished):
+    // show progress + speed + ETA in place of the Download button. If
+    // the underlying TransferStatus reports an error, fall back to the
+    // standard Download button so the user can retry.
+    let body = match status {
+        Some(s) if !s.is_finished && s.error.is_none() && is_in_flight(s.state) => transfer_progress_block(s),
+        _ => action_row(offer),
+    };
 
-    column([header, meta, actions])
+    column([header, meta, body])
         .gap(tokens::SPACE_1)
         .padding(Sides::all(tokens::SPACE_2))
         .fill(tokens::SECONDARY)
@@ -367,6 +391,97 @@ fn file_offer_card(offer: &FileOfferInfo) -> El {
         .stroke_width(1.0)
         .radius(tokens::RADIUS_MD)
         .width(Size::Fill(1.0))
+}
+
+/// True when a transfer is active enough that we should render a
+/// progress bar rather than a Download button.
+fn is_in_flight(state: PluginTransferState) -> bool {
+    matches!(
+        state,
+        PluginTransferState::Initializing | PluginTransferState::Downloading | PluginTransferState::Paused
+    )
+}
+
+fn action_row(offer: &FileOfferInfo) -> El {
+    row([
+        spacer(),
+        button_with_icon(IconName::Download, "Download")
+            .key(download_key(&offer.transfer_id))
+            .primary(),
+    ])
+    .width(Size::Fill(1.0))
+    .align(Align::Center)
+}
+
+/// Progress bar + bytes-transferred + speed/ETA line for an in-flight
+/// transfer. The bar is determinate when we know the file size,
+/// indeterminate otherwise (size==0 sentinel).
+fn transfer_progress_block(status: &TransferStatus) -> El {
+    let bar: El = if status.size == 0 {
+        progress_indeterminate(tokens::PRIMARY)
+    } else {
+        progress(status.progress.clamp(0.0, 1.0), tokens::PRIMARY)
+    };
+
+    let speed = if status.state == PluginTransferState::Paused {
+        0
+    } else if status.download_speed > 0 {
+        status.download_speed
+    } else {
+        status.upload_speed
+    };
+
+    let pct = (status.progress.clamp(0.0, 1.0) * 100.0).round() as i32;
+    let transferred = (status.size as f32 * status.progress.clamp(0.0, 1.0)) as u64;
+    let bytes_label = if status.size > 0 {
+        format!("{} / {}", format_size(transferred), format_size(status.size))
+    } else {
+        format_size(transferred)
+    };
+    let speed_label = match status.state {
+        PluginTransferState::Paused => "Paused".to_string(),
+        _ if speed > 0 => format!("{}/s", format_size(speed)),
+        _ => "…".to_string(),
+    };
+    let eta_label = match status.state {
+        PluginTransferState::Paused => String::new(),
+        _ if speed > 0 && status.size > transferred => {
+            let remaining = status.size - transferred;
+            format!(" · {} left", format_eta(remaining, speed))
+        }
+        _ => String::new(),
+    };
+
+    let info_text = text(format!("{pct}% · {bytes_label} · {speed_label}{eta_label}"))
+        .muted()
+        .font_size(tokens::TEXT_XS.size);
+    // Cancel sits on the right of the info line so it stays at a
+    // predictable place across upload + download cards. The relay
+    // backend doesn't support pause/resume yet, so we don't render
+    // those buttons — they'd just bail.
+    let cancel_btn = icon_button(IconName::X)
+        .key(cancel_key(&status.id.0))
+        .ghost()
+        .tooltip("Cancel");
+    let info_line = row([info_text.width(Size::Fill(1.0)), cancel_btn])
+        .gap(tokens::SPACE_1)
+        .align(Align::Center)
+        .width(Size::Fill(1.0));
+
+    column([bar, info_line]).gap(tokens::SPACE_1).width(Size::Fill(1.0))
+}
+
+/// Coarse mm:ss / Hh Mm formatter for a remaining-time estimate.
+/// Caller guarantees `speed > 0`.
+fn format_eta(remaining_bytes: u64, speed_bps: u64) -> String {
+    let secs = remaining_bytes / speed_bps.max(1);
+    if secs >= 3600 {
+        format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
+    } else if secs >= 60 {
+        format!("{}m {}s", secs / 60, secs % 60)
+    } else {
+        format!("{secs}s")
+    }
 }
 
 /// Inline thumbnail card for an image attachment whose underlying
@@ -527,12 +642,17 @@ fn composer(state: &State, chat_input: &str, selection: &Selection) -> El {
         .key(KEY_SHARE_FILE)
         .ghost()
         .tooltip("Share a file");
+    let mut paste = icon_button(SVG_CLIPBOARD.clone())
+        .key(KEY_PASTE_IMAGE)
+        .ghost()
+        .tooltip("Paste image from clipboard");
     let mut sync = icon_button(IconName::RefreshCw)
         .key(KEY_SYNC_HISTORY)
         .ghost()
         .tooltip("Sync chat history");
     if !connected {
         share = share.disabled();
+        paste = paste.disabled();
         sync = sync.disabled();
     }
 
@@ -540,7 +660,7 @@ fn composer(state: &State, chat_input: &str, selection: &Selection) -> El {
         row([input])
             .padding(Sides::xy(tokens::SPACE_4, tokens::SPACE_2))
             .width(Size::Fill(1.0)),
-        row([share, sync, spacer()])
+        row([share, paste, sync, spacer()])
             .gap(tokens::SPACE_1)
             .padding(Sides {
                 left: tokens::SPACE_4,

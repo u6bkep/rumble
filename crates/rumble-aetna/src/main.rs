@@ -76,6 +76,9 @@ fn build_connect_config(settings: &SettingsStore) -> ConnectConfig {
             ),
         }
     }
+    if let Some(dir) = settings.settings().file_transfer.download_dir.clone() {
+        config = config.with_download_dir(dir);
+    }
     config
 }
 

@@ -334,15 +334,13 @@ fn mime_pattern_matches(pattern: &str, mime: &str) -> bool {
     pattern.eq_ignore_ascii_case(mime)
 }
 
-/// File-transfer preferences. Field semantics match `rumble-egui`'s
-/// `FileTransferSettings` so the two clients can share a settings
-/// file once egui migrates onto this store.
+/// File-transfer preferences shared across desktop GUI clients.
 ///
 /// `auto_download_enabled` + `auto_download_rules` are consumed by
-/// rumble-next's incoming-offer pump (see `App::pump_auto_downloads`).
-/// The bandwidth caps and seed/cleanup flags are persisted UI state
-/// today — they'll feed the file-transfer plugin once that surface
-/// lands.
+/// the incoming-offer pump. The bandwidth caps are persisted UI state
+/// today and will feed the file-transfer plugin once that surface lands.
+/// `download_dir` overrides the platform default (system temp dir +
+/// `rumble_downloads`) for fetched files.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct FileTransferSettings {
@@ -352,8 +350,10 @@ pub struct FileTransferSettings {
     pub download_speed_limit: u64,
     /// Upload speed limit in bytes/sec; 0 = unlimited.
     pub upload_speed_limit: u64,
-    pub seed_after_download: bool,
-    pub cleanup_on_exit: bool,
+    /// Directory where fetched files are saved. `None` = use the
+    /// platform default. Applied at next connect (the relay plugin
+    /// captures the value when it's constructed).
+    pub download_dir: Option<PathBuf>,
 }
 
 impl FileTransferSettings {
@@ -384,8 +384,7 @@ impl Default for FileTransferSettings {
             ],
             download_speed_limit: 0,
             upload_speed_limit: 0,
-            seed_after_download: true,
-            cleanup_on_exit: false,
+            download_dir: None,
         }
     }
 }

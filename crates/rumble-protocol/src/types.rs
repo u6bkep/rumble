@@ -1311,6 +1311,13 @@ pub enum Command {
     DownloadFile {
         share_data: String,
     },
+    /// Cancel an in-flight share or download. The transfer is removed
+    /// from the plugin; partial data on disk is left in place (the
+    /// plugin's `delete_files` flag is currently kept off so the user
+    /// can still access an interrupted download manually).
+    CancelTransfer {
+        transfer_id: String,
+    },
 
     // Sound Effects
     /// Play a sound effect.
@@ -1473,6 +1480,10 @@ impl std::fmt::Debug for Command {
             Command::DownloadFile { share_data } => f
                 .debug_struct("DownloadFile")
                 .field("share_data_len", &share_data.len())
+                .finish(),
+            Command::CancelTransfer { transfer_id } => f
+                .debug_struct("CancelTransfer")
+                .field("transfer_id", transfer_id)
                 .finish(),
             Command::PlaySfx { kind, volume } => f
                 .debug_struct("PlaySfx")

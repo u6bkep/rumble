@@ -15,7 +15,7 @@
 //!    that opens a `"file-relay"` stream and requests the file from the server.
 //! 2. The fetched data is written to the downloads directory.
 
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Instant};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -51,6 +51,15 @@ struct TransferEntry {
     error: Option<String>,
     /// Cancellation token for this transfer's task.
     cancel: CancellationToken,
+    /// Smoothed bytes-per-second over the last sampling window. Updated
+    /// by the upload/fetch tasks via [`update_speed`]; reads from
+    /// `transfers()` see the most recent value.
+    speed_bps: u64,
+    /// Bytes transferred at the last speed sample. Combined with
+    /// `last_sample_at` to compute a fresh `speed_bps`.
+    last_sample_bytes: u64,
+    /// Wall-clock instant of the last speed sample.
+    last_sample_at: Instant,
 }
 
 impl TransferEntry {
@@ -64,13 +73,18 @@ impl TransferEntry {
         } else {
             rumble_client_traits::file_transfer::PluginTransferState::Downloading
         };
+        let (download_speed, upload_speed) = if self.is_upload {
+            (0, self.speed_bps)
+        } else {
+            (self.speed_bps, 0)
+        };
         TransferStatus {
             id: self.id.clone(),
             name: self.name.clone(),
             size: self.size,
             progress: self.progress,
-            download_speed: 0,
-            upload_speed: 0,
+            download_speed,
+            upload_speed,
             peers: 0,
             state,
             is_finished: self.is_complete,
@@ -79,6 +93,54 @@ impl TransferEntry {
             peer_details: Vec::new(),
         }
     }
+}
+
+/// Pick a destination path that won't clobber an existing file. If
+/// `dir/name` is free, returns it; otherwise inserts ` (N)` before the
+/// extension and increments `N` until the resulting path is free
+/// (capped to keep the loop bounded against pathological dirs).
+///
+/// Examples:
+/// - `dir/foo.png` taken → `dir/foo (2).png`
+/// - `dir/foo (2).png` also taken → `dir/foo (3).png`
+/// - `dir/no-extension` taken → `dir/no-extension (2)`
+fn unique_dest_path(dir: &std::path::Path, file_name: &str) -> PathBuf {
+    let initial = dir.join(file_name);
+    if !initial.exists() {
+        return initial;
+    }
+    let path = std::path::Path::new(file_name);
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or(file_name);
+    let ext = path.extension().and_then(|s| s.to_str());
+    for n in 2..10_000u32 {
+        let candidate_name = match ext {
+            Some(e) => format!("{stem} ({n}).{e}"),
+            None => format!("{stem} ({n})"),
+        };
+        let candidate = dir.join(&candidate_name);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    initial
+}
+
+/// Update an entry's smoothed bytes-per-second sample. Re-baselines
+/// when at least 250 ms has elapsed since the last sample, which keeps
+/// the displayed speed steady at high data rates without making low-
+/// rate transfers look stalled. Caller already holds the transfers map
+/// lock.
+fn update_speed(entry: &mut TransferEntry, bytes_so_far: u64) {
+    let now = Instant::now();
+    let elapsed = now.duration_since(entry.last_sample_at);
+    if elapsed.as_millis() < 250 {
+        return;
+    }
+    let delta = bytes_so_far.saturating_sub(entry.last_sample_bytes);
+    let secs = elapsed.as_secs_f64().max(0.001);
+    entry.speed_bps = (delta as f64 / secs) as u64;
+    entry.last_sample_bytes = bytes_so_far;
+    entry.last_sample_at = now;
 }
 
 type TransferMap = Arc<parking_lot::Mutex<HashMap<String, TransferEntry>>>;
@@ -217,7 +279,7 @@ async fn do_upload(
         send.write_all(&buf[..n]).await?;
         sent += n as u64;
 
-        // Update progress.
+        // Update progress + speed sample.
         {
             let mut t = transfers.lock();
             if let Some(entry) = t.get_mut(transfer_id) {
@@ -226,6 +288,7 @@ async fn do_upload(
                 } else {
                     1.0
                 };
+                update_speed(entry, sent);
             }
         }
     }
@@ -324,9 +387,11 @@ async fn do_fetch(
         }
     }
 
-    // Write to downloads directory.
+    // Write to downloads directory. Auto-rename on collision so a
+    // re-download of the same name doesn't silently overwrite an
+    // earlier copy the user might still want.
     std::fs::create_dir_all(downloads_dir)?;
-    let dest = downloads_dir.join(&file_name);
+    let dest = unique_dest_path(downloads_dir, &file_name);
     let file = tokio::fs::File::create(&dest).await?;
     let mut writer = tokio::io::BufWriter::new(file);
     let mut buf = vec![0u8; 64 * 1024];
@@ -345,6 +410,7 @@ async fn do_fetch(
                     } else {
                         1.0
                     };
+                    update_speed(entry, received);
                 }
             }
             Ok(Some(_)) => continue, // zero-length read
@@ -397,6 +463,9 @@ impl FileTransferPlugin for FileTransferRelayPlugin {
             is_upload: true,
             error: None,
             cancel: cancel.clone(),
+            speed_bps: 0,
+            last_sample_bytes: 0,
+            last_sample_at: Instant::now(),
         };
 
         self.transfers.lock().insert(transfer_id.clone(), entry);
@@ -443,6 +512,9 @@ impl FileTransferPlugin for FileTransferRelayPlugin {
             is_upload: false,
             error: None,
             cancel: cancel.clone(),
+            speed_bps: 0,
+            last_sample_bytes: 0,
+            last_sample_at: Instant::now(),
         };
 
         self.transfers.lock().insert(transfer_id.clone(), entry);
@@ -488,5 +560,47 @@ impl FileTransferPlugin for FileTransferRelayPlugin {
         // In the cache model, the client always initiates streams.
         // Server-initiated streams are not expected.
         warn!("unexpected incoming file-relay stream from server (cache model)");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn touch(path: &std::path::Path) {
+        std::fs::write(path, b"").unwrap();
+    }
+
+    #[test]
+    fn unique_dest_path_uses_initial_when_free() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = unique_dest_path(dir.path(), "foo.png");
+        assert_eq!(p, dir.path().join("foo.png"));
+    }
+
+    #[test]
+    fn unique_dest_path_appends_suffix_on_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("foo.png"));
+        let p = unique_dest_path(dir.path(), "foo.png");
+        assert_eq!(p, dir.path().join("foo (2).png"));
+    }
+
+    #[test]
+    fn unique_dest_path_walks_past_multiple_collisions() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("foo.png"));
+        touch(&dir.path().join("foo (2).png"));
+        touch(&dir.path().join("foo (3).png"));
+        let p = unique_dest_path(dir.path(), "foo.png");
+        assert_eq!(p, dir.path().join("foo (4).png"));
+    }
+
+    #[test]
+    fn unique_dest_path_handles_missing_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("readme"));
+        let p = unique_dest_path(dir.path(), "readme");
+        assert_eq!(p, dir.path().join("readme (2)"));
     }
 }

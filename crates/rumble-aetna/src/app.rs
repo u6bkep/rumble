@@ -161,6 +161,16 @@ pub struct RumbleApp<B: UiBackend = crate::backend::NativeUiBackend> {
     /// In-flight "Save As" dialog. When the handle completes the App
     /// copies the source file to the user-chosen destination.
     pending_save_as: Option<(PathBuf, JoinHandle<Option<PathBuf>>)>,
+
+    /// In-flight folder picker for the Settings > Files download
+    /// location. The result lands in `settings_state.pending` so the
+    /// dialog stays open with the user's choice already filled in.
+    pending_pick_download_dir: Option<JoinHandle<Option<PathBuf>>>,
+
+    /// True while the OS reports a file is being dragged over the
+    /// window. Drives the drop-target overlay; cleared on
+    /// `HoveredFileCancelled` or when the drop lands.
+    file_drop_hover: bool,
 }
 
 impl<B: UiBackend> RumbleApp<B> {
@@ -218,6 +228,8 @@ impl<B: UiBackend> RumbleApp<B> {
             pending_lightbox_decode: None,
             file_context_menu: None,
             pending_save_as: None,
+            pending_pick_download_dir: None,
+            file_drop_hover: false,
         }
     }
 }
@@ -376,6 +388,7 @@ impl<B: UiBackend> App for RumbleApp<B> {
         self.poll_agent_op();
         self.poll_file_dialog();
         self.poll_save_as();
+        self.poll_pick_download_dir();
         self.pump_chat_sfx();
         self.pump_image_cache();
         self.poll_lightbox_decode();
@@ -386,6 +399,13 @@ impl<B: UiBackend> App for RumbleApp<B> {
         let state = self.backend.state();
         let shell = self.settings.settings();
 
+        let transfers: chat::TransferMap = self
+            .backend
+            .transfers()
+            .into_iter()
+            .map(|t| (t.id.0.clone(), t))
+            .collect();
+
         let main = column([
             top_toolbar(&state),
             row([
@@ -394,6 +414,7 @@ impl<B: UiBackend> App for RumbleApp<B> {
                     &shell.chat,
                     &self.image_cache,
                     &self.gif_playback,
+                    &transfers,
                     &self.chat_input,
                     &self.selection,
                     self.chat_sidebar_w,
@@ -495,6 +516,20 @@ impl<B: UiBackend> App for RumbleApp<B> {
                 None
             };
 
+        // Drop-target hint while the OS is reporting a hovered file.
+        // Suppressed under modals (the user can still drop a file then,
+        // but the prompt would visually fight whatever modal is up).
+        let drop_target_layer = if self.file_drop_hover
+            && !wizard_open
+            && unlock_layer.is_none()
+            && cert_layer.is_none()
+            && state.connection.is_connected()
+        {
+            Some(drop_target_hint())
+        } else {
+            None
+        };
+
         // Always wrap in `overlays(...)` — even with no app layers, the
         // root must be an `Axis::Overlay` container so aetna's runtime
         // tooltip layer overlays the main view instead of competing for
@@ -517,6 +552,7 @@ impl<B: UiBackend> App for RumbleApp<B> {
                 room_tree_overlays.delete_room_modal,
                 lightbox_layer,
                 file_ctx_layer,
+                drop_target_layer,
                 settings_panel,
                 settings_popover,
                 cert_layer,
@@ -657,6 +693,10 @@ impl<B: UiBackend> App for RumbleApp<B> {
             text_input::apply_event(&mut self.chat_input, &mut self.selection, chat::KEY_INPUT, &event);
             return;
         }
+        if event.is_click_or_activate(chat::KEY_PASTE_IMAGE) {
+            self.paste_clipboard_image();
+            return;
+        }
         if event.is_click_or_activate(chat::KEY_SHARE_FILE) {
             self.spawn_share_file_dialog();
             return;
@@ -702,6 +742,16 @@ impl<B: UiBackend> App for RumbleApp<B> {
             && let Some(transfer_id) = chat::parse_download_key(route)
         {
             self.download_offer(transfer_id);
+            return;
+        }
+
+        if matches!(event.kind, UiEventKind::Click | UiEventKind::Activate)
+            && let Some(route) = event.route()
+            && let Some(transfer_id) = chat::parse_cancel_key(route)
+        {
+            self.backend.send(Command::CancelTransfer {
+                transfer_id: transfer_id.to_string(),
+            });
             return;
         }
 
@@ -858,6 +908,28 @@ impl<B: UiBackend> App for RumbleApp<B> {
                 return;
             }
         }
+    }
+
+    fn on_file_drop(&mut self, paths: Vec<PathBuf>) {
+        // Drop is only meaningful while connected — fall back to the
+        // share-file path's local-message warning otherwise so the
+        // user gets the same feedback as the paperclip button.
+        if !self.backend.state().connection.is_connected() {
+            self.backend.send(Command::LocalMessage {
+                text: "Connect to a server before sharing files".to_string(),
+            });
+            return;
+        }
+        for path in paths {
+            self.backend.send(Command::LocalMessage {
+                text: format!("Sharing {}", path.display()),
+            });
+            self.backend.send(Command::ShareFile { path });
+        }
+    }
+
+    fn on_file_hover(&mut self, hovered: bool) {
+        self.file_drop_hover = hovered;
     }
 }
 
@@ -1132,6 +1204,115 @@ impl<B: UiBackend> RumbleApp<B> {
                 .map(|f| f.path().to_path_buf())
         });
         self.pending_file_dialog = Some(handle);
+    }
+
+    /// Read an image off the system clipboard, write it to a temp PNG,
+    /// and dispatch a `ShareFile` for it. Mirrors the rumble-egui
+    /// helper of the same name; arboard works independently of any
+    /// runtime clipboard plumbing so this runs even if winit's text
+    /// clipboard isn't wired (e.g. egui#2108 on the egui side).
+    fn paste_clipboard_image(&mut self) {
+        if !self.backend.state().connection.is_connected() {
+            self.backend.send(Command::LocalMessage {
+                text: "Connect to a server before pasting images".to_string(),
+            });
+            return;
+        }
+        let mut clipboard = match arboard::Clipboard::new() {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("clipboard open failed: {e}");
+                self.backend.send(Command::LocalMessage {
+                    text: "Could not access the clipboard".to_string(),
+                });
+                return;
+            }
+        };
+        let img_data = match clipboard.get_image() {
+            Ok(d) => d,
+            Err(_) => {
+                self.backend.send(Command::LocalMessage {
+                    text: "No image on clipboard".to_string(),
+                });
+                return;
+            }
+        };
+        let Some(rgba) = image::RgbaImage::from_raw(
+            img_data.width as u32,
+            img_data.height as u32,
+            img_data.bytes.into_owned(),
+        ) else {
+            self.backend.send(Command::LocalMessage {
+                text: "Failed to process clipboard image".to_string(),
+            });
+            return;
+        };
+        let temp_dir = match tempfile::tempdir() {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::error!("tempdir create failed: {e}");
+                return;
+            }
+        };
+        let temp_path = temp_dir.path().join("clipboard_image.png");
+        if let Err(e) = rgba.save(&temp_path) {
+            tracing::error!("clipboard image save failed: {e}");
+            self.backend.send(Command::LocalMessage {
+                text: "Failed to write clipboard image to a temp file".to_string(),
+            });
+            return;
+        }
+        // Keep the temp dir alive for the lifetime of the share —
+        // ShareFile copies the bytes into the relay stream, but the
+        // file must still exist when the relay task picks it up.
+        // Process exit cleans the OS temp dir; an explicit cleanup
+        // belongs with the broader transfer-history work.
+        std::mem::forget(temp_dir);
+        self.backend.send(Command::LocalMessage {
+            text: "Sharing pasted image".to_string(),
+        });
+        self.backend.send(Command::ShareFile { path: temp_path });
+    }
+
+    /// Spawn the OS folder picker for the download-location setting.
+    /// The picker resolves through [`Self::poll_pick_download_dir`],
+    /// which pokes the result into the still-open settings dialog.
+    fn spawn_pick_download_dir(&mut self) {
+        if self.pending_pick_download_dir.is_some() {
+            return;
+        }
+        let initial = self
+            .settings_state
+            .pending
+            .as_ref()
+            .and_then(|p| p.download_dir.clone())
+            .or_else(|| self.settings.settings().file_transfer.download_dir.clone());
+        let handle = self.runtime.spawn(async move {
+            let mut dialog = rfd::AsyncFileDialog::new();
+            if let Some(start) = initial {
+                dialog = dialog.set_directory(start);
+            }
+            dialog.pick_folder().await.map(|f| f.path().to_path_buf())
+        });
+        self.pending_pick_download_dir = Some(handle);
+    }
+
+    /// Drain the folder-picker task and update the settings dialog's
+    /// pending download directory. Cancel (None) leaves the value
+    /// unchanged.
+    fn poll_pick_download_dir(&mut self) {
+        let Some(handle) = self.pending_pick_download_dir.as_ref() else {
+            return;
+        };
+        if !handle.is_finished() {
+            return;
+        }
+        let handle = self.pending_pick_download_dir.take().unwrap();
+        match self.runtime.block_on(handle) {
+            Ok(Some(path)) => self.settings_state.set_pending_download_dir(Some(path)),
+            Ok(None) => {}
+            Err(e) => tracing::error!("download-dir picker panicked: {e}"),
+        }
     }
 
     /// Drain a finished file-picker task, dispatching `Command::ShareFile`
@@ -1694,6 +1875,17 @@ impl<B: UiBackend> RumbleApp<B> {
                 self.settings_state.close();
                 true
             }
+            SettingsOutcome::PickDownloadDir => {
+                self.spawn_pick_download_dir();
+                true
+            }
+            SettingsOutcome::OpenDownloadDir(path) => {
+                if let Err(e) = std::fs::create_dir_all(&path) {
+                    tracing::warn!("download dir {:?} create failed: {e}", path);
+                }
+                open_path(&path);
+                true
+            }
         }
     }
 
@@ -1765,8 +1957,7 @@ impl<B: UiBackend> RumbleApp<B> {
                 .collect();
             s.file_transfer.download_speed_limit = (pending.download_speed_kbps as u64) * 1024;
             s.file_transfer.upload_speed_limit = (pending.upload_speed_kbps as u64) * 1024;
-            s.file_transfer.seed_after_download = pending.seed_after_download;
-            s.file_transfer.cleanup_on_exit = pending.cleanup_on_exit;
+            s.file_transfer.download_dir = pending.download_dir.clone();
 
             // Autoconnect: only meaningful once we have a recent server
             // to point at, so reuse the most-recent entry's address. If
@@ -2051,6 +2242,36 @@ fn identity_modal(identity: &Identity) -> El {
             .align(Align::Center),
         ],
     )
+}
+
+/// Translucent full-window scrim with a centred "Drop to share"
+/// banner. Rendered while the OS is reporting a hovered file so the
+/// user gets a visible cue that the window will accept the drop.
+fn drop_target_hint() -> El {
+    let banner = column([
+        icon(IconName::Upload).font_size(28.0),
+        text("Drop to share").title(),
+        text("The file will be uploaded to the current room.")
+            .muted()
+            .font_size(tokens::TEXT_XS.size),
+    ])
+    .gap(tokens::SPACE_2)
+    .align(Align::Center)
+    .padding(Sides::all(tokens::SPACE_5))
+    .fill(tokens::POPOVER)
+    .stroke(tokens::PRIMARY)
+    .stroke_width(2.0)
+    .radius(tokens::RADIUS_LG);
+
+    overlay([
+        El::new(Kind::Custom("drop-target-scrim"))
+            .fill(tokens::OVERLAY_SCRIM)
+            .fill_size(),
+        stack([banner])
+            .fill_size()
+            .padding(Sides::all(tokens::SPACE_7))
+            .align(Align::Center),
+    ])
 }
 
 /// Open `path` with the OS default application. Fires and forgets;
