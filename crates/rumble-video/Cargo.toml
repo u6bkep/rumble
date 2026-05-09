@@ -8,9 +8,16 @@ libc = "0.2"
 tracing = "0.1"
 thiserror = "2"
 
+# GPU mirror: shape `VideoStream` frames into an aetna `AppTexture`
+# the same way `rumble-aetna::AnimatedGpu` does for animated images.
+aetna-core = { path = "../../vendor/aetna/crates/aetna-core" }
+aetna-wgpu = { path = "../../vendor/aetna/crates/aetna-wgpu" }
+wgpu = "29"
+
 [build-dependencies]
 pkg-config = "0.3"
 
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["png"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+aetna-winit-wgpu = { path = "../../vendor/aetna/crates/aetna-winit-wgpu" }

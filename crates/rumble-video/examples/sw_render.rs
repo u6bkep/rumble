@@ -21,7 +21,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let input = PathBuf::from(args.next().ok_or("usage: sw_render <input> <output.png>")?);
     let output = PathBuf::from(args.next().ok_or("usage: sw_render <input> <output.png>")?);
 
-    let mut player = MpvPlayer::new()?;
+    let player = MpvPlayer::new()?;
     // Smoke test wants software-only behaviour and no audio so we
     // can run headless on CI without an audio device or GPU.
     player.set_option_string("hwdec", "no")?;

@@ -18,6 +18,7 @@ pub type mpv_render_context = c_void;
 
 // `mpv_format` — only the variants the wrapper consults.
 pub const MPV_FORMAT_INT64: c_int = 4;
+pub const MPV_FORMAT_DOUBLE: c_int = 5;
 
 // `mpv_event_id` — only the variants the wrapper inspects.
 pub const MPV_EVENT_SHUTDOWN: c_int = 1;

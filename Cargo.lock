@@ -5853,12 +5853,16 @@ dependencies = [
 name = "rumble-video"
 version = "0.1.0"
 dependencies = [
+ "aetna-core",
+ "aetna-wgpu",
+ "aetna-winit-wgpu",
  "image",
  "libc",
  "pkg-config",
  "thiserror 2.0.18",
  "tracing",
  "tracing-subscriber",
+ "wgpu 29.0.3",
 ]
 
 [[package]]

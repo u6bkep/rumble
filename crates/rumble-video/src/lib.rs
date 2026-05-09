@@ -14,9 +14,13 @@
 //! used elsewhere in rumble-aetna.
 
 mod error;
+mod gpu;
+mod stream;
 mod sys;
 
 pub use error::Error;
+pub use gpu::VideoGpu;
+pub use stream::{FrameBuffer, VideoStream};
 
 use std::{
     ffi::{CStr, CString},
@@ -39,9 +43,15 @@ pub struct MpvPlayer {
     render_ctx: *mut sys::mpv_render_context,
 }
 
-// libmpv's handle is internally synchronised across threads. Holding
-// the player on a worker thread (Phase 2 use case) is fine.
+// libmpv's handle is internally synchronised across threads — per
+// the docs, "most functions are thread-safe" and the ones we don't
+// need to call concurrently (mpv_render_context_render in
+// particular) we restrict to a single thread by usage discipline:
+// VideoStream's worker is the only caller of render_sw and
+// wait_for_frame, while the UI thread calls only the
+// command/property-setter methods.
 unsafe impl Send for MpvPlayer {}
+unsafe impl Sync for MpvPlayer {}
 
 impl MpvPlayer {
     /// Create a fresh player + SW render context. Sets a small set of
@@ -139,6 +149,31 @@ impl MpvPlayer {
         Ok(out)
     }
 
+    /// Read a `double` property. Used for `time-pos` / `duration`
+    /// queries. Returns `Ok(None)` if libmpv reports the property
+    /// is unavailable (e.g. `time-pos` before playback has actually
+    /// started); other errors propagate.
+    pub fn get_property_f64(&self, name: &str) -> Result<Option<f64>, Error> {
+        let cname = CString::new(name).map_err(|_| Error::InvalidArg("property name contained NUL"))?;
+        let mut out: f64 = 0.0;
+        let rc = unsafe {
+            sys::mpv_get_property(
+                self.handle,
+                cname.as_ptr(),
+                sys::MPV_FORMAT_DOUBLE,
+                &mut out as *mut f64 as *mut c_void,
+            )
+        };
+        // mpv_error::MPV_ERROR_PROPERTY_UNAVAILABLE = -10. Surface as
+        // `Ok(None)` so callers don't need to special-case the
+        // "property not yet ready" race against decoder startup.
+        if rc == -10 {
+            return Ok(None);
+        }
+        check(rc, "mpv_get_property(double)")?;
+        Ok(Some(out))
+    }
+
     /// Issue a libmpv command. `args` is the same shape libmpv's
     /// `mpv_command` expects: e.g. `&["loadfile", "/tmp/a.mp4"]`.
     pub fn command(&self, args: &[&str]) -> Result<(), Error> {
@@ -198,7 +233,15 @@ impl MpvPlayer {
     /// that a new frame is ready to be pulled with [`Self::render_sw`].
     /// Returns `Ok(true)` if a frame is ready, `Ok(false)` on
     /// timeout. Pumps libmpv's event queue while waiting so log
-    /// messages and end-of-file signals don't pile up unbounded.
+    /// messages and other signals don't pile up unbounded.
+    ///
+    /// `MPV_EVENT_END_FILE` is intentionally ignored here: during
+    /// normal playback it can fire transiently between loop
+    /// iterations of a `loop-file=inf` stream, and at true
+    /// end-of-stream the absence of further frames will surface
+    /// naturally as an `Ok(false)` timeout. Genuine load failures
+    /// are caught by [`Self::load_file`] before this method is
+    /// ever called.
     pub fn wait_for_frame(&self, timeout: Duration) -> Result<bool, Error> {
         let deadline = std::time::Instant::now() + timeout;
         loop {
@@ -215,10 +258,8 @@ impl MpvPlayer {
             // without pushing an event we recognise.
             let step = remaining.as_secs_f64().min(0.05);
             let ev = unsafe { &*sys::mpv_wait_event(self.handle, step) };
-            match ev.event_id {
-                sys::MPV_EVENT_END_FILE => return Err(Error::LoadFailed),
-                sys::MPV_EVENT_SHUTDOWN => return Err(Error::Shutdown),
-                _ => {}
+            if ev.event_id == sys::MPV_EVENT_SHUTDOWN {
+                return Err(Error::Shutdown);
             }
         }
     }
@@ -231,7 +272,7 @@ impl MpvPlayer {
     /// libmpv's SW format produces R, G, B, garbage per pixel; we
     /// post-process to set the alpha byte to `0xff` so callers can
     /// upload directly into an `Rgba8UnormSrgb` texture.
-    pub fn render_sw(&mut self, buf: &mut [u8], width: u32, height: u32, stride: usize) -> Result<(), Error> {
+    pub fn render_sw(&self, buf: &mut [u8], width: u32, height: u32, stride: usize) -> Result<(), Error> {
         if stride < (width as usize) * 4 || stride % 4 != 0 {
             return Err(Error::InvalidArg("stride must be >= width*4 and a multiple of 4"));
         }
