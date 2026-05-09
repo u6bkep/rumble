@@ -45,6 +45,12 @@ pub type TransferMap = HashMap<String, TransferStatus>;
 /// after decode) fall back to the `image()` widget.
 pub type AnimatedTextureMap = HashMap<String, AnimatedGpu>;
 
+/// Decoded poster thumbnails for downloaded videos, keyed by
+/// `transfer_id`. The App's `pump_video_thumbs` populates this via
+/// a one-shot libmpv decode of the first frame; chat consults it to
+/// swap a `file_offer_card` for a `video_preview` card.
+pub type VideoThumbMap = HashMap<String, Image>;
+
 /// Per-message GIF playback state, keyed by `transfer_id`. Lives on the
 /// App separate from the cache so a re-decode (e.g. cache eviction +
 /// repopulation) doesn't reset playback position. Static images don't
@@ -275,6 +281,7 @@ pub fn render(
     image_cache: &ImageCache,
     gif_playback: &HashMap<String, GifPlayback>,
     animated_textures: &AnimatedTextureMap,
+    video_thumbs: &VideoThumbMap,
     transfers: &TransferMap,
     chat_input: &str,
     selection: &Selection,
@@ -291,6 +298,7 @@ pub fn render(
             image_cache,
             gif_playback,
             animated_textures,
+            video_thumbs,
             transfers,
         ),
         divider(),
@@ -307,6 +315,7 @@ fn history(
     image_cache: &ImageCache,
     gif_playback: &HashMap<String, GifPlayback>,
     animated_textures: &AnimatedTextureMap,
+    video_thumbs: &VideoThumbMap,
     transfers: &TransferMap,
 ) -> El {
     if state.chat_messages.is_empty() {
@@ -334,6 +343,7 @@ fn history(
                 image_cache,
                 gif_playback,
                 animated_textures,
+                video_thumbs,
                 transfers,
             )
         })
@@ -352,6 +362,7 @@ fn render_message(
     image_cache: &ImageCache,
     gif_playback: &HashMap<String, GifPlayback>,
     animated_textures: &AnimatedTextureMap,
+    video_thumbs: &VideoThumbMap,
     transfers: &TransferMap,
 ) -> El {
     let prefix = if chat_settings.show_timestamps {
@@ -385,16 +396,20 @@ fn render_message(
 
     // Attachments render below the text line as their own cards. Local
     // messages don't carry attachments, but check `attachment` first so
-    // a future variant slots in cleanly.
+    // a future variant slots in cleanly. Image previews take priority
+    // over video previews when both happen to materialise (the image
+    // cache only tracks image extensions today, so this is moot, but
+    // matters if the format detection ever overlaps).
     match msg.attachment.as_ref() {
         Some(ChatAttachment::FileOffer(offer)) => {
-            let attachment = match image_cache.get(&offer.transfer_id) {
-                Some(cached) => {
-                    let playback = gif_playback.get(&offer.transfer_id);
-                    let gpu = animated_textures.get(&offer.transfer_id);
-                    image_preview(offer, cached, playback, gpu)
-                }
-                None => file_offer_card(offer, transfers.get(&offer.transfer_id)),
+            let attachment = if let Some(cached) = image_cache.get(&offer.transfer_id) {
+                let playback = gif_playback.get(&offer.transfer_id);
+                let gpu = animated_textures.get(&offer.transfer_id);
+                image_preview(offer, cached, playback, gpu)
+            } else if let Some(thumb) = video_thumbs.get(&offer.transfer_id) {
+                video_preview(offer, thumb)
+            } else {
+                file_offer_card(offer, transfers.get(&offer.transfer_id))
             };
             column([line, attachment]).gap(tokens::SPACE_1).width(Size::Fill(1.0))
         }
@@ -615,6 +630,72 @@ fn image_preview(
 
     column([preview_layer, caption])
         .key(preview_key(&offer.transfer_id))
+        .focusable()
+        .cursor(Cursor::Pointer)
+        .gap(tokens::SPACE_1)
+        .padding(Sides::all(tokens::SPACE_2))
+        .fill(tokens::SECONDARY)
+        .stroke(tokens::BORDER)
+        .stroke_width(1.0)
+        .radius(tokens::RADIUS_MD)
+        .width(Size::Fill(1.0))
+}
+
+/// Inline preview card for a downloaded video: poster thumbnail
+/// (first frame extracted via libmpv) with a centered play
+/// overlay, caption beneath. Whole card is clickable —
+/// activating it routes through [`crate::video::open_video_key`]
+/// the same way the file-card "Play" button does.
+fn video_preview(offer: &FileOfferInfo, thumb: &Image) -> El {
+    const PREVIEW_HEIGHT: f32 = 220.0;
+
+    let poster = image(thumb.clone())
+        .image_fit(ImageFit::Contain)
+        .radius(tokens::RADIUS_SM)
+        .width(Size::Fill(1.0))
+        .height(Size::Fixed(PREVIEW_HEIGHT));
+
+    // Centered play badge: a translucent dark backplate with the
+    // existing play SVG centred on top. Sized to feel inviting
+    // without dominating the poster — about a third of the card
+    // height.
+    let play_badge = stack([icon(SVG_PLAY.clone())
+        .text_color(tokens::FOREGROUND)
+        .width(Size::Fixed(36.0))
+        .height(Size::Fixed(36.0))])
+    .padding(Sides::all(tokens::SPACE_3))
+    .fill(tokens::OVERLAY_SCRIM)
+    .radius(tokens::RADIUS_PILL);
+
+    // Center the badge over the poster via leading+trailing
+    // spacers in both axes — the same parking trick the GIF
+    // controls overlay uses, but for the centre slot rather than
+    // a corner.
+    let centred_badge = column([
+        spacer().height(Size::Fill(1.0)),
+        row([
+            spacer().width(Size::Fill(1.0)),
+            play_badge,
+            spacer().width(Size::Fill(1.0)),
+        ])
+        .align(Align::Center)
+        .width(Size::Fill(1.0)),
+        spacer().height(Size::Fill(1.0)),
+    ])
+    .width(Size::Fill(1.0))
+    .height(Size::Fill(1.0));
+
+    let preview_layer = stack([poster, centred_badge])
+        .width(Size::Fill(1.0))
+        .height(Size::Fixed(PREVIEW_HEIGHT));
+
+    let caption = text(format!("{} · {}", offer.name, format_size(offer.size)))
+        .muted()
+        .font_size(tokens::TEXT_XS.size)
+        .ellipsis();
+
+    column([preview_layer, caption])
+        .key(crate::video::open_video_key(&offer.transfer_id))
         .focusable()
         .cursor(Cursor::Pointer)
         .gap(tokens::SPACE_1)

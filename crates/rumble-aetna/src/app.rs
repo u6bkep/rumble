@@ -199,6 +199,23 @@ pub struct RumbleApp<B: UiBackend = crate::backend::NativeUiBackend> {
     /// is offloaded to the runtime to avoid stalling the UI; the
     /// completed stream lands in `active_video` next frame.
     pending_video_open: Option<JoinHandle<Result<(String, String, rumble_video::VideoStream), rumble_video::Error>>>,
+
+    /// Decoded poster thumbnails for downloaded video files,
+    /// keyed by `transfer_id`. Populated by [`Self::pump_video_thumbs`]
+    /// after a one-shot libmpv decode of the first frame; chat
+    /// consults this to swap a `file_offer_card` for a
+    /// `video_preview` card when the entry is ready.
+    video_thumbs: HashMap<String, Image>,
+    /// Transfer ids whose thumbnail extraction has failed at
+    /// least once (file format unsupported, decoder timeout,
+    /// etc.). Mirrors [`Self::image_failed`] — keeps the pump
+    /// from re-attempting on every frame.
+    failed_video_thumbs: HashSet<String>,
+    /// In-flight thumbnail-decode tasks keyed by `transfer_id`.
+    /// Polled in [`Self::pump_video_thumbs`]; on completion the
+    /// result lands in either `video_thumbs` (Ok) or
+    /// `failed_video_thumbs` (Err).
+    pending_video_thumbs: HashMap<String, JoinHandle<Result<Image, rumble_video::Error>>>,
 }
 
 impl<B: UiBackend> RumbleApp<B> {
@@ -262,6 +279,9 @@ impl<B: UiBackend> RumbleApp<B> {
             animated_gpu: HashMap::new(),
             active_video: None,
             pending_video_open: None,
+            video_thumbs: HashMap::new(),
+            failed_video_thumbs: HashSet::new(),
+            pending_video_thumbs: HashMap::new(),
         }
     }
 }
@@ -425,6 +445,7 @@ impl<B: UiBackend> App for RumbleApp<B> {
         self.pump_image_cache();
         self.poll_lightbox_decode();
         self.pump_gif_animations();
+        self.pump_video_thumbs();
         self.poll_video_open();
         if let Some(active) = self.active_video.as_mut() {
             active.refresh_scrub_value();
@@ -451,6 +472,7 @@ impl<B: UiBackend> App for RumbleApp<B> {
                     &self.image_cache,
                     &self.gif_playback,
                     &self.animated_gpu,
+                    &self.video_thumbs,
                     &transfers,
                     &self.chat_input,
                     &self.selection,
@@ -1909,6 +1931,84 @@ impl<B: UiBackend> RumbleApp<B> {
                         path.display()
                     );
                     self.image_failed.insert(id.clone());
+                }
+            }
+        }
+    }
+
+    /// Mirrors [`Self::pump_image_cache`] but for video files:
+    /// kicks off a one-shot libmpv decode of the first frame for
+    /// each downloaded video that doesn't already have a thumbnail
+    /// (or a record of failure), and drains finished decode tasks
+    /// into [`Self::video_thumbs`].
+    ///
+    /// Decode happens off-thread via `runtime.spawn_blocking` so
+    /// the 50–200ms libmpv startup cost doesn't stall the UI on
+    /// the frame the file finishes downloading.
+    fn pump_video_thumbs(&mut self) {
+        let snapshot = self.backend.state();
+        if !snapshot.connection.is_connected() {
+            // Drain any in-flight decodes whether or not we're
+            // still connected — they're cheap to land and the
+            // user might reconnect mid-decode.
+            self.drain_finished_video_thumbs();
+            return;
+        }
+
+        // Drain finished tasks first so the spawn loop below
+        // doesn't see stale `pending_video_thumbs` entries for
+        // ids that just landed.
+        self.drain_finished_video_thumbs();
+
+        for status in self.backend.transfers() {
+            if !status.is_finished {
+                continue;
+            }
+            let Some(path) = status.local_path.clone() else {
+                continue;
+            };
+            let id = status.id.0.clone();
+            if self.video_thumbs.contains_key(&id)
+                || self.failed_video_thumbs.contains(&id)
+                || self.pending_video_thumbs.contains_key(&id)
+            {
+                continue;
+            }
+            if !video::is_video_name(&status.name) {
+                // Not a video — leave the file card alone. We
+                // don't mark it failed because there's nothing
+                // to retry.
+                continue;
+            }
+            let handle = self.runtime.spawn_blocking(move || video::extract_thumbnail(&path));
+            self.pending_video_thumbs.insert(id, handle);
+        }
+    }
+
+    /// Drain every finished entry in [`Self::pending_video_thumbs`]
+    /// into either `video_thumbs` (success) or `failed_video_thumbs`
+    /// (error). Pulled out of `pump_video_thumbs` so the early-
+    /// return when disconnected still flushes results.
+    fn drain_finished_video_thumbs(&mut self) {
+        let finished: Vec<String> = self
+            .pending_video_thumbs
+            .iter()
+            .filter(|(_, h)| h.is_finished())
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in finished {
+            let handle = self.pending_video_thumbs.remove(&id).unwrap();
+            match self.runtime.block_on(handle) {
+                Ok(Ok(image)) => {
+                    self.video_thumbs.insert(id, image);
+                }
+                Ok(Err(e)) => {
+                    tracing::debug!("video thumbnail decode failed for {id}: {e}");
+                    self.failed_video_thumbs.insert(id);
+                }
+                Err(join_err) => {
+                    tracing::warn!("video thumbnail decode task panicked for {id}: {join_err}");
+                    self.failed_video_thumbs.insert(id);
                 }
             }
         }

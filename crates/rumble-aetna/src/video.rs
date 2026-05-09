@@ -13,10 +13,10 @@
 //! `rumble-video`'s `MpvPlayer`). Volume control is handled at the
 //! libmpv layer too via the `volume` / `mute` properties.
 
-use std::{sync::LazyLock, time::Duration};
+use std::{path::Path, sync::LazyLock, time::Duration};
 
 use aetna_core::{prelude::*, surface::SurfaceAlpha};
-use rumble_video::{VideoGpu, VideoStream};
+use rumble_video::{Error as VideoError, MpvPlayer, VideoGpu, VideoStream};
 
 // ---- Routing keys ----
 
@@ -48,6 +48,69 @@ pub fn parse_open_video_key(key: &str) -> Option<&str> {
 pub fn is_video_name(name: &str) -> bool {
     let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
     matches!(ext.as_str(), "mp4" | "m4v" | "mov" | "webm" | "mkv" | "avi" | "ogv")
+}
+
+// ---- Thumbnail extraction ----
+
+/// Cap on the longest edge of an extracted poster thumbnail. The
+/// chat preview only needs to look good at ~220px tall plus a 2x
+/// HiDPI factor, so 1024 is plenty and keeps memory pressure
+/// bounded for 4K source video.
+const POSTER_MAX_DIM: u32 = 1024;
+
+/// Decode the first frame of `path` into an aetna [`Image`] sized
+/// for use as an inline-preview poster. Runs synchronously — the
+/// caller is expected to drive this from `runtime.spawn_blocking`
+/// so the 50–200ms libmpv connect/decode hit doesn't stall the
+/// UI thread.
+///
+/// Internally: spin up a one-shot [`MpvPlayer`] (audio off, hwdec
+/// off, paused), `load_file`, ask libmpv to scale the first
+/// frame into a buffer sized to [`POSTER_MAX_DIM`]'s longest
+/// edge, then wrap the RGBA bytes in an `Image`.
+pub fn extract_thumbnail(path: &Path) -> Result<Image, VideoError> {
+    let player = MpvPlayer::new()?;
+    // Headless / fast-path config: no audio device, no hardware
+    // decode (slower decode but no GPU contention with the host
+    // wgpu device), paused so the decoder doesn't race ahead.
+    player.set_option_string("audio", "no")?;
+    player.set_option_string("hwdec", "no")?;
+    player.set_option_string("pause", "yes")?;
+
+    player.load_file(path)?;
+    let (nat_w, nat_h) = player.dimensions()?;
+
+    // Downsample at render time — libmpv handles the scaling for
+    // us via the SW render API.
+    let (w, h) = scale_to_fit(nat_w, nat_h, POSTER_MAX_DIM);
+    let stride = (w as usize) * 4;
+    let mut buf = vec![0u8; stride * h as usize];
+
+    // First frame should land within a few hundred ms in the
+    // worst case (slow disk, complex header). Anything past 5s
+    // is a stuck decoder we don't want to wait on.
+    if !player.wait_for_frame(Duration::from_secs(5))? {
+        return Err(VideoError::Timeout("first frame for thumbnail"));
+    }
+    player.render_sw(&mut buf, w, h, stride)?;
+
+    Ok(Image::from_rgba8(w, h, buf))
+}
+
+/// Fit `(w, h)` into a box of `max` on its longest edge,
+/// preserving aspect ratio. Result is always at least 1×1.
+fn scale_to_fit(w: u32, h: u32, max: u32) -> (u32, u32) {
+    if w == 0 || h == 0 {
+        return (1, 1);
+    }
+    let longest = w.max(h);
+    if longest <= max {
+        return (w, h);
+    }
+    let scale = max as f64 / longest as f64;
+    let new_w = ((w as f64 * scale).round() as u32).max(1);
+    let new_h = ((h as f64 * scale).round() as u32).max(1);
+    (new_w, new_h)
 }
 
 // ---- Active video state ----
