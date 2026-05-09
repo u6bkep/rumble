@@ -31,7 +31,7 @@ use crate::{
     room_tree::{self, RoomTreeOutcome, RoomTreeState},
     server_picker::{self, ServerForm, ServerPickerOutcome, ServerPickerState},
     settings::{self, SettingsOutcome, SettingsState},
-    theme as palette,
+    theme as palette, video,
     wizard::{self, PendingAgentOp, UnlockState, WizardOutcome, WizardState},
 };
 
@@ -188,6 +188,17 @@ pub struct RumbleApp<B: UiBackend = crate::backend::NativeUiBackend> {
     /// alongside its `gif_playback` slot so the GPU memory tracks the
     /// CPU-side cache.
     animated_gpu: HashMap<String, AnimatedGpu>,
+
+    /// Currently-open video lightbox, if any. Owns the libmpv
+    /// stream + decode worker + GPU mirror; dropped on close to
+    /// free everything in one shot. Only one video plays at a
+    /// time — opening a second supersedes the first.
+    active_video: Option<video::ActiveVideo>,
+    /// In-flight `VideoStream::open` task. `load_file` blocks for
+    /// 10–50ms while libmpv negotiates the container, so opening
+    /// is offloaded to the runtime to avoid stalling the UI; the
+    /// completed stream lands in `active_video` next frame.
+    pending_video_open: Option<JoinHandle<Result<(String, String, rumble_video::VideoStream), rumble_video::Error>>>,
 }
 
 impl<B: UiBackend> RumbleApp<B> {
@@ -249,6 +260,8 @@ impl<B: UiBackend> RumbleApp<B> {
             file_drop_hover: false,
             gpu_device: None,
             animated_gpu: HashMap::new(),
+            active_video: None,
+            pending_video_open: None,
         }
     }
 }
@@ -412,6 +425,10 @@ impl<B: UiBackend> App for RumbleApp<B> {
         self.pump_image_cache();
         self.poll_lightbox_decode();
         self.pump_gif_animations();
+        self.poll_video_open();
+        if let Some(active) = self.active_video.as_mut() {
+            active.refresh_scrub_value();
+        }
     }
 
     fn build(&self, _cx: &BuildCx) -> El {
@@ -530,6 +547,22 @@ impl<B: UiBackend> App for RumbleApp<B> {
             None
         };
 
+        // Video lightbox sits in the same overlay slot as the
+        // image lightbox — only one is ever open at a time, so
+        // they don't visually conflict. Same modal-suppression
+        // rules apply (no popping over wizard / cert / unlock /
+        // settings).
+        let video_lightbox_layer = if !wizard_open
+            && unlock_layer.is_none()
+            && cert_layer.is_none()
+            && !self.settings_state.open
+            && let Some(active) = self.active_video.as_ref()
+        {
+            Some(video::render_lightbox(active))
+        } else {
+            None
+        };
+
         let file_ctx_layer =
             if !wizard_open && unlock_layer.is_none() && cert_layer.is_none() && !self.settings_state.open {
                 self.file_context_menu.as_ref().map(chat::render_file_context_menu)
@@ -572,6 +605,7 @@ impl<B: UiBackend> App for RumbleApp<B> {
                 room_tree_overlays.move_room_modal,
                 room_tree_overlays.delete_room_modal,
                 lightbox_layer,
+                video_lightbox_layer,
                 file_ctx_layer,
                 drop_target_layer,
                 settings_panel,
@@ -893,6 +927,60 @@ impl<B: UiBackend> App for RumbleApp<B> {
             }
         }
 
+        // Video lightbox. Open via the file-card "Play" button on
+        // a downloaded video; close via Close button, scrim, or
+        // Escape. Controls (play/pause, mute, scrub) live inside
+        // the panel so they only reach this handler when the
+        // panel is open.
+        if event.kind == UiEventKind::Click
+            && let Some(route) = event.route()
+            && let Some(transfer_id) = video::parse_open_video_key(route)
+        {
+            self.open_video_lightbox(transfer_id);
+            return;
+        }
+        if self.active_video.is_some()
+            && (event.is_click_or_activate(video::KEY_LIGHTBOX_CLOSE)
+                || (event.is_route(video::KEY_LIGHTBOX_DISMISS) && event.kind == UiEventKind::Click)
+                || event.kind == UiEventKind::Escape)
+        {
+            self.close_video_lightbox();
+            return;
+        }
+        if let Some(active) = self.active_video.as_mut() {
+            if event.is_click_or_activate(video::KEY_PLAY_PAUSE) {
+                active.toggle_play();
+                return;
+            }
+            if event.is_click_or_activate(video::KEY_MUTE) {
+                active.toggle_mute();
+                return;
+            }
+            // Scrub bar: pointer-down anchors a drag, drag fires
+            // seeks at the new value, pointer-up clears the
+            // scrubbing flag so refresh_scrub_value resumes
+            // tracking the playhead.
+            if event.is_route(video::KEY_SCRUB)
+                && let (Some(rect), Some(x)) = (event.target_rect(), event.pointer_x())
+            {
+                match event.kind {
+                    UiEventKind::PointerDown | UiEventKind::Drag => {
+                        let n = aetna_core::widgets::slider::normalized_from_event(rect, x);
+                        active.scrubbing = true;
+                        active.seek_normalized(n);
+                        return;
+                    }
+                    UiEventKind::PointerUp | UiEventKind::Click => {
+                        let n = aetna_core::widgets::slider::normalized_from_event(rect, x);
+                        active.seek_normalized(n);
+                        active.scrubbing = false;
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
         // Top toolbar.
         if event.is_click_or_activate("toolbar:mute") {
             let muted = self.backend.state().audio.self_muted;
@@ -984,6 +1072,7 @@ impl<B: UiBackend> WinitWgpuApp for RumbleApp<B> {
     /// onto the GPU.
     fn before_paint(&mut self, queue: &wgpu::Queue) {
         self.sync_animated_gpu(queue);
+        self.sync_active_video_gpu(queue);
     }
 }
 
@@ -1596,6 +1685,88 @@ impl<B: UiBackend> RumbleApp<B> {
         }
     }
 
+    /// Open the video lightbox for `transfer_id`. Looks up the
+    /// downloaded file's local path from the live transfer set and
+    /// kicks off `VideoStream::open` on the runtime — `load_file`
+    /// blocks 10–50ms while libmpv parses the container, which
+    /// would hitch the UI if done synchronously. The completed
+    /// stream lands in `self.active_video` next frame via
+    /// [`Self::poll_video_open`].
+    ///
+    /// Closing any previous video lightbox (or aborting an
+    /// in-flight open) is the caller's responsibility-of-state
+    /// here: we drop both before kicking off the new open so a
+    /// rapid re-click doesn't leak a libmpv handle.
+    fn open_video_lightbox(&mut self, transfer_id: &str) {
+        // Find the file's name + path from the live transfer set.
+        // Bail if the transfer was GC'd between the click and the
+        // event firing.
+        let entry = self.backend.transfers().into_iter().find(|t| t.id.0 == transfer_id);
+        let Some(status) = entry else {
+            return;
+        };
+        let Some(path) = status.local_path.clone() else {
+            return;
+        };
+        let name = status.name.clone();
+        let id = status.id.0.clone();
+
+        // Drop any existing active video / pending open. Newer
+        // intent supersedes older.
+        self.active_video = None;
+        if let Some(prev) = self.pending_video_open.take() {
+            prev.abort();
+        }
+
+        self.pending_video_open = Some(self.runtime.spawn_blocking(move || {
+            // Open looped so the lightbox doesn't freeze the
+            // moment a short clip ends — matches the "preview"
+            // expectation users have for chat-attachment video.
+            let stream = rumble_video::VideoStream::open(&path, true)?;
+            Ok((id, name, stream))
+        }));
+    }
+
+    /// Tear down the video lightbox: drop the stream (which
+    /// joins the worker and terminates libmpv), drop the GPU
+    /// mirror, abort any in-flight open.
+    fn close_video_lightbox(&mut self) {
+        self.active_video = None;
+        if let Some(handle) = self.pending_video_open.take() {
+            handle.abort();
+        }
+    }
+
+    /// Drain a finished `VideoStream::open` task. On success,
+    /// promote the stream to `active_video`; on failure, log and
+    /// drop. The GPU mirror is allocated lazily in
+    /// [`Self::sync_active_video_gpu`] once the host's wgpu
+    /// device is available.
+    fn poll_video_open(&mut self) {
+        let Some(handle) = self.pending_video_open.as_ref() else {
+            return;
+        };
+        if !handle.is_finished() {
+            return;
+        }
+        let handle = self.pending_video_open.take().unwrap();
+        let result = match self.runtime.block_on(handle) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e, "video: open task panicked");
+                return;
+            }
+        };
+        match result {
+            Ok((id, name, stream)) => {
+                self.active_video = Some(video::ActiveVideo::new(id, name, stream));
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "video: stream open failed");
+            }
+        }
+    }
+
     /// Flip play/pause on an animated entry's playhead. No-op for static
     /// entries (their `gif_playback` slot doesn't exist) — the icon
     /// overlay is only rendered for animated cache entries, so this is
@@ -1819,6 +1990,25 @@ impl<B: UiBackend> RumbleApp<B> {
                 .entry(id.clone())
                 .or_insert_with(|| AnimatedGpu::allocate(device, &frames[0].0));
             entry.upload_frame(queue, frames, idx);
+        }
+    }
+
+    /// Lazily allocate the active video's GPU mirror (needs the
+    /// wgpu device, which arrives after the stream itself), then
+    /// upload the latest decoded frame if the worker has produced
+    /// one since last paint.
+    fn sync_active_video_gpu(&mut self, queue: &wgpu::Queue) {
+        let Some(device) = self.gpu_device.as_ref() else {
+            return;
+        };
+        let Some(active) = self.active_video.as_mut() else {
+            return;
+        };
+        if active.gpu.is_none() {
+            active.gpu = Some(rumble_video::VideoGpu::allocate(device, &active.stream));
+        }
+        if let Some(gpu) = active.gpu.as_mut() {
+            gpu.upload_if_changed(queue, &active.stream);
         }
     }
 

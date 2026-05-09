@@ -137,6 +137,14 @@ impl VideoStream {
         self.player.set_property_string("pause", "no")
     }
 
+    /// Set an arbitrary libmpv property as a string. Escape hatch
+    /// for property names not yet covered by a dedicated method
+    /// (`mute`, `volume`, custom hwdec selection, etc.). Prefer
+    /// the typed wrappers when one exists.
+    pub fn set_property_string(&self, name: &str, value: &str) -> Result<(), Error> {
+        self.player.set_property_string(name, value)
+    }
+
     /// Seek to `target` seconds from the start of the file
     /// (absolute seek). Negative values clamp to zero; values past
     /// the duration land at end-of-file.

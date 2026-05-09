@@ -25,6 +25,7 @@ rumble-client-traits = { path = "../rumble-client-traits" }
 rumble-desktop = { path = "../rumble-desktop" }
 rumble-desktop-shell = { path = "../rumble-desktop-shell" }
 rumble-protocol = { path = "../rumble-protocol" }
+rumble-video = { path = "../rumble-video" }
 
 ed25519-dalek = { workspace = true }
 rand = { workspace = true }

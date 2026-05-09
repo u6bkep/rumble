@@ -426,7 +426,7 @@ fn file_offer_card(offer: &FileOfferInfo, status: Option<&TransferStatus>) -> El
     // standard Download button so the user can retry.
     let body = match status {
         Some(s) if !s.is_finished && s.error.is_none() && is_in_flight(s.state) => transfer_progress_block(s),
-        _ => action_row(offer),
+        _ => action_row(offer, status),
     };
 
     column([header, meta, body])
@@ -448,15 +448,34 @@ fn is_in_flight(state: PluginTransferState) -> bool {
     )
 }
 
-fn action_row(offer: &FileOfferInfo) -> El {
-    row([
-        spacer(),
+fn action_row(offer: &FileOfferInfo, status: Option<&TransferStatus>) -> El {
+    let mut buttons: Vec<El> = vec![spacer()];
+
+    // Downloaded video files get a Play button that opens the
+    // video lightbox. Same look as Download but routes through
+    // the video module's open key.
+    let is_playable_video = matches!(
+        status,
+        Some(s) if s.is_finished && s.error.is_none() && s.local_path.is_some(),
+    ) && crate::video::is_video_name(&offer.name);
+    if is_playable_video {
+        buttons.push(
+            button_with_icon(IconName::Activity, "Play")
+                .key(crate::video::open_video_key(&offer.transfer_id))
+                .primary(),
+        );
+    }
+
+    buttons.push(
         button_with_icon(IconName::Download, "Download")
             .key(download_key(&offer.transfer_id))
             .primary(),
-    ])
-    .width(Size::Fill(1.0))
-    .align(Align::Center)
+    );
+
+    row(buttons)
+        .gap(tokens::SPACE_2)
+        .width(Size::Fill(1.0))
+        .align(Align::Center)
 }
 
 /// Progress bar + bytes-transferred + speed/ETA line for an in-flight

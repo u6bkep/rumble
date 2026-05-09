@@ -5628,6 +5628,7 @@ dependencies = [
  "rumble-desktop",
  "rumble-desktop-shell",
  "rumble-protocol",
+ "rumble-video",
  "serde_json",
  "tempfile",
  "tokio",
