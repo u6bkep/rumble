@@ -11,6 +11,7 @@ use std::{
 };
 
 use aetna_core::prelude::*;
+use aetna_winit_wgpu::WinitWgpuApp;
 
 use rumble_client::{
     ProcessorRegistry, SfxKind, build_default_tx_pipeline, merge_with_default_tx_pipeline, register_builtin_processors,
@@ -23,6 +24,7 @@ use rumble_protocol::{Command, ConnectionState, PendingCertificate, State, Voice
 use tokio::{runtime::Runtime, task::JoinHandle};
 
 use crate::{
+    animated_gpu::AnimatedGpu,
     backend::UiBackend,
     chat,
     identity::Identity,
@@ -171,6 +173,21 @@ pub struct RumbleApp<B: UiBackend = crate::backend::NativeUiBackend> {
     /// window. Drives the drop-target overlay; cleared on
     /// `HoveredFileCancelled` or when the drop lands.
     file_drop_hover: bool,
+
+    /// `wgpu::Device` handle stashed by [`WinitWgpuApp::gpu_setup`]
+    /// once at startup, used in [`Self::sync_animated_gpu`] to lazily
+    /// allocate per-message textures for animated previews. `None`
+    /// before the host has finished bringing up wgpu (e.g. while
+    /// running tests against a `MockUiBackend`).
+    gpu_device: Option<wgpu::Device>,
+
+    /// Per-message GPU mirrors for animated previews keyed by
+    /// `transfer_id`. Populated lazily by [`Self::sync_animated_gpu`]
+    /// the first time `before_paint` runs with an active
+    /// [`chat::GifPlayback`] for an animated cache entry. Dropped
+    /// alongside its `gif_playback` slot so the GPU memory tracks the
+    /// CPU-side cache.
+    animated_gpu: HashMap<String, AnimatedGpu>,
 }
 
 impl<B: UiBackend> RumbleApp<B> {
@@ -230,6 +247,8 @@ impl<B: UiBackend> RumbleApp<B> {
             pending_save_as: None,
             pending_pick_download_dir: None,
             file_drop_hover: false,
+            gpu_device: None,
+            animated_gpu: HashMap::new(),
         }
     }
 }
@@ -414,6 +433,7 @@ impl<B: UiBackend> App for RumbleApp<B> {
                     &shell.chat,
                     &self.image_cache,
                     &self.gif_playback,
+                    &self.animated_gpu,
                     &transfers,
                     &self.chat_input,
                     &self.selection,
@@ -943,6 +963,26 @@ impl<B: UiBackend> App for RumbleApp<B> {
                 return;
             }
         }
+    }
+}
+
+impl<B: UiBackend> WinitWgpuApp for RumbleApp<B> {
+    /// Stash the wgpu device handle so [`Self::sync_animated_gpu`] can
+    /// allocate per-message textures lazily. Both `wgpu::Device` and
+    /// `wgpu::Queue` are `Arc`-backed internally — cloning the device
+    /// here is cheap.
+    fn gpu_setup(&mut self, device: &wgpu::Device, _queue: &wgpu::Queue) {
+        self.gpu_device = Some(device.clone());
+    }
+
+    /// Per-frame GPU-side update for animated previews: ensures every
+    /// active animated entry has a wgpu texture and that the texture
+    /// holds the current frame's pixels. CPU-side frame advance has
+    /// already happened in [`App::before_build`]
+    /// (`pump_gif_animations`); we just mirror the resulting indices
+    /// onto the GPU.
+    fn before_paint(&mut self, queue: &wgpu::Queue) {
+        self.sync_animated_gpu(queue);
     }
 }
 
@@ -1742,6 +1782,42 @@ impl<B: UiBackend> RumbleApp<B> {
             if drop_entry {
                 self.gif_playback.remove(&id);
             }
+        }
+    }
+
+    /// Lazily allocate per-message wgpu textures for animated entries
+    /// with active playback, upload the current frame to each, and
+    /// drop GPU mirrors whose playback has gone away. Called from
+    /// [`WinitWgpuApp::before_paint`] so the upload lands before
+    /// aetna's paint pass samples the texture this frame.
+    ///
+    /// Frame-advance bookkeeping lives in [`Self::pump_gif_animations`]
+    /// (run from `before_build`); this method is purely the GPU-side
+    /// mirror.
+    fn sync_animated_gpu(&mut self, queue: &wgpu::Queue) {
+        let Some(device) = self.gpu_device.as_ref() else {
+            // gpu_setup hasn't run yet (or we're under a test backend
+            // that never calls it). Nothing to do.
+            return;
+        };
+
+        // Drop mirrors whose playback record is gone — keeps the
+        // GPU resident set bounded by the CPU-side cache.
+        self.animated_gpu.retain(|id, _| self.gif_playback.contains_key(id));
+
+        for (id, pb) in &self.gif_playback {
+            let Some(chat::CachedImage::Animated { frames }) = self.image_cache.get(id) else {
+                continue;
+            };
+            if frames.is_empty() {
+                continue;
+            }
+            let idx = pb.frame_idx.min(frames.len() - 1);
+            let entry = self
+                .animated_gpu
+                .entry(id.clone())
+                .or_insert_with(|| AnimatedGpu::allocate(device, &frames[0].0));
+            entry.upload_frame(queue, frames, idx);
         }
     }
 

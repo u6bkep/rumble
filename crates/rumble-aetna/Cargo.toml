@@ -16,6 +16,8 @@ path = "src/main.rs"
 # Aetna UI — vendored under vendor/aetna.
 aetna-core = { path = "../../vendor/aetna/crates/aetna-core" }
 aetna-winit-wgpu = { path = "../../vendor/aetna/crates/aetna-winit-wgpu" }
+aetna-wgpu = { path = "../../vendor/aetna/crates/aetna-wgpu" }
+wgpu = "29"
 
 # Rumble client backend.
 rumble-client = { path = "../rumble-client" }

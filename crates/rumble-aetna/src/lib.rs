@@ -11,6 +11,7 @@
 //! state (form fields, selected room, expanded tree branches) and
 //! reprojects `(state, ui_state)` into an `El` tree on every frame.
 
+pub mod animated_gpu;
 pub mod app;
 pub mod backend;
 pub mod chat;

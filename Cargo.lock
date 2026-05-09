@@ -5614,6 +5614,7 @@ name = "rumble-aetna"
 version = "0.1.0"
 dependencies = [
  "aetna-core",
+ "aetna-wgpu",
  "aetna-winit-wgpu",
  "anyhow",
  "arboard",
@@ -5633,6 +5634,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "wgpu 29.0.3",
 ]
 
 [[package]]

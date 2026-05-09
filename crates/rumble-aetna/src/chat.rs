@@ -16,12 +16,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use aetna_core::prelude::*;
+use aetna_core::{prelude::*, surface::SurfaceAlpha};
 use rumble_client_traits::file_transfer::{PluginTransferState, TransferStatus};
 use rumble_desktop_shell::ChatSettings;
 use rumble_protocol::{ChatAttachment, ChatMessage, ChatMessageKind, FileOfferInfo, State, permissions::Permissions};
 
-use crate::theme as palette;
+use crate::{animated_gpu::AnimatedGpu, theme as palette};
 
 /// Decoded image cache, keyed by `transfer_id`. The App maintains this
 /// map and passes it through on render so the chat can swap a file
@@ -36,6 +36,14 @@ pub type ImageCache = HashMap<String, CachedImage>;
 /// chat renderer so an in-flight FileOffer card can show progress
 /// without each `file_offer_card` call doing its own linear search.
 pub type TransferMap = HashMap<String, TransferStatus>;
+
+/// GPU mirrors for animated previews, keyed by `transfer_id`. The App
+/// owns these (allocates + uploads in `before_paint`) and threads the
+/// map through `render` so [`image_preview`] can pick `surface()` for
+/// any animated entry whose mirror is live. Static images and
+/// animated entries that haven't been mirrored yet (one-frame race
+/// after decode) fall back to the `image()` widget.
+pub type AnimatedTextureMap = HashMap<String, AnimatedGpu>;
 
 /// Per-message GIF playback state, keyed by `transfer_id`. Lives on the
 /// App separate from the cache so a re-decode (e.g. cache eviction +
@@ -248,6 +256,7 @@ pub fn render(
     chat_settings: &ChatSettings,
     image_cache: &ImageCache,
     gif_playback: &HashMap<String, GifPlayback>,
+    animated_textures: &AnimatedTextureMap,
     transfers: &TransferMap,
     chat_input: &str,
     selection: &Selection,
@@ -258,7 +267,14 @@ pub fn render(
             .title()
             .padding(Sides::xy(tokens::SPACE_4, tokens::SPACE_2)),
         divider(),
-        history(state, chat_settings, image_cache, gif_playback, transfers),
+        history(
+            state,
+            chat_settings,
+            image_cache,
+            gif_playback,
+            animated_textures,
+            transfers,
+        ),
         divider(),
         composer(state, chat_input, selection),
     ])
@@ -272,6 +288,7 @@ fn history(
     chat_settings: &ChatSettings,
     image_cache: &ImageCache,
     gif_playback: &HashMap<String, GifPlayback>,
+    animated_textures: &AnimatedTextureMap,
     transfers: &TransferMap,
 ) -> El {
     if state.chat_messages.is_empty() {
@@ -292,7 +309,16 @@ fn history(
     let lines: Vec<El> = state
         .chat_messages
         .iter()
-        .map(|msg| render_message(msg, chat_settings, image_cache, gif_playback, transfers))
+        .map(|msg| {
+            render_message(
+                msg,
+                chat_settings,
+                image_cache,
+                gif_playback,
+                animated_textures,
+                transfers,
+            )
+        })
         .collect();
 
     scroll(lines)
@@ -307,6 +333,7 @@ fn render_message(
     chat_settings: &ChatSettings,
     image_cache: &ImageCache,
     gif_playback: &HashMap<String, GifPlayback>,
+    animated_textures: &AnimatedTextureMap,
     transfers: &TransferMap,
 ) -> El {
     let prefix = if chat_settings.show_timestamps {
@@ -346,7 +373,8 @@ fn render_message(
             let attachment = match image_cache.get(&offer.transfer_id) {
                 Some(cached) => {
                     let playback = gif_playback.get(&offer.transfer_id);
-                    image_preview(offer, cached, playback)
+                    let gpu = animated_textures.get(&offer.transfer_id);
+                    image_preview(offer, cached, playback, gpu)
                 }
                 None => file_offer_card(offer, transfers.get(&offer.transfer_id)),
             };
@@ -499,32 +527,47 @@ fn format_eta(remaining_bytes: u64, speed_bps: u64) -> String {
 /// of the preview area: play/pause toggle and an explicit "open
 /// lightbox" icon. These nest above the card so their click events
 /// route to `chat:gif:*` rather than the underlying preview key.
-fn image_preview(offer: &FileOfferInfo, cached: &CachedImage, playback: Option<&GifPlayback>) -> El {
+///
+/// Animated entries with a live GPU mirror render through aetna's
+/// `surface()` widget — the per-message texture is updated in-place
+/// each frame transition (in the App's `before_paint`), so playback
+/// doesn't churn aetna's image content-hash cache. Static images, and
+/// animated entries before their GPU mirror has been allocated (a
+/// one-frame race after decode lands), use the regular `image()`
+/// widget with `ImageFit::Contain`.
+fn image_preview(
+    offer: &FileOfferInfo,
+    cached: &CachedImage,
+    playback: Option<&GifPlayback>,
+    gpu: Option<&AnimatedGpu>,
+) -> El {
     const PREVIEW_HEIGHT: f32 = 220.0;
 
-    let frame = cached.current_frame(playback);
-    let preview = image(frame.clone())
-        .image_fit(ImageFit::Contain)
-        .radius(tokens::RADIUS_SM)
-        .width(Size::Fill(1.0))
-        .height(Size::Fixed(PREVIEW_HEIGHT));
-
-    let preview_layer: El = if cached.is_animated() {
-        let is_playing = playback.map(|p| p.playing).unwrap_or(false);
-        let mut layers: Vec<El> = vec![preview, gif_controls_overlay(&offer.transfer_id, is_playing)];
-        if is_playing {
-            // aetna's idle loop only re-fires when an event lands or
-            // when a `samples_time` shader is in the resolved op list.
-            // We need the second to keep our `pump_gif_animations`
-            // ticking while the user is otherwise idle. A zero-size
-            // transparent spinner has the right effect — its stock
-            // shader is registered with `samples_time=true` — and adds
-            // no visual weight. See `vendor/aetna/.../widgets/spinner.rs`.
-            layers.push(redraw_tick_keeper());
+    let preview_layer: El = match (cached, gpu) {
+        (CachedImage::Animated { .. }, Some(gpu)) => {
+            let is_playing = playback.map(|p| p.playing).unwrap_or(false);
+            animated_surface_preview(&offer.transfer_id, gpu, is_playing, PREVIEW_HEIGHT)
         }
-        stack(layers).width(Size::Fill(1.0)).height(Size::Fixed(PREVIEW_HEIGHT))
-    } else {
-        preview
+        _ => {
+            let frame = cached.current_frame(playback);
+            let preview = image(frame.clone())
+                .image_fit(ImageFit::Contain)
+                .radius(tokens::RADIUS_SM)
+                .width(Size::Fill(1.0))
+                .height(Size::Fixed(PREVIEW_HEIGHT));
+            if cached.is_animated() {
+                // Animated cache entry whose GPU mirror hasn't
+                // materialized yet (one-frame race after decode).
+                // Fall through to image()-based playback for this
+                // frame; the next frame swaps to surface().
+                let is_playing = playback.map(|p| p.playing).unwrap_or(false);
+                stack([preview, gif_controls_overlay(&offer.transfer_id, is_playing)])
+                    .width(Size::Fill(1.0))
+                    .height(Size::Fixed(PREVIEW_HEIGHT))
+            } else {
+                preview
+            }
+        }
     };
 
     let caption = text(format!("{} · {}", offer.name, format_size(offer.size)))
@@ -545,14 +588,46 @@ fn image_preview(offer: &FileOfferInfo, cached: &CachedImage, playback: Option<&
         .width(Size::Fill(1.0))
 }
 
-/// Zero-size transparent spinner. Used as a marker that pulls the
-/// stock spinner shader (which the runtime treats as `samples_time`)
-/// into the resolved op list, keeping the idle redraw loop alive while
-/// at least one GIF is playing.
-fn redraw_tick_keeper() -> El {
-    spinner_with_color(Color::rgba(0, 0, 0, 0))
-        .width(Size::Fixed(1.0))
-        .height(Size::Fixed(1.0))
+/// Build the surface-based preview for an animated entry. Sizes the
+/// surface to the texture's natural aspect ratio (height-pinned at
+/// `PREVIEW_HEIGHT`, width capped at `PREVIEW_MAX_WIDTH` for very wide
+/// images), and centers it horizontally in the card width with
+/// leading/trailing spacers — equivalent to a height-only
+/// `ImageFit::Contain` with no letterbox bands. The controls overlay
+/// stacks above the surface so its bottom-right corner sits on the
+/// image, not on empty card padding.
+fn animated_surface_preview(transfer_id: &str, gpu: &AnimatedGpu, is_playing: bool, preview_height: f32) -> El {
+    /// Cap on the inscribed surface width. Beyond this the preview
+    /// would dominate narrow chat panels; very wide images
+    /// downsample to fit.
+    const PREVIEW_MAX_WIDTH: f32 = 480.0;
+
+    let (tw, th) = gpu.size();
+    let aspect = (tw as f32) / (th.max(1) as f32);
+    let mut w = preview_height * aspect;
+    let mut h = preview_height;
+    if w > PREVIEW_MAX_WIDTH {
+        w = PREVIEW_MAX_WIDTH;
+        h = w / aspect;
+    }
+
+    let surface_el = surface(gpu.app_texture().clone())
+        .surface_alpha(SurfaceAlpha::Straight)
+        .width(Size::Fixed(w))
+        .height(Size::Fixed(h))
+        .radius(tokens::RADIUS_SM);
+
+    let inscribed = stack([surface_el, gif_controls_overlay(transfer_id, is_playing)])
+        .width(Size::Fixed(w))
+        .height(Size::Fixed(h));
+
+    row([
+        spacer().width(Size::Fill(1.0)),
+        inscribed,
+        spacer().width(Size::Fill(1.0)),
+    ])
+    .width(Size::Fill(1.0))
+    .height(Size::Fixed(h))
 }
 
 /// Bottom-right pill of icon buttons overlaid on an animated image
@@ -811,6 +886,32 @@ fn lightbox_body(lightbox: &Lightbox, img: &Image) -> El {
     // user drags / zooms — no re-layout cost per frame, and the
     // image's allocated rect stays the lightbox body so subsequent
     // pointer events still target the same region.
+    //
+    // TODO(upstream surface): when aetna's `surface()` widget gains
+    // ImageFit-style modes (currently fill-the-rect only — see the
+    // sizing contract in `aetna_core::surface` and `aetna_core::tree::
+    // surface`), animated entries should switch to:
+    //
+    //     surface(animated_gpu.app_texture().clone())
+    //         .surface_alpha(SurfaceAlpha::Straight)
+    //         .surface_fit(SurfaceFit::Contain) // upstream-pending
+    //         .radius(tokens::RADIUS_MD)
+    //         .width(Size::Fill(1.0))
+    //         .height(Size::Fill(1.0))
+    //         .scale(lightbox.zoom)
+    //         .translate(lightbox.pan.0, lightbox.pan.1)
+    //
+    // i.e. add a `gpu: Option<&AnimatedGpu>` arg to this fn, branch on
+    // (cached, gpu) like `image_preview` does, and reuse the same
+    // per-message texture the inline preview is already updating in
+    // `before_paint`. Today the lightbox uses `image()` per frame —
+    // bounded cost (one open at a time, one re-upload per frame
+    // transition through aetna's image cache) but redundant with the
+    // inline preview's texture write when both are visible. The
+    // dynamic Fill×Fill body rect is the reason we can't ship this
+    // without `ImageFit` on `surface`: a manual letterbox would
+    // either ship a one-frame stretch on every window resize or burn
+    // the wgpu allocator re-creating the texture per resize tick.
     let inner = image(img.clone())
         .image_fit(ImageFit::Contain)
         .radius(tokens::RADIUS_MD)

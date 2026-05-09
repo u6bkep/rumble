@@ -50,7 +50,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let host_config = HostConfig::default()
         .with_redraw_interval(Duration::from_millis(33))
         .with_low_latency_present(true);
-    aetna_winit_wgpu::run_with_config("Rumble", viewport, app, host_config)?;
+    aetna_winit_wgpu::run_host_app_with_config("Rumble", viewport, app, host_config)?;
     Ok(())
 }
 
