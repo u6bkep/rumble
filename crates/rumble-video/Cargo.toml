@@ -1,0 +1,16 @@
+[package]
+name = "rumble-video"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+libc = "0.2"
+tracing = "0.1"
+thiserror = "2"
+
+[build-dependencies]
+pkg-config = "0.3"
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

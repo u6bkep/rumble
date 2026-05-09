@@ -5850,6 +5850,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rumble-video"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "libc",
+ "pkg-config",
+ "thiserror 2.0.18",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "rumble-widgets"
 version = "0.1.0"
 dependencies = [
