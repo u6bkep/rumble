@@ -380,11 +380,13 @@ fn push_room_subtree(
 
     let mut row_el = row([
         spacer().width(Size::Fixed(indent)),
-        icon(IconName::Folder).text_color(if is_current {
-            tokens::PRIMARY
-        } else {
-            tokens::MUTED_FOREGROUND
-        }),
+        icon(IconName::Folder)
+            .icon_size(tokens::ICON_MD)
+            .text_color(if is_current {
+                tokens::PRIMARY
+            } else {
+                tokens::MUTED_FOREGROUND
+            }),
         label,
     ])
     .key(room_route_key(room_id))
@@ -426,7 +428,7 @@ fn push_room_subtree(
             SVG_TALKING_OFF.clone()
         };
 
-        let mut name_el = text(user.username.clone()).font_size(tokens::TEXT_XS.size);
+        let mut name_el = text(user.username.clone()).font_size(tokens::TEXT_SM.size);
         if user.is_elevated {
             name_el = name_el.text_color(palette::ELEVATED);
         }
@@ -435,13 +437,13 @@ fn push_room_subtree(
         out.push(
             row([
                 spacer().width(Size::Fixed(indent + tokens::SPACE_4)),
-                icon(mic_icon).icon_size(12.0),
+                icon(mic_icon).icon_size(tokens::ICON_MD),
                 name_el,
             ])
             .key(user_key.clone())
             .gap(tokens::SPACE_2)
             .align(Align::Center)
-            .padding(Sides::xy(tokens::SPACE_1, 2.0))
+            .padding(Sides::xy(tokens::SPACE_1, tokens::SPACE_1))
             .focusable(),
         );
         // User row drops into its parent room.
