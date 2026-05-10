@@ -1,5 +1,7 @@
+#[cfg(not(windows))]
 use std::ffi::CStr;
 
+#[cfg(not(windows))]
 use crate::sys;
 
 /// Errors surfaced from the libmpv FFI layer. The numeric `code` is
@@ -29,8 +31,14 @@ pub enum Error {
 
     #[error("libmpv: invalid argument — {0}")]
     InvalidArg(&'static str),
+
+    /// Returned by every `MpvPlayer` / `VideoStream` constructor on
+    /// platforms where libmpv isn't linked in. Currently: Windows.
+    #[error("rumble-video: unsupported on this platform — {0}")]
+    Unsupported(&'static str),
 }
 
+#[cfg(not(windows))]
 impl Error {
     pub(crate) fn from_code(code: i32, context: &'static str) -> Self {
         // Safety: per docs `mpv_error_string` returns a static
@@ -51,6 +59,7 @@ impl Error {
 /// Convenience: convert a libmpv int return into `Result`. `0` is
 /// success per the libmpv convention; negative values map through
 /// `mpv_error_string`.
+#[cfg(not(windows))]
 pub(crate) fn check(code: i32, context: &'static str) -> Result<(), Error> {
     if code >= 0 {
         Ok(())

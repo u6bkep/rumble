@@ -136,7 +136,7 @@ dependencies = [
 
 [[package]]
 name = "aetna-core"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "aetna-fonts",
  "bytemuck",
@@ -155,7 +155,7 @@ dependencies = [
 
 [[package]]
 name = "aetna-fonts"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "aetna-fonts-emoji",
  "aetna-fonts-inter",
@@ -181,7 +181,7 @@ version = "0.1.0"
 
 [[package]]
 name = "aetna-wgpu"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "aetna-core",
  "bytemuck",
@@ -193,7 +193,7 @@ dependencies = [
 
 [[package]]
 name = "aetna-winit-wgpu"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "aetna-core",
  "aetna-wgpu",

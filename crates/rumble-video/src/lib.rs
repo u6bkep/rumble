@@ -12,16 +12,37 @@
 //! every fourth byte with `0xff` post-render. This matches the
 //! pixel-format requirements of `wgpu::TextureFormat::Rgba8UnormSrgb`
 //! used elsewhere in rumble-aetna.
+//!
+//! ## Platform support
+//!
+//! Native (Linux/macOS): links against the system libmpv via
+//! pkg-config and provides the full `MpvPlayer` / `VideoStream` /
+//! `VideoGpu` surface.
+//!
+//! Windows: the libmpv FFI is compiled out and the public types
+//! resolve to stubs in [`windows_stub`] whose constructors return
+//! [`Error::Unsupported`]. This lets `rumble-aetna` cross-compile to
+//! `x86_64-pc-windows-gnu` without bundling a Windows libmpv build;
+//! the chat UI gracefully no-ops video features (no playback, no
+//! thumbnails) until a follow-up phase wires up Windows libmpv.
 
 mod error;
 mod gpu;
+#[cfg(not(windows))]
 mod stream;
+#[cfg(not(windows))]
 mod sys;
+#[cfg(windows)]
+mod windows_stub;
 
 pub use error::Error;
 pub use gpu::VideoGpu;
+#[cfg(not(windows))]
 pub use stream::{FrameBuffer, VideoStream};
+#[cfg(windows)]
+pub use windows_stub::{FrameBuffer, MpvPlayer, VideoStream};
 
+#[cfg(not(windows))]
 use std::{
     ffi::{CStr, CString},
     os::raw::{c_char, c_void},
@@ -30,11 +51,13 @@ use std::{
     time::Duration,
 };
 
+#[cfg(not(windows))]
 use error::check;
 
 /// Owned libmpv player handle plus a SW render context attached to it.
 /// `Drop` tears both down in the correct order (render context first,
 /// then `mpv_terminate_destroy`).
+#[cfg(not(windows))]
 pub struct MpvPlayer {
     /// `*mut mpv_handle`. Internally synchronised by libmpv — safe to
     /// hand to multiple threads as long as no two methods are called
@@ -50,9 +73,12 @@ pub struct MpvPlayer {
 // VideoStream's worker is the only caller of render_sw and
 // wait_for_frame, while the UI thread calls only the
 // command/property-setter methods.
+#[cfg(not(windows))]
 unsafe impl Send for MpvPlayer {}
+#[cfg(not(windows))]
 unsafe impl Sync for MpvPlayer {}
 
+#[cfg(not(windows))]
 impl MpvPlayer {
     /// Create a fresh player + SW render context. Sets a small set of
     /// "library embedding" defaults (no terminal, no input handling,
@@ -342,6 +368,7 @@ impl MpvPlayer {
     }
 }
 
+#[cfg(not(windows))]
 impl Drop for MpvPlayer {
     fn drop(&mut self) {
         // Render context must be freed *before* the handle, per the

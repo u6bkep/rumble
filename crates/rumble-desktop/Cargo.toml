@@ -26,12 +26,6 @@ prost = "0.14"
 # Audio
 cpal = "0.17.0"
 
-# Linux: PulseAudio backend (also speaks to PipeWire-pulse on PipeWire systems).
-# Optional behind the `pulse` feature, on by default for Linux builds.
-[target.'cfg(target_os = "linux")'.dependencies]
-libpulse-binding = { version = "2.30", optional = true }
-libpulse-simple-binding = { version = "2.29", optional = true }
-
 # Codec
 opus = { git = "https://github.com/u6bkep/opus-rs.git", rev = "2c545dc" }
 
@@ -62,6 +56,15 @@ tokio-util = "0.7"
 anyhow = "1"
 async-trait = "0.1"
 tracing = "0.1"
+
+# Linux: PulseAudio backend (also speaks to PipeWire-pulse on PipeWire systems).
+# Optional behind the `pulse` feature, on by default for Linux builds.
+# Kept at the bottom of the manifest on purpose: a `[target.'cfg(...)'.dependencies]`
+# block silently captures every dep below it until the next top-level table, so
+# keeping it last avoids accidentally Linux-gating unrelated deps.
+[target.'cfg(target_os = "linux")'.dependencies]
+libpulse-binding = { version = "2.30", optional = true }
+libpulse-simple-binding = { version = "2.29", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

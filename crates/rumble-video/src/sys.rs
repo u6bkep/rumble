@@ -9,6 +9,10 @@
 //! Coverage matches what the safe wrapper in `lib.rs` actually uses.
 //! Add new entries as the wrapper grows; do not preemptively bind
 //! anything we don't use.
+//!
+//! Compiled out on Windows — the crate ships stub `MpvPlayer` /
+//! `VideoStream` types there (see `src/windows_stub.rs`).
+#![cfg(not(windows))]
 #![allow(non_camel_case_types)]
 
 use std::os::raw::{c_char, c_double, c_int, c_void};
