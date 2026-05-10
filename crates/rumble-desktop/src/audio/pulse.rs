@@ -32,7 +32,7 @@ use libpulse_binding::{
 use libpulse_simple_binding::Simple;
 use tracing::{debug, error, info, warn};
 
-use rumble_client_traits::audio::{AudioBackend, AudioCaptureStream, AudioPlaybackStream};
+use rumble_client_traits::audio::{AudioBackend, AudioCaptureStream, AudioPlaybackStream, FillBufferFn, OnFrameFn};
 use rumble_protocol::AudioDeviceInfo;
 
 const SAMPLE_RATE: u32 = 48000;
@@ -203,7 +203,7 @@ fn spawn_capture_thread(
     simple: Simple,
     active: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
-    on_frame: Arc<Mutex<Box<dyn FnMut(&[f32]) + Send>>>,
+    on_frame: Arc<Mutex<OnFrameFn>>,
 ) -> JoinHandle<()> {
     thread::Builder::new()
         .name("rumble-pulse-capture".into())
@@ -233,7 +233,7 @@ fn spawn_capture_thread(
 fn spawn_playback_thread(
     simple: Simple,
     stop: Arc<AtomicBool>,
-    fill_buffer: Arc<Mutex<Box<dyn FnMut(&mut [f32]) + Send>>>,
+    fill_buffer: Arc<Mutex<FillBufferFn>>,
 ) -> JoinHandle<()> {
     thread::Builder::new()
         .name("rumble-pulse-playback".into())
@@ -304,18 +304,19 @@ impl Drop for PulsePlaybackStream {
 // Probe + introspection (one-shot mainloop)
 // ---------------------------------------------------------------------------
 
+/// Tuple of `(sources, sinks, default_source_name, default_sink_name)`.
+type EnumerateResult = (
+    Vec<AudioDeviceInfo>,
+    Vec<AudioDeviceInfo>,
+    Option<String>,
+    Option<String>,
+);
+
 /// Run a one-shot mainloop, return (sources, sinks, default_source_name, default_sink_name).
 ///
 /// `need_sinks`: whether to also fetch the sink list. Sources are always
 /// fetched because we need them for the default-source label.
-fn enumerate(
-    need_sinks: bool,
-) -> anyhow::Result<(
-    Vec<AudioDeviceInfo>,
-    Vec<AudioDeviceInfo>,
-    Option<String>,
-    Option<String>,
-)> {
+fn enumerate(need_sinks: bool) -> anyhow::Result<EnumerateResult> {
     let mut props = Proplist::new().ok_or_else(|| anyhow::anyhow!("Proplist::new failed"))?;
     let _ = props.set_str(properties::APPLICATION_NAME, APP_NAME);
 

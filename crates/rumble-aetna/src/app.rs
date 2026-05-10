@@ -35,6 +35,9 @@ use crate::{
     wizard::{self, PendingAgentOp, UnlockState, WizardOutcome, WizardState},
 };
 
+/// Result yielded by `pending_video_open`: `(transfer_id, file_name, stream)` or libmpv error.
+type PendingVideoOpenResult = Result<(String, String, rumble_video::VideoStream), rumble_video::Error>;
+
 pub struct RumbleApp<B: UiBackend = crate::backend::NativeUiBackend> {
     backend: B,
     identity: Identity,
@@ -198,7 +201,7 @@ pub struct RumbleApp<B: UiBackend = crate::backend::NativeUiBackend> {
     /// 10–50ms while libmpv negotiates the container, so opening
     /// is offloaded to the runtime to avoid stalling the UI; the
     /// completed stream lands in `active_video` next frame.
-    pending_video_open: Option<JoinHandle<Result<(String, String, rumble_video::VideoStream), rumble_video::Error>>>,
+    pending_video_open: Option<JoinHandle<PendingVideoOpenResult>>,
 
     /// Decoded poster thumbnails for downloaded video files,
     /// keyed by `transfer_id`. Populated by [`Self::pump_video_thumbs`]
@@ -1075,7 +1078,7 @@ impl<B: UiBackend> App for RumbleApp<B> {
         let room_tree_state = self.backend.state();
         match room_tree::handle_event(&mut self.room_tree, &event, &room_tree_state) {
             RoomTreeOutcome::Ignored => {}
-            RoomTreeOutcome::Handled => return,
+            RoomTreeOutcome::Handled => (),
             RoomTreeOutcome::Dispatch(commands) => {
                 let auto_sync = self.settings.settings().chat.auto_sync_history;
                 let has_join = commands.iter().any(|c| matches!(c, Command::JoinRoom { .. }));
@@ -1087,7 +1090,6 @@ impl<B: UiBackend> App for RumbleApp<B> {
                     }
                     self.backend.send(cmd);
                 }
-                return;
             }
         }
     }
@@ -1241,9 +1243,7 @@ impl<B: UiBackend> RumbleApp<B> {
     /// are overwritten and the edit's `last_used_unix` carries over to
     /// the larger of the two.
     fn save_server_form(&mut self) -> Option<RecentServer> {
-        let Some(form) = self.server_picker.form.as_mut() else {
-            return None;
-        };
+        let form = self.server_picker.form.as_mut()?;
         let addr = form.addr.trim().to_string();
         if addr.is_empty() {
             form.error = Some("Address is required.".to_string());

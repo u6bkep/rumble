@@ -554,11 +554,10 @@ async fn run_connection_task<P: Platform>(
                                     P::create_file_transfer_plugin(opener, downloads_dir);
 
                                 // Set the initial room ID on the relay plugin
-                                if let Some(ft) = &ft_arc {
-                                    if let Some(room_uuid) = read_state(&state).my_room_id {
+                                if let Some(ft) = &ft_arc
+                                    && let Some(room_uuid) = read_state(&state).my_room_id {
                                         ft.set_room_id(room_uuid.to_string());
                                     }
-                                }
 
                                 // Keep a reference for room-change updates,
                                 // and publish to the shared slot so UI threads
@@ -717,11 +716,10 @@ async fn run_connection_task<P: Platform>(
                                         P::create_file_transfer_plugin(opener, downloads_dir);
 
                                     // Set the initial room ID on the relay plugin
-                                    if let Some(ft) = &ft_arc {
-                                        if let Some(room_uuid) = read_state(&state).my_room_id {
+                                    if let Some(ft) = &ft_arc
+                                        && let Some(room_uuid) = read_state(&state).my_room_id {
                                             ft.set_room_id(room_uuid.to_string());
                                         }
-                                    }
 
                                     // Keep a reference for room-change updates,
                                     // and publish to the shared slot so UI threads
@@ -1001,9 +999,7 @@ async fn run_connection_task<P: Platform>(
                     Command::SetMuted { muted } => {
                         // Send status update to server
                         if let Some(t) = &mut transport {
-                            let s = read_state(&state);
-                            let is_deafened = s.audio.self_deafened;
-                            drop(s);
+                            let is_deafened = read_state(&state).audio.self_deafened;
                             let env = proto::Envelope {
                                 state_hash: Vec::new(),
                                 payload: Some(Payload::SetUserStatus(proto::SetUserStatus {
@@ -1021,9 +1017,7 @@ async fn run_connection_task<P: Platform>(
                         // Send status update to server
                         // Note: deafen implies mute
                         if let Some(t) = &mut transport {
-                            let s = read_state(&state);
-                            let is_muted = s.audio.self_muted || deafened;
-                            drop(s);
+                            let is_muted = read_state(&state).audio.self_muted || deafened;
                             let env = proto::Envelope {
                                 state_hash: Vec::new(),
                                 payload: Some(Payload::SetUserStatus(proto::SetUserStatus {
@@ -1642,7 +1636,7 @@ async fn run_stream_dispatch<H: BiStreamHandle>(bi_handle: H, file_transfer: Opt
 
 /// Add a local status message to the chat.
 fn add_local_message(state: &Arc<RwLock<State>>, text: String, repaint: &Arc<dyn Fn() + Send + Sync>) {
-    let mut s = write_state(&state);
+    let mut s = write_state(state);
     s.chat_messages.push(crate::events::ChatMessage {
         id: uuid::Uuid::new_v4().into_bytes(),
         sender: String::new(),
@@ -1680,7 +1674,7 @@ fn handle_server_message(
                 match kind {
                     proto::server_event::Kind::ServerState(ss) => {
                         // Full state replacement
-                        let mut s = write_state(&state);
+                        let mut s = write_state(state);
 
                         // Extract per-room effective permissions from server-computed values
                         s.per_room_permissions.clear();
@@ -1696,10 +1690,10 @@ fn handle_server_message(
                         s.rebuild_room_tree();
 
                         // Update effective_permissions from per-room data for current room
-                        if let Some(my_room) = s.my_room_id {
-                            if let Some(&perms) = s.per_room_permissions.get(&my_room) {
-                                s.effective_permissions = perms;
-                            }
+                        if let Some(my_room) = s.my_room_id
+                            && let Some(&perms) = s.per_room_permissions.get(&my_room)
+                        {
+                            s.effective_permissions = perms;
                         }
 
                         // Sync our own server-muted state to the audio task on
@@ -1773,7 +1767,7 @@ fn handle_server_message(
                                 share.content.messages.len()
                             );
                             let incoming = share.content.to_messages();
-                            let mut s = write_state(&state);
+                            let mut s = write_state(state);
                             // Collect existing IDs to skip duplicates
                             let existing_ids: std::collections::HashSet<[u8; 16]> =
                                 s.chat_messages.iter().map(|m| m.id).collect();
@@ -1806,7 +1800,7 @@ fn handle_server_message(
 
                         let attachment = cb.attachment.and_then(rumble_protocol::chat_attachment_from_proto);
 
-                        let mut s = write_state(&state);
+                        let mut s = write_state(state);
                         s.chat_messages.push(crate::events::ChatMessage {
                             id,
                             sender: cb.sender,
@@ -1832,7 +1826,7 @@ fn handle_server_message(
                             std::time::SystemTime::now()
                         };
 
-                        let mut s = write_state(&state);
+                        let mut s = write_state(state);
                         s.chat_messages.push(crate::events::ChatMessage {
                             id,
                             sender: dm.sender_name.clone(),
@@ -1855,7 +1849,7 @@ fn handle_server_message(
                         // Ignore keep-alive for now
                     }
                     proto::server_event::Kind::WelcomeMessage(wm) => {
-                        let mut s = write_state(&state);
+                        let mut s = write_state(state);
                         s.chat_messages.push(crate::events::ChatMessage {
                             id: uuid::Uuid::new_v4().into_bytes(),
                             sender: "Server".to_string(),
@@ -1876,13 +1870,13 @@ fn handle_server_message(
         }
         Some(Payload::PermissionDenied(pd)) => {
             warn!("Permission denied: {}", pd.message);
-            let mut s = write_state(&state);
+            let mut s = write_state(state);
             s.permission_denied = Some(pd.message);
             drop(s);
             repaint();
         }
         Some(Payload::UserKicked(uk)) => {
-            let my_user_id = read_state(&state).my_user_id;
+            let my_user_id = read_state(state).my_user_id;
             if my_user_id == Some(uk.user_id) {
                 // We were kicked
                 let reason = if uk.reason.is_empty() {
@@ -1891,7 +1885,7 @@ fn handle_server_message(
                     format!("Kicked by {}: {}", uk.kicked_by, uk.reason)
                 };
                 warn!("{}", reason);
-                let mut s = write_state(&state);
+                let mut s = write_state(state);
                 s.kicked = Some(reason);
                 drop(s);
                 // The server will close the connection, so we don't need to disconnect explicitly
@@ -1914,7 +1908,7 @@ fn apply_state_update(
     file_transfer: &Option<Arc<dyn FileTransferPlugin>>,
 ) {
     if let Some(u) = update.update {
-        let mut s = write_state(&state);
+        let mut s = write_state(state);
         match u {
             proto::state_update::Update::RoomCreated(rc) => {
                 if let Some(room) = rc.room {
@@ -1995,13 +1989,11 @@ fn apply_state_update(
 
                         s.users.push(user);
 
-                        if notify_audio {
-                            if let Some(uid) = user_id_value {
-                                drop(s);
-                                audio_task.send(AudioCommand::UserJoinedRoom { user_id: uid });
-                                repaint();
-                                return;
-                            }
+                        if notify_audio && let Some(uid) = user_id_value {
+                            drop(s);
+                            audio_task.send(AudioCommand::UserJoinedRoom { user_id: uid });
+                            repaint();
+                            return;
                         }
                     }
                 }
@@ -2030,7 +2022,7 @@ fn apply_state_update(
                 }
             }
             proto::state_update::Update::UserMoved(um) => {
-                if let (Some(uid), Some(to_room)) = (um.user_id.clone(), um.to_room_id.clone()) {
+                if let (Some(uid), Some(to_room)) = (um.user_id, um.to_room_id.clone()) {
                     let to_room_clone = to_room.clone();
                     let to_room_id = rumble_protocol::uuid_from_room_id(&to_room_clone);
                     let my_room_id = s.my_room_id;
@@ -2267,10 +2259,10 @@ fn recalculate_effective_permissions(state: &Arc<RwLock<State>>) {
     s.per_room_permissions = per_room;
 
     // Update the current room's effective_permissions for backward compatibility
-    if let Some(my_room) = my_room_id {
-        if let Some(&perms) = s.per_room_permissions.get(&my_room) {
-            s.effective_permissions = perms;
-        }
+    if let Some(my_room) = my_room_id
+        && let Some(&perms) = s.per_room_permissions.get(&my_room)
+    {
+        s.effective_permissions = perms;
     }
 }
 

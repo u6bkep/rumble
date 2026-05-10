@@ -15,7 +15,7 @@ use cpal::{
 };
 use tracing::{debug, error, info, warn};
 
-use rumble_client_traits::audio::{AudioBackend, AudioCaptureStream, AudioPlaybackStream};
+use rumble_client_traits::audio::{AudioBackend, AudioCaptureStream, AudioPlaybackStream, FillBufferFn, OnFrameFn};
 use rumble_protocol::AudioDeviceInfo;
 
 const SAMPLE_RATE: u32 = 48000;
@@ -80,7 +80,7 @@ fn pick_config(
     configs: impl Iterator<Item = cpal::SupportedStreamConfigRange>,
 ) -> Option<(StreamConfig, SampleFormat, u32, u16)> {
     let mut all: Vec<cpal::SupportedStreamConfigRange> = configs.collect();
-    all.sort_by(|a, b| sample_format_preference(b.sample_format()).cmp(&sample_format_preference(a.sample_format())));
+    all.sort_by_key(|c| std::cmp::Reverse(sample_format_preference(c.sample_format())));
 
     for cfg in &all {
         if cfg.channels() == CHANNELS && cfg.min_sample_rate() <= SAMPLE_RATE && cfg.max_sample_rate() >= SAMPLE_RATE {
@@ -103,7 +103,7 @@ fn pick_config(
             return Some((sc, cfg.sample_format(), SAMPLE_RATE, ch));
         }
     }
-    for cfg in &all {
+    if let Some(cfg) = all.first() {
         let rate = cfg.max_sample_rate();
         let ch = cfg.channels();
         let sc = StreamConfig {
@@ -137,11 +137,11 @@ fn resample(input: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
 struct InputProcessor {
     buffer: Vec<f32>,
     frame_size: usize,
-    on_frame: Box<dyn FnMut(&[f32]) + Send>,
+    on_frame: OnFrameFn,
 }
 
 impl InputProcessor {
-    fn new(frame_size: usize, on_frame: Box<dyn FnMut(&[f32]) + Send>) -> Self {
+    fn new(frame_size: usize, on_frame: OnFrameFn) -> Self {
         Self {
             buffer: Vec::with_capacity(frame_size * 2),
             frame_size,
@@ -520,12 +520,7 @@ fn expand_output(mono: &[f32], channels: u16, device_rate: u32) -> Vec<f32> {
     }
 }
 
-fn write_output_f32(
-    data: &mut [f32],
-    fill: &Arc<Mutex<Box<dyn FnMut(&mut [f32]) + Send>>>,
-    channels: u16,
-    device_rate: u32,
-) {
+fn write_output_f32(data: &mut [f32], fill: &Arc<Mutex<FillBufferFn>>, channels: u16, device_rate: u32) {
     if channels == 1 && device_rate == SAMPLE_RATE {
         if let Ok(mut f) = fill.lock() {
             f(data);

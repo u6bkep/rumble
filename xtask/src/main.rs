@@ -77,12 +77,11 @@ fn workspace_root() -> PathBuf {
     let mut dir = start.as_path();
     loop {
         let cargo_toml = dir.join("Cargo.toml");
-        if cargo_toml.exists() {
-            if let Ok(content) = fs::read_to_string(&cargo_toml) {
-                if content.contains("[workspace]") {
-                    return dir.to_path_buf();
-                }
-            }
+        if cargo_toml.exists()
+            && let Ok(content) = fs::read_to_string(&cargo_toml)
+            && content.contains("[workspace]")
+        {
+            return dir.to_path_buf();
         }
         match dir.parent() {
             Some(parent) => dir = parent,
@@ -104,10 +103,10 @@ fn parse_allowlist(content: &str) -> HashSet<u32> {
                 .chars()
                 .take_while(|c| c.is_ascii_hexdigit())
                 .collect();
-            if !hex_str.is_empty() {
-                if let Ok(cp) = u32::from_str_radix(&hex_str, 16) {
-                    set.insert(cp);
-                }
+            if !hex_str.is_empty()
+                && let Ok(cp) = u32::from_str_radix(&hex_str, 16)
+            {
+                set.insert(cp);
             }
         }
     }

@@ -84,18 +84,13 @@ impl SettingsTab {
 /// At most one select dropdown is open at a time. Tracking it here
 /// avoids one bool per select and gives `handle_event` a single place
 /// to clear it when the user opens a different one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OpenSelect {
+    #[default]
     None,
     InputDevice,
     OutputDevice,
     TimestampFormat,
-}
-
-impl Default for OpenSelect {
-    fn default() -> Self {
-        OpenSelect::None
-    }
 }
 
 /// Pending edits accumulated while the dialog is open. Initialised
@@ -490,11 +485,9 @@ pub fn render(
             // Wrapping the body lets content stop short of the
             // scrollbar gutter (active thumb = 10 px + 2 px track
             // inset = 12 px).
-            scroll([
-                column([body])
-                    .padding(Sides::xy(tokens::SPACE_3, 0.0))
-                    .width(Size::Fill(1.0)),
-            ])
+            scroll([column([body])
+                .padding(Sides::xy(tokens::SPACE_3, 0.0))
+                .width(Size::Fill(1.0))])
             .padding(Sides::xy(0.0, tokens::SPACE_2))
             .gap(tokens::SPACE_3)
             .width(Size::Fill(1.0))
@@ -745,19 +738,18 @@ fn render_processing(
         }
 
         // Per-processor schema fields (only when the processor is on).
-        if proc_config.enabled {
-            if let Some(schema) = registry.settings_schema(&proc_config.type_id) {
-                if let Some(properties) = schema.get("properties").and_then(|p| p.as_object()) {
-                    for (key, prop_schema) in properties {
-                        rows.push(render_schema_field(
-                            idx,
-                            key,
-                            prop_schema,
-                            &proc_config.settings,
-                            selection,
-                        ));
-                    }
-                }
+        if proc_config.enabled
+            && let Some(schema) = registry.settings_schema(&proc_config.type_id)
+            && let Some(properties) = schema.get("properties").and_then(|p| p.as_object())
+        {
+            for (key, prop_schema) in properties {
+                rows.push(render_schema_field(
+                    idx,
+                    key,
+                    prop_schema,
+                    &proc_config.settings,
+                    selection,
+                ));
             }
         }
         rows.push(spacer().height(Size::Fixed(tokens::SPACE_1)));
@@ -808,8 +800,8 @@ fn render_schema_field(
             )
         }
         "integer" => {
-            let min = schema.get("minimum").and_then(|m| m.as_i64()).unwrap_or(0) as i64;
-            let max = schema.get("maximum").and_then(|m| m.as_i64()).unwrap_or(100) as i64;
+            let min = schema.get("minimum").and_then(|m| m.as_i64()).unwrap_or(0);
+            let max = schema.get("maximum").and_then(|m| m.as_i64()).unwrap_or(100);
             let default = schema.get("default").and_then(|d| d.as_i64()).unwrap_or(0);
             let value = settings.get(key).and_then(|v| v.as_i64()).unwrap_or(default);
             let span = (max - min).max(1) as f32;
@@ -894,7 +886,7 @@ fn input_level_meter(pipeline: &PipelineConfig, audio: &AudioState) -> El {
     };
 
     column([
-        row([bar.into(), text(level_label).mono().font_size(tokens::TEXT_XS.size)])
+        row([bar, text(level_label).mono().font_size(tokens::TEXT_XS.size)])
             .gap(tokens::SPACE_2)
             .align(Align::Center),
         text(threshold_label).muted().font_size(tokens::TEXT_XS.size),
@@ -1010,25 +1002,21 @@ fn render_chat(pending: &PendingSettings) -> El {
 }
 
 fn render_files(pending: &PendingSettings, selection: &Selection) -> El {
-    let mut children: Vec<El> = Vec::new();
-    children.push(section_heading("Auto-download"));
-    children.push(field_row(
-        "Enable auto-download",
-        switch(pending.auto_download_enabled).key(KEY_FILES_AUTO_DOWNLOAD),
-    ));
-    children.push(
+    let mut children: Vec<El> = vec![
+        section_heading("Auto-download"),
+        field_row(
+            "Enable auto-download",
+            switch(pending.auto_download_enabled).key(KEY_FILES_AUTO_DOWNLOAD),
+        ),
         paragraph(
             "Auto-download offers whose MIME type matches a rule below, up to the per-rule size limit. Set a size of \
              `0` to keep a pattern around without it firing.",
         )
         .muted()
         .font_size(tokens::TEXT_XS.size),
-    );
-
-    // Header row aligns with the inputs underneath. Width budgets:
-    // mime grows to fill, size column is fixed (~80 px), trailing
-    // remove icon is square.
-    children.push(
+        // Header row aligns with the inputs underneath. Width budgets:
+        // mime grows to fill, size column is fixed (~80 px), trailing
+        // remove icon is square.
         row([
             text("MIME pattern").muted().font_size(tokens::TEXT_XS.size),
             spacer(),
@@ -1041,7 +1029,7 @@ fn render_files(pending: &PendingSettings, selection: &Selection) -> El {
         .gap(tokens::SPACE_2)
         .align(Align::Center)
         .width(Size::Fill(1.0)),
-    );
+    ];
 
     if pending.auto_download_rules.is_empty() {
         children.push(
@@ -1306,7 +1294,7 @@ pub fn handle_event(
 
     // Tab switching.
     if let Some(tab) = state.tab.as_mut()
-        && tabs::apply_event(tab, event, KEY_TABS, |s| SettingsTab::from_slug(s))
+        && tabs::apply_event(tab, event, KEY_TABS, SettingsTab::from_slug)
     {
         // Switching tabs implicitly closes any open dropdown so its
         // popover doesn't outlive the surface it was anchored to.
@@ -1594,21 +1582,19 @@ pub fn handle_event(
     // check this before the generic `route()`-driven handlers.
     if let Some(target) = event.target_key()
         && let Some((idx, Some(field))) = parse_proc_route(target)
+        && let Some(proc_config) = pending.tx_pipeline.processors.get_mut(idx)
+        && schema_field_type(processor_registry, &proc_config.type_id, field) == Some("string")
     {
-        if let Some(proc_config) = pending.tx_pipeline.processors.get_mut(idx)
-            && schema_field_type(processor_registry, &proc_config.type_id, field) == Some("string")
-        {
-            let route = proc_field_key(idx, field);
-            let mut value = proc_config
-                .settings
-                .get(field)
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string();
-            text_input::apply_event(&mut value, selection, &route, event);
-            ensure_object(&mut proc_config.settings)[field] = JsonValue::String(value);
-            return SettingsOutcome::Handled;
-        }
+        let route = proc_field_key(idx, field);
+        let mut value = proc_config
+            .settings
+            .get(field)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        text_input::apply_event(&mut value, selection, &route, event);
+        ensure_object(&mut proc_config.settings)[field] = JsonValue::String(value);
+        return SettingsOutcome::Handled;
     }
 
     if let Some(route) = event.route()
@@ -1723,7 +1709,7 @@ pub fn handle_event(
 /// Look up the JSON-Schema `type` for a single property of the named
 /// processor. Returns `None` when the processor or property is unknown
 /// — callers fall through to "ignore the event" in that case.
-fn schema_field_type<'a>(registry: &'a ProcessorRegistry, type_id: &str, field: &str) -> Option<&'static str> {
+fn schema_field_type(registry: &ProcessorRegistry, type_id: &str, field: &str) -> Option<&'static str> {
     let schema = registry.settings_schema(type_id)?;
     let properties = schema.get("properties")?.as_object()?;
     let prop = properties.get(field)?;

@@ -275,6 +275,7 @@ pub fn render_file_context_menu(menu: &FileContextMenu) -> El {
 }
 
 /// Render the chat sidebar (header, history, composer).
+#[allow(clippy::too_many_arguments)]
 pub fn render(
     state: &State,
     chat_settings: &ChatSettings,
@@ -572,8 +573,8 @@ fn format_eta(remaining_bytes: u64, speed_bps: u64) -> String {
 ///
 /// The whole card carries a `chat:preview:<transfer-id>` route so a
 /// click anywhere on it opens the lightbox at full size. `focusable`
-/// + the pointer cursor surface the affordance to keyboard and mouse
-/// users alike.
+/// plus the pointer cursor surface the affordance to keyboard and
+/// mouse users alike.
 ///
 /// Animated entries get a YouTube-style icon pill in the bottom-right
 /// of the preview area: play/pause toggle and an explicit "open

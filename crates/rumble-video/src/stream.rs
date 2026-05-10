@@ -186,7 +186,7 @@ impl VideoStream {
     /// frame swaps for the duration of any outstanding read.
     pub fn with_latest_frame<R>(&self, f: impl FnOnce(&FrameBuffer) -> R) -> R {
         let guard = self.inner.latest.lock().expect("video frame mutex poisoned");
-        f(&*guard)
+        f(&guard)
     }
 }
 

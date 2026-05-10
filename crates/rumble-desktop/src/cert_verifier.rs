@@ -202,6 +202,12 @@ pub struct AcceptAllVerifier {
     provider: Arc<CryptoProvider>,
 }
 
+impl Default for AcceptAllVerifier {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AcceptAllVerifier {
     pub fn new() -> Self {
         Self {
@@ -250,25 +256,21 @@ impl ServerCertVerifier for AcceptAllVerifier {
 /// This checks for both standard rustls errors and quinn-wrapped TLS errors.
 pub fn is_cert_verification_error(error: &anyhow::Error) -> bool {
     for cause in error.chain() {
-        if let Some(rustls_err) = cause.downcast_ref::<Error>() {
-            match rustls_err {
-                Error::InvalidCertificate(CertificateError::UnknownIssuer)
-                | Error::InvalidCertificate(CertificateError::BadSignature) => {
-                    return true;
-                }
-                _ => {}
-            }
+        if let Some(Error::InvalidCertificate(CertificateError::UnknownIssuer | CertificateError::BadSignature)) =
+            cause.downcast_ref::<Error>()
+        {
+            return true;
         }
 
-        if let Some(conn_err) = cause.downcast_ref::<quinn::ConnectionError>() {
-            if let quinn::ConnectionError::TransportError(te) = conn_err {
-                let reason = te.to_string();
-                if reason.contains("UnknownIssuer")
-                    || reason.contains("BadSignature")
-                    || reason.contains("invalid peer certificate")
-                {
-                    return true;
-                }
+        if let Some(conn_err) = cause.downcast_ref::<quinn::ConnectionError>()
+            && let quinn::ConnectionError::TransportError(te) = conn_err
+        {
+            let reason = te.to_string();
+            if reason.contains("UnknownIssuer")
+                || reason.contains("BadSignature")
+                || reason.contains("invalid peer certificate")
+            {
+                return true;
             }
         }
 

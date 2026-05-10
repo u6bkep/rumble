@@ -445,9 +445,10 @@ impl PartialEq for PendingCertificate {
 impl Eq for PendingCertificate {}
 
 /// Connection lifecycle state.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum ConnectionState {
     /// Not connected to any server.
+    #[default]
     Disconnected,
     /// Attempting to establish a connection.
     Connecting { server_addr: String },
@@ -460,12 +461,6 @@ pub enum ConnectionState {
         /// Information about the certificate awaiting confirmation.
         cert_info: PendingCertificate,
     },
-}
-
-impl Default for ConnectionState {
-    fn default() -> Self {
-        ConnectionState::Disconnected
-    }
 }
 
 impl serde::Serialize for ConnectionState {

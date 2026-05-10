@@ -90,8 +90,7 @@ impl AudioProcessor for DenoiseProcessor {
             if !self.first_frame_done {
                 self.first_frame_done = true;
                 // Fill with zeros to maintain timing
-                self.output_buffer
-                    .extend(std::iter::repeat(0.0).take(DENOISE_FRAME_SIZE));
+                self.output_buffer.extend(std::iter::repeat_n(0.0, DENOISE_FRAME_SIZE));
                 continue;
             }
 

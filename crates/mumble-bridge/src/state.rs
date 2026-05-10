@@ -154,6 +154,12 @@ pub struct BridgeState {
     pub welcome_message: Option<String>,
 }
 
+impl Default for BridgeState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BridgeState {
     pub fn new() -> Self {
         Self {

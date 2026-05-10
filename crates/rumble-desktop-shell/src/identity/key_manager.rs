@@ -83,7 +83,7 @@ impl KeyInfo {
 }
 
 /// Result of first-run setup.
-#[allow(dead_code)]
+#[allow(dead_code, clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum SetupResult {
     LocalKeyGenerated(KeyConfig, SigningKey),

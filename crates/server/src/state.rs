@@ -657,21 +657,21 @@ impl ServerState {
         let mut rooms = self.get_rooms().await;
         if let Some(persist) = persistence {
             for room in &mut rooms {
-                if let Some(uuid) = room.id.as_ref().and_then(uuid_from_room_id) {
-                    if let Some(acl) = persist.get_room_acl(uuid.as_bytes()) {
-                        room.inherit_acl = acl.inherit_acl;
-                        room.acls = acl
-                            .entries
-                            .iter()
-                            .map(|e| rumble_protocol::proto::RoomAclEntry {
-                                group: e.group.clone(),
-                                grant: e.grant,
-                                deny: e.deny,
-                                apply_here: e.apply_here,
-                                apply_subs: e.apply_subs,
-                            })
-                            .collect();
-                    }
+                if let Some(uuid) = room.id.as_ref().and_then(uuid_from_room_id)
+                    && let Some(acl) = persist.get_room_acl(uuid.as_bytes())
+                {
+                    room.inherit_acl = acl.inherit_acl;
+                    room.acls = acl
+                        .entries
+                        .iter()
+                        .map(|e| rumble_protocol::proto::RoomAclEntry {
+                            group: e.group.clone(),
+                            grant: e.grant,
+                            deny: e.deny,
+                            apply_here: e.apply_here,
+                            apply_subs: e.apply_subs,
+                        })
+                        .collect();
                 }
             }
         }

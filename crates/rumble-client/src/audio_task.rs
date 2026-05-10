@@ -537,10 +537,7 @@ async fn run_audio_task<P: Platform>(mut command_rx: mpsc::UnboundedReceiver<Aud
     // the output stream's callback reads from it.
     let playback_buffer: Arc<Mutex<VecDeque<f32>>> =
         Arc::new(Mutex::new(VecDeque::with_capacity(MAX_PLAYBACK_BUFFER_SAMPLES)));
-    // Start audio output immediately so SFX can play even when disconnected.
-    // The output is cheap when idle (just outputs silence).
-    // (Initialized below after audio_backend and selected_output are set up.)
-    let mut playback_stream: Option<PlayStream<P>> = None;
+    // playback_stream is started below once audio_backend and selected_output are ready.
 
     // Sound effects sample queue - mixed into playback output each frame
     let mut sfx_queue: VecDeque<f32> = VecDeque::new();
@@ -660,7 +657,8 @@ async fn run_audio_task<P: Platform>(mut command_rx: mpsc::UnboundedReceiver<Aud
     let mut stats_interval = tokio::time::interval(Duration::from_millis(500));
 
     // Start audio output at startup so SFX can play without a connection
-    playback_stream = start_audio_output::<P>(&audio_backend, &selected_output, playback_buffer.clone());
+    let mut playback_stream: Option<PlayStream<P>> =
+        start_audio_output::<P>(&audio_backend, &selected_output, playback_buffer.clone());
 
     info!("Audio task started");
 
@@ -1099,13 +1097,13 @@ async fn run_audio_task<P: Platform>(mut command_rx: mpsc::UnboundedReceiver<Aud
                         // Update per-user config
                         let user_rx = per_user_rx
                             .entry(user_id)
-                            .or_insert_with(rumble_audio::UserRxConfig::default);
+                            .or_default();
                         user_rx.volume_db = volume_db;
                         {
                             let mut s = write_state(&state);
                             let user_rx = s.audio.per_user_rx
                                 .entry(user_id)
-                                .or_insert_with(rumble_audio::UserRxConfig::default);
+                                .or_default();
                             user_rx.volume_db = volume_db;
                         }
                         // Update live user state if they exist
@@ -1316,8 +1314,8 @@ async fn run_audio_task<P: Platform>(mut command_rx: mpsc::UnboundedReceiver<Aud
             } => {
                 match datagram {
                     Ok(Some(data)) => {
-                        if let Ok(voice) = VoiceDatagram::decode(data.as_slice()) {
-                            if let Some(sender_id) = voice.sender_id {
+                        if let Ok(voice) = VoiceDatagram::decode(data.as_slice())
+                            && let Some(sender_id) = voice.sender_id {
                                 // Don't play back our own audio or audio from muted users
                                 if sender_id != my_user_id && !muted_users.contains(&sender_id) {
                                     handle_voice_datagram::<P::Codec>(
@@ -1336,7 +1334,6 @@ async fn run_audio_task<P: Platform>(mut command_rx: mpsc::UnboundedReceiver<Aud
                                     );
                                 }
                             }
-                        }
                     }
                     Ok(None) => {
                         // Connection closed - the connection task will handle cleanup
@@ -1373,6 +1370,7 @@ async fn run_audio_task<P: Platform>(mut command_rx: mpsc::UnboundedReceiver<Aud
 /// The `capture_active` flag controls whether captured samples are processed and
 /// encoded (true) or silently discarded (false). This avoids ALSA device
 /// enumeration errors on every PTT press/release cycle.
+#[allow(clippy::too_many_arguments)]
 fn start_transmission<P: Platform>(
     audio_backend: &P::AudioBackend,
     selected_input: &Option<String>,
@@ -1409,10 +1407,10 @@ fn start_transmission<P: Platform>(
                 return;
             }
             // Update settings if they've changed
-            if let Some(enc) = guard.as_mut() {
-                if let Err(e) = enc.apply_settings(&encoder_settings) {
-                    warn!("Failed to update encoder settings: {}", e);
-                }
+            if let Some(enc) = guard.as_mut()
+                && let Err(e) = enc.apply_settings(&encoder_settings)
+            {
+                warn!("Failed to update encoder settings: {}", e);
             }
         } else {
             error!("Failed to lock encoder");
@@ -1512,23 +1510,23 @@ fn start_transmission<P: Platform>(
             was_transmitting_for_callback.store(true, std::sync::atomic::Ordering::Relaxed);
 
             // Encode the processed audio frame using the connection-scoped encoder
-            if let Ok(mut guard) = encoder_for_callback.lock() {
-                if let Some(enc) = guard.as_mut() {
-                    let mut opus_buf = [0u8; OPUS_MAX_PACKET_SIZE];
-                    match enc.encode(&processed_samples, &mut opus_buf) {
-                        Ok(len) => {
-                            let encoded = &opus_buf[..len];
-                            // Dump TX opus packet (after encoding)
-                            dumper_for_callback.write_tx_opus(encoded);
+            if let Ok(mut guard) = encoder_for_callback.lock()
+                && let Some(enc) = guard.as_mut()
+            {
+                let mut opus_buf = [0u8; OPUS_MAX_PACKET_SIZE];
+                match enc.encode(&processed_samples, &mut opus_buf) {
+                    Ok(len) => {
+                        let encoded = &opus_buf[..len];
+                        // Dump TX opus packet (after encoding)
+                        dumper_for_callback.write_tx_opus(encoded);
 
-                            let _ = encoded_tx.send(CaptureMessage::EncodedFrame {
-                                data: Bytes::copy_from_slice(encoded),
-                                size_bytes: len,
-                            });
-                        }
-                        Err(e) => {
-                            trace!("Encode error: {}", e);
-                        }
+                        let _ = encoded_tx.send(CaptureMessage::EncodedFrame {
+                            data: Bytes::copy_from_slice(encoded),
+                            size_bytes: len,
+                        });
+                    }
+                    Err(e) => {
+                        trace!("Encode error: {}", e);
                     }
                 }
             }
@@ -1601,6 +1599,7 @@ fn start_audio_output<P: Platform>(
 }
 
 /// Handle received voice datagram - insert into jitter buffer or handle end-of-stream.
+#[allow(clippy::too_many_arguments)]
 fn handle_voice_datagram<C: VoiceCodec>(
     sender_id: u64,
     sequence: u32,
@@ -1634,7 +1633,7 @@ fn handle_voice_datagram<C: VoiceCodec>(
 
     // Get or create per-user audio state
     let jitter_delay = audio_settings.jitter_buffer_delay_packets;
-    if !user_audio.contains_key(&sender_id) {
+    if let std::collections::hash_map::Entry::Vacant(e) = user_audio.entry(sender_id) {
         // Determine pipeline config and volume for this user
         let (pipeline_config, volume_db) = match per_user_rx.get(&sender_id) {
             Some(user_rx) => {
@@ -1663,7 +1662,7 @@ fn handle_voice_datagram<C: VoiceCodec>(
         let mut new_state = UserAudioState::new(decoder, jitter_delay);
         new_state.rx_pipeline = rx_pipeline;
         new_state.volume_db = volume_db;
-        user_audio.insert(sender_id, new_state);
+        e.insert(new_state);
     }
     let Some(user_state) = user_audio.get_mut(&sender_id) else {
         return; // Entry was just inserted above; unreachable in practice
@@ -1676,7 +1675,7 @@ fn handle_voice_datagram<C: VoiceCodec>(
     // Update talking_users
     let mut needs_repaint = false;
     {
-        let mut s = write_state(&state);
+        let mut s = write_state(state);
         if !s.audio.talking_users.contains(&sender_id) {
             s.audio.talking_users.insert(sender_id);
             needs_repaint = true;
@@ -1788,7 +1787,7 @@ fn cleanup_stale_users<D: VoiceDecoderTrait>(
     // The decoder must persist to avoid crackle when the user starts talking again
     let mut needs_repaint = false;
     {
-        let mut s = write_state(&state);
+        let mut s = write_state(state);
         for user_id in &stale_users {
             if s.audio.talking_users.remove(user_id) {
                 needs_repaint = true;
@@ -1839,7 +1838,7 @@ fn update_stats<D: VoiceDecoderTrait>(
 
     // Update state
     {
-        let mut s = write_state(&state);
+        let mut s = write_state(state);
         s.audio.stats.packets_sent = packets_sent;
         s.audio.stats.packets_received = total_packets_received;
         s.audio.stats.packets_lost = total_packets_lost;

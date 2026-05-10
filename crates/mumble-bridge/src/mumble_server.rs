@@ -171,7 +171,7 @@ async fn mumble_auth_handshake(
     let channels;
     let users;
     {
-        let mut state = write_bridge(&bridge_state);
+        let mut state = write_bridge(bridge_state);
         session = state.allocate_mumble_session();
         state.mumble_clients.insert(
             session,
@@ -237,7 +237,7 @@ async fn mumble_auth_handshake(
 
     // Use the Rumble server's welcome message if available, otherwise fall back to config
     let welcome_text = {
-        let state = read_bridge(&bridge_state);
+        let state = read_bridge(bridge_state);
         state
             .welcome_message
             .clone()
@@ -438,15 +438,15 @@ async fn mumble_message_loop(
                 })?;
             }
             Some(MessageType::TextMessage) => {
-                if let Ok(text_msg) = mumble::TextMessage::decode(&*msg.payload) {
-                    if let Some(message) = text_msg.message {
-                        bridge_tx.send(BridgeEvent::MumbleChat {
-                            session,
-                            message,
-                            target_sessions: text_msg.session,
-                            target_tree_ids: text_msg.tree_id,
-                        })?;
-                    }
+                if let Ok(text_msg) = mumble::TextMessage::decode(&*msg.payload)
+                    && let Some(message) = text_msg.message
+                {
+                    bridge_tx.send(BridgeEvent::MumbleChat {
+                        session,
+                        message,
+                        target_sessions: text_msg.session,
+                        target_tree_ids: text_msg.tree_id,
+                    })?;
                 }
             }
             Some(MessageType::UserState) => {

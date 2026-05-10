@@ -21,7 +21,7 @@
 use std::{
     fs::File,
     io::{BufWriter, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 use tracing::{debug, error, info};
@@ -58,7 +58,7 @@ impl AudioDumpConfig {
         std::env::var("RUMBLE_AUDIO_DUMP_DIR")
             .ok()
             .filter(|s| !s.is_empty())
-            .map(|dir| Self::new(dir))
+            .map(Self::new)
     }
 }
 
@@ -133,7 +133,7 @@ impl AudioDumper {
         Self::new(AudioDumpConfig::disabled())
     }
 
-    fn open_file(dir: &PathBuf, name: &str) -> Option<BufWriter<File>> {
+    fn open_file(dir: &Path, name: &str) -> Option<BufWriter<File>> {
         let path = dir.join(name);
         match File::create(&path) {
             Ok(f) => {
@@ -154,12 +154,12 @@ impl AudioDumper {
 
     /// Write raw microphone samples (f32 PCM).
     pub fn write_mic_raw(&self, samples: &[f32]) {
-        if let Ok(mut inner) = self.inner.lock() {
-            if let Some(ref mut f) = inner.mic_raw {
-                for &sample in samples {
-                    if f.write_all(&sample.to_le_bytes()).is_err() {
-                        break;
-                    }
+        if let Ok(mut inner) = self.inner.lock()
+            && let Some(ref mut f) = inner.mic_raw
+        {
+            for &sample in samples {
+                if f.write_all(&sample.to_le_bytes()).is_err() {
+                    break;
                 }
             }
         }
@@ -167,34 +167,34 @@ impl AudioDumper {
 
     /// Write encoded Opus packet (length-prefixed).
     pub fn write_tx_opus(&self, opus_data: &[u8]) {
-        if let Ok(mut inner) = self.inner.lock() {
-            if let Some(ref mut f) = inner.tx_opus {
-                let len = opus_data.len() as u32;
-                let _ = f.write_all(&len.to_le_bytes());
-                let _ = f.write_all(opus_data);
-            }
+        if let Ok(mut inner) = self.inner.lock()
+            && let Some(ref mut f) = inner.tx_opus
+        {
+            let len = opus_data.len() as u32;
+            let _ = f.write_all(&len.to_le_bytes());
+            let _ = f.write_all(opus_data);
         }
     }
 
     /// Write received Opus packet (length-prefixed).
     pub fn write_rx_opus(&self, opus_data: &[u8]) {
-        if let Ok(mut inner) = self.inner.lock() {
-            if let Some(ref mut f) = inner.rx_opus {
-                let len = opus_data.len() as u32;
-                let _ = f.write_all(&len.to_le_bytes());
-                let _ = f.write_all(opus_data);
-            }
+        if let Ok(mut inner) = self.inner.lock()
+            && let Some(ref mut f) = inner.rx_opus
+        {
+            let len = opus_data.len() as u32;
+            let _ = f.write_all(&len.to_le_bytes());
+            let _ = f.write_all(opus_data);
         }
     }
 
     /// Write decoded audio samples (f32 PCM).
     pub fn write_rx_decoded(&self, samples: &[f32]) {
-        if let Ok(mut inner) = self.inner.lock() {
-            if let Some(ref mut f) = inner.rx_decoded {
-                for &sample in samples {
-                    if f.write_all(&sample.to_le_bytes()).is_err() {
-                        break;
-                    }
+        if let Ok(mut inner) = self.inner.lock()
+            && let Some(ref mut f) = inner.rx_decoded
+        {
+            for &sample in samples {
+                if f.write_all(&sample.to_le_bytes()).is_err() {
+                    break;
                 }
             }
         }
@@ -203,12 +203,12 @@ impl AudioDumper {
     /// Write mixed audio samples that are sent to playback (f32 PCM).
     /// This captures the exact audio that goes to the cpal output buffer.
     pub fn write_playback(&self, samples: &[f32]) {
-        if let Ok(mut inner) = self.inner.lock() {
-            if let Some(ref mut f) = inner.playback {
-                for &sample in samples {
-                    if f.write_all(&sample.to_le_bytes()).is_err() {
-                        break;
-                    }
+        if let Ok(mut inner) = self.inner.lock()
+            && let Some(ref mut f) = inner.playback
+        {
+            for &sample in samples {
+                if f.write_all(&sample.to_le_bytes()).is_err() {
+                    break;
                 }
             }
         }

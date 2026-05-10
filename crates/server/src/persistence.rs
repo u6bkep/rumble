@@ -159,17 +159,16 @@ impl Persistence {
     /// This ensures that registered usernames can only be used by their registered key.
     pub fn is_username_taken(&self, username: &str, public_key: &[u8; 32]) -> bool {
         for result in self.registered_users.iter() {
-            if let Ok((key, value)) = result {
-                if let Ok(user) = bincode::deserialize::<RegisteredUser>(&value) {
-                    if user.username.eq_ignore_ascii_case(username) {
-                        // This username is registered - only allow if it's the same key
-                        if key.as_ref() != public_key {
-                            return true; // Username taken by different key
-                        }
-                        // Same key owns this username - not taken
-                        return false;
-                    }
+            if let Ok((key, value)) = result
+                && let Ok(user) = bincode::deserialize::<RegisteredUser>(&value)
+                && user.username.eq_ignore_ascii_case(username)
+            {
+                // This username is registered - only allow if it's the same key
+                if key.as_ref() != public_key {
+                    return true; // Username taken by different key
                 }
+                // Same key owns this username - not taken
+                return false;
             }
         }
         false
@@ -230,12 +229,11 @@ impl Persistence {
     /// Check if a username is registered (for group name collision check).
     pub fn is_username_registered(&self, username: &str) -> bool {
         for result in self.registered_users.iter() {
-            if let Ok((_key, value)) = result {
-                if let Ok(user) = bincode::deserialize::<RegisteredUser>(&value) {
-                    if user.username.eq_ignore_ascii_case(username) {
-                        return true;
-                    }
-                }
+            if let Ok((_key, value)) = result
+                && let Ok(user) = bincode::deserialize::<RegisteredUser>(&value)
+                && user.username.eq_ignore_ascii_case(username)
+            {
+                return true;
             }
         }
         false
@@ -397,15 +395,15 @@ impl Persistence {
     /// Remove a group from all users' group lists (used when deleting a group).
     pub fn remove_group_from_all_users(&self, group: &str) {
         for entry in self.user_groups.iter() {
-            if let Ok((key, value)) = entry {
-                if let Ok(mut groups) = bincode::deserialize::<Vec<String>>(&value) {
-                    let before = groups.len();
-                    groups.retain(|g| g != group);
-                    if groups.len() != before {
-                        if let Ok(key_arr) = <[u8; 32]>::try_from(key.as_ref()) {
-                            let _ = self.set_user_groups(&key_arr, &groups);
-                        }
-                    }
+            if let Ok((key, value)) = entry
+                && let Ok(mut groups) = bincode::deserialize::<Vec<String>>(&value)
+            {
+                let before = groups.len();
+                groups.retain(|g| g != group);
+                if groups.len() != before
+                    && let Ok(key_arr) = <[u8; 32]>::try_from(key.as_ref())
+                {
+                    let _ = self.set_user_groups(&key_arr, &groups);
                 }
             }
         }

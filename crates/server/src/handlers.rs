@@ -260,9 +260,6 @@ pub async fn handle_envelope(
             | Payload::UserKicked(_),
         )
         | None => {}
-        _ => {
-            warn!("Received unknown or unhandled message type");
-        }
     }
     Ok(())
 }
@@ -296,26 +293,25 @@ async fn handle_client_hello(
     // 3. Check password for unknown keys
     if let Some(persist) = &persistence {
         let is_known = persist.is_known_key(&public_key);
-        if !is_known {
-            if let Ok(required) = std::env::var("RUMBLE_SERVER_PASSWORD") {
-                if !required.is_empty() {
-                    match &ch.password {
-                        Some(pw) if pw == &required => { /* OK */ }
-                        _ => {
-                            return send_auth_failed(&sender, "Password required for new users").await;
-                        }
-                    }
+        if !is_known
+            && let Ok(required) = std::env::var("RUMBLE_SERVER_PASSWORD")
+            && !required.is_empty()
+        {
+            match &ch.password {
+                Some(pw) if pw == &required => { /* OK */ }
+                _ => {
+                    return send_auth_failed(&sender, "Password required for new users").await;
                 }
             }
         }
     } else {
         // No persistence - check password for everyone if set
-        if let Ok(required) = std::env::var("RUMBLE_SERVER_PASSWORD") {
-            if !required.is_empty() {
-                match &ch.password {
-                    Some(pw) if pw == &required => { /* OK */ }
-                    _ => return send_auth_failed(&sender, "Password required").await,
-                }
+        if let Ok(required) = std::env::var("RUMBLE_SERVER_PASSWORD")
+            && !required.is_empty()
+        {
+            match &ch.password {
+                Some(pw) if pw == &required => { /* OK */ }
+                _ => return send_auth_failed(&sender, "Password required").await,
             }
         }
     }
@@ -414,10 +410,10 @@ async fn handle_authenticate(
             }
         }
         // Add username-as-group
-        if let Some(registered) = persist.get_registered_user(&pending.public_key) {
-            if !check_groups.contains(&registered.username) {
-                check_groups.push(registered.username);
-            }
+        if let Some(registered) = persist.get_registered_user(&pending.public_key)
+            && !check_groups.contains(&registered.username)
+        {
+            check_groups.push(registered.username);
         }
         // Build group permissions map
         let mut group_perms = std::collections::HashMap::new();
@@ -486,29 +482,29 @@ async fn handle_authenticate(
     sender.authenticated.store(true, Ordering::SeqCst);
 
     // 6b. Mark key as known (if persistence enabled)
-    if let Some(persist) = &persistence {
-        if let Err(e) = persist.add_known_key(&pending.public_key) {
-            warn!("Failed to mark key as known: {e}");
-        }
+    if let Some(persist) = &persistence
+        && let Err(e) = persist.add_known_key(&pending.public_key)
+    {
+        warn!("Failed to mark key as known: {e}");
     }
 
     // 6c. Load user's groups from persistence
     if let Some(persist) = &persistence {
         let mut groups = vec!["default".to_string()];
-        if let Some(user_groups_data) = persist.get_raw("user_groups", &pending.public_key) {
-            if let Ok(stored_groups) = bincode::deserialize::<Vec<String>>(&user_groups_data) {
-                for g in stored_groups {
-                    if !groups.contains(&g) {
-                        groups.push(g);
-                    }
+        if let Some(user_groups_data) = persist.get_raw("user_groups", &pending.public_key)
+            && let Ok(stored_groups) = bincode::deserialize::<Vec<String>>(&user_groups_data)
+        {
+            for g in stored_groups {
+                if !groups.contains(&g) {
+                    groups.push(g);
                 }
             }
         }
         // Add username-as-group (implicit personal group)
-        if let Some(registered) = persist.get_registered_user(&pending.public_key) {
-            if !groups.contains(&registered.username) {
-                groups.push(registered.username);
-            }
+        if let Some(registered) = persist.get_registered_user(&pending.public_key)
+            && !groups.contains(&registered.username)
+        {
+            groups.push(registered.username);
         }
         *sender.groups.write().await = groups;
     }
@@ -1006,14 +1002,12 @@ async fn handle_join_room(
     }
 
     // Save last room for registered users
-    if let Some(persist) = &persistence {
-        if let Some(public_key) = state.get_user_public_key(sender.user_id) {
-            if persist.is_registered(&public_key) {
-                if let Err(e) = persist.update_user_last_room(&public_key, Some(new_room_uuid.into_bytes())) {
-                    warn!("Failed to save user's last room: {e}");
-                }
-            }
-        }
+    if let Some(persist) = &persistence
+        && let Some(public_key) = state.get_user_public_key(sender.user_id)
+        && persist.is_registered(&public_key)
+        && let Err(e) = persist.update_user_last_room(&public_key, Some(new_room_uuid.into_bytes()))
+    {
+        warn!("Failed to save user's last room: {e}");
     }
 
     // Send incremental update about user moving rooms (from_room is implicit)
@@ -1670,12 +1664,11 @@ pub async fn handle_datagrams(conn: quinn::Connection, state: Arc<ServerState>, 
                         };
 
                         // Check if sender is server-muted — drop voice silently
-                        if !is_bridge {
-                            if let Some(client) = state.get_client(sender_user_id) {
-                                if client.server_muted.load(Ordering::Relaxed) {
-                                    continue;
-                                }
-                            }
+                        if !is_bridge
+                            && let Some(client) = state.get_client(sender_user_id)
+                            && client.server_muted.load(Ordering::Relaxed)
+                        {
+                            continue;
                         }
 
                         // Check if sender is self-muted — drop voice silently
@@ -1761,14 +1754,14 @@ pub async fn handle_datagrams(conn: quinn::Connection, state: Arc<ServerState>, 
                                 continue;
                             }
 
-                            if let Some(client) = target_client {
-                                if let Err(e) = client.conn.send_datagram(relay_bytes.clone().into()) {
-                                    debug!(
-                                        user_id = recipient_id,
-                                        error = ?e,
-                                        "server: failed to relay voice datagram"
-                                    );
-                                }
+                            if let Some(client) = target_client
+                                && let Err(e) = client.conn.send_datagram(relay_bytes.clone().into())
+                            {
+                                debug!(
+                                    user_id = recipient_id,
+                                    error = ?e,
+                                    "server: failed to relay voice datagram"
+                                );
                             }
                         }
                     }
@@ -2007,8 +2000,8 @@ async fn handle_set_server_mute(
     } else {
         let target_room = state.get_user_room(target_user_id).await.unwrap_or(ROOT_ROOM_UUID);
         let perms = acl::evaluate_user_permissions(&state, &target_client, target_room, &persistence).await;
-        let speak_denied = !perms.contains(Permissions::SPEAK);
-        speak_denied // manually_muted is false at this point
+
+        !perms.contains(Permissions::SPEAK) // manually_muted is false at this point
     };
     target_client.server_muted.store(effective_muted, Ordering::Relaxed);
 

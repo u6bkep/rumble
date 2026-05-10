@@ -286,7 +286,7 @@ impl MpvPlayer {
     /// post-process to set the alpha byte to `0xff` so callers can
     /// upload directly into an `Rgba8UnormSrgb` texture.
     pub fn render_sw(&self, buf: &mut [u8], width: u32, height: u32, stride: usize) -> Result<(), Error> {
-        if stride < (width as usize) * 4 || stride % 4 != 0 {
+        if stride < (width as usize) * 4 || !stride.is_multiple_of(4) {
             return Err(Error::InvalidArg("stride must be >= width*4 and a multiple of 4"));
         }
         let needed = stride

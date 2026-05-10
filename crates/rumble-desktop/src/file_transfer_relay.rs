@@ -202,6 +202,7 @@ async fn read_length_prefixed(recv: &mut dyn BiRecvStream, max_len: usize) -> Re
 }
 
 /// Upload a file to the server's relay cache.
+#[allow(clippy::too_many_arguments)]
 async fn run_upload(
     opener: Arc<dyn StreamOpener>,
     transfer_id: String,
@@ -240,6 +241,7 @@ async fn run_upload(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn do_upload(
     opener: &Arc<dyn StreamOpener>,
     transfer_id: &str,

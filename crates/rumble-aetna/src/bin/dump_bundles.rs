@@ -410,8 +410,10 @@ fn make_chat_full(
 }
 
 fn connected_state() -> State {
-    let mut audio = AudioState::default();
-    audio.voice_mode = VoiceMode::Continuous;
+    let mut audio = AudioState {
+        voice_mode: VoiceMode::Continuous,
+        ..AudioState::default()
+    };
     // Bob is talking; Charlie is self-muted.
     audio.talking_users.insert(2);
 
@@ -537,15 +539,17 @@ fn processing_state() -> AudioState {
 }
 
 fn stats_state() -> AudioState {
-    let mut stats = AudioStats::default();
-    stats.actual_bitrate_bps = 64_000.0;
-    stats.avg_frame_size_bytes = 159.4;
-    stats.packets_sent = 12_804;
-    stats.packets_received = 12_731;
-    stats.packets_lost = 73;
-    stats.packets_recovered_fec = 41;
-    stats.frames_concealed = 14;
-    stats.playback_buffer_packets = 3;
+    let stats = AudioStats {
+        actual_bitrate_bps: 64_000.0,
+        avg_frame_size_bytes: 159.4,
+        packets_sent: 12_804,
+        packets_received: 12_731,
+        packets_lost: 73,
+        packets_recovered_fec: 41,
+        frames_concealed: 14,
+        playback_buffer_packets: 3,
+        ..AudioStats::default()
+    };
     AudioState {
         stats,
         ..AudioState::default()

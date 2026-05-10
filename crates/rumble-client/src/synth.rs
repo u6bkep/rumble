@@ -60,8 +60,6 @@ impl Envelope {
             let release_t = t - release_start;
             if self.release > 0.0 && release_t < self.release {
                 self.sustain * (1.0 - release_t / self.release)
-            } else if self.release <= 0.0 {
-                0.0
             } else {
                 0.0
             }
@@ -102,7 +100,7 @@ pub fn generate_tone(tone: &Tone, sample_rate: u32) -> Vec<f32> {
 
     let delay_samples = (tone.delay * sample_rate as f32).ceil() as usize;
 
-    for i in 0..total_samples {
+    for (i, sample) in samples.iter_mut().enumerate() {
         if i < delay_samples {
             continue;
         }
@@ -126,7 +124,7 @@ pub fn generate_tone(tone: &Tone, sample_rate: u32) -> Vec<f32> {
         let wave = waveform_sample(tone.waveform, phase);
         let env = tone.envelope.amplitude(t, tone.duration);
 
-        samples[i] = wave * env * tone.amplitude;
+        *sample = wave * env * tone.amplitude;
     }
 
     samples
@@ -178,7 +176,7 @@ mod tests {
         assert!(!samples.is_empty());
         // Check samples are within range
         for &s in &samples {
-            assert!(s >= -1.0 && s <= 1.0);
+            assert!((-1.0..=1.0).contains(&s));
         }
     }
 
@@ -207,7 +205,7 @@ mod tests {
         let mixed = mix_tones(&tones, 48000);
         assert!(!mixed.is_empty());
         for &s in &mixed {
-            assert!(s >= -1.0 && s <= 1.0);
+            assert!((-1.0..=1.0).contains(&s));
         }
     }
 

@@ -83,7 +83,7 @@ impl Server {
 
         // Create plugin context and wrap plugins in Arc
         let plugin_ctx = Arc::new(ServerCtx::new(state.clone(), persistence.clone()));
-        let plugins: Vec<Arc<dyn ServerPlugin>> = config.plugins.into_iter().map(|p| Arc::from(p)).collect();
+        let plugins: Vec<Arc<dyn ServerPlugin>> = config.plugins.into_iter().map(Arc::from).collect();
 
         Ok(Self {
             endpoint,
@@ -370,6 +370,7 @@ async fn run_envelope_stream(
 /// Like [`run_envelope_stream`] but seeds the read buffer with already-consumed
 /// bytes (used when plugin header probing consumed bytes that turned out to be
 /// envelope data).
+#[allow(clippy::too_many_arguments)]
 async fn run_envelope_stream_with_prefix(
     mut recv: quinn::RecvStream,
     handle: Arc<ClientHandle>,
@@ -461,6 +462,7 @@ const MAX_PLUGIN_NAME_LEN: u16 = 255;
 /// determine if it carries a [`StreamHeader`] addressed to a registered plugin.
 /// If so, the stream is handed off to that plugin. Otherwise it falls back to
 /// the normal envelope processing loop.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_secondary_stream(
     send: quinn::SendStream,
     mut recv: quinn::RecvStream,
@@ -499,19 +501,19 @@ async fn dispatch_secondary_stream(
         }
 
         // Check for valid UTF-8 and matching plugin
-        if let Ok(plugin_name) = std::str::from_utf8(&name_buf) {
-            if let Some(plugin) = plugins.iter().find(|p| p.name() == plugin_name) {
-                // It's a plugin stream -- build header and dispatch
-                info!(plugin = plugin_name, "routing secondary stream to plugin");
-                let header = StreamHeader {
-                    plugin: plugin_name.to_owned(),
-                    metadata: Vec::new(), // plugin reads its own metadata from recv
-                };
-                if let Err(e) = plugin.on_stream(header, send, recv, &primary_handle, &ctx).await {
-                    error!(plugin = plugin_name, "plugin on_stream error: {e:?}");
-                }
-                return;
+        if let Ok(plugin_name) = std::str::from_utf8(&name_buf)
+            && let Some(plugin) = plugins.iter().find(|p| p.name() == plugin_name)
+        {
+            // It's a plugin stream -- build header and dispatch
+            info!(plugin = plugin_name, "routing secondary stream to plugin");
+            let header = StreamHeader {
+                plugin: plugin_name.to_owned(),
+                metadata: Vec::new(), // plugin reads its own metadata from recv
+            };
+            if let Err(e) = plugin.on_stream(header, send, recv, &primary_handle, &ctx).await {
+                error!(plugin = plugin_name, "plugin on_stream error: {e:?}");
             }
+            return;
         }
 
         // Not a plugin stream -- fall back to envelope processing.

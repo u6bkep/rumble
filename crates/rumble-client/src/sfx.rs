@@ -12,6 +12,12 @@ pub struct SfxLibrary {
     sounds: HashMap<SfxKind, Vec<f32>>,
 }
 
+impl Default for SfxLibrary {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SfxLibrary {
     pub fn new() -> Self {
         let mut sounds = HashMap::new();

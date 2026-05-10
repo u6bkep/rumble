@@ -362,7 +362,7 @@ impl HotkeyManager {
                 match Self::binding_to_hotkey(binding) {
                     Ok(hotkey) => {
                         let id = hotkey.id();
-                        if let Err(e) = manager.register(hotkey.clone()) {
+                        if let Err(e) = manager.register(hotkey) {
                             tracing::warn!("Failed to register {action:?}: {e}");
                             self.registration_status
                                 .insert(action, HotkeyRegistrationStatus::Failed);
@@ -392,7 +392,7 @@ impl HotkeyManager {
         {
             if let Some(ref manager) = self.manager {
                 for hotkey in &self.registered_hotkeys {
-                    let _ = manager.unregister(hotkey.clone());
+                    let _ = manager.unregister(*hotkey);
                 }
             }
             self.hotkey_actions.clear();

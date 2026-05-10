@@ -1,21 +1,21 @@
-/// Parse and encode Mumble UDPTunnel voice packets (Opus over TCP).
-///
-/// Client -> Server format (no session ID — server knows sender from TCP connection):
-/// ```text
-/// byte 0:  header byte  (bits 7-5 = type [4=Opus], bits 4-0 = target [0=normal])
-/// byte 1+: varint sequence number
-/// byte N+: varint opus length (bits 12-0 = size, bit 13 = terminator)
-/// byte M+: opus frame data
-/// ```
-///
-/// Server -> Client format (includes session ID so client knows who is speaking):
-/// ```text
-/// byte 0:  header byte
-/// byte 1+: varint session ID (sender)
-/// byte N+: varint sequence number
-/// byte P+: varint opus length (bits 12-0 = size, bit 13 = terminator)
-/// byte Q+: opus frame data
-/// ```
+//! Parse and encode Mumble UDPTunnel voice packets (Opus over TCP).
+//!
+//! Client -> Server format (no session ID — server knows sender from TCP connection):
+//! ```text
+//! byte 0:  header byte  (bits 7-5 = type [4=Opus], bits 4-0 = target [0=normal])
+//! byte 1+: varint sequence number
+//! byte N+: varint opus length (bits 12-0 = size, bit 13 = terminator)
+//! byte M+: opus frame data
+//! ```
+//!
+//! Server -> Client format (includes session ID so client knows who is speaking):
+//! ```text
+//! byte 0:  header byte
+//! byte 1+: varint session ID (sender)
+//! byte N+: varint sequence number
+//! byte P+: varint opus length (bits 12-0 = size, bit 13 = terminator)
+//! byte Q+: opus frame data
+//! ```
 
 /// Opus type code in the header byte (bits 7-5).
 const OPUS_TYPE: u8 = 4;
@@ -180,7 +180,7 @@ pub fn parse_voice_packet(data: &[u8]) -> Option<MumbleVoicePacket> {
 ///
 /// Server->client format: `header + session(varint) + sequence(varint) + opus_len(varint) + opus_data`
 pub fn encode_voice_packet(session_id: u32, sequence: u64, opus_data: &[u8], is_last: bool) -> Vec<u8> {
-    let header: u8 = (OPUS_TYPE << 5) | 0; // target 0 = normal
+    let header: u8 = OPUS_TYPE << 5; // target 0 = normal
     let session_varint = encode_varint(session_id as u64);
     let sequence_varint = encode_varint(sequence);
 
@@ -232,7 +232,7 @@ mod tests {
         // No session ID in this direction.
         let opus_data = vec![0xDE, 0xAD, 0xBE, 0xEF];
         let mut packet = Vec::new();
-        packet.push((OPUS_TYPE << 5) | 0); // header
+        packet.push(OPUS_TYPE << 5); // header
         packet.extend_from_slice(&encode_varint(7)); // sequence = 7
         packet.extend_from_slice(&encode_varint(opus_data.len() as u64)); // opus_len
         packet.extend_from_slice(&opus_data);
@@ -247,7 +247,7 @@ mod tests {
     fn test_parse_client_to_server_with_terminator() {
         let opus_data = vec![0x01, 0x02];
         let mut packet = Vec::new();
-        packet.push((OPUS_TYPE << 5) | 0);
+        packet.push(OPUS_TYPE << 5);
         packet.extend_from_slice(&encode_varint(99)); // sequence = 99
         packet.extend_from_slice(&encode_varint(opus_data.len() as u64 | 0x2000)); // terminator bit
         packet.extend_from_slice(&opus_data);

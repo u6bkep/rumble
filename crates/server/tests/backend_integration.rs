@@ -17,11 +17,10 @@ use ed25519_dalek::{Signer, SigningKey};
 use prost::Message;
 use quinn::{Endpoint, crypto::rustls::QuicClientConfig};
 use rumble_protocol::{
-    build_auth_payload, build_session_cert_payload, compute_cert_hash, compute_session_id, encode_frame,
+    build_auth_payload, build_session_cert_payload, compute_cert_hash, encode_frame,
     proto::{self, Envelope, RoomInfo, User, envelope::Payload},
     room_id_from_uuid, try_decode_frame, uuid_from_room_id,
 };
-use rustls_pemfile;
 use std::sync::Arc;
 use tempfile::TempDir;
 
@@ -89,7 +88,7 @@ fn start_server_with_options(port: u16, data_dir_override: Option<&str>, passwor
         let port_copy = port;
         std::thread::spawn(move || {
             let reader = BufReader::new(out);
-            for line in reader.lines().flatten() {
+            for line in reader.lines().map_while(Result::ok) {
                 println!("[server:{} stdout] {}", port_copy, line);
             }
         });
@@ -98,7 +97,7 @@ fn start_server_with_options(port: u16, data_dir_override: Option<&str>, passwor
         let port_copy = port;
         std::thread::spawn(move || {
             let reader = BufReader::new(err);
-            for line in reader.lines().flatten() {
+            for line in reader.lines().map_while(Result::ok) {
                 eprintln!("[server:{} stderr] {}", port_copy, line);
             }
         });
@@ -157,6 +156,7 @@ struct RawConnection {
     user_id: u64,
     nonce: Option<[u8; 32]>,
     cert_der: Vec<u8>,
+    #[allow(dead_code)]
     signing_key: Option<SigningKey>,
 }
 
@@ -227,14 +227,14 @@ impl RawConnection {
                 Ok(Ok(Some(n))) => {
                     raw.buf.extend_from_slice(&chunk[..n]);
                     while let Some(frame) = try_decode_frame(&mut raw.buf) {
-                        if let Ok(env) = Envelope::decode(&*frame) {
-                            if let Some(Payload::ServerHello(sh)) = env.payload {
-                                raw.user_id = sh.user_id;
-                                if sh.nonce.len() == 32 {
-                                    let mut n = [0u8; 32];
-                                    n.copy_from_slice(&sh.nonce);
-                                    raw.nonce = Some(n);
-                                }
+                        if let Ok(env) = Envelope::decode(&*frame)
+                            && let Some(Payload::ServerHello(sh)) = env.payload
+                        {
+                            raw.user_id = sh.user_id;
+                            if sh.nonce.len() == 32 {
+                                let mut n = [0u8; 32];
+                                n.copy_from_slice(&sh.nonce);
+                                raw.nonce = Some(n);
                             }
                         }
                     }
@@ -361,6 +361,7 @@ enum AuthResult {
 // =============================================================================
 
 /// Result of attempting to connect - can be success or auth failure.
+#[allow(clippy::large_enum_variant)]
 enum ConnectResult {
     Success(TestClient),
     AuthFailed(String),
@@ -537,10 +538,10 @@ impl TestClient {
                     // Connection closed or error - check if there's a queued AuthFailed message
                     // in our buffer before giving up
                     while let Some(frame) = try_decode_frame(&mut self.buf) {
-                        if let Ok(env) = Envelope::decode(&*frame) {
-                            if let Some(Payload::AuthFailed(af)) = env.payload {
-                                return Ok(HandshakeResult::AuthFailed(af.error));
-                            }
+                        if let Ok(env) = Envelope::decode(&*frame)
+                            && let Some(Payload::AuthFailed(af)) = env.payload
+                        {
+                            return Ok(HandshakeResult::AuthFailed(af.error));
                         }
                     }
                     anyhow::bail!("Connection closed during handshake");
@@ -678,19 +679,19 @@ impl TestClient {
     }
 
     fn handle_envelope(&mut self, env: Envelope) {
-        if let Some(Payload::ServerEvent(se)) = env.payload {
-            if let Some(kind) = se.kind {
-                match kind {
-                    proto::server_event::Kind::ServerState(ss) => {
-                        self.rooms = ss.rooms;
-                        self.users = ss.users;
-                    }
-                    proto::server_event::Kind::StateUpdate(su) => {
-                        self.apply_state_update(su);
-                    }
-                    // Ignore other event types in tests
-                    _ => {}
+        if let Some(Payload::ServerEvent(se)) = env.payload
+            && let Some(kind) = se.kind
+        {
+            match kind {
+                proto::server_event::Kind::ServerState(ss) => {
+                    self.rooms = ss.rooms;
+                    self.users = ss.users;
                 }
+                proto::server_event::Kind::StateUpdate(su) => {
+                    self.apply_state_update(su);
+                }
+                // Ignore other event types in tests
+                _ => {}
             }
         }
     }
@@ -710,14 +711,13 @@ impl TestClient {
                     }
                 }
                 proto::state_update::Update::RoomRenamed(rr) => {
-                    if let Some(rid) = rr.room_id.and_then(|r| uuid_from_room_id(&r)) {
-                        if let Some(room) = self
+                    if let Some(rid) = rr.room_id.and_then(|r| uuid_from_room_id(&r))
+                        && let Some(room) = self
                             .rooms
                             .iter_mut()
                             .find(|r| r.id.as_ref().and_then(uuid_from_room_id) == Some(rid))
-                        {
-                            room.name = rr.new_name;
-                        }
+                    {
+                        room.name = rr.new_name;
                     }
                 }
                 proto::state_update::Update::UserJoined(uj) => {
@@ -732,52 +732,48 @@ impl TestClient {
                     }
                 }
                 proto::state_update::Update::UserMoved(um) => {
-                    if let (Some(uid), Some(to_room)) = (um.user_id, um.to_room_id) {
-                        if let Some(user) = self
+                    if let (Some(uid), Some(to_room)) = (um.user_id, um.to_room_id)
+                        && let Some(user) = self
                             .users
                             .iter_mut()
                             .find(|u| u.user_id.as_ref().map(|id| id.value) == Some(uid.value))
-                        {
-                            user.current_room = Some(to_room);
-                        }
+                    {
+                        user.current_room = Some(to_room);
                     }
                 }
                 proto::state_update::Update::UserStatusChanged(usc) => {
-                    if let Some(uid) = usc.user_id {
-                        if let Some(user) = self
+                    if let Some(uid) = usc.user_id
+                        && let Some(user) = self
                             .users
                             .iter_mut()
                             .find(|u| u.user_id.as_ref().map(|id| id.value) == Some(uid.value))
-                        {
-                            user.is_muted = usc.is_muted;
-                            user.is_deafened = usc.is_deafened;
-                        }
+                    {
+                        user.is_muted = usc.is_muted;
+                        user.is_deafened = usc.is_deafened;
                     }
                 }
                 proto::state_update::Update::RoomMoved(rm) => {
-                    if let Some(rid) = rm.room_id.and_then(|r| uuid_from_room_id(&r)) {
-                        if let Some(room) = self
+                    if let Some(rid) = rm.room_id.and_then(|r| uuid_from_room_id(&r))
+                        && let Some(room) = self
                             .rooms
                             .iter_mut()
                             .find(|r| r.id.as_ref().and_then(uuid_from_room_id) == Some(rid))
-                        {
-                            room.parent_id = rm.new_parent_id;
-                        }
+                    {
+                        room.parent_id = rm.new_parent_id;
                     }
                 }
                 proto::state_update::Update::RoomDescriptionChanged(rdc) => {
-                    if let Some(rid) = rdc.room_id.and_then(|r| uuid_from_room_id(&r)) {
-                        if let Some(room) = self
+                    if let Some(rid) = rdc.room_id.and_then(|r| uuid_from_room_id(&r))
+                        && let Some(room) = self
                             .rooms
                             .iter_mut()
                             .find(|r| r.id.as_ref().and_then(uuid_from_room_id) == Some(rid))
-                        {
-                            room.description = if rdc.description.is_empty() {
-                                None
-                            } else {
-                                Some(rdc.description)
-                            };
-                        }
+                    {
+                        room.description = if rdc.description.is_empty() {
+                            None
+                        } else {
+                            Some(rdc.description)
+                        };
                     }
                 }
                 proto::state_update::Update::GroupChanged(_) => {}
@@ -797,15 +793,14 @@ impl TestClient {
                     }
                 }
                 proto::state_update::Update::RoomAclChanged(rac) => {
-                    if let Some(rid) = rac.room_id.and_then(|r| rumble_protocol::uuid_from_room_id(&r)) {
-                        if let Some(room) = self
+                    if let Some(rid) = rac.room_id.and_then(|r| rumble_protocol::uuid_from_room_id(&r))
+                        && let Some(room) = self
                             .rooms
                             .iter_mut()
                             .find(|r| r.id.as_ref().and_then(rumble_protocol::uuid_from_room_id) == Some(rid))
-                        {
-                            room.inherit_acl = rac.inherit_acl;
-                            room.acls = rac.entries;
-                        }
+                    {
+                        room.inherit_acl = rac.inherit_acl;
+                        room.acls = rac.entries;
                     }
                 }
             }
@@ -1096,7 +1091,7 @@ async fn test_second_client_sees_first_client() {
         .await
         .expect("client 1 should connect");
 
-    let mut client2 = TestClient::connect(&format!("127.0.0.1:{}", port), "second-client", &server.cert_path)
+    let client2 = TestClient::connect(&format!("127.0.0.1:{}", port), "second-client", &server.cert_path)
         .await
         .expect("client 2 should connect");
 
@@ -1840,7 +1835,7 @@ async fn test_rooms_persist_across_restart() {
         let server = start_server_with_options(port2, Some(temp_dir.path().to_str().unwrap()), None);
         tokio::time::sleep(Duration::from_millis(500)).await;
 
-        let mut client = TestClient::connect(&format!("127.0.0.1:{}", port2), "room-checker", &server.cert_path)
+        let client = TestClient::connect(&format!("127.0.0.1:{}", port2), "room-checker", &server.cert_path)
             .await
             .expect("should connect to restarted server");
 

@@ -73,7 +73,7 @@ fn start_server(port: u16) -> ServerGuard {
         let port_copy = port;
         std::thread::spawn(move || {
             let reader = BufReader::new(out);
-            for line in reader.lines().flatten() {
+            for line in reader.lines().map_while(Result::ok) {
                 println!("[server:{} stdout] {}", port_copy, line);
             }
         });
@@ -82,7 +82,7 @@ fn start_server(port: u16) -> ServerGuard {
         let port_copy = port;
         std::thread::spawn(move || {
             let reader = BufReader::new(err);
-            for line in reader.lines().flatten() {
+            for line in reader.lines().map_while(Result::ok) {
                 eprintln!("[server:{} stderr] {}", port_copy, line);
             }
         });

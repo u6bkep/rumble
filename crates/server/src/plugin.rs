@@ -108,10 +108,10 @@ impl ServerCtx {
         let members = self.state.get_room_members(room_id).await;
         let frame = rumble_protocol::encode_frame(&envelope);
         for uid in members {
-            if let Some(client) = self.state.get_client(uid) {
-                if let Err(e) = client.send_frame(&frame).await {
-                    tracing::warn!(user_id = uid, "failed to send to room member: {e}");
-                }
+            if let Some(client) = self.state.get_client(uid)
+                && let Err(e) = client.send_frame(&frame).await
+            {
+                tracing::warn!(user_id = uid, "failed to send to room member: {e}");
             }
         }
         Ok(())
