@@ -69,6 +69,10 @@ enum Scene {
     Connecting,
     /// Live session: rooms, users, chat — exercises the full shell.
     Connected,
+    /// Live session with the local user actively transmitting voice —
+    /// exercises the self-talking room-tree indicator path that
+    /// doesn't go through `talking_users` (which is remote-only).
+    ConnectedSelfTalking,
     /// Live session with a completed image transfer rendered as an
     /// inline preview in the chat sidebar.
     ConnectedImagePreview,
@@ -120,6 +124,7 @@ impl Scene {
         Scene::EditServerModal,
         Scene::Connecting,
         Scene::Connected,
+        Scene::ConnectedSelfTalking,
         Scene::ConnectedImagePreview,
         Scene::ImageLightbox,
         Scene::ImageLightboxZoomed,
@@ -149,6 +154,7 @@ impl Scene {
             Scene::EditServerModal => "edit_server_modal",
             Scene::Connecting => "connecting",
             Scene::Connected => "connected",
+            Scene::ConnectedSelfTalking => "connected_self_talking",
             Scene::ConnectedImagePreview => "connected_image_preview",
             Scene::ImageLightbox => "image_lightbox",
             Scene::ImageLightboxZoomed => "image_lightbox_zoomed",
@@ -184,6 +190,11 @@ impl Scene {
             },
             Scene::Connected | Scene::ConnectedImagePreview | Scene::ImageLightbox | Scene::ImageLightboxZoomed => {
                 connected_state()
+            }
+            Scene::ConnectedSelfTalking => {
+                let mut s = connected_state();
+                s.audio.is_transmitting = true;
+                s
             }
             Scene::ConnectionLost => State {
                 connection: ConnectionState::ConnectionLost {
