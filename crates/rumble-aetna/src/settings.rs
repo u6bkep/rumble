@@ -482,11 +482,23 @@ pub fn render(
         "Settings",
         [
             tabs_row,
-            scroll([body])
-                .padding(Sides::xy(0.0, tokens::SPACE_2))
-                .gap(tokens::SPACE_3)
-                .width(Size::Fill(1.0))
-                .height(Size::Fill(1.0)),
+            // Horizontal padding has to live on a wrapper *inside* the
+            // scroll, not on the scroll itself: the scrollbar thumb is
+            // anchored to `scroll.inner.right() - 8`, so padding on
+            // scroll moves the thumb and content together and the
+            // thumb keeps painting on top of full-width children.
+            // Wrapping the body lets content stop short of the
+            // scrollbar gutter (active thumb = 10 px + 2 px track
+            // inset = 12 px).
+            scroll([
+                column([body])
+                    .padding(Sides::xy(tokens::SPACE_3, 0.0))
+                    .width(Size::Fill(1.0)),
+            ])
+            .padding(Sides::xy(0.0, tokens::SPACE_2))
+            .gap(tokens::SPACE_3)
+            .width(Size::Fill(1.0))
+            .height(Size::Fill(1.0)),
             divider(),
             footer,
         ],
