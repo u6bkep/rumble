@@ -1,0 +1,56 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+# A push to a same-repo PR branch fires both `push` and `pull_request`. Cancel
+# in-flight runs for the same ref so we don't double up.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: '0'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libpulse-dev \
+            libasound2-dev \
+            libmpv-dev \
+            libssl-dev
+
+      # Install nightly first, then stable, so stable ends up as the default
+      # toolchain. Clippy runs on stable; `cargo +nightly fmt` reaches across.
+      - name: Install nightly (rustfmt)
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+
+      - name: Install stable (clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci
+
+      - name: Run CI script
+        run: ./scripts/ci.sh
