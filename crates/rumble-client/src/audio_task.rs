@@ -476,20 +476,24 @@ impl AudioTaskHandle {
 }
 
 /// Configuration for the audio task.
-pub struct AudioTaskConfig {
+pub struct AudioTaskConfig<P: Platform> {
     /// Shared state for updating talking_users.
     pub state: Arc<RwLock<State>>,
     /// Repaint callback for UI updates.
     pub repaint: Arc<dyn Fn() + Send + Sync>,
     /// Audio dumper for debugging (optional).
     pub audio_dumper: Option<AudioDumper>,
+    /// Audio backend instance, owned by the audio task. Tests can pass a
+    /// `MockAudioBackend` here to bypass cpal entirely; production code
+    /// passes `P::AudioBackend::default()`.
+    pub audio_backend: P::AudioBackend,
 }
 
 /// Spawn the audio task and return a handle for sending commands.
 ///
 /// The audio task runs on a separate thread with its own tokio runtime
 /// to avoid any blocking from audio I/O affecting other async tasks.
-pub fn spawn_audio_task<P: Platform>(config: AudioTaskConfig) -> AudioTaskHandle {
+pub fn spawn_audio_task<P: Platform>(config: AudioTaskConfig<P>) -> AudioTaskHandle {
     let (command_tx, command_rx) = mpsc::unbounded_channel();
 
     std::thread::spawn(move || {
@@ -505,13 +509,16 @@ pub fn spawn_audio_task<P: Platform>(config: AudioTaskConfig) -> AudioTaskHandle
 }
 
 /// Main audio task loop.
-async fn run_audio_task<P: Platform>(mut command_rx: mpsc::UnboundedReceiver<AudioCommand>, config: AudioTaskConfig) {
+async fn run_audio_task<P: Platform>(
+    mut command_rx: mpsc::UnboundedReceiver<AudioCommand>,
+    config: AudioTaskConfig<P>,
+) {
     let state = config.state;
     let repaint = config.repaint;
     let audio_dumper = config.audio_dumper.unwrap_or_else(AudioDumper::disabled);
 
     // Audio backend for device access (lives on this thread)
-    let audio_backend = P::AudioBackend::default();
+    let audio_backend = config.audio_backend;
 
     // Current connection state (datagram handle for voice I/O)
     let mut connection: Option<Arc<dyn DatagramTransport>> = None;

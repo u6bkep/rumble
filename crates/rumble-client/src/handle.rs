@@ -103,7 +103,13 @@ impl<P: Platform> BackendHandle<P> {
     where
         F: Fn() + Send + Sync + 'static,
     {
-        Self::with_config_and_dumper(repaint_callback, ConnectConfig::new(), key_signer, None)
+        Self::with_config_and_dumper(
+            repaint_callback,
+            ConnectConfig::new(),
+            key_signer,
+            None,
+            P::AudioBackend::default(),
+        )
     }
 
     /// Create a new backend handle with a repaint callback, connect config,
@@ -112,7 +118,13 @@ impl<P: Platform> BackendHandle<P> {
     where
         F: Fn() + Send + Sync + 'static,
     {
-        Self::with_config_and_dumper(repaint_callback, connect_config, key_signer, None)
+        Self::with_config_and_dumper(
+            repaint_callback,
+            connect_config,
+            key_signer,
+            None,
+            P::AudioBackend::default(),
+        )
     }
 
     /// Create a new backend handle with audio dumping enabled.
@@ -131,7 +143,29 @@ impl<P: Platform> BackendHandle<P> {
     where
         F: Fn() + Send + Sync + 'static,
     {
-        Self::with_config_and_dumper(repaint_callback, connect_config, key_signer, Some(audio_dumper))
+        Self::with_config_and_dumper(
+            repaint_callback,
+            connect_config,
+            key_signer,
+            Some(audio_dumper),
+            P::AudioBackend::default(),
+        )
+    }
+
+    /// Create a new backend handle with a caller-supplied audio backend.
+    ///
+    /// Tests use this to inject a `MockAudioBackend` so the engine runs
+    /// against fake capture/playback instead of opening a real device.
+    pub fn with_audio_backend<F>(
+        repaint_callback: F,
+        connect_config: ConnectConfig,
+        key_signer: Arc<dyn KeySigning>,
+        audio_backend: P::AudioBackend,
+    ) -> Self
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        Self::with_config_and_dumper(repaint_callback, connect_config, key_signer, None, audio_backend)
     }
 
     /// Internal constructor with optional audio dumper.
@@ -140,6 +174,7 @@ impl<P: Platform> BackendHandle<P> {
         connect_config: ConnectConfig,
         key_signer: Arc<dyn KeySigning>,
         audio_dumper: Option<AudioDumper>,
+        audio_backend: P::AudioBackend,
     ) -> Self
     where
         F: Fn() + Send + Sync + 'static,
@@ -151,8 +186,8 @@ impl<P: Platform> BackendHandle<P> {
         let repaint_callback = Arc::new(repaint_callback);
         let (command_tx, command_rx) = mpsc::unbounded_channel();
 
-        // Initialize audio backend (on main thread) and get device lists
-        let audio_backend = P::AudioBackend::default();
+        // Snapshot device lists from the supplied backend before handing it
+        // to the audio task.
         let input_devices = audio_backend.list_input_devices();
         let output_devices = audio_backend.list_output_devices();
 
@@ -200,6 +235,7 @@ impl<P: Platform> BackendHandle<P> {
             state: state.clone(),
             repaint: repaint_callback.clone(),
             audio_dumper,
+            audio_backend,
         });
 
         // Clone handles for the connection task

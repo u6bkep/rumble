@@ -11,6 +11,7 @@ pub mod codec;
 pub mod file_transfer;
 pub mod keys;
 pub mod platform;
+pub mod test_audio;
 pub mod transport;
 
 // Re-export key types

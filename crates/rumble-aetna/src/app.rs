@@ -18,9 +18,10 @@ use rumble_client::{
 };
 use rumble_desktop_shell::{
     AcceptedCertificate, RecentServer, SettingsStore,
+    hotkeys::{HotkeyEvent, HotkeyManager},
     identity::{connect_and_list_keys, generate_and_add_to_agent},
 };
-use rumble_protocol::{Command, ConnectionState, PendingCertificate, State, VoiceMode};
+use rumble_protocol::{AudioSettings, Command, ConnectionState, PendingCertificate, State, VoiceMode};
 use tokio::{runtime::Runtime, task::JoinHandle};
 
 use crate::{
@@ -48,6 +49,12 @@ pub struct RumbleApp<B: UiBackend = crate::backend::NativeUiBackend> {
     /// `pending_agent_op.is_finished()` each frame and `block_on`s the
     /// completed handle to land the result on the same frame.
     runtime: Runtime,
+
+    /// Global hotkey service. Drives PTT / mute / deafen from the
+    /// user's persisted bindings, drained each frame in
+    /// [`Self::pump_hotkeys`]. Initialised against `runtime` so the
+    /// XDG portal backend (Wayland) shares the same async context.
+    hotkeys: HotkeyManager,
 
     /// First-run identity wizard. `NotNeeded` when an identity is
     /// already configured.
@@ -246,11 +253,44 @@ impl<B: UiBackend> RumbleApp<B> {
             config: initial_pipeline,
         });
 
+        // Push the rest of the persisted audio config so the audio task
+        // starts with the user's chosen voice mode, devices, and encoder
+        // settings — not the BackendHandle's hardcoded defaults. Without
+        // this, a user who last saved Continuous mode boots in PTT every
+        // session and the mic stays silent until they reopen Settings.
+        let persisted = settings.settings();
+        backend.send(Command::SetVoiceMode {
+            mode: VoiceMode::from(persisted.voice_mode),
+        });
+        backend.send(Command::UpdateAudioSettings {
+            settings: AudioSettings::from(&persisted.audio),
+        });
+        backend.send(Command::SetInputDevice {
+            device_id: persisted.input_device_id.clone(),
+        });
+        backend.send(Command::SetOutputDevice {
+            device_id: persisted.output_device_id.clone(),
+        });
+
+        // Bring up global hotkeys (PTT, mute, deafen) from the user's
+        // persisted keyboard bindings. On Wayland the portal backend
+        // needs an async init; we use `runtime.block_on` so the
+        // initialisation completes before the first frame is built.
+        let mut hotkeys = HotkeyManager::new();
+        let runtime_handle = runtime.handle().clone();
+        runtime.block_on(async {
+            hotkeys.init_portal_backend(runtime_handle).await;
+        });
+        if let Err(e) = hotkeys.register_from_settings(&persisted.keyboard) {
+            tracing::warn!("hotkey registration failed: {e}");
+        }
+
         Self {
             backend,
             identity,
             settings,
             runtime,
+            hotkeys,
             wizard,
             unlock: UnlockState::default(),
             pending_agent_op: None,
@@ -450,6 +490,7 @@ impl<B: UiBackend> App for RumbleApp<B> {
         self.pump_gif_animations();
         self.pump_video_thumbs();
         self.poll_video_open();
+        self.pump_hotkeys();
         if let Some(active) = self.active_video.as_mut() {
             active.refresh_scrub_value();
         }
@@ -1889,6 +1930,53 @@ impl<B: UiBackend> RumbleApp<B> {
             kind,
             volume: sfx.volume.clamp(0.0, 1.0),
         });
+    }
+
+    /// Drain queued global hotkey events and turn them into backend
+    /// commands. Mirrors `rumble-next::App::pump_hotkeys` so PTT / mute /
+    /// deafen behaviour stays consistent across clients.
+    ///
+    /// All hotkeys are gated on `connection.is_connected()` — toggling
+    /// state while disconnected would be confusing and produce stray
+    /// SetMuted / SetDeafened sends that the server would never see.
+    /// Server-muted users have PTT suppressed (the server would drop the
+    /// packets anyway).
+    fn pump_hotkeys(&mut self) {
+        let events = self.hotkeys.poll_events();
+        if events.is_empty() {
+            return;
+        }
+        let state = self.backend.state();
+        if !state.connection.is_connected() {
+            return;
+        }
+        let server_muted = state
+            .my_user_id
+            .and_then(|id| state.get_user(id))
+            .is_some_and(|u| u.server_muted);
+        for event in events {
+            match event {
+                HotkeyEvent::PttPressed => {
+                    if server_muted {
+                        continue;
+                    }
+                    self.backend.send(Command::StartTransmit);
+                }
+                HotkeyEvent::PttReleased => {
+                    self.backend.send(Command::StopTransmit);
+                }
+                HotkeyEvent::ToggleMute => {
+                    self.backend.send(Command::SetMuted {
+                        muted: !state.audio.self_muted,
+                    });
+                }
+                HotkeyEvent::ToggleDeafen => {
+                    self.backend.send(Command::SetDeafened {
+                        deafened: !state.audio.self_deafened,
+                    });
+                }
+            }
+        }
     }
 
     /// Walk the live transfer list each frame and decode any newly-
