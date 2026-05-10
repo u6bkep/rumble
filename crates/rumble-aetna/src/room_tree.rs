@@ -413,8 +413,7 @@ fn push_room_subtree(
         // talking_users only tracks remote peers (populated from received
         // voice datagrams); for self we use the local capture/VAD signal.
         let is_self = state.my_user_id == Some(user_id);
-        let is_talking = state.audio.talking_users.contains(&user_id)
-            || (is_self && state.audio.is_transmitting);
+        let is_talking = state.audio.talking_users.contains(&user_id) || (is_self && state.audio.is_transmitting);
         // Mic-state glyph picks up its color from the bundled Mumble
         // SVG itself (red self-mute, blue server-mute, blue talking,
         // green idle), so no `.text_color(...)` override here.

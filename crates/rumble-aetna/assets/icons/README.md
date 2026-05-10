@@ -1,7 +1,6 @@
 # Rumble icons
 
-SVGs lifted directly from
-`/home/ben/Documents/programmingPlay/mumble/mumble/themes/Default/`
+SVGs lifted directly from `mumble-voip/mumble/themes/Default/`
 (LGPL-3.0-or-later, same license as Mumble itself; redistributable
 under the GPL-2.0+ in the rumble project).
 
