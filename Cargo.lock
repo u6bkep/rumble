@@ -148,6 +148,7 @@ dependencies = [
 [[package]]
 name = "aetna-core"
 version = "0.3.1"
+source = "git+https://github.com/computer-whisperer/aetna?rev=1d6c6352d061e5ba6af549244c21c2c18def1599#1d6c6352d061e5ba6af549244c21c2c18def1599"
 dependencies = [
  "aetna-fonts",
  "bytemuck",
@@ -167,6 +168,7 @@ dependencies = [
 [[package]]
 name = "aetna-fonts"
 version = "0.3.1"
+source = "git+https://github.com/computer-whisperer/aetna?rev=1d6c6352d061e5ba6af549244c21c2c18def1599#1d6c6352d061e5ba6af549244c21c2c18def1599"
 dependencies = [
  "aetna-fonts-emoji",
  "aetna-fonts-inter",
@@ -177,22 +179,27 @@ dependencies = [
 [[package]]
 name = "aetna-fonts-emoji"
 version = "0.1.0"
+source = "git+https://github.com/computer-whisperer/aetna?rev=1d6c6352d061e5ba6af549244c21c2c18def1599#1d6c6352d061e5ba6af549244c21c2c18def1599"
 
 [[package]]
 name = "aetna-fonts-inter"
 version = "0.1.0"
+source = "git+https://github.com/computer-whisperer/aetna?rev=1d6c6352d061e5ba6af549244c21c2c18def1599#1d6c6352d061e5ba6af549244c21c2c18def1599"
 
 [[package]]
 name = "aetna-fonts-jetbrains-mono"
 version = "0.1.0"
+source = "git+https://github.com/computer-whisperer/aetna?rev=1d6c6352d061e5ba6af549244c21c2c18def1599#1d6c6352d061e5ba6af549244c21c2c18def1599"
 
 [[package]]
 name = "aetna-fonts-symbols"
 version = "0.1.0"
+source = "git+https://github.com/computer-whisperer/aetna?rev=1d6c6352d061e5ba6af549244c21c2c18def1599#1d6c6352d061e5ba6af549244c21c2c18def1599"
 
 [[package]]
 name = "aetna-wgpu"
 version = "0.3.1"
+source = "git+https://github.com/computer-whisperer/aetna?rev=1d6c6352d061e5ba6af549244c21c2c18def1599#1d6c6352d061e5ba6af549244c21c2c18def1599"
 dependencies = [
  "aetna-core",
  "bytemuck",
@@ -205,6 +212,7 @@ dependencies = [
 [[package]]
 name = "aetna-winit-wgpu"
 version = "0.3.1"
+source = "git+https://github.com/computer-whisperer/aetna?rev=1d6c6352d061e5ba6af549244c21c2c18def1599#1d6c6352d061e5ba6af549244c21c2c18def1599"
 dependencies = [
  "aetna-core",
  "aetna-wgpu",
