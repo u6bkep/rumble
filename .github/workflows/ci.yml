@@ -33,7 +33,8 @@ jobs:
             libpulse-dev \
             libasound2-dev \
             libmpv-dev \
-            libssl-dev
+            libssl-dev \
+            protobuf-compiler
 
       # Install nightly first, then stable, so stable ends up as the default
       # toolchain. Clippy runs on stable; `cargo +nightly fmt` reaches across.
