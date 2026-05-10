@@ -1,0 +1,136 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish release
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: '0'
+      WIN_TARGET: x86_64-pc-windows-gnu
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Tag metadata
+        id: meta
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          # SemVer pre-release: anything with a hyphen suffix (-rc.1, -beta.2, -alpha.0, ...).
+          if [[ "$VERSION" == *-* ]]; then
+            PRERELEASE=true
+          else
+            PRERELEASE=false
+          fi
+          echo "tag=$TAG"           >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION"   >> "$GITHUB_OUTPUT"
+          echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
+          echo "Tag=$TAG version=$VERSION prerelease=$PRERELEASE"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libpulse-dev \
+            libasound2-dev \
+            libmpv-dev \
+            libssl-dev \
+            mingw-w64
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release
+
+      - name: Build Linux release binaries
+        run: |
+          cargo build --release \
+            -p server \
+            -p mumble-bridge \
+            -p rumble-aetna
+
+      - name: Build Windows client (cross-compile)
+        run: |
+          cargo build --release \
+            --target "$WIN_TARGET" \
+            -p rumble-aetna
+
+      - name: Strip Linux binaries
+        run: |
+          strip target/release/server
+          strip target/release/mumble-bridge
+          strip target/release/rumble-aetna
+
+      - name: Package release archives
+        id: package
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.meta.outputs.version }}"
+          OUT="$GITHUB_WORKSPACE/dist"
+          mkdir -p "$OUT"
+
+          pack_linux() {
+            local bin="$1"
+            local archive="$OUT/${bin}-${VERSION}-linux-x86_64.tar.gz"
+            local stage="$(mktemp -d)/${bin}-${VERSION}-linux-x86_64"
+            mkdir -p "$stage"
+            cp "target/release/$bin" "$stage/"
+            cp README.md LICENSE* "$stage/" 2>/dev/null || true
+            tar -C "$(dirname "$stage")" -czf "$archive" "$(basename "$stage")"
+            (cd "$OUT" && sha256sum "$(basename "$archive")" > "$(basename "$archive").sha256")
+            echo "$archive"
+          }
+
+          pack_linux server
+          pack_linux mumble-bridge
+          pack_linux rumble-aetna
+
+          # Windows client: bin + the libmpv-2.dll that build.rs fetched and copied
+          # next to the artifact (see crates/rumble-video/build.rs).
+          WIN_DIR="target/${WIN_TARGET}/release"
+          if [ ! -f "$WIN_DIR/libmpv-2.dll" ]; then
+            echo "expected $WIN_DIR/libmpv-2.dll to exist (rumble-video build.rs)" >&2
+            exit 1
+          fi
+          win_archive="$OUT/rumble-aetna-${VERSION}-windows-x86_64.zip"
+          win_stage="$(mktemp -d)/rumble-aetna-${VERSION}-windows-x86_64"
+          mkdir -p "$win_stage"
+          cp "$WIN_DIR/rumble-aetna.exe" "$win_stage/"
+          cp "$WIN_DIR/libmpv-2.dll"     "$win_stage/"
+          cp README.md LICENSE* "$win_stage/" 2>/dev/null || true
+          (cd "$(dirname "$win_stage")" && zip -r "$win_archive" "$(basename "$win_stage")")
+          (cd "$OUT" && sha256sum "$(basename "$win_archive")" > "$(basename "$win_archive").sha256")
+
+          ls -la "$OUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: ${{ steps.meta.outputs.tag }}
+          prerelease: ${{ steps.meta.outputs.prerelease }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
