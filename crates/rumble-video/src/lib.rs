@@ -15,34 +15,26 @@
 //!
 //! ## Platform support
 //!
-//! Native (Linux/macOS): links against the system libmpv via
-//! pkg-config and provides the full `MpvPlayer` / `VideoStream` /
-//! `VideoGpu` surface.
+//! Linux/macOS: `build.rs` probes pkg-config for a system
+//! `libmpv >= 2.0`.
 //!
-//! Windows: the libmpv FFI is compiled out and the public types
-//! resolve to stubs in [`windows_stub`] whose constructors return
-//! [`Error::Unsupported`]. This lets `rumble-aetna` cross-compile to
-//! `x86_64-pc-windows-gnu` without bundling a Windows libmpv build;
-//! the chat UI gracefully no-ops video features (no playback, no
-//! thumbnails) until a follow-up phase wires up Windows libmpv.
+//! Windows (`x86_64-pc-windows-gnu`): `build.rs` fetches a pinned
+//! `mpv-dev-x86_64-…7z` from sourceforge, verifies a sha256, extracts
+//! it into `OUT_DIR/libmpv-<version>/`, and copies `libmpv-2.dll`
+//! next to the eventual binary so `cargo run --target
+//! x86_64-pc-windows-gnu` produces a runnable artifact. Set
+//! `LIBMPV_DIR` to skip the network step in offline / CI-cached
+//! builds.
 
 mod error;
 mod gpu;
-#[cfg(not(windows))]
 mod stream;
-#[cfg(not(windows))]
 mod sys;
-#[cfg(windows)]
-mod windows_stub;
 
 pub use error::Error;
 pub use gpu::VideoGpu;
-#[cfg(not(windows))]
 pub use stream::{FrameBuffer, VideoStream};
-#[cfg(windows)]
-pub use windows_stub::{FrameBuffer, MpvPlayer, VideoStream};
 
-#[cfg(not(windows))]
 use std::{
     ffi::{CStr, CString},
     os::raw::{c_char, c_void},
@@ -51,13 +43,11 @@ use std::{
     time::Duration,
 };
 
-#[cfg(not(windows))]
 use error::check;
 
 /// Owned libmpv player handle plus a SW render context attached to it.
 /// `Drop` tears both down in the correct order (render context first,
 /// then `mpv_terminate_destroy`).
-#[cfg(not(windows))]
 pub struct MpvPlayer {
     /// `*mut mpv_handle`. Internally synchronised by libmpv — safe to
     /// hand to multiple threads as long as no two methods are called
@@ -73,12 +63,9 @@ pub struct MpvPlayer {
 // VideoStream's worker is the only caller of render_sw and
 // wait_for_frame, while the UI thread calls only the
 // command/property-setter methods.
-#[cfg(not(windows))]
 unsafe impl Send for MpvPlayer {}
-#[cfg(not(windows))]
 unsafe impl Sync for MpvPlayer {}
 
-#[cfg(not(windows))]
 impl MpvPlayer {
     /// Create a fresh player + SW render context. Sets a small set of
     /// "library embedding" defaults (no terminal, no input handling,
@@ -368,7 +355,6 @@ impl MpvPlayer {
     }
 }
 
-#[cfg(not(windows))]
 impl Drop for MpvPlayer {
     fn drop(&mut self) {
         // Render context must be freed *before* the handle, per the

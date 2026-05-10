@@ -14,11 +14,17 @@ aetna-core = { path = "../../vendor/aetna/crates/aetna-core" }
 aetna-wgpu = { path = "../../vendor/aetna/crates/aetna-wgpu" }
 wgpu = "29"
 
-# pkg-config probes for libmpv on Linux/macOS. Windows ships a stub
-# crate (see `src/windows_stub.rs`) that doesn't link libmpv, so the
-# build-dep is gated to non-Windows targets.
-[target.'cfg(not(windows))'.build-dependencies]
+# build.rs picks pkg-config (Linux/macOS targets) or fetch-and-extract
+# (Windows targets) based on CARGO_CFG_TARGET_OS. Build-dependency cfg
+# expressions evaluate against the **host**, not the target, so we
+# can't gate these per-target without breaking cross-compile from
+# Linux→Windows. They're cheap to compile (~seconds) and the network
+# fetch only runs when the target actually demands it.
+[build-dependencies]
 pkg-config = "0.3"
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+sevenz-rust2 = "0.18"
+sha2 = "0.10"
 
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["png"] }

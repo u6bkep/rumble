@@ -1,4 +1,3 @@
-#![cfg(not(windows))]
 //! High-level video stream: wraps an `MpvPlayer` with a worker
 //! thread that pulls decoded frames into a CPU mailbox, plus the
 //! control surface (pause/resume/seek/time-pos/duration) the UI
