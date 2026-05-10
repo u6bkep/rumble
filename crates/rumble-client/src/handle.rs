@@ -42,12 +42,12 @@ use crate::{
     ConnectConfig,
     audio_dump::AudioDumper,
     audio_task::{AudioCommand, AudioTaskConfig, AudioTaskHandle, spawn_audio_task},
-    events::{AudioState, Command, ConnectionState, PendingCertificate, SigningCallback, State, VoiceMode},
+    events::{AudioState, Command, ConnectionState, PendingCertificate, State, VoiceMode},
 };
 use ed25519_dalek::SigningKey;
 use prost::Message;
 use rumble_client_traits::{
-    AudioBackend, FileTransferPlugin, Platform, StreamHeader,
+    AudioBackend, FileTransferPlugin, KeySigning, Platform, StreamHeader,
     auth::{send_envelope, wait_for_auth_result, wait_for_server_hello},
     cert::{CapturedCert, is_cert_error_message, new_captured_cert, take_captured_cert},
     file_transfer::{TransferId, TransferStatus},
@@ -96,23 +96,23 @@ pub struct BackendHandle<P: Platform> {
 }
 
 impl<P: Platform> BackendHandle<P> {
-    /// Create a new backend handle with the given repaint callback.
-    ///
-    /// The repaint callback is called whenever state changes, allowing
-    /// the UI to request a repaint.
-    pub fn new<F>(repaint_callback: F) -> Self
+    /// Create a new backend handle with the given repaint callback and key
+    /// signer. The signer is invoked during the QUIC handshake to produce
+    /// auth signatures; see [`KeySigning`].
+    pub fn new<F>(repaint_callback: F, key_signer: Arc<dyn KeySigning>) -> Self
     where
         F: Fn() + Send + Sync + 'static,
     {
-        Self::with_config_and_dumper(repaint_callback, ConnectConfig::new(), None)
+        Self::with_config_and_dumper(repaint_callback, ConnectConfig::new(), key_signer, None)
     }
 
-    /// Create a new backend handle with a repaint callback and connect config.
-    pub fn with_config<F>(repaint_callback: F, connect_config: ConnectConfig) -> Self
+    /// Create a new backend handle with a repaint callback, connect config,
+    /// and key signer.
+    pub fn with_config<F>(repaint_callback: F, connect_config: ConnectConfig, key_signer: Arc<dyn KeySigning>) -> Self
     where
         F: Fn() + Send + Sync + 'static,
     {
-        Self::with_config_and_dumper(repaint_callback, connect_config, None)
+        Self::with_config_and_dumper(repaint_callback, connect_config, key_signer, None)
     }
 
     /// Create a new backend handle with audio dumping enabled.
@@ -122,17 +122,23 @@ impl<P: Platform> BackendHandle<P> {
     /// - `tx_opus.bin` - Encoded opus packets being sent
     /// - `rx_opus.bin` - Received opus packets
     /// - `rx_decoded.pcm` - Decoded audio before mixing (f32 samples)
-    pub fn with_audio_dumper<F>(repaint_callback: F, connect_config: ConnectConfig, audio_dumper: AudioDumper) -> Self
+    pub fn with_audio_dumper<F>(
+        repaint_callback: F,
+        connect_config: ConnectConfig,
+        key_signer: Arc<dyn KeySigning>,
+        audio_dumper: AudioDumper,
+    ) -> Self
     where
         F: Fn() + Send + Sync + 'static,
     {
-        Self::with_config_and_dumper(repaint_callback, connect_config, Some(audio_dumper))
+        Self::with_config_and_dumper(repaint_callback, connect_config, key_signer, Some(audio_dumper))
     }
 
     /// Internal constructor with optional audio dumper.
     fn with_config_and_dumper<F>(
         repaint_callback: F,
         connect_config: ConnectConfig,
+        key_signer: Arc<dyn KeySigning>,
         audio_dumper: Option<AudioDumper>,
     ) -> Self
     where
@@ -205,6 +211,7 @@ impl<P: Platform> BackendHandle<P> {
         let file_transfer_for_task = file_transfer.clone();
 
         // Spawn background thread with tokio runtime for connection task
+        let key_signer_for_task = key_signer.clone();
         let runtime_thread = std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("create tokio runtime");
             rt.block_on(async move {
@@ -214,6 +221,7 @@ impl<P: Platform> BackendHandle<P> {
                     state_for_task,
                     repaint_for_task,
                     config_for_task,
+                    key_signer_for_task,
                     audio_task_for_connection,
                     file_transfer_for_task,
                 )
@@ -449,12 +457,14 @@ pub(crate) fn write_state(state: &Arc<RwLock<State>>) -> RwLockWriteGuard<'_, St
 /// - State synchronization
 ///
 /// It notifies the audio task when a connection is established or closed.
+#[allow(clippy::too_many_arguments)] // private helper; bundling its args would just push churn
 async fn run_connection_task<P: Platform>(
     mut command_rx: mpsc::UnboundedReceiver<Command>,
     command_tx: mpsc::UnboundedSender<Command>,
     state: Arc<RwLock<State>>,
     repaint: Arc<dyn Fn() + Send + Sync>,
     config: ConnectConfig,
+    key_signer: Arc<dyn KeySigning>,
     audio_task: AudioTaskHandle,
     file_transfer_slot: Arc<RwLock<Option<Arc<dyn FileTransferPlugin>>>>,
 ) {
@@ -486,7 +496,7 @@ async fn run_connection_task<P: Platform>(
                     return;
                 };
                 match cmd {
-                    Command::Connect { addr, name, public_key, signer, password } => {
+                    Command::Connect { addr, name, public_key, password } => {
                         client_name = name.clone();
 
                         // Update state to Connecting
@@ -500,7 +510,7 @@ async fn run_connection_task<P: Platform>(
                         let captured_cert = new_captured_cert();
 
                         // Attempt connection with Ed25519 auth
-                        match connect_to_server::<P::Transport>(&addr, &name, &public_key, &signer, password.as_deref(), &config, captured_cert.clone()).await {
+                        match connect_to_server::<P::Transport>(&addr, &name, &public_key, key_signer.as_ref(), password.as_deref(), &config, captured_cert.clone()).await {
                             Ok((mut new_transport, user_id, rooms, users, groups, session_info)) => {
                                 // Update state to Connected
                                 {
@@ -595,7 +605,6 @@ async fn run_connection_task<P: Platform>(
                                         username: name.clone(),
                                         password: password.clone(),
                                         public_key,
-                                        signer: signer.clone(),
                                     };
                                     {
                                         let mut s = write_state(&state);
@@ -658,7 +667,7 @@ async fn run_connection_task<P: Platform>(
                                 &pending.server_addr,
                                 &pending.username,
                                 &pending.public_key,
-                                &pending.signer,
+                                key_signer.as_ref(),
                                 pending.password.as_deref(),
                                 &new_config,
                                 captured_cert,
@@ -1393,7 +1402,7 @@ async fn connect_to_server<T: Transport>(
     addr: &str,
     client_name: &str,
     public_key: &[u8; 32],
-    signer: &SigningCallback,
+    key_signer: &dyn KeySigning,
     password: Option<&str>,
     config: &ConnectConfig,
     captured_cert: CapturedCert,
@@ -1407,25 +1416,15 @@ async fn connect_to_server<T: Transport>(
 )> {
     info!(server_addr = %addr, client_name, "Connecting to server");
 
-    // Build TlsConfig from ConnectConfig
+    // Build TlsConfig from ConnectConfig. We pass raw file bytes through —
+    // the Transport impl handles PEM/DER detection (see TlsConfig docs).
     let mut additional_ca_certs = Vec::new();
 
-    // Load additional certificates from file paths
     for cert_path in &config.additional_certs {
         match std::fs::read(cert_path) {
             Ok(cert_bytes) => {
-                if cert_bytes.starts_with(b"-----BEGIN") {
-                    let mut reader = std::io::BufReader::new(cert_bytes.as_slice());
-                    let certs: Vec<Vec<u8>> = rustls_pemfile::certs(&mut reader)
-                        .filter_map(|r| r.ok())
-                        .map(|c| c.to_vec())
-                        .collect();
-                    additional_ca_certs.extend(certs);
-                    info!("Loaded PEM certificate(s) from {:?}", cert_path);
-                } else {
-                    additional_ca_certs.push(cert_bytes);
-                    info!("Loaded DER certificate from {:?}", cert_path);
-                }
+                info!("Loaded certificate file {:?}", cert_path);
+                additional_ca_certs.push(cert_bytes);
             }
             Err(e) => {
                 error!("Failed to load cert from {:?}: {}", cert_path, e);
@@ -1433,7 +1432,7 @@ async fn connect_to_server<T: Transport>(
         }
     }
 
-    // Add user-accepted certificates (from interactive prompts)
+    // Add user-accepted certificates (from interactive prompts). Always DER.
     for cert_der in &config.accepted_certs {
         additional_ca_certs.push(cert_der.clone());
     }
@@ -1485,13 +1484,19 @@ async fn connect_to_server<T: Transport>(
     let expires_ms = timestamp_ms + 24 * 60 * 60 * 1000; // 24h validity for session cert
 
     let cert_payload = build_session_cert_payload(&session_public_bytes, timestamp_ms, expires_ms, Some(client_name));
-    let session_signature = signer(&cert_payload).map_err(|e| anyhow::anyhow!("Signing failed: {}", e))?;
+    let session_signature = key_signer
+        .sign(public_key, &cert_payload)
+        .await
+        .map_err(|e| anyhow::anyhow!("Signing session cert failed: {}", e))?;
 
     // Step 5: Compute signature payload for handshake
     let payload = build_auth_payload(&nonce, timestamp_ms, public_key, user_id, &server_cert_hash);
 
     // Step 6: Sign the handshake payload
-    let signature = signer(&payload).map_err(|e| anyhow::anyhow!("Signing failed: {}", e))?;
+    let signature = key_signer
+        .sign(public_key, &payload)
+        .await
+        .map_err(|e| anyhow::anyhow!("Signing handshake payload failed: {}", e))?;
 
     // Step 7: Send Authenticate (includes session certificate)
     let auth = proto::Envelope {

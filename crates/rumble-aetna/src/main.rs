@@ -28,7 +28,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `State` ~30fps. When state actually changes the next frame
     // picks it up; idle frames are cheap (no input events, animations
     // settle, GPU stays idle).
-    let backend = BackendHandle::<rumble_desktop::NativePlatform>::with_config(|| {}, connect_config);
+    let signer = identity.signer();
+    let backend = BackendHandle::<rumble_desktop::NativePlatform>::with_config(|| {}, connect_config, signer);
     let backend = NativeUiBackend::new(backend);
 
     // Owned tokio runtime for ssh-agent ops fired from the wizard. Kept

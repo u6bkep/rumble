@@ -15,7 +15,7 @@
 //! draw-op stream the wgpu Runner would, so layout regressions show
 //! up faithfully without spinning up a window or device.
 
-use std::{path::PathBuf, sync::Arc, time::SystemTime};
+use std::{path::PathBuf, time::SystemTime};
 
 use aetna_core::prelude::*;
 
@@ -628,8 +628,6 @@ fn demo_preview_image() -> Image {
 }
 
 fn demo_pending_cert() -> PendingCertificate {
-    let no_op_signer: rumble_client::SigningCallback =
-        Arc::new(|_payload: &[u8]| Err("fixture identity is not signing".to_string()));
     PendingCertificate {
         certificate_der: vec![0u8; 32],
         fingerprint: [
@@ -641,7 +639,6 @@ fn demo_pending_cert() -> PendingCertificate {
         username: "alice".into(),
         password: None,
         public_key: [0u8; 32],
-        signer: no_op_signer,
     }
 }
 

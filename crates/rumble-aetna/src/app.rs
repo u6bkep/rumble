@@ -1196,7 +1196,6 @@ impl<B: UiBackend> RumbleApp<B> {
             });
             return;
         }
-        let signer = self.identity.signer();
 
         let addr = if server.addr.trim().is_empty() {
             "127.0.0.1:5000".to_string()
@@ -1228,7 +1227,6 @@ impl<B: UiBackend> RumbleApp<B> {
             addr,
             name,
             public_key,
-            signer,
             password: None,
         });
     }

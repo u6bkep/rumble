@@ -9,7 +9,6 @@ use crate::proto::{RoomInfo, User};
 use rumble_audio::{PipelineConfig, UserRxConfig};
 use std::{
     collections::{HashMap, HashSet},
-    sync::Arc,
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
@@ -225,19 +224,6 @@ impl<'a> Iterator for AncestorIterator<'a> {
 }
 
 // =============================================================================
-// Authentication Types
-// =============================================================================
-
-/// Callback for signing authentication challenges.
-///
-/// The UI provides this callback. It may:
-/// - Sign using a local Ed25519 private key
-/// - Sign using the SSH agent
-///
-/// Takes the payload to sign, returns the 64-byte signature or an error.
-pub type SigningCallback = Arc<dyn Fn(&[u8]) -> Result<[u8; 64], String> + Send + Sync>;
-
-// =============================================================================
 // Audio Settings (Configurable)
 // =============================================================================
 
@@ -375,7 +361,7 @@ impl AudioStats {
 // =============================================================================
 
 /// Information about a pending certificate for user confirmation.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct PendingCertificate {
     /// The DER-encoded certificate data.
     pub certificate_der: Vec<u8>,
@@ -391,22 +377,6 @@ pub struct PendingCertificate {
     pub password: Option<String>,
     /// Public key for retry.
     pub public_key: [u8; 32],
-    /// Signer callback for retry.
-    pub signer: SigningCallback,
-}
-
-// Implement Debug manually since SigningCallback doesn't implement Debug
-impl std::fmt::Debug for PendingCertificate {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PendingCertificate")
-            .field("fingerprint", &self.fingerprint_short())
-            .field("server_name", &self.server_name)
-            .field("server_addr", &self.server_addr)
-            .field("username", &self.username)
-            .field("password", &self.password.is_some())
-            .field("public_key", &format!("{:02x?}...", &self.public_key[..4]))
-            .finish()
-    }
 }
 
 impl PendingCertificate {
@@ -433,7 +403,7 @@ impl PendingCertificate {
     }
 }
 
-// Implement PartialEq manually since SigningCallback doesn't implement it
+// Equality is by fingerprint + address tuple, not the full byte-for-byte cert.
 impl PartialEq for PendingCertificate {
     fn eq(&self, other: &Self) -> bool {
         self.fingerprint == other.fingerprint
@@ -1158,7 +1128,6 @@ pub enum Command {
         addr: String,
         name: String,
         public_key: [u8; 32],     // Ed25519 public key
-        signer: SigningCallback,  // Signs auth challenge
         password: Option<String>, // Server password (for unknown keys)
     },
     /// Disconnect from the current server.
@@ -1380,7 +1349,8 @@ pub enum Command {
     },
 }
 
-// Implement Debug manually since SigningCallback doesn't implement Debug
+// Hand-written Debug — hides password presence as a boolean and abbreviates
+// the public key for log readability.
 impl std::fmt::Debug for Command {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

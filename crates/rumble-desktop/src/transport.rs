@@ -186,12 +186,26 @@ impl Transport for QuinnTransport {
         // Build rustls ClientConfig
         let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
 
-        // Build root store with additional CAs
+        // Build root store with additional CAs. Each entry in
+        // `additional_ca_certs` is raw file bytes — either DER or PEM. We
+        // detect PEM by the standard `-----BEGIN` armor; a single PEM file
+        // may concatenate multiple certificates.
         let mut root_store = RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        for cert_der in &tls_config.additional_ca_certs {
-            let cert = rustls::pki_types::CertificateDer::from(cert_der.clone());
-            let _ = root_store.add(cert);
+        for cert_bytes in &tls_config.additional_ca_certs {
+            let der_certs: Vec<Vec<u8>> = if cert_bytes.starts_with(b"-----BEGIN") {
+                let mut reader = std::io::BufReader::new(cert_bytes.as_slice());
+                rustls_pemfile::certs(&mut reader)
+                    .filter_map(|r| r.ok())
+                    .map(|c| c.to_vec())
+                    .collect()
+            } else {
+                vec![cert_bytes.clone()]
+            };
+            for der in der_certs {
+                let cert = rustls::pki_types::CertificateDer::from(der);
+                let _ = root_store.add(cert);
+            }
         }
 
         let mut client_cfg = if tls_config.accept_invalid_certs {

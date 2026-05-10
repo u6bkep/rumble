@@ -1,8 +1,11 @@
 //! Key management for Ed25519 authentication.
 //!
-//! Lifted from `rumble-egui/src/key_manager.rs`. The on-disk format,
-//! file path (`<config>/identity.json`), and `SigningCallback` shape
-//! are unchanged so existing identities load straight in.
+//! Lifted from `rumble-egui/src/key_manager.rs`. The on-disk format and
+//! file path (`<config>/identity.json`) are unchanged so existing
+//! identities load straight in. Signing is exposed to the engine via
+//! [`KeyManagerSigner`], which implements [`rumble_client_traits::KeySigning`]
+//! and is the seam future macOS Keychain / mobile keyring backends will
+//! plug into.
 //!
 //! Encrypted-key support requires the `encrypted-keys` feature; SSH
 //! agent support requires `ssh-agent`. The `KeySource` enum keeps all
@@ -10,9 +13,14 @@
 //! the *handling* code, so an old identity file with a now-disabled
 //! variant gives a clean error rather than corrupting on save.
 
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::PathBuf,
+    sync::{Arc, RwLock},
+};
 
+use async_trait::async_trait;
 use ed25519_dalek::SigningKey;
+use rumble_client_traits::KeySigning;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -150,39 +158,6 @@ impl KeyManager {
 
     pub fn signing_key(&self) -> Option<&SigningKey> {
         self.cached_signing_key.as_ref()
-    }
-
-    /// Build a signing callback for the backend. `None` if no key is
-    /// configured, the encrypted key hasn't been unlocked, or the
-    /// configured source variant requires a feature that isn't built
-    /// in (e.g. an SSH-agent identity loaded by a binary built without
-    /// the `ssh-agent` feature).
-    pub fn create_signer(&self) -> Option<rumble_client::SigningCallback> {
-        let config = self.config.as_ref()?;
-        match &config.source {
-            KeySource::LocalPlaintext { private_key_hex } => {
-                let signing_key = parse_signing_key(private_key_hex)?;
-                Some(local_signer(signing_key))
-            }
-            KeySource::LocalEncrypted { .. } => {
-                // The decryption happens in `unlock_local_key`; here
-                // we just hand out a signer based on the cached key.
-                let signing_key = self.cached_signing_key.as_ref()?;
-                Some(local_signer(signing_key.clone()))
-            }
-            KeySource::SshAgent { fingerprint, .. } => {
-                #[cfg(feature = "ssh-agent")]
-                {
-                    Some(create_agent_signer(fingerprint.clone()))
-                }
-                #[cfg(not(feature = "ssh-agent"))]
-                {
-                    let _ = fingerprint;
-                    tracing::error!("SSH-agent identity loaded but ssh-agent feature is disabled");
-                    None
-                }
-            }
-        }
     }
 
     /// Generate a new local key, optionally password-protected. Empty
@@ -352,13 +327,60 @@ pub fn parse_signing_key(hex_key: &str) -> Option<SigningKey> {
     Some(SigningKey::from_bytes(&arr))
 }
 
-fn local_signer(signing_key: SigningKey) -> rumble_client::SigningCallback {
-    let signing_key_bytes = signing_key.to_bytes();
-    Arc::new(move |payload: &[u8]| {
-        use ed25519_dalek::Signer;
-        let key = SigningKey::from_bytes(&signing_key_bytes);
-        Ok(key.sign(payload).to_bytes())
-    })
+/// `KeySigning` adapter that signs using a shared [`KeyManager`].
+///
+/// Wraps the manager in an [`Arc<RwLock<_>>`] so the UI can keep mutating
+/// the identity (generate, unlock, switch agent key) while the backend
+/// holds a long-lived signer that always reflects the latest state.
+///
+/// Locking is brief: we snapshot the source + cached key under the lock,
+/// release it, then do any async work (SSH-agent IPC) without holding it.
+pub struct KeyManagerSigner {
+    inner: Arc<RwLock<KeyManager>>,
+}
+
+impl KeyManagerSigner {
+    pub fn new(inner: Arc<RwLock<KeyManager>>) -> Self {
+        Self { inner }
+    }
+}
+
+#[async_trait]
+impl KeySigning for KeyManagerSigner {
+    async fn sign(&self, _public_key: &[u8; 32], payload: &[u8]) -> anyhow::Result<[u8; 64]> {
+        let (source, cached_key) = {
+            let km = self
+                .inner
+                .read()
+                .map_err(|_| anyhow::anyhow!("KeyManager lock poisoned"))?;
+            let config = km
+                .config
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("No identity configured"))?;
+            (config.source.clone(), km.cached_signing_key.clone())
+        };
+
+        match source {
+            KeySource::LocalPlaintext { private_key_hex } => {
+                use ed25519_dalek::Signer;
+                let signing_key =
+                    parse_signing_key(&private_key_hex).ok_or_else(|| anyhow::anyhow!("Invalid stored private key"))?;
+                Ok(signing_key.sign(payload).to_bytes())
+            }
+            KeySource::LocalEncrypted { .. } => {
+                use ed25519_dalek::Signer;
+                let sk = cached_key.ok_or_else(|| anyhow::anyhow!("Encrypted identity not unlocked"))?;
+                Ok(sk.sign(payload).to_bytes())
+            }
+            #[cfg(feature = "ssh-agent")]
+            KeySource::SshAgent { fingerprint, .. } => {
+                let mut client = SshAgentClient::connect().await?;
+                client.sign(&fingerprint, payload).await
+            }
+            #[cfg(not(feature = "ssh-agent"))]
+            KeySource::SshAgent { .. } => anyhow::bail!("ssh-agent feature is disabled"),
+        }
+    }
 }
 
 // =============================================================================
@@ -628,44 +650,6 @@ pub async fn generate_and_add_to_agent(comment: String) -> anyhow::Result<KeyInf
     client.add_key(&signing_key, &comment).await?;
 
     Ok(KeyInfo::from_public_key(public_key, comment))
-}
-
-/// Build a SigningCallback that hits the SSH agent on every signature.
-///
-/// `SigningCallback` is sync, but the agent client is async. To avoid
-/// nested-runtime issues we spawn a one-shot thread per signature. This
-/// is fine for the handshake but would be wasteful for high-frequency
-/// signing — keep an eye on it if we ever add periodic re-auth.
-#[cfg(feature = "ssh-agent")]
-pub fn create_agent_signer(fingerprint: String) -> rumble_client::SigningCallback {
-    Arc::new(move |payload: &[u8]| {
-        let fingerprint = fingerprint.clone();
-        let payload = payload.to_vec();
-
-        let (tx, rx) = std::sync::mpsc::channel();
-
-        std::thread::spawn(move || {
-            let result = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| format!("Failed to create runtime: {}", e))
-                .and_then(|rt| {
-                    rt.block_on(async {
-                        let mut client = SshAgentClient::connect()
-                            .await
-                            .map_err(|e| format!("Failed to connect to agent: {}", e))?;
-
-                        client
-                            .sign(&fingerprint, &payload)
-                            .await
-                            .map_err(|e| format!("Signing failed: {}", e))
-                    })
-                });
-            let _ = tx.send(result);
-        });
-
-        rx.recv().map_err(|e| format!("Channel receive error: {}", e))?
-    })
 }
 
 #[cfg(test)]

@@ -10,7 +10,10 @@ path = "src/main.rs"
 [dependencies]
 rumble-protocol = { path = "../rumble-protocol" }
 rumble-client-traits = { path = "../rumble-client-traits" }
-rumble-desktop = { path = "../rumble-desktop" }
+# The bridge is a server-side daemon; it uses rumble-desktop only for the QUIC
+# transport pieces and never opens audio devices. Disable default features to
+# drop the libpulse runtime dep — keeps the docker image tiny.
+rumble-desktop = { path = "../rumble-desktop", default-features = false }
 tokio = { version = "1", features = ["full"] }
 prost = "0.14"
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }

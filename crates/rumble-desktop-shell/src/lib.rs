@@ -12,7 +12,9 @@ pub use hotkeys::{
     HotkeyAction, HotkeyBinding, HotkeyEvent, HotkeyManager, HotkeyModifiers, HotkeyRegistrationStatus,
     KeyboardSettings,
 };
-pub use identity::{KeyConfig, KeyInfo, KeyManager, KeySource, compute_fingerprint, parse_signing_key};
+pub use identity::{
+    KeyConfig, KeyInfo, KeyManager, KeyManagerSigner, KeySource, compute_fingerprint, parse_signing_key,
+};
 pub use settings::{
     AcceptedCertificate, AutoDownloadRule, ChatSettings, FileTransferSettings, PersistentAudioSettings,
     PersistentVoiceMode, RecentServer, Settings, SettingsStore, SfxSettings, TimestampFormat,

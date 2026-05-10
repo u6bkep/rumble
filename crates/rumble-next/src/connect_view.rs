@@ -500,7 +500,6 @@ fn commit_and_connect<B: UiBackend>(
         addr,
         name: username,
         public_key,
-        signer: identity.signer(),
         password,
     });
 }

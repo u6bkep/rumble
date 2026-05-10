@@ -5,8 +5,16 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-default = ["pulse"]
-pulse = ["dep:libpulse-binding", "dep:libpulse-simple-binding"]
+default = ["audio", "codec", "pulse"]
+# Cpal-based audio capture/playback (alsa on Linux, CoreAudio on macOS, WASAPI
+# on Windows). Drop for server-side daemons that never open audio devices
+# (e.g. mumble-bridge).
+audio = ["dep:cpal"]
+# Linux PulseAudio backend. Implies `audio` since `DesktopAudioBackend` only
+# adds the Pulse variant when this is on.
+pulse = ["audio", "dep:libpulse-binding", "dep:libpulse-simple-binding"]
+# Opus voice codec. Drop for daemons that just relay opaque opus payloads.
+codec = ["dep:opus"]
 
 [dependencies]
 rumble-client-traits = { path = "../rumble-client-traits" }
@@ -23,29 +31,15 @@ bytes = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "io-util", "net", "fs", "sync"] }
 prost = "0.14"
 
-# Audio
-cpal = "0.17.0"
+# Audio (gated by `audio` feature)
+cpal = { version = "0.17.0", optional = true }
 
-# Codec
-opus = { git = "https://github.com/u6bkep/opus-rs.git", rev = "2c545dc" }
-
-# Storage
-directories = "6.0"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-
-# Key Management
-ed25519-dalek = { workspace = true }
-rand = { workspace = true }
-rand_core = { workspace = true }
-hex = "0.4"
-argon2 = "0.5"
-chacha20poly1305 = "0.10"
-ssh-agent-lib = "0.5"
-ssh-key = { version = "0.6", features = ["ed25519"] }
-service-binding = "3.0"
+# Codec (gated by `codec` feature)
+opus = { git = "https://github.com/u6bkep/opus-rs.git", rev = "2c545dc", optional = true }
 
 # File transfer relay
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 uuid = { version = "1.19.0", features = ["v4"] }
 mime_guess = "2"
 parking_lot = "0.12"

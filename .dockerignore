@@ -1,0 +1,20 @@
+# Build context trimming for docker/*.Dockerfile.
+# Mirror .gitignore plus things we never want sent to the daemon.
+
+target/
+vendor/
+data/
+certs/
+chat_logs/
+client_configs/
+reference/
+.venv/
+.idea/
+.git/
+.github/
+.claude/
+crates/rumble-aetna/out/
+
+# Editor/OS junk
+*.swp
+.DS_Store

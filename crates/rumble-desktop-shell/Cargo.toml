@@ -28,9 +28,11 @@ base64 = "0.22"
 hex = "0.4"
 sha2 = "0.10"
 anyhow = "1.0"
+async-trait = "0.1"
 ed25519-dalek = { workspace = true }
 rand = { workspace = true }
 rumble-client = { path = "../rumble-client" }
+rumble-client-traits = { path = "../rumble-client-traits" }
 # Tokio is on the hotkey API surface (init_portal_backend takes a Handle)
 # even on non-Linux platforms, so it's unconditional.
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros"] }

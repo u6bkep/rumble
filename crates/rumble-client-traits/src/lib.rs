@@ -11,7 +11,6 @@ pub mod codec;
 pub mod file_transfer;
 pub mod keys;
 pub mod platform;
-pub mod storage;
 pub mod transport;
 
 // Re-export key types
@@ -25,9 +24,8 @@ pub use file_transfer::{
     FileOffer, FileTransferPlugin, PluginPeerConnectionType, PluginPeerInfo, PluginPeerState, PluginTransferState,
     TransferId, TransferStatus,
 };
-pub use keys::{KeyInfo, KeySigning, KeySource};
+pub use keys::KeySigning;
 pub use platform::Platform;
-pub use storage::PersistentStorage;
 pub use transport::{
     BiRecvStream, BiSendStream, BiStreamHandle, BiStreamOpener, DatagramTransport, StreamHeader, StreamOpener,
     TlsConfig, Transport, TransportRecvStream, read_exact,

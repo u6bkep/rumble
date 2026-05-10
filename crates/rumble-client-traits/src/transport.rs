@@ -82,7 +82,9 @@ pub async fn read_exact(recv: &mut (impl BiRecvStream + ?Sized), buf: &mut [u8])
 /// TLS configuration for transport connections.
 pub struct TlsConfig {
     pub accept_invalid_certs: bool,
-    /// DER-encoded additional CA certificates.
+    /// Additional CA certificates to trust. Each entry is the raw file bytes —
+    /// either DER (binary) or PEM (begins with `-----BEGIN`). The transport
+    /// implementation is responsible for detecting the format and converting.
     pub additional_ca_certs: Vec<Vec<u8>>,
     /// SHA-256 fingerprints of accepted server certificates.
     pub accepted_fingerprints: Vec<[u8; 32]>,

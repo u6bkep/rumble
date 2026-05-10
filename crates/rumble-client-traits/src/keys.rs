@@ -1,43 +1,23 @@
-//! Key management and signing abstraction.
+//! Identity signing abstraction.
+//!
+//! The engine signs auth challenges during the QUIC handshake via this trait.
+//! `sign` is async so implementations can reach out to hardware-backed
+//! keystores (SSH agent, macOS Keychain, Android Keystore, iOS Secure Enclave,
+//! etc.) without blocking the calling task.
 
 use async_trait::async_trait;
 
-pub use rumble_protocol::SigningCallback;
-
-/// Information about a signing key.
-#[derive(Debug, Clone)]
-pub struct KeyInfo {
-    /// The 32-byte Ed25519 public key.
-    pub public_key: [u8; 32],
-    /// Human-readable label for the key.
-    pub label: String,
-    /// Where the key is stored/managed.
-    pub source: KeySource,
-}
-
-/// Where a key is stored/managed.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum KeySource {
-    /// Local key file on disk.
-    Local,
-    /// SSH agent.
-    SshAgent,
-    /// Generated in-memory (ephemeral, not persisted).
-    Ephemeral,
-}
-
-/// Platform key management: listing, signing, generating, and importing keys.
+/// Identity signing — the only key-manager surface the client engine needs.
+///
+/// Higher-level concerns (key generation, on-disk storage, password unlock,
+/// agent enumeration) live in the app or shell layer; they are not part of
+/// this trait.
 #[async_trait]
 pub trait KeySigning: Send + Sync + 'static {
-    /// List all available signing keys.
-    async fn list_keys(&self) -> anyhow::Result<Vec<KeyInfo>>;
-
-    /// Get a synchronous signing callback for the given public key.
-    async fn get_signer(&self, public_key: &[u8; 32]) -> anyhow::Result<SigningCallback>;
-
-    /// Generate a new Ed25519 key pair and persist it with the given label.
-    async fn generate_key(&self, label: &str) -> anyhow::Result<KeyInfo>;
-
-    /// Import an existing private key and persist it with the given label.
-    async fn import_key(&self, private_key: &[u8; 32], label: &str) -> anyhow::Result<KeyInfo>;
+    /// Sign `payload` with the private half of `public_key`.
+    ///
+    /// Returns the 64-byte Ed25519 signature. `public_key` lets a
+    /// multi-identity implementation pick the right key; single-identity
+    /// implementations may ignore it.
+    async fn sign(&self, public_key: &[u8; 32], payload: &[u8]) -> anyhow::Result<[u8; 64]>;
 }

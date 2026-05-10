@@ -70,9 +70,9 @@ pub use audio_task::{AudioCommand, AudioTaskConfig, AudioTaskHandle, spawn_audio
 pub mod audio_dump;
 pub use audio_dump::{AudioDumpConfig, AudioDumper};
 
-// Certificate verification for self-signed cert handling
-pub mod cert_verifier;
-pub use cert_verifier::{
+// Certificate-handling types live in rumble-client-traits; re-export for
+// callers that have historically imported them as `rumble_client::...`.
+pub use rumble_client_traits::cert::{
     CapturedCert, ServerCertInfo, compute_sha256_fingerprint, is_cert_error_message, new_captured_cert,
     peek_captured_cert, take_captured_cert,
 };

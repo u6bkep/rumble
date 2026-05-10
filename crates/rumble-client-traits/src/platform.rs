@@ -1,23 +1,21 @@
-//! Platform bundle trait that ties together all platform-specific abstractions.
+//! Platform bundle trait that ties together the engine's platform-specific
+//! associated types.
 
 use std::{path::PathBuf, sync::Arc};
 
-use crate::{
-    FileTransferPlugin, StreamOpener, audio::AudioBackend, codec::VoiceCodec, keys::KeySigning,
-    storage::PersistentStorage, transport::Transport,
-};
+use crate::{FileTransferPlugin, StreamOpener, audio::AudioBackend, codec::VoiceCodec, transport::Transport};
 
-/// Bundle trait grouping all platform-specific associated types.
+/// Bundle trait grouping the platform-specific associated types the engine
+/// consumes generically.
 ///
-/// A concrete `Platform` implementation selects the transport, audio backend,
-/// codec, persistent storage, and key-signing strategy for a given target
-/// (e.g. native desktop vs. web).
+/// Key signing is intentionally *not* an associated type here — the engine
+/// holds an `Arc<dyn KeySigning>` provided by the app, which keeps multiple
+/// identity sources (e.g. shell SSH agent + macOS Keychain) selectable at
+/// runtime without re-parameterising `BackendHandle`.
 pub trait Platform: Send + Sync + 'static {
     type Transport: Transport;
     type AudioBackend: AudioBackend;
     type Codec: VoiceCodec;
-    type Storage: PersistentStorage;
-    type KeyManager: KeySigning;
 
     /// Create the file transfer plugin for this platform, if supported.
     ///

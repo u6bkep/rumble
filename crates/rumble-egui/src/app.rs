@@ -447,7 +447,7 @@ pub struct RumbleApp {
     client_name: String,
 
     // Key manager for Ed25519 identity
-    key_manager: KeyManager,
+    key_manager: std::sync::Arc<std::sync::RwLock<KeyManager>>,
 
     // First-run setup state (shown if no key is configured)
     first_run_state: FirstRunState,
@@ -691,13 +691,20 @@ impl RumbleApp {
             }
         }
 
-        // Create backend handle with repaint callback
+        // Wrap key_manager in Arc<RwLock> so the long-lived backend signer
+        // and the UI both share the same state.
+        let key_manager = std::sync::Arc::new(std::sync::RwLock::new(key_manager));
+        let signer: std::sync::Arc<dyn rumble_client_traits::KeySigning> =
+            std::sync::Arc::new(rumble_desktop_shell::KeyManagerSigner::new(key_manager.clone()));
+
+        // Create backend handle with repaint callback + signer
         let ctx_for_repaint = ctx.clone();
         let backend = BackendHandle::with_config(
             move || {
                 ctx_for_repaint.request_repaint();
             },
             config,
+            signer,
         );
 
         // Apply persistent audio settings to backend
@@ -1005,33 +1012,25 @@ impl RumbleApp {
 
     /// Connect to the server using current settings.
     fn connect(&mut self) {
-        // Check if we have a key configured and can create a signer
-        let public_key = match self.key_manager.public_key_bytes() {
-            Some(key) => key,
-            None => {
-                self.backend.send(Command::LocalMessage {
-                    text: "Cannot connect: No identity key configured. Please complete first-run setup.".to_string(),
-                });
-                return;
-            }
+        // Check if we have a key configured and unlocked. Signing itself is
+        // wired through the shared `KeyManagerSigner` installed on the
+        // BackendHandle at construction; we just gate here for the UX message.
+        let (public_key, needs_unlock) = {
+            let km = self.key_manager.read().unwrap();
+            (km.public_key_bytes(), km.needs_unlock())
         };
-
-        let signer = match self.key_manager.create_signer() {
-            Some(s) => s,
-            None => {
-                // Check if key needs unlocking
-                if self.key_manager.needs_unlock() {
-                    self.backend.send(Command::LocalMessage {
-                        text: "Cannot connect: Key is encrypted. Please unlock it in settings.".to_string(),
-                    });
-                } else {
-                    self.backend.send(Command::LocalMessage {
-                        text: "Cannot connect: Failed to create signer for key.".to_string(),
-                    });
-                }
-                return;
-            }
+        let Some(public_key) = public_key else {
+            self.backend.send(Command::LocalMessage {
+                text: "Cannot connect: No identity key configured. Please complete first-run setup.".to_string(),
+            });
+            return;
         };
+        if needs_unlock {
+            self.backend.send(Command::LocalMessage {
+                text: "Cannot connect: Key is encrypted. Please unlock it in settings.".to_string(),
+            });
+            return;
+        }
 
         let addr = if self.connect_address.trim().is_empty() {
             "127.0.0.1:5000".to_string()
@@ -1053,7 +1052,6 @@ impl RumbleApp {
             addr,
             name,
             public_key,
-            signer,
             password,
         });
     }
@@ -1334,7 +1332,8 @@ impl RumbleApp {
         ui.heading("Identity");
         ui.add_space(4.0);
 
-        if let Some(public_key_hex) = self.key_manager.public_key_hex() {
+        let km_read = self.key_manager.read().unwrap();
+        if let Some(public_key_hex) = km_read.public_key_hex() {
             ui.horizontal(|ui| {
                 ui.label("Public Key:");
                 // Show truncated key with copy button
@@ -1346,7 +1345,7 @@ impl RumbleApp {
             });
 
             // Show key source
-            if let Some(config) = self.key_manager.config() {
+            if let Some(config) = km_read.config() {
                 let source_desc = match &config.source {
                     KeySource::LocalPlaintext { .. } => "Local (unencrypted)",
                     KeySource::LocalEncrypted { .. } => "Local (password protected)",
@@ -1359,6 +1358,7 @@ impl RumbleApp {
             }
 
             ui.add_space(8.0);
+            drop(km_read);
             if ui
                 .button("🔑 Generate New Identity...")
                 .on_hover_text("Generate a new identity key (will replace the current one)")
@@ -1367,6 +1367,7 @@ impl RumbleApp {
                 self.first_run_state = FirstRunState::SelectMethod;
             }
         } else {
+            drop(km_read);
             ui.colored_label(egui::Color32::YELLOW, "⚠ No identity key configured");
             if ui.button("🔑 Configure Identity...").clicked() {
                 self.first_run_state = FirstRunState::SelectMethod;
@@ -3153,7 +3154,7 @@ impl RumbleApp {
                             match self.tokio_handle.block_on(handle) {
                                 Ok(Ok(key_info)) => {
                                     // Save the key config
-                                    if let Err(e) = self.key_manager.select_agent_key(&key_info) {
+                                    if let Err(e) = self.key_manager.write().unwrap().select_agent_key(&key_info) {
                                         self.first_run_state = FirstRunState::Error {
                                             message: format!("Failed to save key config: {}", e),
                                         };
@@ -3187,10 +3188,12 @@ impl RumbleApp {
         // Handle key generation if requested
         if let Some(password_opt) = generate_key_password {
             let password_str = password_opt.as_deref();
-            match self.key_manager.generate_local_key(password_str) {
+            let mut km = self.key_manager.write().unwrap();
+            match km.generate_local_key(password_str) {
                 Ok(key_info) => {
                     // Get the signing key
-                    self.signing_key = self.key_manager.signing_key().cloned();
+                    self.signing_key = km.signing_key().cloned();
+                    drop(km);
                     self.first_run_state = FirstRunState::Complete;
 
                     self.backend.send(Command::LocalMessage {
@@ -3198,6 +3201,7 @@ impl RumbleApp {
                     });
                 }
                 Err(e) => {
+                    drop(km);
                     self.first_run_state = FirstRunState::GenerateLocal {
                         password: password_opt.clone().unwrap_or_default(),
                         password_confirm: password_opt.unwrap_or_default(),
@@ -3209,7 +3213,7 @@ impl RumbleApp {
 
         // Handle selecting an agent key
         if let Some(key_info) = select_agent_key {
-            match self.key_manager.select_agent_key(&key_info) {
+            match self.key_manager.write().unwrap().select_agent_key(&key_info) {
                 Ok(()) => {
                     // Agent keys don't have a signing_key cached locally
                     self.signing_key = None;

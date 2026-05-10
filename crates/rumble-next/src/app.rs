@@ -169,11 +169,13 @@ impl App<NativeUiBackend> {
         egui_extras::install_image_loaders(&cc.egui_ctx);
 
         let ctx_for_repaint = cc.egui_ctx.clone();
+        let signer = initial.identity.signer();
         let backend = BackendHandle::with_config(
             move || {
                 ctx_for_repaint.request_repaint();
             },
             config,
+            signer,
         );
         Self::from_initial_state(cc, NativeUiBackend::new(backend), initial)
     }
@@ -395,7 +397,6 @@ impl<B: UiBackend> eframe::App for App<B> {
                 addr: target.0,
                 name: target.1,
                 public_key: self.identity.public_key().expect("checked above"),
-                signer: self.identity.signer(),
                 password: None,
             });
             self.auto_connect_pending = false;

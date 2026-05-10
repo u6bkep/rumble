@@ -16,7 +16,8 @@
 pub mod key_manager;
 
 pub use key_manager::{
-    AgentResult, KeyConfig, KeyInfo, KeyManager, KeySource, SetupResult, compute_fingerprint, parse_signing_key,
+    AgentResult, KeyConfig, KeyInfo, KeyManager, KeyManagerSigner, KeySource, SetupResult, compute_fingerprint,
+    parse_signing_key,
 };
 
 #[cfg(feature = "ssh-agent")]
