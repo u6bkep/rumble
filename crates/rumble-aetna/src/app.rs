@@ -970,6 +970,22 @@ impl<B: UiBackend> App for RumbleApp<B> {
             return;
         }
         if let Some(active) = self.active_video.as_mut() {
+            // Keyboard shortcuts: arrows (seek ±5s, +Shift =
+            // ±30s), Home/End (seek to start/end), M (mute).
+            // Space is handled separately via Activate routed to
+            // the focused surface — aetna translates focused-
+            // Space into Activate before KeyDown reaches us.
+            if video::handle_lightbox_key(active, &event) {
+                return;
+            }
+            // Click or Space/Enter on the surface itself toggles
+            // play. Conventional video-player behaviour and the
+            // primary path for play/pause once focus has landed
+            // anywhere inside the lightbox.
+            if event.is_click_or_activate(video::KEY_LIGHTBOX_SURFACE) {
+                active.toggle_play();
+                return;
+            }
             if event.is_click_or_activate(video::KEY_PLAY_PAUSE) {
                 active.toggle_play();
                 return;
@@ -1720,6 +1736,14 @@ impl<B: UiBackend> RumbleApp<B> {
     /// here: we drop both before kicking off the new open so a
     /// rapid re-click doesn't leak a libmpv handle.
     fn open_video_lightbox(&mut self, transfer_id: &str) {
+        // Re-clicking the same Play button while the lightbox is
+        // already open is a no-op — avoids dropping the running
+        // libmpv handle and re-opening from scratch when a
+        // stale Activate (e.g. focus left on the chat-side
+        // preview, user hits Space) sends us the same id.
+        if self.active_video.as_ref().map(|a| a.transfer_id.as_str()) == Some(transfer_id) {
+            return;
+        }
         // Find the file's name + path from the live transfer set.
         // Bail if the transfer was GC'd between the click and the
         // event firing.

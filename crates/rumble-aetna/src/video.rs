@@ -205,6 +205,59 @@ impl ActiveVideo {
         }
     }
 
+    /// Seek `delta_secs` relative to the current playhead.
+    /// Negative steps backward, positive forward; clamps the
+    /// target into `[0, duration]`. Used by the keyboard
+    /// shortcuts for arrow-key seek. No-op when time-pos /
+    /// duration aren't available yet.
+    pub fn seek_relative(&mut self, delta_secs: f64) {
+        let pos = match self.stream.time_pos() {
+            Ok(Some(d)) => d.as_secs_f64(),
+            _ => return,
+        };
+        let dur = match self.stream.duration() {
+            Ok(Some(d)) => d.as_secs_f64(),
+            _ => return,
+        };
+        let target = (pos + delta_secs).clamp(0.0, dur);
+        if let Err(e) = self.stream.seek(Duration::from_secs_f64(target)) {
+            tracing::warn!(error = %e, "video: seek_relative failed");
+        }
+        // Reflect the new position in the scrub bar immediately
+        // so the thumb doesn't visibly trail by one
+        // refresh_scrub_value cycle. The next frame's refresh
+        // will overwrite this from time-pos anyway, but the
+        // initial paint after the keypress feels much snappier.
+        if dur > f64::EPSILON {
+            self.scrub_value = (target / dur) as f32;
+        }
+    }
+
+    /// Seek to start (0) or end (just before duration) of the
+    /// stream. The "just before" matters for non-looped streams:
+    /// landing exactly on duration tends to immediately fire
+    /// END_FILE rather than displaying the last frame.
+    pub fn seek_to_edge(&mut self, end: bool) {
+        if !end {
+            self.seek_normalized(0.0);
+            return;
+        }
+        let dur = match self.stream.duration() {
+            Ok(Some(d)) => d.as_secs_f64(),
+            _ => return,
+        };
+        // Park 250ms shy of the very end so loop-file=inf has a
+        // moment to wrap around without snapping to the first
+        // frame mid-keypress.
+        let target = (dur - 0.25).max(0.0);
+        if let Err(e) = self.stream.seek(Duration::from_secs_f64(target)) {
+            tracing::warn!(error = %e, "video: seek_to_edge failed");
+        }
+        if dur > f64::EPSILON {
+            self.scrub_value = (target / dur) as f32;
+        }
+    }
+
     /// Refresh the scrub-bar display from the live playback head
     /// when the user isn't actively dragging. Called once per
     /// frame from `App::before_build`.
@@ -220,6 +273,67 @@ impl ActiveVideo {
             self.scrub_value = (pos.as_secs_f64() / dur.as_secs_f64()) as f32;
             self.scrub_value = self.scrub_value.clamp(0.0, 1.0);
         }
+    }
+}
+
+// ---- Keyboard shortcuts ----
+
+/// Seek step, in seconds, applied by Left/Right without modifiers.
+/// Tuned to match common video-player muscle memory (mpv defaults
+/// to 5s, VLC to 10s; we land in between).
+const SEEK_STEP_SMALL: f64 = 5.0;
+/// Coarser seek step for Shift+Left / Shift+Right. mpv uses 60s
+/// here; 30s feels less jarring for short chat clips.
+const SEEK_STEP_LARGE: f64 = 30.0;
+
+/// Try to handle `event` as a video-lightbox keyboard shortcut.
+/// Returns `true` if the event was consumed (the caller should
+/// `return` from `on_event` without further processing). Only
+/// inspects [`UiEventKind::KeyDown`] events — other event kinds
+/// are ignored (and pass through unchanged).
+pub fn handle_lightbox_key(active: &mut ActiveVideo, event: &UiEvent) -> bool {
+    if event.kind != UiEventKind::KeyDown {
+        return false;
+    }
+    let Some(kp) = event.key_press.as_ref() else {
+        return false;
+    };
+    let mods = kp.modifiers;
+    // Block all shortcuts when Ctrl/Alt/Logo are held — those
+    // belong to the OS / app-level chord namespace, not to the
+    // lightbox.
+    if mods.ctrl || mods.alt || mods.logo {
+        return false;
+    }
+
+    match &kp.key {
+        UiKey::Space if !mods.shift => {
+            active.toggle_play();
+            true
+        }
+        UiKey::ArrowLeft => {
+            let step = if mods.shift { SEEK_STEP_LARGE } else { SEEK_STEP_SMALL };
+            active.seek_relative(-step);
+            true
+        }
+        UiKey::ArrowRight => {
+            let step = if mods.shift { SEEK_STEP_LARGE } else { SEEK_STEP_SMALL };
+            active.seek_relative(step);
+            true
+        }
+        UiKey::Home if !mods.shift => {
+            active.seek_to_edge(false);
+            true
+        }
+        UiKey::End if !mods.shift => {
+            active.seek_to_edge(true);
+            true
+        }
+        UiKey::Character(s) if s.eq_ignore_ascii_case("m") && !mods.shift => {
+            active.toggle_mute();
+            true
+        }
+        _ => false,
     }
 }
 
@@ -305,8 +419,16 @@ fn lightbox_body(active: &ActiveVideo) -> El {
         None => text("Loading…").muted().width(Size::Fill(1.0)).height(Size::Fill(1.0)),
     };
 
+    // Focusable surface so keyboard events route here once the
+    // user clicks (or Tabs) to it. Click/Activate flips
+    // play/pause — matches YouTube / most native players. Once
+    // the surface is the focus target, Space → Activate fires
+    // here too (aetna translates Space-with-focus to Activate
+    // before our KeyDown handler ever sees it).
     stack([inner])
         .key(KEY_LIGHTBOX_SURFACE)
+        .focusable()
+        .cursor(Cursor::Pointer)
         .clip()
         .fill(tokens::CARD)
         .radius(tokens::RADIUS_MD)
