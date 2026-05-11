@@ -7,6 +7,7 @@ use std::{
     collections::{HashMap, HashSet},
     io::BufReader,
     path::{Path, PathBuf},
+    sync::LazyLock,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -32,7 +33,7 @@ use crate::{
     room_tree::{self, RoomTreeOutcome, RoomTreeState},
     server_picker::{self, ServerForm, ServerPickerOutcome, ServerPickerState},
     settings::{self, SettingsOutcome, SettingsState},
-    theme as palette, video,
+    video,
     wizard::{self, PendingAgentOp, UnlockState, WizardOutcome, WizardState},
 };
 
@@ -69,8 +70,11 @@ pub struct RumbleApp<B: UiBackend = crate::backend::NativeUiBackend> {
     /// Saved-server picker (disconnected center area + add/edit form).
     /// See [`crate::server_picker`].
     server_picker: ServerPickerState,
-    identity_modal_open: bool,
     settings_state: SettingsState,
+    /// Open flag for the toolbar transmission-mode dropdown. Drives the
+    /// popover layer composed below the trigger; cleared by Escape,
+    /// scrim click, or picking an option.
+    voice_mode_menu_open: bool,
     /// Force the unlock prompt visible regardless of `needs_unlock()`.
     /// Set by `set_unlock_state_for_test` so `dump_bundles` can render
     /// the prompt against a fresh on-disk identity that isn't actually
@@ -295,8 +299,8 @@ impl<B: UiBackend> RumbleApp<B> {
             unlock: UnlockState::default(),
             pending_agent_op: None,
             server_picker: ServerPickerState::default(),
-            identity_modal_open: false,
             settings_state: SettingsState::default(),
+            voice_mode_menu_open: false,
             force_unlock_for_test: false,
             default_username: default_username(),
             selection: Selection::default(),
@@ -558,12 +562,16 @@ impl<B: UiBackend> App for RumbleApp<B> {
             None
         };
 
-        let identity_layer =
-            if self.identity_modal_open && !wizard_open && unlock_layer.is_none() && cert_layer.is_none() {
-                Some(identity_modal(&self.identity))
-            } else {
-                None
-            };
+        let voice_mode_layer = if self.voice_mode_menu_open
+            && !wizard_open
+            && unlock_layer.is_none()
+            && cert_layer.is_none()
+            && state.connection.is_connected()
+        {
+            Some(voice_mode_menu(state.audio.voice_mode))
+        } else {
+            None
+        };
 
         let (settings_panel, settings_popover) = if !wizard_open && unlock_layer.is_none() && cert_layer.is_none() {
             settings::render(
@@ -664,7 +672,6 @@ impl<B: UiBackend> App for RumbleApp<B> {
         overlays(
             main,
             [
-                identity_layer,
                 connect_layer,
                 room_tree_overlays.room_context_menu,
                 room_tree_overlays.user_context_menu,
@@ -674,6 +681,7 @@ impl<B: UiBackend> App for RumbleApp<B> {
                 video_lightbox_layer,
                 file_ctx_layer,
                 drop_target_layer,
+                voice_mode_layer,
                 settings_panel,
                 settings_popover,
                 cert_layer,
@@ -1074,41 +1082,37 @@ impl<B: UiBackend> App for RumbleApp<B> {
             self.backend.send(Command::SetDeafened { deafened: !deafened });
             return;
         }
-        if event.is_click_or_activate("toolbar:voice-mode") {
-            let mode = self.backend.state().audio.voice_mode;
-            let next = match mode {
-                VoiceMode::PushToTalk => VoiceMode::Continuous,
-                VoiceMode::Continuous => VoiceMode::PushToTalk,
-            };
-            self.backend.send(Command::SetVoiceMode { mode: next });
+        if let Some(action) = aetna_core::widgets::select::classify_event(&event, KEY_TB_VOICE_MODE) {
+            use aetna_core::widgets::select::SelectAction;
+            match action {
+                SelectAction::Toggle => self.voice_mode_menu_open = !self.voice_mode_menu_open,
+                SelectAction::Dismiss => self.voice_mode_menu_open = false,
+                SelectAction::Pick(value) => {
+                    let next = match value.as_str() {
+                        "ptt" => Some(VoiceMode::PushToTalk),
+                        "cont" => Some(VoiceMode::Continuous),
+                        _ => None,
+                    };
+                    if let Some(mode) = next {
+                        self.backend.send(Command::SetVoiceMode { mode });
+                    }
+                    self.voice_mode_menu_open = false;
+                }
+                _ => {}
+            }
+            return;
+        }
+        if self.voice_mode_menu_open && event.kind == UiEventKind::Escape {
+            self.voice_mode_menu_open = false;
             return;
         }
         if event.is_click_or_activate("toolbar:disconnect") {
             self.backend.send(Command::Disconnect);
             return;
         }
-        if event.is_click_or_activate("toolbar:identity") {
-            self.identity_modal_open = true;
-            return;
-        }
         if event.is_click_or_activate("toolbar:settings") {
             let snapshot = self.backend.state();
             self.settings_state.open_with(&snapshot.audio, self.settings.settings());
-            return;
-        }
-        if event.is_click_or_activate("identity:close")
-            || event.is_route("identity:dismiss") && event.kind == UiEventKind::Click
-            || (self.identity_modal_open && event.kind == UiEventKind::Escape)
-        {
-            self.identity_modal_open = false;
-            return;
-        }
-        if event.is_click_or_activate("identity:regenerate") {
-            // Drop the modal, re-enter the wizard. Existing key on disk
-            // is *not* deleted yet — only overwritten if the user
-            // actually completes a Generate / Select flow.
-            self.identity_modal_open = false;
-            self.wizard = WizardState::SelectMethod;
             return;
         }
 
@@ -2500,9 +2504,9 @@ impl<B: UiBackend> RumbleApp<B> {
         self.force_unlock_for_test = true;
     }
 
-    /// Test/scene-dump hook for the toolbar "Identity" modal.
-    pub fn set_identity_modal_open_for_test(&mut self, open: bool) {
-        self.identity_modal_open = open;
+    /// Test/scene-dump hook for the toolbar transmission-mode dropdown.
+    pub fn set_voice_mode_menu_open_for_test(&mut self, open: bool) {
+        self.voice_mode_menu_open = open;
     }
 
     /// Test/scene-dump hook for the settings dialog. Snapshots the
@@ -2568,6 +2572,30 @@ impl<B: UiBackend> RumbleApp<B> {
 
 const CHAT_SIDEBAR_HANDLE: &str = "chat-sidebar:resize";
 
+// Toolbar icon glyphs. Reused from the bundled Mumble theme — the
+// Mumble paint baked into each SVG is the visual signal we want
+// (red for mute, green for active sound, orange for PTT), so we
+// `parse` (not `parse_current_color`) and skip `.text_color(...)`.
+static SVG_TB_MIC_ON: LazyLock<SvgIcon> =
+    LazyLock::new(|| SvgIcon::parse(include_str!("../assets/icons/talking_off.svg")).expect("talking_off.svg parses"));
+static SVG_TB_MIC_OFF: LazyLock<SvgIcon> =
+    LazyLock::new(|| SvgIcon::parse(include_str!("../assets/icons/muted_self.svg")).expect("muted_self.svg parses"));
+static SVG_TB_SOUND_ON: LazyLock<SvgIcon> = LazyLock::new(|| {
+    SvgIcon::parse(include_str!("../assets/icons/self_undeafened.svg")).expect("self_undeafened.svg parses")
+});
+static SVG_TB_SOUND_OFF: LazyLock<SvgIcon> = LazyLock::new(|| {
+    SvgIcon::parse(include_str!("../assets/icons/deafened_self.svg")).expect("deafened_self.svg parses")
+});
+static SVG_TB_MODE_CONT: LazyLock<SvgIcon> =
+    LazyLock::new(|| SvgIcon::parse(include_str!("../assets/icons/talking_off.svg")).expect("talking_off.svg parses"));
+static SVG_TB_MODE_PTT: LazyLock<SvgIcon> = LazyLock::new(|| {
+    SvgIcon::parse(include_str!("../assets/icons/muted_pushtomute.svg")).expect("muted_pushtomute.svg parses")
+});
+static SVG_TB_DISCONNECT: LazyLock<SvgIcon> =
+    LazyLock::new(|| SvgIcon::parse(include_str!("../assets/icons/disconnect.svg")).expect("disconnect.svg parses"));
+
+const KEY_TB_VOICE_MODE: &str = "toolbar:voice-mode";
+
 fn top_toolbar(state: &State) -> El {
     let connected = matches!(state.connection, ConnectionState::Connected { .. });
 
@@ -2581,42 +2609,44 @@ fn top_toolbar(state: &State) -> El {
         }
     };
 
-    // Mute / deafen indicators.
-    let mute_label = if state.audio.self_muted { "Muted" } else { "Mic" };
-    let deafen_label = if state.audio.self_deafened { "Deafened" } else { "Sound" };
-    let voice_mode_label = match state.audio.voice_mode {
-        VoiceMode::PushToTalk => "PTT",
-        VoiceMode::Continuous => "Continuous",
-    };
-
     let mut children: Vec<El> = vec![text("Rumble").title(), status, spacer()];
 
     if connected {
-        let mute_btn = button(mute_label).key("toolbar:mute");
-        let mute_btn = if state.audio.self_muted {
-            mute_btn.text_color(palette::MUTED_SELF)
+        let (mute_icon, mute_tip) = if state.audio.self_muted {
+            (SVG_TB_MIC_OFF.clone(), "Unmute microphone")
         } else {
-            mute_btn.text_color(palette::TALKING)
+            (SVG_TB_MIC_ON.clone(), "Mute microphone")
         };
-        children.push(mute_btn);
+        children.push(icon_button(mute_icon).key("toolbar:mute").tooltip(mute_tip));
 
-        let deafen_btn = button(deafen_label).key("toolbar:deafen");
-        let deafen_btn = if state.audio.self_deafened {
-            deafen_btn.text_color(palette::MUTED_SELF)
+        let (deafen_icon, deafen_tip) = if state.audio.self_deafened {
+            (SVG_TB_SOUND_OFF.clone(), "Undeafen")
         } else {
-            deafen_btn
+            (SVG_TB_SOUND_ON.clone(), "Deafen")
         };
-        children.push(deafen_btn);
+        children.push(icon_button(deafen_icon).key("toolbar:deafen").tooltip(deafen_tip));
 
-        children.push(button(voice_mode_label).key("toolbar:voice-mode").ghost());
-        children.push(button("Disconnect").key("toolbar:disconnect").secondary());
+        let (mode_icon, mode_tip) = match state.audio.voice_mode {
+            VoiceMode::PushToTalk => (SVG_TB_MODE_PTT.clone(), "Voice mode: Push-to-Talk"),
+            VoiceMode::Continuous => (SVG_TB_MODE_CONT.clone(), "Voice mode: Continuous"),
+        };
+        children.push(voice_mode_trigger(mode_icon, mode_tip));
+
+        children.push(
+            icon_button(SVG_TB_DISCONNECT.clone())
+                .key("toolbar:disconnect")
+                .tooltip("Disconnect from server"),
+        );
     }
     // When disconnected, the center area renders the saved-server picker
     // (with its own "Add server…" / Connect / Edit / Remove controls), so
     // we don't add a redundant toolbar-level connect entry point here.
 
-    children.push(button("Identity").key("toolbar:identity").ghost());
-    children.push(button("Settings").key("toolbar:settings").ghost());
+    children.push(
+        icon_button(IconName::Settings)
+            .key("toolbar:settings")
+            .tooltip("Settings"),
+    );
 
     row(children)
         .gap(tokens::SPACE_2)
@@ -2625,6 +2655,46 @@ fn top_toolbar(state: &State) -> El {
         .width(Size::Fill(1.0))
         .fill(tokens::ACCENT)
         .align(Align::Center)
+}
+
+/// Voice-mode dropdown trigger: an icon button paired with a chevron
+/// so it reads as a select. The trigger key is `KEY_TB_VOICE_MODE`;
+/// the popover (`voice_mode_menu`) anchors below it.
+fn voice_mode_trigger(mode_icon: SvgIcon, tooltip_text: &str) -> El {
+    row([
+        icon(mode_icon).icon_size(tokens::ICON_SM),
+        icon(IconName::ChevronDown)
+            .icon_size(tokens::ICON_SM)
+            .text_color(tokens::MUTED_FOREGROUND),
+    ])
+    .key(KEY_TB_VOICE_MODE)
+    .gap(tokens::SPACE_1)
+    .align(Align::Center)
+    .padding(Sides::xy(tokens::SPACE_2, 0.0))
+    .height(Size::Fixed(tokens::CONTROL_HEIGHT))
+    .fill(tokens::SECONDARY)
+    .stroke(tokens::BORDER)
+    .radius(tokens::RADIUS_MD)
+    .focusable()
+    .paint_overflow(Sides::all(tokens::RING_WIDTH))
+    .cursor(Cursor::Pointer)
+    .tooltip(tooltip_text)
+}
+
+/// Voice-mode dropdown popover panel. Composed at root via `popover`
+/// so it paints over the toolbar surface.
+fn voice_mode_menu(current: VoiceMode) -> El {
+    use aetna_core::widgets::popover::{Anchor, menu_item, popover, popover_panel};
+    let cont_label = if current == VoiceMode::Continuous { "Continuous (VAD) ✓" } else { "Continuous (VAD)" };
+    let ptt_label = if current == VoiceMode::PushToTalk { "Push-to-Talk ✓" } else { "Push-to-Talk" };
+    popover(
+        KEY_TB_VOICE_MODE,
+        Anchor::below_key(KEY_TB_VOICE_MODE),
+        popover_panel([
+            menu_item(cont_label).key(format!("{KEY_TB_VOICE_MODE}:option:cont")),
+            menu_item(ptt_label).key(format!("{KEY_TB_VOICE_MODE}:option:ptt")),
+        ]),
+    )
 }
 
 fn center_area(state: &State, recent_servers: &[RecentServer], room_tree: &RoomTreeState) -> El {
@@ -2662,70 +2732,6 @@ fn cert_modal(cert_info: &PendingCertificate) -> El {
                 button("Reject").key("cert:reject"),
                 spacer(),
                 button("Trust and connect").key("cert:accept").primary(),
-            ])
-            .gap(tokens::SPACE_2)
-            .width(Size::Fill(1.0))
-            .align(Align::Center),
-        ],
-    )
-}
-
-fn identity_modal(identity: &Identity) -> El {
-    use rumble_desktop_shell::KeySource;
-
-    let fingerprint = identity.fingerprint();
-    let (source_label, detail) = match identity.manager().config().map(|c| &c.source) {
-        Some(KeySource::LocalPlaintext { .. }) => (
-            "Local key (plaintext)",
-            "Stored unencrypted at identity.json — fine for personal machines.".to_string(),
-        ),
-        Some(KeySource::LocalEncrypted { .. }) => (
-            "Local key (encrypted)",
-            "Encrypted with Argon2 + ChaCha20-Poly1305. Password required at startup.".to_string(),
-        ),
-        Some(KeySource::SshAgent {
-            fingerprint: agent_fp,
-            comment,
-        }) => {
-            let line = if comment.is_empty() {
-                format!("ssh-agent fingerprint: {agent_fp}")
-            } else {
-                format!("ssh-agent: {comment} ({agent_fp})")
-            };
-            ("SSH agent", line)
-        }
-        None => ("Not configured", "Run the identity wizard to set this up.".to_string()),
-    };
-    let path = identity.manager().config_dir().join("identity.json");
-
-    modal(
-        "identity",
-        "Rumble identity",
-        [
-            text("Fingerprint (SHA-256)").muted(),
-            mono(fingerprint).font_size(tokens::TEXT_XS.size).wrap_text(),
-            divider(),
-            text("Storage").muted(),
-            text(source_label.to_string()).semibold(),
-            paragraph(detail).muted().font_size(tokens::TEXT_XS.size),
-            text("On disk").muted(),
-            mono(path.display().to_string())
-                .font_size(tokens::TEXT_XS.size)
-                .wrap_text(),
-            alert([
-                alert_title("Regenerating overwrites your identity"),
-                alert_description(
-                    "Servers that knew the old key won't recognise the new one — you'll have to re-register or be \
-                     re-approved.",
-                ),
-            ])
-            .warning(),
-            row([
-                button("Close").key("identity:close"),
-                spacer(),
-                button("Generate new identity…")
-                    .key("identity:regenerate")
-                    .destructive(),
             ])
             .gap(tokens::SPACE_2)
             .width(Size::Fill(1.0))

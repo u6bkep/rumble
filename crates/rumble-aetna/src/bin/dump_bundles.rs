@@ -96,10 +96,10 @@ enum Scene {
     WizardError,
     /// Encrypted-key unlock prompt at startup.
     UnlockPrompt,
-    /// Toolbar "Identity" modal showing the configured key + regenerate.
-    IdentityModal,
     /// Settings dialog — Connection tab (default).
     SettingsConnection,
+    /// Live session with the toolbar transmission-mode dropdown open.
+    ToolbarVoiceModeOpen,
     /// Settings dialog — Devices tab with the input dropdown open.
     SettingsDevices,
     /// Settings dialog — Voice tab (encoder/jitter/PTT toggles).
@@ -135,8 +135,8 @@ impl Scene {
         Scene::WizardSelectAgentKey,
         Scene::WizardError,
         Scene::UnlockPrompt,
-        Scene::IdentityModal,
         Scene::SettingsConnection,
+        Scene::ToolbarVoiceModeOpen,
         Scene::SettingsDevices,
         Scene::SettingsVoice,
         Scene::SettingsProcessing,
@@ -165,8 +165,8 @@ impl Scene {
             Scene::WizardSelectAgentKey => "wizard_select_agent_key",
             Scene::WizardError => "wizard_error",
             Scene::UnlockPrompt => "unlock_prompt",
-            Scene::IdentityModal => "identity_modal",
             Scene::SettingsConnection => "settings_connection",
+            Scene::ToolbarVoiceModeOpen => "toolbar_voice_mode_open",
             Scene::SettingsDevices => "settings_devices",
             Scene::SettingsVoice => "settings_voice",
             Scene::SettingsProcessing => "settings_processing",
@@ -213,12 +213,15 @@ impl Scene {
             | Scene::WizardSelectAgentKey
             | Scene::WizardError
             | Scene::UnlockPrompt
-            | Scene::IdentityModal
             | Scene::SettingsConnection
             | Scene::SettingsChat
             | Scene::SettingsVoice
             | Scene::SettingsSounds
             | Scene::SettingsFiles => State::default(),
+            // Toolbar dropdown only renders while connected (the trigger
+            // is gated on `state.connection.is_connected()`), so reuse
+            // the live-session fixture so the popover anchors correctly.
+            Scene::ToolbarVoiceModeOpen => connected_state(),
             // The Processing scene needs a populated TX pipeline so
             // the editor isn't an empty placeholder; the MockBackend
             // discards `UpdateTxPipeline` so we seed the state up
@@ -303,10 +306,8 @@ impl Scene {
                     error: Some("Wrong password — try again.".to_string()),
                 });
             }
-            Scene::IdentityModal => {
-                app.set_identity_modal_open_for_test(true);
-            }
             Scene::SettingsConnection => app.open_settings_for_test(SettingsTab::Connection),
+            Scene::ToolbarVoiceModeOpen => app.set_voice_mode_menu_open_for_test(true),
             Scene::SettingsDevices => {
                 app.open_settings_for_test(SettingsTab::Devices);
                 app.open_settings_dropdown_for_test(SettingsOpenSelect::InputDevice);

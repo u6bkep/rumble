@@ -541,16 +541,41 @@ fn render_connection(pending: &PendingSettings, identity: &Identity) -> El {
     use rumble_desktop_shell::KeySource;
 
     let identity_lines: Vec<El> = if let Some(config) = identity.manager().config() {
-        let storage = match &config.source {
-            KeySource::LocalPlaintext { .. } => "Local (unencrypted)",
-            KeySource::LocalEncrypted { .. } => "Local (password protected)",
-            KeySource::SshAgent { .. } => "SSH agent",
+        let (storage, detail) = match &config.source {
+            KeySource::LocalPlaintext { .. } => (
+                "Local (unencrypted)",
+                "Stored unencrypted at identity.json — fine for personal machines.".to_string(),
+            ),
+            KeySource::LocalEncrypted { .. } => (
+                "Local (password protected)",
+                "Encrypted with Argon2 + ChaCha20-Poly1305. Password required at startup.".to_string(),
+            ),
+            KeySource::SshAgent {
+                fingerprint: agent_fp,
+                comment,
+            } => {
+                let line = if comment.is_empty() {
+                    format!("ssh-agent fingerprint: {agent_fp}")
+                } else {
+                    format!("ssh-agent: {comment} ({agent_fp})")
+                };
+                ("SSH agent", line)
+            }
         };
+        let path = identity.manager().config_dir().join("identity.json");
         vec![
             field_row("Storage", text(storage.to_string()).semibold()),
+            paragraph(detail).muted().font_size(tokens::TEXT_XS.size),
             field_row(
                 "Fingerprint",
                 mono(identity.fingerprint())
+                    .font_size(tokens::TEXT_XS.size)
+                    .ellipsis()
+                    .width(Size::Fill(1.0)),
+            ),
+            field_row(
+                "On disk",
+                mono(path.display().to_string())
                     .font_size(tokens::TEXT_XS.size)
                     .ellipsis()
                     .width(Size::Fill(1.0)),
@@ -563,6 +588,16 @@ fn render_connection(pending: &PendingSettings, identity: &Identity) -> El {
     let mut children: Vec<El> = Vec::new();
     children.push(section_heading("Identity"));
     children.extend(identity_lines);
+    children.push(
+        alert([
+            alert_title("Regenerating overwrites your identity"),
+            alert_description(
+                "Servers that knew the old key won't recognise the new one — you'll have to re-register or be \
+                 re-approved.",
+            ),
+        ])
+        .warning(),
+    );
     children.push(
         row([
             spacer(),

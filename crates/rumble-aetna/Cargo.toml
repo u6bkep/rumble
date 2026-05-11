@@ -43,3 +43,4 @@ rfd = "0.16"
 image = { version = "0.25", default-features = false, features = ["bmp", "gif", "ico", "jpeg", "png", "tiff", "webp"] }
 arboard = "3"
 tempfile = "3"
+

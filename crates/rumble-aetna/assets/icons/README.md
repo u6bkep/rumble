@@ -42,6 +42,18 @@ User-state mic glyphs in `app.rs::push_room_subtree`:
 | Self-muted | `muted_self.svg` |
 | Server-muted | `muted_server.svg` |
 
+Top toolbar (`app.rs::top_toolbar`):
+
+| Control | SVG |
+|---|---|
+| Mute toggle (active mic) | `talking_off.svg` |
+| Mute toggle (muted) | `muted_self.svg` |
+| Deafen toggle (active sound) | `self_undeafened.svg` |
+| Deafen toggle (deafened) | `deafened_self.svg` |
+| Voice mode trigger (Continuous/VAD) | `talking_off.svg` |
+| Voice mode trigger (PTT) | `muted_pushtomute.svg` |
+| Disconnect | `disconnect.svg` |
+
 ## Index — wire as needed
 
 - `talking_on.svg` / `talking_off.svg` — speaking indicators (wired).
