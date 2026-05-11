@@ -138,7 +138,7 @@ To add a new scene, extend the `Scene` enum and `drive_setup` in `crates/rumble-
 
 Cargo consumes these from upstream GitHub at a pinned rev rather than crates.io. The `vendor/` directory is gitignored and holds local working copies for iterating alongside rumble; Cargo does not consult it for builds.
 
-- **aetna** — UI library powering `rumble-aetna`. Pinned in `crates/rumble-aetna/Cargo.toml` and `crates/rumble-video/Cargo.toml` to a rev of `https://github.com/computer-whisperer/aetna`. Bump both Cargo.tomls in lockstep when updating. To iterate locally against `vendor/aetna`, add `[patch."https://github.com/computer-whisperer/aetna"]` entries to the workspace `Cargo.toml` pointing at the per-crate paths.
+- **aetna** — UI library powering `rumble-aetna`. Pinned in `crates/rumble-aetna/Cargo.toml` and `crates/rumble-video/Cargo.toml` to a rev of `https://github.com/computer-whisperer/aetna`. Bump both Cargo.tomls in lockstep when updating. To iterate locally against `vendor/aetna` without touching tracked files, run cargo through `scripts/aetna-local.sh` (e.g. `scripts/aetna-local.sh build -p rumble-aetna`). It applies the gitignored `.cargo/local-aetna.toml` overlay as a `--config` patch and restores `Cargo.lock` afterwards, so CI and other machines stay on the git pin.
 - **opus-rs** — Opus audio codec bindings, pinned via `opus = { git = "...", rev = "..." }` in `crates/rumble-desktop/Cargo.toml`.
 - **egui** family — patched workspace-wide via `[patch.crates-io]` to a rumble fork (see comment at top of root `Cargo.toml`).
 - **egui_ltreeview** — tree widget consumed only by the deprecated `rumble-egui` crate.

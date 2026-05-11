@@ -1,2 +1,6 @@
 [alias]
 xtask = "run --package xtask --"
+# To iterate against vendor/aetna instead of the git-pinned rev, use the
+# wrapper at `scripts/aetna-local.sh`. It applies `.cargo/local-aetna.toml`
+# as a `--config` overlay and restores Cargo.lock afterwards so the lockfile
+# always reflects the git pin (CI and other machines stay unaffected).
