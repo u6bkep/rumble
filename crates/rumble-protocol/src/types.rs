@@ -1132,6 +1132,11 @@ pub enum Command {
     },
     /// Disconnect from the current server.
     Disconnect,
+    /// Send a graceful disconnect to the server and terminate the
+    /// connection task. Used during process shutdown so the server
+    /// removes us from its state immediately instead of waiting for
+    /// the QUIC idle timeout.
+    Shutdown,
     /// Accept the pending self-signed certificate and retry connection.
     /// The certificate will be added to the trusted store.
     AcceptCertificate,
@@ -1368,6 +1373,7 @@ impl std::fmt::Debug for Command {
                 .field("password", &password.is_some())
                 .finish(),
             Command::Disconnect => write!(f, "Disconnect"),
+            Command::Shutdown => write!(f, "Shutdown"),
             Command::AcceptCertificate => write!(f, "AcceptCertificate"),
             Command::RejectCertificate => write!(f, "RejectCertificate"),
             Command::JoinRoom { room_id } => f.debug_struct("JoinRoom").field("room_id", room_id).finish(),

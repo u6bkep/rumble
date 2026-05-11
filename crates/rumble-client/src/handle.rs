@@ -86,7 +86,9 @@ pub struct BackendHandle<P: Platform> {
     /// through the command channel.
     file_transfer: Arc<RwLock<Option<Arc<dyn FileTransferPlugin>>>>,
     /// Background thread running the tokio runtime for connection task.
-    _runtime_thread: std::thread::JoinHandle<()>,
+    /// Held in an `Option` so `Drop` can `take()` and `join()` it after
+    /// signalling the connection task to send a graceful disconnect.
+    runtime_thread: Option<std::thread::JoinHandle<()>>,
     /// Connection configuration (certificates, etc.). stored incase we want to inspect it later.
     _connect_config: ConnectConfig,
     /// Pre-generated sound effects library.
@@ -270,7 +272,7 @@ impl<P: Platform> BackendHandle<P> {
             command_tx,
             audio_task,
             file_transfer,
-            _runtime_thread: runtime_thread,
+            runtime_thread: Some(runtime_thread),
             _connect_config: connect_config,
             sfx_library: crate::sfx::SfxLibrary::new(),
             _phantom: std::marker::PhantomData,
@@ -463,6 +465,19 @@ impl<P: Platform> BackendHandle<P> {
     }
 }
 
+impl<P: Platform> Drop for BackendHandle<P> {
+    fn drop(&mut self) {
+        // Tell the connection task to flush a graceful Disconnect and exit,
+        // then wait for its thread before we let the process tear down the
+        // tokio runtime. Without this the runtime is dropped mid-shutdown
+        // and the server only notices us missing after its idle timeout.
+        let _ = self.command_tx.send(Command::Shutdown);
+        if let Some(thread) = self.runtime_thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 /// Acquire a read lock on the state, recovering from lock poisoning.
 pub(crate) fn read_state(state: &Arc<RwLock<State>>) -> RwLockReadGuard<'_, State> {
     match state.read() {
@@ -482,6 +497,22 @@ pub(crate) fn write_state(state: &Arc<RwLock<State>>) -> RwLockWriteGuard<'_, St
             warn!("State RwLock was poisoned (write), recovering");
             poisoned.into_inner()
         }
+    }
+}
+
+/// Best-effort send of a `proto::Disconnect` envelope. Used during shutdown
+/// so the server can evict us immediately instead of waiting on the QUIC
+/// idle timeout. A failure here is non-fatal: the subsequent `transport.close()`
+/// still trips the server's connection-loss path, just without the named reason.
+async fn send_disconnect_envelope<T: rumble_client_traits::transport::Transport>(transport: &mut T, reason: &str) {
+    let env = proto::Envelope {
+        state_hash: Vec::new(),
+        payload: Some(Payload::Disconnect(proto::Disconnect {
+            reason: reason.to_string(),
+        })),
+    };
+    if let Err(e) = send_envelope(transport, &env).await {
+        debug!("Failed to send Disconnect envelope during shutdown: {}", e);
     }
 }
 
@@ -524,9 +555,14 @@ async fn run_connection_task<P: Platform>(
         tokio::select! {
             cmd = command_rx.recv() => {
                 let Some(cmd) = cmd else {
-                    // Channel closed, handle is dropped, exit task
+                    // Channel closed, handle is dropped, exit task. Normal
+                    // shutdown should reach this via Command::Shutdown
+                    // first; this branch is the belt-and-suspenders path
+                    // for the case where every sender clone went away
+                    // without one being sent.
                     debug!("Command channel closed, shutting down connection task");
-                    if let Some(t) = transport.take() {
+                    if let Some(mut t) = transport.take() {
+                        send_disconnect_envelope(&mut t, "client shutdown").await;
                         t.close().await;
                     }
                     return;
@@ -823,7 +859,8 @@ async fn run_connection_task<P: Platform>(
                         // Notify audio task before closing
                         audio_task.send(AudioCommand::ConnectionClosed);
 
-                        if let Some(t) = transport.take() {
+                        if let Some(mut t) = transport.take() {
+                            send_disconnect_envelope(&mut t, "client disconnected").await;
                             t.close().await;
                         }
                         file_transfer = None;
@@ -840,6 +877,20 @@ async fn run_connection_task<P: Platform>(
                             s.rebuild_room_tree();
                         }
                         repaint();
+                    }
+
+                    Command::Shutdown => {
+                        // Process shutdown — flush a graceful Disconnect to
+                        // the server and exit the connection task so the
+                        // BackendHandle's Drop can join this thread before
+                        // the process exits. Without this the server only
+                        // notices we're gone after its QUIC idle timeout.
+                        audio_task.send(AudioCommand::ConnectionClosed);
+                        if let Some(mut t) = transport.take() {
+                            send_disconnect_envelope(&mut t, "client shutdown").await;
+                            t.close().await;
+                        }
+                        return;
                     }
 
                     Command::JoinRoom { room_id } => {

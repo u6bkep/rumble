@@ -370,5 +370,12 @@ impl Transport for QuinnTransport {
 
     async fn close(&self) {
         self.connection.close(quinn::VarInt::from_u32(0), b"bye");
+        // Wait for the connection to actually finish closing so the
+        // CONNECTION_CLOSE frame reaches the server. Without this, a
+        // caller that closes the transport and immediately exits its
+        // runtime (e.g. on process shutdown) can lose the frame and
+        // leave the server waiting for the 30s idle timeout to evict
+        // the user.
+        let _ = self.connection.closed().await;
     }
 }
