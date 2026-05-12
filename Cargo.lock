@@ -147,8 +147,8 @@ dependencies = [
 
 [[package]]
 name = "aetna-core"
-version = "0.3.1"
-source = "git+https://github.com/computer-whisperer/aetna?rev=1d6c6352d061e5ba6af549244c21c2c18def1599#1d6c6352d061e5ba6af549244c21c2c18def1599"
+version = "0.3.2"
+source = "git+https://github.com/computer-whisperer/aetna?rev=196264667d9fdfc246fe8b768895402fa8803073#196264667d9fdfc246fe8b768895402fa8803073"
 dependencies = [
  "aetna-fonts",
  "bytemuck",
@@ -157,8 +157,11 @@ dependencies = [
  "fdsm-ttf-parser",
  "image",
  "kurbo",
+ "lru",
  "lyon_tessellation",
  "nalgebra",
+ "roxmltree 0.21.1",
+ "rustc-hash 2.1.1",
  "swash",
  "ttf-parser",
  "usvg",
@@ -167,8 +170,8 @@ dependencies = [
 
 [[package]]
 name = "aetna-fonts"
-version = "0.3.1"
-source = "git+https://github.com/computer-whisperer/aetna?rev=1d6c6352d061e5ba6af549244c21c2c18def1599#1d6c6352d061e5ba6af549244c21c2c18def1599"
+version = "0.3.2"
+source = "git+https://github.com/computer-whisperer/aetna?rev=196264667d9fdfc246fe8b768895402fa8803073#196264667d9fdfc246fe8b768895402fa8803073"
 dependencies = [
  "aetna-fonts-emoji",
  "aetna-fonts-inter",
@@ -179,27 +182,27 @@ dependencies = [
 [[package]]
 name = "aetna-fonts-emoji"
 version = "0.1.0"
-source = "git+https://github.com/computer-whisperer/aetna?rev=1d6c6352d061e5ba6af549244c21c2c18def1599#1d6c6352d061e5ba6af549244c21c2c18def1599"
+source = "git+https://github.com/computer-whisperer/aetna?rev=196264667d9fdfc246fe8b768895402fa8803073#196264667d9fdfc246fe8b768895402fa8803073"
 
 [[package]]
 name = "aetna-fonts-inter"
 version = "0.1.0"
-source = "git+https://github.com/computer-whisperer/aetna?rev=1d6c6352d061e5ba6af549244c21c2c18def1599#1d6c6352d061e5ba6af549244c21c2c18def1599"
+source = "git+https://github.com/computer-whisperer/aetna?rev=196264667d9fdfc246fe8b768895402fa8803073#196264667d9fdfc246fe8b768895402fa8803073"
 
 [[package]]
 name = "aetna-fonts-jetbrains-mono"
 version = "0.1.0"
-source = "git+https://github.com/computer-whisperer/aetna?rev=1d6c6352d061e5ba6af549244c21c2c18def1599#1d6c6352d061e5ba6af549244c21c2c18def1599"
+source = "git+https://github.com/computer-whisperer/aetna?rev=196264667d9fdfc246fe8b768895402fa8803073#196264667d9fdfc246fe8b768895402fa8803073"
 
 [[package]]
 name = "aetna-fonts-symbols"
 version = "0.1.0"
-source = "git+https://github.com/computer-whisperer/aetna?rev=1d6c6352d061e5ba6af549244c21c2c18def1599#1d6c6352d061e5ba6af549244c21c2c18def1599"
+source = "git+https://github.com/computer-whisperer/aetna?rev=196264667d9fdfc246fe8b768895402fa8803073#196264667d9fdfc246fe8b768895402fa8803073"
 
 [[package]]
 name = "aetna-wgpu"
-version = "0.3.1"
-source = "git+https://github.com/computer-whisperer/aetna?rev=1d6c6352d061e5ba6af549244c21c2c18def1599#1d6c6352d061e5ba6af549244c21c2c18def1599"
+version = "0.3.2"
+source = "git+https://github.com/computer-whisperer/aetna?rev=196264667d9fdfc246fe8b768895402fa8803073#196264667d9fdfc246fe8b768895402fa8803073"
 dependencies = [
  "aetna-core",
  "bytemuck",
@@ -211,11 +214,13 @@ dependencies = [
 
 [[package]]
 name = "aetna-winit-wgpu"
-version = "0.3.1"
-source = "git+https://github.com/computer-whisperer/aetna?rev=1d6c6352d061e5ba6af549244c21c2c18def1599#1d6c6352d061e5ba6af549244c21c2c18def1599"
+version = "0.3.2"
+source = "git+https://github.com/computer-whisperer/aetna?rev=196264667d9fdfc246fe8b768895402fa8803073#196264667d9fdfc246fe8b768895402fa8803073"
 dependencies = [
  "aetna-core",
  "aetna-wgpu",
+ "arboard",
+ "open",
  "pollster",
  "wgpu 29.0.3",
  "winit",
@@ -419,6 +424,7 @@ dependencies = [
  "parking_lot 0.12.5",
  "percent-encoding",
  "windows-sys 0.60.2",
+ "wl-clipboard-rs",
  "x11rb",
 ]
 
@@ -3072,6 +3078,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "hashbrown"
+version = "0.17.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+dependencies = [
+ "allocator-api2",
+ "equivalent",
+ "foldhash 0.2.0",
+]
+
+[[package]]
 name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3685,6 +3702,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0fae87c125b03c1d2c0150c90365d7d6bcc53fb73a9acaef207d2d065860f062"
 dependencies = [
  "imgref",
+]
+
+[[package]]
+name = "lru"
+version = "0.18.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a860605968fce16869fd239cf4237a82f3ac470723415db603b0e8b6c8d4fb9"
+dependencies = [
+ "hashbrown 0.17.1",
 ]
 
 [[package]]
@@ -4664,6 +4690,16 @@ checksum = "9aa2b01e1d916879f73a53d01d1d6cee68adbb31d6d9177a8cfce093cced1d50"
 dependencies = [
  "futures-core",
  "pin-project-lite",
+]
+
+[[package]]
+name = "os_pipe"
+version = "1.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d8fae84b431384b68627d0f9b3b1245fcf9f46f6c0e3dc902e9dce64edd1967"
+dependencies = [
+ "libc",
+ "windows-sys 0.45.0",
 ]
 
 [[package]]
@@ -7172,6 +7208,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "tree_magic_mini"
+version = "3.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b8765b90061cba6c22b5831f675da109ae5561588290f9fa2317adab2714d5a6"
+dependencies = [
+ "memchr",
+ "nom 8.0.0",
+ "petgraph",
+]
+
+[[package]]
 name = "ttf-parser"
 version = "0.25.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8721,6 +8768,24 @@ dependencies = [
  "serde_json",
  "unicode-xid",
  "wasmparser",
+]
+
+[[package]]
+name = "wl-clipboard-rs"
+version = "0.9.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9651471a32e87d96ef3a127715382b2d11cc7c8bb9822ded8a7cc94072eb0a3"
+dependencies = [
+ "libc",
+ "log",
+ "os_pipe",
+ "rustix 1.1.4",
+ "thiserror 2.0.18",
+ "tree_magic_mini",
+ "wayland-backend",
+ "wayland-client",
+ "wayland-protocols",
+ "wayland-protocols-wlr",
 ]
 
 [[package]]

@@ -10,9 +10,9 @@ thiserror = "2"
 
 # GPU mirror: shape `VideoStream` frames into an aetna `AppTexture`
 # the same way `rumble-aetna::AnimatedGpu` does for animated images.
-# Aetna pinning lives in rumble-aetna's Cargo.toml — keep these in lockstep.
-aetna-core = { git = "https://github.com/computer-whisperer/aetna", rev = "1d6c6352d061e5ba6af549244c21c2c18def1599" }
-aetna-wgpu = { git = "https://github.com/computer-whisperer/aetna", rev = "1d6c6352d061e5ba6af549244c21c2c18def1599" }
+# Aetna pin lives in the workspace [workspace.dependencies] block.
+aetna-core = { workspace = true }
+aetna-wgpu = { workspace = true }
 wgpu = "29"
 
 # build.rs picks pkg-config (Linux/macOS targets) or fetch-and-extract
@@ -30,4 +30,4 @@ sha2 = "0.10"
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["png"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-aetna-winit-wgpu = { git = "https://github.com/computer-whisperer/aetna", rev = "1d6c6352d061e5ba6af549244c21c2c18def1599" }
+aetna-winit-wgpu = { workspace = true }

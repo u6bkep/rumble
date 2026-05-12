@@ -13,12 +13,10 @@ name = "rumble-aetna"
 path = "src/main.rs"
 
 [dependencies]
-# Aetna UI. Pinned by git rev to upstream computer-whisperer/aetna; override
-# locally with `[patch."https://github.com/computer-whisperer/aetna"]` if
-# you're iterating on aetna alongside rumble.
-aetna-core = { git = "https://github.com/computer-whisperer/aetna", rev = "1d6c6352d061e5ba6af549244c21c2c18def1599" }
-aetna-winit-wgpu = { git = "https://github.com/computer-whisperer/aetna", rev = "1d6c6352d061e5ba6af549244c21c2c18def1599" }
-aetna-wgpu = { git = "https://github.com/computer-whisperer/aetna", rev = "1d6c6352d061e5ba6af549244c21c2c18def1599" }
+# Aetna UI. Pin lives in the workspace [workspace.dependencies] block.
+aetna-core = { workspace = true }
+aetna-winit-wgpu = { workspace = true }
+aetna-wgpu = { workspace = true }
 wgpu = "29"
 
 # Rumble client backend.
