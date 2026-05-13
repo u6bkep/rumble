@@ -20,7 +20,7 @@ use std::{path::PathBuf, time::SystemTime};
 use aetna_core::prelude::*;
 
 use rumble_aetna::{
-    Identity, RumbleApp, SettingsOpenSelect, SettingsTab, UnlockState, WizardState, backend::UiBackend,
+    ElevateState, Identity, RumbleApp, SettingsOpenSelect, SettingsTab, UnlockState, WizardState, backend::UiBackend,
 };
 use rumble_desktop_shell::{KeyInfo, RecentServer, SettingsStore};
 use rumble_protocol::{
@@ -121,6 +121,16 @@ enum Scene {
     /// targeting a nested room so the breadcrumb has real depth and
     /// the inherited block has rules to show.
     RoomAclModal,
+    /// Sudo elevation modal with a populated password field + an
+    /// error message — exercises the form-message treatment.
+    ElevatePrompt,
+    /// Settings → Connection while the local user holds [`SUDO`] but
+    /// hasn't elevated yet — the "Elevate to superuser…" button is
+    /// visible.
+    SettingsConnectionSudo,
+    /// Settings → Connection after a successful elevation — the
+    /// button is replaced with the "Elevated this session" notice.
+    SettingsConnectionElevated,
 }
 
 impl Scene {
@@ -153,6 +163,9 @@ impl Scene {
         Scene::SettingsStats,
         Scene::SettingsAdmin,
         Scene::RoomAclModal,
+        Scene::ElevatePrompt,
+        Scene::SettingsConnectionSudo,
+        Scene::SettingsConnectionElevated,
     ];
 
     fn slug(self) -> &'static str {
@@ -185,6 +198,9 @@ impl Scene {
             Scene::SettingsStats => "settings_stats",
             Scene::SettingsAdmin => "settings_admin",
             Scene::RoomAclModal => "room_acl_modal",
+            Scene::ElevatePrompt => "elevate_prompt",
+            Scene::SettingsConnectionSudo => "settings_connection_sudo",
+            Scene::SettingsConnectionElevated => "settings_connection_elevated",
         }
     }
 
@@ -255,6 +271,8 @@ impl Scene {
             },
             Scene::SettingsAdmin => admin_state(),
             Scene::RoomAclModal => room_acl_state(),
+            Scene::ElevatePrompt | Scene::SettingsConnectionSudo => sudo_capable_state(false),
+            Scene::SettingsConnectionElevated => sudo_capable_state(true),
         }
     }
 
@@ -340,6 +358,15 @@ impl Scene {
             }
             Scene::RoomAclModal => {
                 app.open_room_acl_modal_for_test(Uuid::from_u128(ROOM_STAGE));
+            }
+            Scene::ElevatePrompt => {
+                app.set_elevate_state_for_test(ElevateState {
+                    password: "••••••••".to_string(),
+                    error: Some("Incorrect password".to_string()),
+                });
+            }
+            Scene::SettingsConnectionSudo | Scene::SettingsConnectionElevated => {
+                app.open_settings_for_test(SettingsTab::Connection);
             }
             Scene::ConnectedImagePreview => {
                 // Pre-decoded image so the preview path renders without
@@ -699,6 +726,24 @@ fn connected_state() -> State {
         ..State::default()
     };
     state.rebuild_room_tree();
+    state
+}
+
+/// Connected state with `SUDO` (and `TEXT_MESSAGE`) on the local user
+/// so the Connection-tab elevate UI renders. `elevated` flips the
+/// local user's `is_elevated` flag — driving the gold name in the room
+/// tree and swapping the button for the "already elevated" notice in
+/// Settings.
+fn sudo_capable_state(elevated: bool) -> State {
+    let mut state = connected_state();
+    state.effective_permissions = (Permissions::TEXT_MESSAGE | Permissions::SUDO).bits();
+    if let Some(me) = state
+        .users
+        .iter_mut()
+        .find(|u| u.user_id.as_ref().map(|id| id.value) == Some(1))
+    {
+        me.is_elevated = elevated;
+    }
     state
 }
 

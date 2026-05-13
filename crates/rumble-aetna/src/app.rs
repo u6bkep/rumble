@@ -29,6 +29,7 @@ use crate::{
     animated_gpu::AnimatedGpu,
     backend::UiBackend,
     chat,
+    elevate::{self, ElevateOutcome, ElevateState},
     identity::Identity,
     room_acl,
     room_tree::{self, RoomTreeOutcome, RoomTreeState},
@@ -64,6 +65,11 @@ pub struct RumbleApp<B: UiBackend = crate::backend::NativeUiBackend> {
     /// Encrypted-key unlock prompt state. Only shown when
     /// `identity.needs_unlock()` is true and the wizard is hidden.
     unlock: UnlockState,
+    /// Sudo / superuser elevation prompt. `Some` while the modal is
+    /// open; cleared on Cancel/Escape/scrim or on submit. Result lands
+    /// asynchronously as a `CommandResult` chat line and (on success)
+    /// a `UserStatusChanged.is_elevated=true` broadcast.
+    elevate: Option<ElevateState>,
     /// In-flight ssh-agent op spawned on `runtime`.
     pending_agent_op: Option<PendingAgentOp>,
 
@@ -303,6 +309,7 @@ impl<B: UiBackend> RumbleApp<B> {
             hotkeys,
             wizard,
             unlock: UnlockState::default(),
+            elevate: None,
             pending_agent_op: None,
             server_picker: ServerPickerState::default(),
             settings_state: SettingsState::default(),
@@ -680,6 +687,20 @@ impl<B: UiBackend> App for RumbleApp<B> {
             None
         };
 
+        // Sudo elevation prompt. Suppressed by the same session-gate
+        // modals (wizard/unlock/cert). Renders above settings since the
+        // App closes settings when opening it — no overlap by design,
+        // but the explicit ordering keeps the precedence obvious.
+        let elevate_layer = if !wizard_open
+            && unlock_layer.is_none()
+            && cert_layer.is_none()
+            && let Some(es) = self.elevate.as_ref()
+        {
+            Some(elevate::render(es, &self.selection))
+        } else {
+            None
+        };
+
         // Always wrap in `overlays(...)` — even with no app layers, the
         // root must be an `Axis::Overlay` container so aetna's runtime
         // tooltip layer overlays the main view instead of competing for
@@ -708,6 +729,7 @@ impl<B: UiBackend> App for RumbleApp<B> {
                 settings_popover,
                 room_acl_modal_layer,
                 room_acl_popover_layer,
+                elevate_layer,
                 cert_layer,
                 unlock_layer,
                 wizard_layer,
@@ -779,6 +801,28 @@ impl<B: UiBackend> App for RumbleApp<B> {
             let outcome = wizard::handle_unlock_event(&mut self.unlock, &event, &mut self.selection);
             self.dispatch_wizard_outcome(outcome);
             return;
+        }
+
+        // Sudo elevation prompt claims its events first so a stray
+        // password-field click doesn't reach the chat input behind it.
+        if self.elevate.is_some() {
+            let outcome = {
+                let es = self.elevate.as_mut().expect("checked");
+                elevate::handle_event(es, &event, &mut self.selection)
+            };
+            match outcome {
+                ElevateOutcome::Ignored => {}
+                ElevateOutcome::Handled => return,
+                ElevateOutcome::Cancel => {
+                    self.elevate = None;
+                    return;
+                }
+                ElevateOutcome::Submit { password } => {
+                    self.backend.send(Command::Elevate { password });
+                    self.elevate = None;
+                    return;
+                }
+            }
         }
 
         // Per-room ACL editor modal claims events before the rest of
@@ -2403,6 +2447,11 @@ impl<B: UiBackend> RumbleApp<B> {
                 self.wizard = WizardState::SelectMethod;
                 true
             }
+            SettingsOutcome::OpenElevate => {
+                self.settings_state.close();
+                self.elevate = Some(ElevateState::default());
+                true
+            }
             SettingsOutcome::PreviewSfx { kind, volume } => {
                 self.backend.send(Command::PlaySfx { kind, volume });
                 true
@@ -2559,6 +2608,11 @@ impl<B: UiBackend> RumbleApp<B> {
     pub fn set_unlock_state_for_test(&mut self, state: UnlockState) {
         self.unlock = state;
         self.force_unlock_for_test = true;
+    }
+
+    /// Test/scene-dump hook for the sudo elevation prompt.
+    pub fn set_elevate_state_for_test(&mut self, state: ElevateState) {
+        self.elevate = Some(state);
     }
 
     /// Test/scene-dump hook for the toolbar transmission-mode dropdown.

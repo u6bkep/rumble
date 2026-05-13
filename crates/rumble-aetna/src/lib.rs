@@ -16,6 +16,7 @@ pub mod animated_gpu;
 pub mod app;
 pub mod backend;
 pub mod chat;
+pub mod elevate;
 pub mod identity;
 pub mod password_input;
 pub mod room_acl;
@@ -28,6 +29,7 @@ pub mod wizard;
 
 pub use app::RumbleApp;
 pub use backend::{NativeUiBackend, UiBackend};
+pub use elevate::ElevateState;
 pub use identity::Identity;
 pub use server_picker::ServerForm;
 pub use settings::{OpenSelect as SettingsOpenSelect, SettingsState, SettingsTab};

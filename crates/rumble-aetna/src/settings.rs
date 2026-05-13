@@ -303,6 +303,9 @@ pub enum SettingsOutcome {
     /// User clicked "Generate new identity"; close settings and open
     /// the identity wizard.
     OpenIdentityWizard,
+    /// User clicked "Elevate to superuser…"; close settings and open
+    /// the sudo-password prompt.
+    OpenElevate,
     /// One-shot side effects.
     PreviewSfx {
         kind: SfxKind,
@@ -333,6 +336,7 @@ const KEY_SAVE: &str = "settings:save";
 
 const KEY_AUTOCONNECT: &str = "settings:conn:autoconnect";
 const KEY_REGENERATE: &str = "settings:conn:regenerate";
+const KEY_ELEVATE: &str = "settings:conn:elevate";
 
 const KEY_INPUT_DEVICE: &str = "settings:dev:input";
 const KEY_OUTPUT_DEVICE: &str = "settings:dev:output";
@@ -484,7 +488,7 @@ pub fn render(
     }
 
     let body = match tab {
-        SettingsTab::Connection => render_connection(pending, identity),
+        SettingsTab::Connection => render_connection(pending, identity, app_state),
         SettingsTab::Devices => render_devices(pending, &app_state.audio),
         SettingsTab::Voice => render_voice(pending),
         SettingsTab::Processing => render_processing(pending, &app_state.audio, processor_registry, selection),
@@ -599,7 +603,7 @@ pub fn render(
 
 // ---- per-tab views --------------------------------------------------
 
-fn render_connection(pending: &PendingSettings, identity: &Identity) -> El {
+fn render_connection(pending: &PendingSettings, identity: &Identity, app_state: &State) -> El {
     use rumble_desktop_shell::KeySource;
 
     let identity_lines: Vec<El> = if let Some(config) = identity.manager().config() {
@@ -681,7 +685,54 @@ fn render_connection(pending: &PendingSettings, identity: &Identity) -> El {
         .font_size(tokens::TEXT_XS.size),
     );
 
+    if let Some(superuser) = render_superuser_section(app_state) {
+        children.push(divider());
+        children.push(section_heading("Superuser"));
+        children.extend(superuser);
+    }
+
     column(children).gap(tokens::SPACE_3).width(Size::Fill(1.0))
+}
+
+/// Render the Elevate / superuser section of the Connection tab, or
+/// `None` when the local user can't sudo (not connected, or the
+/// server's effective permissions don't carry [`Permissions::SUDO`]).
+/// When already elevated, swaps the button for a status notice.
+fn render_superuser_section(app_state: &State) -> Option<Vec<El>> {
+    if !app_state.connection.is_connected() {
+        return None;
+    }
+    let perms = Permissions::from_bits_truncate(app_state.effective_permissions);
+    if !perms.contains(Permissions::SUDO) {
+        return None;
+    }
+    let already_elevated = app_state
+        .my_user_id
+        .and_then(|id| app_state.get_user(id))
+        .map(|u| u.is_elevated)
+        .unwrap_or(false);
+
+    let mut out: Vec<El> = Vec::new();
+    if already_elevated {
+        out.push(
+            alert([
+                alert_title("Elevated this session"),
+                alert_description("You're operating as superuser. Disconnect to drop the elevation."),
+            ])
+            .info(),
+        );
+    } else {
+        out.push(
+            paragraph(
+                "Elevation bypasses the ACL system for the rest of this session — disconnect to drop it. Requires the \
+                 server-side sudo password set via `server set-sudo-password`.",
+            )
+            .muted()
+            .font_size(tokens::TEXT_XS.size),
+        );
+        out.push(row([spacer(), button("Elevate to superuser…").key(KEY_ELEVATE).primary()]).width(Size::Fill(1.0)));
+    }
+    Some(out)
 }
 
 fn render_devices(pending: &PendingSettings, audio: &AudioState) -> El {
@@ -1415,6 +1466,10 @@ pub fn handle_event(
     // Identity regenerate is a one-shot side effect — close + open wizard.
     if event.is_click_or_activate(KEY_REGENERATE) {
         return SettingsOutcome::OpenIdentityWizard;
+    }
+    // Elevate handoff: close settings and let the App open the modal.
+    if event.is_click_or_activate(KEY_ELEVATE) {
+        return SettingsOutcome::OpenElevate;
     }
     if event.is_click_or_activate(KEY_REFRESH_DEVICES) {
         return SettingsOutcome::RefreshDevices;
