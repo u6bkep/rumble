@@ -147,8 +147,8 @@ dependencies = [
 
 [[package]]
 name = "aetna-core"
-version = "0.3.2"
-source = "git+https://github.com/computer-whisperer/aetna?rev=196264667d9fdfc246fe8b768895402fa8803073#196264667d9fdfc246fe8b768895402fa8803073"
+version = "0.3.3"
+source = "git+https://github.com/computer-whisperer/aetna?rev=957250ec35ccbf793454aed98d6130d6f500e373#957250ec35ccbf793454aed98d6130d6f500e373"
 dependencies = [
  "aetna-fonts",
  "bytemuck",
@@ -170,8 +170,8 @@ dependencies = [
 
 [[package]]
 name = "aetna-fonts"
-version = "0.3.2"
-source = "git+https://github.com/computer-whisperer/aetna?rev=196264667d9fdfc246fe8b768895402fa8803073#196264667d9fdfc246fe8b768895402fa8803073"
+version = "0.3.3"
+source = "git+https://github.com/computer-whisperer/aetna?rev=957250ec35ccbf793454aed98d6130d6f500e373#957250ec35ccbf793454aed98d6130d6f500e373"
 dependencies = [
  "aetna-fonts-emoji",
  "aetna-fonts-inter",
@@ -182,27 +182,27 @@ dependencies = [
 [[package]]
 name = "aetna-fonts-emoji"
 version = "0.1.0"
-source = "git+https://github.com/computer-whisperer/aetna?rev=196264667d9fdfc246fe8b768895402fa8803073#196264667d9fdfc246fe8b768895402fa8803073"
+source = "git+https://github.com/computer-whisperer/aetna?rev=957250ec35ccbf793454aed98d6130d6f500e373#957250ec35ccbf793454aed98d6130d6f500e373"
 
 [[package]]
 name = "aetna-fonts-inter"
 version = "0.1.0"
-source = "git+https://github.com/computer-whisperer/aetna?rev=196264667d9fdfc246fe8b768895402fa8803073#196264667d9fdfc246fe8b768895402fa8803073"
+source = "git+https://github.com/computer-whisperer/aetna?rev=957250ec35ccbf793454aed98d6130d6f500e373#957250ec35ccbf793454aed98d6130d6f500e373"
 
 [[package]]
 name = "aetna-fonts-jetbrains-mono"
 version = "0.1.0"
-source = "git+https://github.com/computer-whisperer/aetna?rev=196264667d9fdfc246fe8b768895402fa8803073#196264667d9fdfc246fe8b768895402fa8803073"
+source = "git+https://github.com/computer-whisperer/aetna?rev=957250ec35ccbf793454aed98d6130d6f500e373#957250ec35ccbf793454aed98d6130d6f500e373"
 
 [[package]]
 name = "aetna-fonts-symbols"
 version = "0.1.0"
-source = "git+https://github.com/computer-whisperer/aetna?rev=196264667d9fdfc246fe8b768895402fa8803073#196264667d9fdfc246fe8b768895402fa8803073"
+source = "git+https://github.com/computer-whisperer/aetna?rev=957250ec35ccbf793454aed98d6130d6f500e373#957250ec35ccbf793454aed98d6130d6f500e373"
 
 [[package]]
 name = "aetna-wgpu"
-version = "0.3.2"
-source = "git+https://github.com/computer-whisperer/aetna?rev=196264667d9fdfc246fe8b768895402fa8803073#196264667d9fdfc246fe8b768895402fa8803073"
+version = "0.3.3"
+source = "git+https://github.com/computer-whisperer/aetna?rev=957250ec35ccbf793454aed98d6130d6f500e373#957250ec35ccbf793454aed98d6130d6f500e373"
 dependencies = [
  "aetna-core",
  "bytemuck",
@@ -214,8 +214,8 @@ dependencies = [
 
 [[package]]
 name = "aetna-winit-wgpu"
-version = "0.3.2"
-source = "git+https://github.com/computer-whisperer/aetna?rev=196264667d9fdfc246fe8b768895402fa8803073#196264667d9fdfc246fe8b768895402fa8803073"
+version = "0.3.3"
+source = "git+https://github.com/computer-whisperer/aetna?rev=957250ec35ccbf793454aed98d6130d6f500e373#957250ec35ccbf793454aed98d6130d6f500e373"
 dependencies = [
  "aetna-core",
  "aetna-wgpu",
