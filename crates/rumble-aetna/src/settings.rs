@@ -306,6 +306,10 @@ pub enum SettingsOutcome {
     /// User clicked "Elevate to superuser…"; close settings and open
     /// the sudo-password prompt.
     OpenElevate,
+    /// User clicked "Copy" next to their public key. Carries the
+    /// base64-encoded 32-byte Ed25519 pubkey for the App to push onto
+    /// the OS clipboard.
+    CopyPublicKey(String),
     /// One-shot side effects.
     PreviewSfx {
         kind: SfxKind,
@@ -337,6 +341,7 @@ const KEY_SAVE: &str = "settings:save";
 const KEY_AUTOCONNECT: &str = "settings:conn:autoconnect";
 const KEY_REGENERATE: &str = "settings:conn:regenerate";
 const KEY_ELEVATE: &str = "settings:conn:elevate";
+const KEY_COPY_PUBKEY: &str = "settings:conn:copy-pubkey";
 
 const KEY_INPUT_DEVICE: &str = "settings:dev:input";
 const KEY_OUTPUT_DEVICE: &str = "settings:dev:output";
@@ -629,7 +634,7 @@ fn render_connection(pending: &PendingSettings, identity: &Identity, app_state: 
             }
         };
         let path = identity.manager().config_dir().join("identity.json");
-        vec![
+        let mut lines: Vec<El> = vec![
             field_row("Storage", text(storage.to_string()).semibold()),
             paragraph(detail).muted().font_size(tokens::TEXT_XS.size),
             field_row(
@@ -639,14 +644,31 @@ fn render_connection(pending: &PendingSettings, identity: &Identity, app_state: 
                     .ellipsis()
                     .width(Size::Fill(1.0)),
             ),
-            field_row(
-                "On disk",
-                mono(path.display().to_string())
-                    .font_size(tokens::TEXT_XS.size)
-                    .ellipsis()
-                    .width(Size::Fill(1.0)),
-            ),
-        ]
+        ];
+        if let Some(pubkey) = identity.public_key() {
+            let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, pubkey);
+            lines.push(field_row(
+                "Public key",
+                row([
+                    mono(b64)
+                        .font_size(tokens::TEXT_XS.size)
+                        .ellipsis()
+                        .width(Size::Fill(1.0)),
+                    button("Copy").key(KEY_COPY_PUBKEY),
+                ])
+                .gap(tokens::SPACE_2)
+                .width(Size::Fill(1.0))
+                .align(Align::Center),
+            ));
+        }
+        lines.push(field_row(
+            "On disk",
+            mono(path.display().to_string())
+                .font_size(tokens::TEXT_XS.size)
+                .ellipsis()
+                .width(Size::Fill(1.0)),
+        ));
+        lines
     } else {
         vec![paragraph("No identity configured.").text_color(tokens::WARNING)]
     };
@@ -1409,6 +1431,7 @@ pub fn handle_event(
     state: &mut SettingsState,
     event: &UiEvent,
     app_state: &State,
+    identity: &Identity,
     selection: &mut Selection,
     processor_registry: &ProcessorRegistry,
 ) -> SettingsOutcome {
@@ -1470,6 +1493,12 @@ pub fn handle_event(
     // Elevate handoff: close settings and let the App open the modal.
     if event.is_click_or_activate(KEY_ELEVATE) {
         return SettingsOutcome::OpenElevate;
+    }
+    if event.is_click_or_activate(KEY_COPY_PUBKEY)
+        && let Some(pubkey) = identity.public_key()
+    {
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, pubkey);
+        return SettingsOutcome::CopyPublicKey(b64);
     }
     if event.is_click_or_activate(KEY_REFRESH_DEVICES) {
         return SettingsOutcome::RefreshDevices;

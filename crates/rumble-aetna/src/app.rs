@@ -854,6 +854,7 @@ impl<B: UiBackend> App for RumbleApp<B> {
                 &mut self.settings_state,
                 &event,
                 &app_state,
+                &self.identity,
                 &mut self.selection,
                 &self.processor_registry,
             );
@@ -1523,6 +1524,26 @@ impl<B: UiBackend> RumbleApp<B> {
                 .map(|f| f.path().to_path_buf())
         });
         self.pending_file_dialog = Some(handle);
+    }
+
+    /// Push `text` onto the OS clipboard and surface either `success_msg`
+    /// or a generic failure as a local chat line. `arboard` opens a
+    /// fresh handle per call — short-lived and side-effect-free, same
+    /// pattern as `paste_clipboard_image`.
+    fn copy_to_clipboard(&mut self, text: String, success_msg: &str) {
+        match arboard::Clipboard::new().and_then(|mut c| c.set_text(text)) {
+            Ok(()) => {
+                self.backend.send(Command::LocalMessage {
+                    text: success_msg.to_string(),
+                });
+            }
+            Err(e) => {
+                tracing::warn!("clipboard write failed: {e}");
+                self.backend.send(Command::LocalMessage {
+                    text: "Could not write to the clipboard".to_string(),
+                });
+            }
+        }
     }
 
     /// Read an image off the system clipboard, write it to a temp PNG,
@@ -2450,6 +2471,10 @@ impl<B: UiBackend> RumbleApp<B> {
             SettingsOutcome::OpenElevate => {
                 self.settings_state.close();
                 self.elevate = Some(ElevateState::default());
+                true
+            }
+            SettingsOutcome::CopyPublicKey(b64) => {
+                self.copy_to_clipboard(b64, "Public key copied to clipboard");
                 true
             }
             SettingsOutcome::PreviewSfx { kind, volume } => {

@@ -5735,6 +5735,7 @@ dependencies = [
  "aetna-winit-wgpu",
  "anyhow",
  "arboard",
+ "base64 0.21.7",
  "directories",
  "ed25519-dalek 3.0.0-pre.6",
  "image",
