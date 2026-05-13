@@ -182,6 +182,9 @@ pub enum RoomTreeOutcome {
     /// thin wrapper over the command surface, and paired commands
     /// like `(JoinRoom, RequestChatHistory)` fit naturally as a list.
     Dispatch(Vec<Command>),
+    /// User picked "Permissions…" on a room — App should open the
+    /// per-room ACL editor modal for this room.
+    OpenAclEditor(Uuid),
 }
 
 impl RoomTreeOutcome {
@@ -202,6 +205,7 @@ impl RoomTreeOutcome {
 
 const KEY_ROOM_CTX_DISMISS: &str = "room_ctx:dismiss";
 const KEY_ROOM_CTX_JOIN: &str = "room_ctx:join";
+const KEY_ROOM_CTX_PERMS: &str = "room_ctx:perms";
 const KEY_ROOM_CTX_ADD_CHILD: &str = "room_ctx:add_child";
 const KEY_ROOM_CTX_DELETE: &str = "room_ctx:delete";
 
@@ -504,6 +508,9 @@ fn render_room_context_menu(menu: &RoomContextMenu, app_state: &State) -> El {
     if perms.contains(Permissions::MAKE_ROOM) {
         items.push(menu_item("Add child room").key(KEY_ROOM_CTX_ADD_CHILD));
     }
+    if perms.contains(Permissions::WRITE) {
+        items.push(menu_item("Permissions…").key(KEY_ROOM_CTX_PERMS));
+    }
     if perms.contains(Permissions::MODIFY_ROOM) && !menu.is_root {
         items.push(menu_item("Delete room…").key(KEY_ROOM_CTX_DELETE));
     }
@@ -777,6 +784,10 @@ fn handle_room_context_menu_event(state: &mut RoomTreeState, event: &UiEvent) ->
             state.delete_room_modal = Some(DeleteRoomModal { room_id, room_name });
             state.room_context_menu = None;
             Some(RoomTreeOutcome::Handled)
+        }
+        KEY_ROOM_CTX_PERMS => {
+            state.room_context_menu = None;
+            Some(RoomTreeOutcome::OpenAclEditor(room_id))
         }
         _ => None,
     }

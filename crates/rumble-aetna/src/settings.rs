@@ -17,10 +17,13 @@ use aetna_core::prelude::*;
 
 use rumble_client::{PipelineConfig, ProcessorRegistry, SfxKind};
 use rumble_desktop_shell::{AutoDownloadRule, PersistentVoiceMode, Settings, TimestampFormat};
-use rumble_protocol::{AudioSettings, AudioState, State};
+use rumble_protocol::{AudioSettings, AudioState, State, permissions::Permissions};
 use serde_json::Value as JsonValue;
 
-use crate::identity::Identity;
+use crate::{
+    admin::{self, AdminOutcome, AdminState},
+    identity::Identity,
+};
 
 // ============================================================
 // State
@@ -36,6 +39,10 @@ pub enum SettingsTab {
     Chat,
     Files,
     Stats,
+    /// Server-administration UI. Rendered only when the connected user
+    /// has `MANAGE_ACL` at the root; the tab disappears from the row
+    /// when the permission is revoked mid-session.
+    Admin,
 }
 
 impl SettingsTab {
@@ -48,6 +55,7 @@ impl SettingsTab {
         SettingsTab::Chat,
         SettingsTab::Files,
         SettingsTab::Stats,
+        SettingsTab::Admin,
     ];
 
     fn slug(self) -> &'static str {
@@ -60,6 +68,7 @@ impl SettingsTab {
             SettingsTab::Chat => "chat",
             SettingsTab::Files => "files",
             SettingsTab::Stats => "stats",
+            SettingsTab::Admin => "admin",
         }
     }
 
@@ -73,12 +82,30 @@ impl SettingsTab {
             SettingsTab::Chat => "Chat",
             SettingsTab::Files => "Files",
             SettingsTab::Stats => "Stats",
+            SettingsTab::Admin => "Admin",
         }
     }
 
     fn from_slug(s: &str) -> Option<Self> {
         Self::ALL.iter().copied().find(|t| t.slug() == s)
     }
+}
+
+/// True when the current user holds `MANAGE_ACL` on the root, gating
+/// the Admin tab. Read on every render so revoking the permission
+/// mid-session hides the tab immediately.
+pub fn admin_visible(app_state: &State) -> bool {
+    Permissions::from_bits_truncate(app_state.effective_permissions).contains(Permissions::MANAGE_ACL)
+}
+
+/// Filter `SettingsTab::ALL` to the tabs visible for the current
+/// session — Admin is dropped when the user lacks `MANAGE_ACL`.
+fn visible_tabs(app_state: &State) -> Vec<SettingsTab> {
+    SettingsTab::ALL
+        .iter()
+        .copied()
+        .filter(|t| !matches!(t, SettingsTab::Admin) || admin_visible(app_state))
+        .collect()
 }
 
 /// At most one select dropdown is open at a time. Tracking it here
@@ -220,6 +247,10 @@ pub struct SettingsState {
     pub tab: Option<SettingsTab>,
     pub open_select: OpenSelect,
     pub pending: Option<PendingSettings>,
+    /// Persistent admin-tab UI state. Lives here so search query / open
+    /// accordion / open popover survive across re-opens of the Settings
+    /// dialog within one session.
+    pub admin: AdminState,
 }
 
 impl SettingsState {
@@ -286,6 +317,9 @@ pub enum SettingsOutcome {
     /// Open `path` in the system file manager. Path is the
     /// effective destination (pending override, or platform default).
     OpenDownloadDir(PathBuf),
+    /// Fire-and-forget commands surfaced by the Admin tab. Settings
+    /// stays open so the user can keep editing.
+    Dispatch(Vec<rumble_protocol::Command>),
 }
 
 // ============================================================
@@ -440,7 +474,14 @@ pub fn render(
         Some(p) => p,
         None => return (None, None),
     };
-    let tab = state.tab.unwrap_or(SettingsTab::Connection);
+    // Resolve the active tab against the live visibility filter so a
+    // permission revocation mid-session falls back gracefully to
+    // Connection instead of rendering a hidden tab.
+    let tabs = visible_tabs(app_state);
+    let mut tab = state.tab.unwrap_or(SettingsTab::Connection);
+    if !tabs.contains(&tab) {
+        tab = SettingsTab::Connection;
+    }
 
     let body = match tab {
         SettingsTab::Connection => render_connection(pending, identity),
@@ -451,13 +492,10 @@ pub fn render(
         SettingsTab::Chat => render_chat(pending),
         SettingsTab::Files => render_files(pending, selection),
         SettingsTab::Stats => render_stats(&app_state.audio),
+        SettingsTab::Admin => admin::render(&state.admin, app_state, selection),
     };
 
-    let tabs_row = tabs_list(
-        KEY_TABS,
-        &tab.slug(),
-        SettingsTab::ALL.iter().map(|t| (t.slug(), t.label())),
-    );
+    let tabs_row = tabs_list(KEY_TABS, &tab.slug(), tabs.iter().map(|t| (t.slug(), t.label())));
 
     let footer = row([
         button("Close").key(KEY_CLOSE),
@@ -469,10 +507,10 @@ pub fn render(
     .align(Align::Center);
 
     // Stock `modal_panel` is fixed at 420 px wide × Hug; the settings
-    // dialog needs a roomier 880 × 620 frame so the eight-tab segmented
-    // control fits "Connection" and "Processing" without truncation.
-    // 840 was 1–2 px short for "Connection" at the default label size
-    // (caught by the layout-lint pass).
+    // dialog needs a roomier frame so the segmented tabs row fits all
+    // tab labels without truncation. 880 was the right width at
+    // eight tabs; adding "Admin" pushed "Connection" / "Processing"
+    // back over the edge, so 940 leaves a couple of pixels of slack.
     let panel = modal_panel(
         "Settings",
         [
@@ -496,12 +534,12 @@ pub fn render(
             footer,
         ],
     )
-    .width(Size::Fixed(880.0))
+    .width(Size::Fixed(960.0))
     .height(Size::Fixed(620.0));
 
     let panel_layer = overlay([scrim(KEY_DISMISS), panel.block_pointer()]);
 
-    let popover_layer = match state.open_select {
+    let select_popover = match state.open_select {
         OpenSelect::None => None,
         OpenSelect::InputDevice => Some(select_menu(
             KEY_INPUT_DEVICE,
@@ -530,6 +568,30 @@ pub fn render(
                 .enumerate()
                 .map(|(idx, fmt)| (idx.to_string(), fmt.label().to_string())),
         )),
+    };
+
+    // Admin overlays (action menus, popovers, dialogs) ride above the
+    // settings panel. Only meaningful while the Admin tab is active —
+    // closing the tab leaves the state in place but the overlays are
+    // suppressed to avoid floating orphans.
+    let popover_layer = if matches!(tab, SettingsTab::Admin) {
+        let admin_overlays = admin::render_overlays(&state.admin, app_state, selection);
+        if admin_overlays.any() {
+            // Stack admin overlays + the select dropdown into one
+            // layer using `overlays(...)`; the empty main is just a
+            // pass-through so the stack composes flat.
+            let main = stack::<_, El>([]);
+            let layers: Vec<Option<El>> = admin_overlays
+                .into_layers()
+                .into_iter()
+                .chain(std::iter::once(select_popover))
+                .collect();
+            Some(overlays(main, layers))
+        } else {
+            select_popover
+        }
+    } else {
+        select_popover
     };
 
     (Some(panel_layer), popover_layer)
@@ -1295,11 +1357,24 @@ fn parse_bitrate(slug: &str) -> Option<i32> {
 pub fn handle_event(
     state: &mut SettingsState,
     event: &UiEvent,
+    app_state: &State,
     selection: &mut Selection,
     processor_registry: &ProcessorRegistry,
 ) -> SettingsOutcome {
     if !state.open {
         return SettingsOutcome::Ignored;
+    }
+
+    // Admin tab routes first when active so its popover/dialog events
+    // win over the generic dispatch below. Settings stays open after
+    // admin commands fire — they're fire-and-forget against the
+    // connected server.
+    if matches!(state.tab, Some(SettingsTab::Admin)) && admin_visible(app_state) {
+        match admin::handle_event(&mut state.admin, event, app_state, selection) {
+            AdminOutcome::Ignored => {}
+            AdminOutcome::Handled => return SettingsOutcome::Handled,
+            AdminOutcome::Dispatch(cmds) => return SettingsOutcome::Dispatch(cmds),
+        }
     }
 
     // Esc unconditionally cancels.

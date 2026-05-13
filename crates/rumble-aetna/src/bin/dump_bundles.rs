@@ -26,8 +26,8 @@ use rumble_desktop_shell::{KeyInfo, RecentServer, SettingsStore};
 use rumble_protocol::{
     AudioDeviceInfo, AudioState, AudioStats, ChatAttachment, ChatMessage, ChatMessageKind, Command, ConnectionState,
     FileOfferInfo, PendingCertificate, State, Uuid, VoiceMode,
-    permissions::Permissions,
-    proto::{RoomInfo, User, UserId},
+    permissions::{ADMIN_PERMISSIONS, DEFAULT_PERMISSIONS, Permissions},
+    proto::{GroupInfo, RoomAclEntry, RoomInfo, User, UserId},
     room_id_from_uuid,
 };
 
@@ -114,6 +114,13 @@ enum Scene {
     SettingsFiles,
     /// Settings dialog — Stats tab (read-only audio metrics).
     SettingsStats,
+    /// Settings dialog — Admin tab (Groups & ACL) with the "moderators"
+    /// group expanded to show the chip list + base-perm grid.
+    SettingsAdmin,
+    /// Per-room Permissions editor modal over the connected backdrop,
+    /// targeting a nested room so the breadcrumb has real depth and
+    /// the inherited block has rules to show.
+    RoomAclModal,
 }
 
 impl Scene {
@@ -144,6 +151,8 @@ impl Scene {
         Scene::SettingsChat,
         Scene::SettingsFiles,
         Scene::SettingsStats,
+        Scene::SettingsAdmin,
+        Scene::RoomAclModal,
     ];
 
     fn slug(self) -> &'static str {
@@ -174,6 +183,8 @@ impl Scene {
             Scene::SettingsChat => "settings_chat",
             Scene::SettingsFiles => "settings_files",
             Scene::SettingsStats => "settings_stats",
+            Scene::SettingsAdmin => "settings_admin",
+            Scene::RoomAclModal => "room_acl_modal",
         }
     }
 
@@ -242,6 +253,8 @@ impl Scene {
                 audio: stats_state(),
                 ..State::default()
             },
+            Scene::SettingsAdmin => admin_state(),
+            Scene::RoomAclModal => room_acl_state(),
         }
     }
 
@@ -321,6 +334,13 @@ impl Scene {
             }
             Scene::SettingsFiles => app.open_settings_for_test(SettingsTab::Files),
             Scene::SettingsStats => app.open_settings_for_test(SettingsTab::Stats),
+            Scene::SettingsAdmin => {
+                app.open_settings_for_test(SettingsTab::Admin);
+                app.set_admin_expanded_group_for_test(Some("moderators".to_string()));
+            }
+            Scene::RoomAclModal => {
+                app.open_room_acl_modal_for_test(Uuid::from_u128(ROOM_STAGE));
+            }
             Scene::ConnectedImagePreview => {
                 // Pre-decoded image so the preview path renders without
                 // a real file-transfer plugin underneath. The fixture
@@ -368,6 +388,8 @@ impl Scene {
 
 const ROOM_LOBBY: u128 = 0x1111_1111_1111_1111_1111_1111_1111_1111;
 const ROOM_WORK: u128 = 0x2222_2222_2222_2222_2222_2222_2222_2222;
+const ROOM_STAGE: u128 = 0x3333_3333_3333_3333_3333_3333_3333_3333;
+const ROOM_STAGE_GAMING: u128 = 0x4444_4444_4444_4444_4444_4444_4444_4444;
 
 fn make_room(uuid: u128, name: &str) -> RoomInfo {
     RoomInfo {
@@ -418,6 +440,195 @@ fn make_chat_full(
         is_local,
         kind,
         attachment,
+    }
+}
+
+/// Fixture for the Admin scene: a connected session where the local
+/// user has `MANAGE_ACL` (so the tab is gated open), a mix of built-in
+/// and custom groups, four users with overlapping group membership,
+/// and a couple of rooms that reference the custom groups in ACLs so
+/// "Used in N rooms" surfaces a non-zero count.
+fn admin_state() -> State {
+    let mut state = State {
+        connection: ConnectionState::Connected {
+            server_name: "rumble.example".into(),
+            user_id: 1,
+        },
+        rooms: vec![
+            RoomInfo {
+                acls: vec![RoomAclEntry {
+                    group: "moderators".into(),
+                    grant: (Permissions::MUTE_DEAFEN | Permissions::MOVE_USER).bits(),
+                    deny: 0,
+                    apply_here: true,
+                    apply_subs: true,
+                }],
+                ..make_room(ROOM_LOBBY, "Lobby")
+            },
+            RoomInfo {
+                acls: vec![RoomAclEntry {
+                    group: "streamers".into(),
+                    grant: Permissions::SPEAK.bits(),
+                    deny: 0,
+                    apply_here: true,
+                    apply_subs: false,
+                }],
+                ..make_room(ROOM_WORK, "Stage")
+            },
+        ],
+        users: vec![
+            make_user(1, "alice", ROOM_LOBBY, |u| {
+                u.groups = vec!["admin".into(), "moderators".into()];
+            }),
+            make_user(2, "bob", ROOM_LOBBY, |u| {
+                u.groups = vec!["moderators".into()];
+            }),
+            make_user(3, "charlie", ROOM_WORK, |u| {
+                u.groups = vec!["moderators".into(), "streamers".into()];
+            }),
+            make_user(4, "diana", ROOM_WORK, |u| {
+                u.groups = vec!["streamers".into()];
+            }),
+            make_user(5, "eve", ROOM_LOBBY, |_| {}),
+        ],
+        my_user_id: Some(1),
+        my_room_id: Some(Uuid::from_u128(ROOM_LOBBY)),
+        effective_permissions: ADMIN_PERMISSIONS.bits(),
+        group_definitions: vec![
+            GroupInfo {
+                name: "default".into(),
+                permissions: DEFAULT_PERMISSIONS.bits(),
+                is_builtin: true,
+            },
+            GroupInfo {
+                name: "admin".into(),
+                permissions: ADMIN_PERMISSIONS.bits(),
+                is_builtin: true,
+            },
+            GroupInfo {
+                name: "moderators".into(),
+                permissions: (Permissions::MUTE_DEAFEN | Permissions::MOVE_USER | Permissions::KICK).bits(),
+                is_builtin: false,
+            },
+            GroupInfo {
+                name: "streamers".into(),
+                permissions: 0,
+                is_builtin: false,
+            },
+        ],
+        ..State::default()
+    };
+    state.rebuild_room_tree();
+    state
+}
+
+/// Fixture for the per-room ACL editor scene. Three-level room tree
+/// (Root → Stage → Stage/Gaming with our edit target one level
+/// deeper), real ancestor ACLs so the inherited block has rules to
+/// list, and the local-rules editor pre-populated with two entries:
+/// one all-on, one with a SPEAK deny so the tri-state buttons show
+/// both `+` and `−` selections in the dump.
+fn room_acl_state() -> State {
+    let stage_uuid = Uuid::from_u128(ROOM_STAGE);
+    let stage_gaming_uuid = Uuid::from_u128(ROOM_STAGE_GAMING);
+    let _ = stage_gaming_uuid; // currently unused; reserved for a future deeper-modal scene.
+
+    let mut state = State {
+        connection: ConnectionState::Connected {
+            server_name: "rumble.example".into(),
+            user_id: 1,
+        },
+        rooms: vec![
+            // Root holds an ACL granting moderators MUTE_DEAFEN —
+            // surfaces in the inherited block of the target room as a
+            // `/Root` rule.
+            RoomInfo {
+                acls: vec![RoomAclEntry {
+                    group: "moderators".into(),
+                    grant: Permissions::MUTE_DEAFEN.bits(),
+                    deny: 0,
+                    apply_here: true,
+                    apply_subs: true,
+                }],
+                inherit_acl: false,
+                ..make_room_with_parent(rumble_protocol::ROOT_ROOM_UUID.as_u128(), "Root", None)
+            },
+            // Mid-level parent. No own ACL; just contributes a
+            // breadcrumb segment.
+            make_room_with_parent(ROOM_WORK, "Lobby", Some(rumble_protocol::ROOT_ROOM_UUID.as_u128())),
+            // Edit target: a sub-room with two local entries.
+            RoomInfo {
+                inherit_acl: true,
+                acls: vec![
+                    RoomAclEntry {
+                        group: "streamers".into(),
+                        grant: (Permissions::SPEAK | Permissions::SHARE_FILE).bits(),
+                        deny: 0,
+                        apply_here: true,
+                        apply_subs: true,
+                    },
+                    RoomAclEntry {
+                        group: "default".into(),
+                        grant: 0,
+                        deny: Permissions::SPEAK.bits(),
+                        apply_here: true,
+                        apply_subs: false,
+                    },
+                ],
+                ..make_room_with_parent(ROOM_STAGE, "Strategy", Some(ROOM_WORK))
+            },
+        ],
+        users: vec![
+            make_user(1, "alice", ROOM_STAGE, |u| {
+                u.groups = vec!["admin".into(), "moderators".into()];
+            }),
+            make_user(2, "bob", ROOM_STAGE, |u| {
+                u.groups = vec!["streamers".into()];
+            }),
+        ],
+        my_user_id: Some(1),
+        my_room_id: Some(stage_uuid),
+        effective_permissions: (Permissions::WRITE | Permissions::TEXT_MESSAGE | Permissions::SPEAK).bits(),
+        group_definitions: vec![
+            GroupInfo {
+                name: "default".into(),
+                permissions: DEFAULT_PERMISSIONS.bits(),
+                is_builtin: true,
+            },
+            GroupInfo {
+                name: "admin".into(),
+                permissions: ADMIN_PERMISSIONS.bits(),
+                is_builtin: true,
+            },
+            GroupInfo {
+                name: "moderators".into(),
+                permissions: (Permissions::MUTE_DEAFEN | Permissions::MOVE_USER).bits(),
+                is_builtin: false,
+            },
+            GroupInfo {
+                name: "streamers".into(),
+                permissions: 0,
+                is_builtin: false,
+            },
+        ],
+        ..State::default()
+    };
+    state.rebuild_room_tree();
+    state
+}
+
+/// Same as `make_room` but lets the fixture set a parent_id. The
+/// existing `make_room` always returns root-level rooms; the room-acl
+/// scene needs a real tree depth so the breadcrumb has segments.
+fn make_room_with_parent(uuid: u128, name: &str, parent: Option<u128>) -> RoomInfo {
+    RoomInfo {
+        id: Some(room_id_from_uuid(Uuid::from_u128(uuid))),
+        name: name.into(),
+        parent_id: parent.map(|p| room_id_from_uuid(Uuid::from_u128(p))),
+        description: None,
+        inherit_acl: true,
+        acls: Vec::new(),
+        effective_permissions: 0,
     }
 }
 

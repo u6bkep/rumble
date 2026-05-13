@@ -30,6 +30,7 @@ use crate::{
     backend::UiBackend,
     chat,
     identity::Identity,
+    room_acl,
     room_tree::{self, RoomTreeOutcome, RoomTreeState},
     server_picker::{self, ServerForm, ServerPickerOutcome, ServerPickerState},
     settings::{self, SettingsOutcome, SettingsState},
@@ -188,6 +189,11 @@ pub struct RumbleApp<B: UiBackend = crate::backend::NativeUiBackend> {
     /// `HoveredFileCancelled` or when the drop lands.
     file_drop_hover: bool,
 
+    /// Per-room Permissions editor modal. `Some` between the user
+    /// picking "Permissions…" from the room context menu and the
+    /// Save / Cancel that closes the modal. See [`crate::room_acl`].
+    room_acl_modal: Option<room_acl::RoomAclModalState>,
+
     /// `wgpu::Device` handle stashed by [`WinitWgpuApp::gpu_setup`]
     /// once at startup, used in [`Self::sync_animated_gpu`] to lazily
     /// allocate per-message textures for animated previews. `None`
@@ -322,6 +328,7 @@ impl<B: UiBackend> RumbleApp<B> {
             pending_save_as: None,
             pending_pick_download_dir: None,
             file_drop_hover: false,
+            room_acl_modal: None,
             gpu_device: None,
             animated_gpu: HashMap::new(),
             active_video: None,
@@ -644,6 +651,21 @@ impl<B: UiBackend> App for RumbleApp<B> {
                 None
             };
 
+        // Per-room ACL editor modal. Suppressed under cert / unlock /
+        // wizard for the same reason settings is — those gate the
+        // session itself. Renders above the settings dialog when both
+        // are somehow open (shouldn't happen by normal flow).
+        let (room_acl_modal_layer, room_acl_popover_layer) = if !wizard_open
+            && unlock_layer.is_none()
+            && cert_layer.is_none()
+            && let Some(modal) = self.room_acl_modal.as_ref()
+        {
+            let layers = room_acl::render(modal, &state, &self.selection);
+            (layers.modal, layers.popover)
+        } else {
+            (None, None)
+        };
+
         // Drop-target hint while the OS is reporting a hovered file.
         // Suppressed under modals (the user can still drop a file then,
         // but the prompt would visually fight whatever modal is up).
@@ -684,6 +706,8 @@ impl<B: UiBackend> App for RumbleApp<B> {
                 voice_mode_layer,
                 settings_panel,
                 settings_popover,
+                room_acl_modal_layer,
+                room_acl_popover_layer,
                 cert_layer,
                 unlock_layer,
                 wizard_layer,
@@ -757,13 +781,35 @@ impl<B: UiBackend> App for RumbleApp<B> {
             return;
         }
 
+        // Per-room ACL editor modal claims events before the rest of
+        // the UI. Save / Cancel close the modal; everything else
+        // mutates pending entries in place.
+        if let Some(modal) = self.room_acl_modal.as_mut() {
+            let app_state = self.backend.state();
+            match room_acl::handle_event(modal, &event, &app_state, &mut self.selection) {
+                room_acl::RoomAclOutcome::Ignored => {}
+                room_acl::RoomAclOutcome::Handled => return,
+                room_acl::RoomAclOutcome::Close => {
+                    self.room_acl_modal = None;
+                    return;
+                }
+                room_acl::RoomAclOutcome::Save(cmd) => {
+                    self.backend.send(cmd);
+                    self.room_acl_modal = None;
+                    return;
+                }
+            }
+        }
+
         // Settings dialog owns its own routed-key namespace; let it
         // claim its events first so the toolbar / chat / room handlers
         // below don't accidentally swallow them.
         if self.settings_state.open {
+            let app_state = self.backend.state();
             let outcome = settings::handle_event(
                 &mut self.settings_state,
                 &event,
+                &app_state,
                 &mut self.selection,
                 &self.processor_registry,
             );
@@ -1134,6 +1180,11 @@ impl<B: UiBackend> App for RumbleApp<B> {
                         continue;
                     }
                     self.backend.send(cmd);
+                }
+            }
+            RoomTreeOutcome::OpenAclEditor(room_id) => {
+                if let Some(modal) = room_acl::RoomAclModalState::open_for(&room_tree_state, room_id) {
+                    self.room_acl_modal = Some(modal);
                 }
             }
         }
@@ -2380,6 +2431,12 @@ impl<B: UiBackend> RumbleApp<B> {
                 open_path(&path);
                 true
             }
+            SettingsOutcome::Dispatch(commands) => {
+                for cmd in commands {
+                    self.backend.send(cmd);
+                }
+                true
+            }
         }
     }
 
@@ -2539,6 +2596,27 @@ impl<B: UiBackend> RumbleApp<B> {
         self.settings_state.open_select = which;
     }
 
+    /// Test/scene-dump hook for the Admin tab — sets which group's
+    /// accordion is expanded so a scene can snapshot the chip list +
+    /// base-perm grid without driving a click event first.
+    pub fn set_admin_expanded_group_for_test(&mut self, group: Option<String>) {
+        self.settings_state.admin.expanded_group = group;
+    }
+
+    /// Test/scene-dump hook for the per-room Permissions editor modal.
+    /// Builds the modal state directly from the current backend
+    /// snapshot (no context-menu click needed). Expands the first
+    /// local rule so the dump includes the tri-state grid.
+    pub fn open_room_acl_modal_for_test(&mut self, room_id: uuid::Uuid) {
+        let snapshot = self.backend.state();
+        if let Some(mut modal) = room_acl::RoomAclModalState::open_for(&snapshot, room_id) {
+            if !modal.entries.is_empty() {
+                modal.expanded_entry = Some(0);
+            }
+            self.room_acl_modal = Some(modal);
+        }
+    }
+
     /// Test/scene-dump hook to seed the chat image-preview cache. The
     /// runtime path goes through `pump_image_cache`, but bundle dumps
     /// don't have a real file-transfer plugin behind them — so let the
@@ -2685,8 +2763,16 @@ fn voice_mode_trigger(mode_icon: SvgIcon, tooltip_text: &str) -> El {
 /// so it paints over the toolbar surface.
 fn voice_mode_menu(current: VoiceMode) -> El {
     use aetna_core::widgets::popover::{Anchor, menu_item, popover, popover_panel};
-    let cont_label = if current == VoiceMode::Continuous { "Continuous (VAD) ✓" } else { "Continuous (VAD)" };
-    let ptt_label = if current == VoiceMode::PushToTalk { "Push-to-Talk ✓" } else { "Push-to-Talk" };
+    let cont_label = if current == VoiceMode::Continuous {
+        "Continuous (VAD) ✓"
+    } else {
+        "Continuous (VAD)"
+    };
+    let ptt_label = if current == VoiceMode::PushToTalk {
+        "Push-to-Talk ✓"
+    } else {
+        "Push-to-Talk"
+    };
     popover(
         KEY_TB_VOICE_MODE,
         Anchor::below_key(KEY_TB_VOICE_MODE),
