@@ -826,11 +826,11 @@ fn handle_new_group_event(
         return Some(AdminOutcome::Handled);
     }
 
-    if let Some(form) = state.new_group.as_mut() {
-        if aetna_core::widgets::text_input::apply_event(&mut form.name, selection, KEY_NEW_GROUP_NAME, event) {
-            form.error = None;
-            return Some(AdminOutcome::Handled);
-        }
+    if let Some(form) = state.new_group.as_mut()
+        && aetna_core::widgets::text_input::apply_event(&mut form.name, selection, KEY_NEW_GROUP_NAME, event)
+    {
+        form.error = None;
+        return Some(AdminOutcome::Handled);
     }
 
     if event.is_click_or_activate(KEY_NEW_GROUP_CANCEL) {
@@ -966,16 +966,16 @@ fn handle_group_action(
                 AdminOutcome::Handled
             }
             Some(rest) => {
-                if let Some(uid_str) = rest.strip_prefix("pick:") {
-                    if let Ok(uid) = uid_str.parse::<u64>() {
-                        state.add_user_popover = None;
-                        return AdminOutcome::one(Command::SetUserGroup {
-                            target_user_id: uid,
-                            group: group.to_string(),
-                            add: true,
-                            expires_at: 0,
-                        });
-                    }
+                if let Some(uid_str) = rest.strip_prefix("pick:")
+                    && let Ok(uid) = uid_str.parse::<u64>()
+                {
+                    state.add_user_popover = None;
+                    return AdminOutcome::one(Command::SetUserGroup {
+                        target_user_id: uid,
+                        group: group.to_string(),
+                        add: true,
+                        expires_at: 0,
+                    });
                 }
                 AdminOutcome::Handled
             }

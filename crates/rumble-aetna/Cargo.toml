@@ -3,6 +3,7 @@ name = "rumble-aetna"
 version = "0.1.0"
 edition = "2024"
 description = "Rumble client built on the aetna UI library"
+default-run = "rumble-aetna"
 
 [lib]
 name = "rumble_aetna"
