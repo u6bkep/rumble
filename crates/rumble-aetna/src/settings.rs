@@ -43,6 +43,8 @@ pub enum SettingsTab {
     /// has `MANAGE_ACL` at the root; the tab disappears from the row
     /// when the permission is revoked mid-session.
     Admin,
+    /// Build / version info — git describe output from build.rs.
+    About,
 }
 
 impl SettingsTab {
@@ -56,6 +58,7 @@ impl SettingsTab {
         SettingsTab::Files,
         SettingsTab::Stats,
         SettingsTab::Admin,
+        SettingsTab::About,
     ];
 
     fn slug(self) -> &'static str {
@@ -69,6 +72,7 @@ impl SettingsTab {
             SettingsTab::Files => "files",
             SettingsTab::Stats => "stats",
             SettingsTab::Admin => "admin",
+            SettingsTab::About => "about",
         }
     }
 
@@ -83,6 +87,7 @@ impl SettingsTab {
             SettingsTab::Files => "Files",
             SettingsTab::Stats => "Stats",
             SettingsTab::Admin => "Admin",
+            SettingsTab::About => "About",
         }
     }
 
@@ -502,6 +507,7 @@ pub fn render(
         SettingsTab::Files => render_files(pending, selection),
         SettingsTab::Stats => render_stats(&app_state.audio),
         SettingsTab::Admin => admin::render(&state.admin, app_state, selection),
+        SettingsTab::About => render_about(),
     };
 
     let tabs_row = tabs_list(KEY_TABS, &tab.slug(), tabs.iter().map(|t| (t.slug(), t.label())));
@@ -520,6 +526,7 @@ pub fn render(
     // tab labels without truncation. 880 was the right width at
     // eight tabs; adding "Admin" pushed "Connection" / "Processing"
     // back over the edge, so 940 leaves a couple of pixels of slack.
+    // "About" was added later, bumping the width up again.
     let panel = modal_panel(
         "Settings",
         [
@@ -543,7 +550,7 @@ pub fn render(
             footer,
         ],
     )
-    .width(Size::Fixed(960.0))
+    .width(Size::Fixed(1020.0))
     .height(Size::Fixed(620.0));
 
     let panel_layer = overlay([scrim(KEY_DISMISS), panel.block_pointer()]);
@@ -1363,6 +1370,49 @@ fn render_stats(audio: &AudioState) -> El {
     ])
     .gap(tokens::SPACE_1)
     .width(Size::Fill(1.0))
+}
+
+/// Build / version info populated by `build.rs` via `cargo:rustc-env=`.
+/// Tag is empty when HEAD isn't tagged; dirty is "true" / "false".
+fn render_about() -> El {
+    let pkg_version = env!("CARGO_PKG_VERSION");
+    let describe = env!("RUMBLE_AETNA_GIT_DESCRIBE");
+    let short_hash = env!("RUMBLE_AETNA_GIT_SHORT_HASH");
+    let full_hash = env!("RUMBLE_AETNA_GIT_HASH");
+    let tag = env!("RUMBLE_AETNA_GIT_TAG");
+    let dirty = env!("RUMBLE_AETNA_GIT_DIRTY") == "true";
+
+    let mut rows: Vec<El> = Vec::new();
+    rows.push(section_heading("Rumble"));
+    rows.push(field_row("Package version", text(pkg_version).semibold()));
+
+    if !tag.is_empty() {
+        rows.push(field_row("Tag", text(tag).semibold()));
+    }
+    rows.push(field_row(
+        "Commit",
+        mono(format!("{short_hash} ({full_hash})"))
+            .font_size(tokens::TEXT_XS.size)
+            .ellipsis()
+            .width(Size::Fill(1.0)),
+    ));
+    rows.push(field_row(
+        "Working tree",
+        if dirty {
+            text("dirty — built from uncommitted changes").text_color(tokens::WARNING)
+        } else {
+            text("clean").text_color(tokens::SUCCESS)
+        },
+    ));
+    rows.push(field_row(
+        "git describe",
+        mono(describe)
+            .font_size(tokens::TEXT_XS.size)
+            .ellipsis()
+            .width(Size::Fill(1.0)),
+    ));
+
+    column(rows).gap(tokens::SPACE_2).width(Size::Fill(1.0))
 }
 
 // ---- view helpers ---------------------------------------------------

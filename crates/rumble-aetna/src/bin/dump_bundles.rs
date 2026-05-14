@@ -117,6 +117,8 @@ enum Scene {
     /// Settings dialog — Admin tab (Groups & ACL) with the "moderators"
     /// group expanded to show the chip list + base-perm grid.
     SettingsAdmin,
+    /// Settings dialog — About tab (build / git describe info).
+    SettingsAbout,
     /// Per-room Permissions editor modal over the connected backdrop,
     /// targeting a nested room so the breadcrumb has real depth and
     /// the inherited block has rules to show.
@@ -162,6 +164,7 @@ impl Scene {
         Scene::SettingsFiles,
         Scene::SettingsStats,
         Scene::SettingsAdmin,
+        Scene::SettingsAbout,
         Scene::RoomAclModal,
         Scene::ElevatePrompt,
         Scene::SettingsConnectionSudo,
@@ -197,6 +200,7 @@ impl Scene {
             Scene::SettingsFiles => "settings_files",
             Scene::SettingsStats => "settings_stats",
             Scene::SettingsAdmin => "settings_admin",
+            Scene::SettingsAbout => "settings_about",
             Scene::RoomAclModal => "room_acl_modal",
             Scene::ElevatePrompt => "elevate_prompt",
             Scene::SettingsConnectionSudo => "settings_connection_sudo",
@@ -244,7 +248,8 @@ impl Scene {
             | Scene::SettingsChat
             | Scene::SettingsVoice
             | Scene::SettingsSounds
-            | Scene::SettingsFiles => State::default(),
+            | Scene::SettingsFiles
+            | Scene::SettingsAbout => State::default(),
             // Toolbar dropdown only renders while connected (the trigger
             // is gated on `state.connection.is_connected()`), so reuse
             // the live-session fixture so the popover anchors correctly.
@@ -356,6 +361,7 @@ impl Scene {
                 app.open_settings_for_test(SettingsTab::Admin);
                 app.set_admin_expanded_group_for_test(Some("moderators".to_string()));
             }
+            Scene::SettingsAbout => app.open_settings_for_test(SettingsTab::About),
             Scene::RoomAclModal => {
                 app.open_room_acl_modal_for_test(Uuid::from_u128(ROOM_STAGE));
             }
