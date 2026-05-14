@@ -9,14 +9,20 @@ pub type OnFrameFn = Box<dyn FnMut(&[f32]) + Send>;
 pub type FillBufferFn = Box<dyn FnMut(&mut [f32]) + Send>;
 
 /// A live audio capture stream that can be paused/resumed.
-pub trait AudioCaptureStream: Send {
+///
+/// Not `Send`: cpal's `Stream` is `!Send` on Windows (WASAPI's COM
+/// model pins it to the creating thread). The audio task owns streams
+/// as locals on its dedicated thread (see `spawn_audio_task`), so
+/// they never need to cross threads in practice.
+pub trait AudioCaptureStream {
     /// Enable or disable capture. When inactive, the stream should produce
     /// silence (or simply not invoke the callback).
     fn set_active(&self, active: bool);
 }
 
-/// A live audio playback stream.
-pub trait AudioPlaybackStream: Send {}
+/// A live audio playback stream. See `AudioCaptureStream` for why
+/// this trait doesn't require `Send`.
+pub trait AudioPlaybackStream {}
 
 /// Platform audio I/O: device enumeration, capture, and playback.
 ///

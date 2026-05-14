@@ -553,14 +553,8 @@ impl AudioCaptureStream for CpalCaptureStream {
     }
 }
 
-// SAFETY: cpal::Stream is Send on all desktop platforms we target.
-unsafe impl Send for CpalCaptureStream {}
-
 pub struct CpalPlaybackStream {
     _stream: cpal::Stream,
 }
 
 impl AudioPlaybackStream for CpalPlaybackStream {}
-
-// SAFETY: cpal::Stream is Send on all desktop platforms we target.
-unsafe impl Send for CpalPlaybackStream {}
