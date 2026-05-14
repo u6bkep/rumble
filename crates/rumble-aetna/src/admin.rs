@@ -626,7 +626,7 @@ fn render_add_user_popover(popover_state: &AddUserPopover, app_state: &State, se
         .filter(|u| !u.groups.contains(group))
         .filter(|u| query.is_empty() || u.username.to_lowercase().contains(&query))
         .collect();
-    candidates.sort_by(|a, b| a.username.to_lowercase().cmp(&b.username.to_lowercase()));
+    candidates.sort_by_key(|u| u.username.to_lowercase());
 
     let search = text_input_with(
         &popover_state.query,
