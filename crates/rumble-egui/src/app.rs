@@ -27,10 +27,10 @@ use crate::{
         AcceptedCertificate, Args, AutoDownloadRule, PersistentAudioSettings, PersistentSettings, PersistentVoiceMode,
         TimestampFormat,
     },
+    toasts::ToastManager,
 };
 use rumble_desktop_shell::{
     AcceptedCertificate as SharedAcceptedCertificate, KeyInfo, KeyManager, KeySource, RecentServer, SettingsStore,
-    ToastManager,
     hotkeys::HotkeyEvent,
     identity::key_manager::{
         PendingAgentOp, SshAgentClient, connect_and_list_keys, generate_and_add_to_agent, parse_signing_key,

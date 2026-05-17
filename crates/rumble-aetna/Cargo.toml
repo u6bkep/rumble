@@ -18,7 +18,7 @@ path = "src/main.rs"
 aetna-core = { workspace = true }
 aetna-winit-wgpu = { workspace = true }
 aetna-wgpu = { workspace = true }
-wgpu = "29"
+wgpu = { workspace = true }
 
 # Rumble client backend.
 rumble-client = { path = "../rumble-client" }
@@ -31,16 +31,26 @@ rumble-video = { path = "../rumble-video" }
 ed25519-dalek = { workspace = true }
 rand = { workspace = true }
 
-serde_json = "1.0"
-uuid = { version = "1.18.1", features = ["v4"] }
-directories = "6.0"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
-anyhow = "1.0"
-rfd = "0.16"
+serde_json = { workspace = true }
+uuid = { workspace = true }
+directories = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+anyhow = { workspace = true }
+rfd = "0.17"
 image = { version = "0.25", default-features = false, features = ["bmp", "gif", "ico", "jpeg", "png", "tiff", "webp"] }
 arboard = "3"
 tempfile = "3"
-base64 = "0.21"
+base64 = { workspace = true }
+
+# Platform-conditional feature opt-ins. Linux-only PulseAudio output
+# (rumble-desktop::pulse) + XDG GlobalShortcuts portal
+# (rumble-desktop-shell::wayland-portal) are gated to Linux builds.
+# Splitting these out of the crates' `default` features keeps non-Linux
+# builds from depending on cargo silently dropping feature references
+# to target-gated optional deps.
+[target.'cfg(target_os = "linux")'.dependencies]
+rumble-desktop = { path = "../rumble-desktop", features = ["pulse"] }
+rumble-desktop-shell = { path = "../rumble-desktop-shell", features = ["wayland-portal"] }
 

@@ -569,6 +569,7 @@ impl HotkeyManager {
     }
 
     /// Convert egui Key to our string representation.
+    #[cfg(feature = "egui-keys")]
     pub fn egui_key_to_string(key: eframe::egui::Key) -> Option<String> {
         use eframe::egui::Key;
         let s = match key {
@@ -652,6 +653,7 @@ impl HotkeyManager {
     }
 
     /// Convert key string to egui Key (for window-focused fallback).
+    #[cfg(feature = "egui-keys")]
     pub fn key_string_to_egui_key(key: &str) -> Option<eframe::egui::Key> {
         use eframe::egui::Key;
         match key.to_lowercase().as_str() {
@@ -802,6 +804,7 @@ mod tests {
         assert_eq!(binding2.display(), "F1");
     }
 
+    #[cfg(feature = "egui-keys")]
     #[test]
     fn key_string_to_egui_roundtrip() {
         use eframe::egui::Key;

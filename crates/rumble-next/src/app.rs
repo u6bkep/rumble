@@ -11,8 +11,9 @@ use rumble_protocol::Command;
 use rumble_widgets::{ButtonArgs, PressableRole, SurfaceFrame, SurfaceKind, UiExt, install_theme};
 
 pub use crate::paradigm::Paradigm;
+use crate::toasts::ToastManager;
 use rumble_desktop_shell::{
-    KeyInfo, SettingsStore, ToastManager,
+    KeyInfo, SettingsStore,
     hotkeys::{HotkeyEvent, HotkeyManager},
     identity::key_manager::{PendingAgentOp, SshAgentClient, connect_and_list_keys, generate_and_add_to_agent},
 };

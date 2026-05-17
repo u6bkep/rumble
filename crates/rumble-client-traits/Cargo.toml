@@ -7,9 +7,9 @@ edition = "2024"
 [dependencies]
 rumble-protocol = { path = "../rumble-protocol" }
 rumble-audio = { path = "../rumble-audio" }
-anyhow = "1"
-async-trait = "0.1"
-prost = "0.14"
-sha2 = "0.10"
-uuid = { version = "1.19.0", features = ["v4"] }
-serde = { version = "1", features = ["derive"] }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+prost = { workspace = true }
+sha2 = { workspace = true }
+uuid = { workspace = true }
+serde = { workspace = true }

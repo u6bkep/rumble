@@ -25,7 +25,7 @@ rumble-widgets = { path = "../rumble-widgets" }
 rumble-client = { path = "../rumble-client" }
 rumble-client-traits = { path = "../rumble-client-traits" }
 rumble-desktop = { path = "../rumble-desktop" }
-rumble-desktop-shell = { path = "../rumble-desktop-shell" }
+rumble-desktop-shell = { path = "../rumble-desktop-shell", features = ["egui-keys"] }
 rumble-protocol = { path = "../rumble-protocol" }
 ed25519-dalek = { workspace = true }
 rand = { workspace = true }
@@ -43,6 +43,11 @@ arboard = "3"
 rfd = "0.16"
 open = "5"
 egui_kittest = { version = "0.33", features = ["wgpu", "eframe"], optional = true }
+
+# Linux-only opt-ins for the deprecated egui-next client.
+[target.'cfg(target_os = "linux")'.dependencies]
+rumble-desktop = { path = "../rumble-desktop", features = ["pulse"] }
+rumble-desktop-shell = { path = "../rumble-desktop-shell", features = ["wayland-portal"] }
 
 [[example]]
 name = "screenshot"

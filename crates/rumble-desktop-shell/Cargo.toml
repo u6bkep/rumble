@@ -8,34 +8,48 @@ name = "rumble_desktop_shell"
 path = "src/lib.rs"
 
 [features]
-default = ["encrypted-keys", "ssh-agent", "global-hotkeys", "wayland-portal"]
+# Cross-platform defaults only. `wayland-portal` is Linux-only —
+# consumers opt in via a `[target.'cfg(target_os = "linux")'.dependencies]`
+# block so non-Linux builds don't depend on cargo silently dropping
+# feature references to missing target-gated optional deps.
+#
+# `ssh-agent` stays on by default because its underlying crates
+# (ssh-agent-lib, ssh-key, service-binding) compile on every platform
+# and the API surface — `SshAgentClient`, `connect_and_list_keys`,
+# `select_agent_key` — is referenced unconditionally by `rumble-aetna`.
+# Cfg-gating those call sites would be a much larger change.
+default = ["encrypted-keys", "ssh-agent", "global-hotkeys"]
 # Enables Argon2 + ChaCha20Poly1305 encrypted-at-rest identity files.
 encrypted-keys = ["dep:argon2", "dep:chacha20poly1305", "dep:getrandom"]
-# Enables ssh-agent-backed identity (Unix only at use sites).
+# Enables ssh-agent-backed identity.
 ssh-agent = ["dep:ssh-agent-lib", "dep:ssh-key", "dep:service-binding"]
 # Enables the cross-platform global hotkey backend.
 global-hotkeys = ["dep:global-hotkey"]
 # Enables the Linux XDG GlobalShortcuts portal backend.
 wayland-portal = ["dep:ashpd", "dep:futures-util"]
+# Enables egui Key <-> string helpers on `HotkeyManager`. Only the
+# egui-based clients (deprecated) need these; aetna doesn't, so we keep
+# the eframe dep off the default build path.
+egui-keys = ["dep:eframe"]
 
 [dependencies]
-eframe = "0.33.3"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-directories = "6.0"
-tracing = "0.1"
-base64 = "0.22"
-hex = "0.4"
-sha2 = "0.10"
-anyhow = "1.0"
-async-trait = "0.1"
+eframe = { workspace = true, optional = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+directories = { workspace = true }
+tracing = { workspace = true }
+base64 = { workspace = true }
+hex = { workspace = true }
+sha2 = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
 ed25519-dalek = { workspace = true }
 rand = { workspace = true }
 rumble-client = { path = "../rumble-client" }
 rumble-client-traits = { path = "../rumble-client-traits" }
 # Tokio is on the hotkey API surface (init_portal_backend takes a Handle)
 # even on non-Linux platforms, so it's unconditional.
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "macros"] }
 
 # Cross-platform global hotkeys (X11, Windows, macOS).
 global-hotkey = { version = "0.7", optional = true }

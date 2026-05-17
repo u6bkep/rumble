@@ -13,12 +13,13 @@ pub mod identity;
 pub mod paradigm;
 pub mod settings_panel;
 pub mod shell;
+pub mod toasts;
 
 pub use app::{App, Paradigm};
 #[cfg(feature = "test-harness")]
 pub use backend::MockBackend;
 pub use backend::{NativeUiBackend, UiBackend};
-pub use rumble_desktop_shell::{ToastLevel, ToastManager};
+pub use toasts::{Toast, ToastLevel, ToastManager};
 
 #[cfg(feature = "test-harness")]
 pub use harness::TestHarness;

@@ -1,12 +1,9 @@
-//! Desktop client shell — settings, identity/key management, hotkeys,
-//! and toast notifications shared between `rumble-egui` and
-//! `rumble-next`. See `docs/rumble-next-bringup.md` for the migration
-//! plan.
+//! Desktop client shell — settings, identity/key management, and
+//! hotkeys shared between desktop client frontends.
 
 pub mod hotkeys;
 pub mod identity;
 pub mod settings;
-pub mod toasts;
 
 pub use hotkeys::{
     HotkeyAction, HotkeyBinding, HotkeyEvent, HotkeyManager, HotkeyModifiers, HotkeyRegistrationStatus,
@@ -19,4 +16,3 @@ pub use settings::{
     AcceptedCertificate, AutoDownloadRule, ChatSettings, FileTransferSettings, PersistentAudioSettings,
     PersistentVoiceMode, RecentServer, Settings, SettingsStore, SfxSettings, TimestampFormat,
 };
-pub use toasts::{Toast, ToastLevel, ToastManager};

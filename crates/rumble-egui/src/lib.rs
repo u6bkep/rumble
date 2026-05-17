@@ -10,6 +10,7 @@ pub mod first_run;
 pub mod harness;
 pub mod rpc_client;
 pub mod settings;
+pub mod toasts;
 
 // Re-export the shared key-management module under its old name so
 // existing call sites compile unchanged.
@@ -22,6 +23,7 @@ pub use app::RumbleApp;
 pub use harness::TestHarness;
 pub use rumble_desktop_shell::{
     HotkeyAction, HotkeyBinding, HotkeyEvent, HotkeyManager, HotkeyModifiers, HotkeyRegistrationStatus,
-    KeyboardSettings, ToastManager,
+    KeyboardSettings,
 };
 pub use settings::{Args, PersistentSettings};
+pub use toasts::{Toast, ToastLevel, ToastManager};

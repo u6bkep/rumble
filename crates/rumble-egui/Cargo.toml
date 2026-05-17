@@ -26,7 +26,7 @@ uuid = { version = "1.18.1", features = ["v4"] }
 rumble-client = { path = "../rumble-client" }
 rumble-client-traits = { path = "../rumble-client-traits" }
 rumble-desktop = { path = "../rumble-desktop" }
-rumble-desktop-shell = { path = "../rumble-desktop-shell" }
+rumble-desktop-shell = { path = "../rumble-desktop-shell", features = ["egui-keys"] }
 rumble-protocol = { path = "../rumble-protocol" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 clap = { version = "4.5.53", features = ["derive"] }
@@ -52,3 +52,10 @@ tempfile = "3"
 
 # Optional test harness dependencies
 egui_kittest = { version = "0.33", features = ["wgpu", "snapshot"], optional = true }
+
+# Linux-only opt-ins (PulseAudio output + XDG portal hotkeys). The
+# deprecated egui client is Linux-only in practice; gating these to
+# Linux keeps the manifest honest if anyone ever tries to cross-build.
+[target.'cfg(target_os = "linux")'.dependencies]
+rumble-desktop = { path = "../rumble-desktop", features = ["pulse"] }
+rumble-desktop-shell = { path = "../rumble-desktop-shell", features = ["wayland-portal"] }

@@ -5,7 +5,11 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-default = ["audio", "codec", "pulse"]
+# Cross-platform defaults only. `pulse` is Linux-only — consumers
+# opt in via a `[target.'cfg(target_os = "linux")'.dependencies]`
+# block so non-Linux builds don't depend on cargo silently dropping
+# feature references to missing target-gated optional deps.
+default = ["audio", "codec"]
 # Cpal-based audio capture/playback (alsa on Linux, CoreAudio on macOS, WASAPI
 # on Windows). Drop for server-side daemons that never open audio devices
 # (e.g. mumble-bridge).
@@ -21,15 +25,15 @@ rumble-client-traits = { path = "../rumble-client-traits" }
 rumble-protocol = { path = "../rumble-protocol" }
 
 # Transport
-quinn = { version = "0.11", default-features = false, features = ["rustls-aws-lc-rs", "bloom", "log", "platform-verifier", "runtime-tokio"] }
-rustls = { version = "0.23", default-features = true }
-rustls-pemfile = "2"
-webpki-roots = "1.0.4"
-url = "2.5.7"
-sha2 = "0.10"
-bytes = "1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "io-util", "net", "fs", "sync"] }
-prost = "0.14"
+quinn = { workspace = true, features = ["rustls-aws-lc-rs", "bloom", "log", "platform-verifier", "runtime-tokio"] }
+rustls = { workspace = true, default-features = true }
+rustls-pemfile = { workspace = true }
+webpki-roots = { workspace = true }
+url = { workspace = true }
+sha2 = { workspace = true }
+bytes = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "io-util", "net", "fs", "sync"] }
+prost = { workspace = true }
 
 # Audio (gated by `audio` feature)
 cpal = { version = "0.17.0", optional = true }
@@ -38,18 +42,18 @@ cpal = { version = "0.17.0", optional = true }
 opus = { git = "https://github.com/u6bkep/opus-rs.git", rev = "2c545dc", optional = true }
 
 # File transfer relay
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-uuid = { version = "1.19.0", features = ["v4"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
 mime_guess = "2"
 parking_lot = "0.12"
-tokio-util = "0.7"
+tokio-util = { workspace = true }
 
 
 # Shared
-anyhow = "1"
-async-trait = "0.1"
-tracing = "0.1"
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
 
 # Linux: PulseAudio backend (also speaks to PipeWire-pulse on PipeWire systems).
 # Optional behind the `pulse` feature, on by default for Linux builds.
@@ -62,4 +66,4 @@ libpulse-simple-binding = { version = "2.29", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

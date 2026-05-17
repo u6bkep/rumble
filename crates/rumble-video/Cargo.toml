@@ -5,15 +5,15 @@ edition = "2024"
 
 [dependencies]
 libc = "0.2"
-tracing = "0.1"
-thiserror = "2"
+tracing = { workspace = true }
+thiserror = { workspace = true }
 
 # GPU mirror: shape `VideoStream` frames into an aetna `AppTexture`
 # the same way `rumble-aetna::AnimatedGpu` does for animated images.
 # Aetna pin lives in the workspace [workspace.dependencies] block.
 aetna-core = { workspace = true }
 aetna-wgpu = { workspace = true }
-wgpu = "29"
+wgpu = { workspace = true }
 
 # build.rs picks pkg-config (Linux/macOS targets) or fetch-and-extract
 # (Windows targets) based on CARGO_CFG_TARGET_OS. Build-dependency cfg
@@ -25,9 +25,9 @@ wgpu = "29"
 pkg-config = "0.3"
 ureq = { version = "3", default-features = false, features = ["rustls"] }
 sevenz-rust2 = "0.18"
-sha2 = "0.10"
+sha2 = { workspace = true }
 
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["png"] }
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { workspace = true }
 aetna-winit-wgpu = { workspace = true }
