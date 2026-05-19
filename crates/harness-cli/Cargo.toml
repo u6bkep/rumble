@@ -25,6 +25,7 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 
 # Project crates
 rumble-egui = { path = "../rumble-egui" }
+rumble-desktop-shell = { path = "../rumble-desktop-shell" }
 server = { path = "../server" }
 rumble-client = { path = "../rumble-client" }
 rumble-protocol = { path = "../rumble-protocol" }

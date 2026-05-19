@@ -30,6 +30,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // settle, GPU stays idle).
     let signer = identity.signer();
     let backend = BackendHandle::<rumble_desktop::NativePlatform>::with_config(|| {}, connect_config, signer);
+
+    // Optional Unix-socket RPC server for external process control —
+    // notably the "system DE shortcut → rumble-ctl command" path on
+    // Wayland. Opt-in via `--rpc-server [path]`; if no path is given
+    // we use `$XDG_RUNTIME_DIR/rumble/aetna.sock` so we don't clobber
+    // rumble-egui's default socket when both are installed. Held in a
+    // local until `run_host_app_with_config` returns so the listener
+    // outlives the GUI.
+    #[cfg(unix)]
+    let _rpc_server = match rpc_server_socket_path() {
+        Some(path) => match backend.start_rpc_server(path) {
+            Ok(server) => {
+                tracing::info!("RPC server started");
+                Some(server)
+            }
+            Err(e) => {
+                tracing::warn!("RPC server failed to start: {e}");
+                None
+            }
+        },
+        None => None,
+    };
+
     let backend = NativeUiBackend::new(backend);
 
     // Owned tokio runtime for ssh-agent ops fired from the wizard. Kept
@@ -81,6 +104,39 @@ fn build_connect_config(settings: &SettingsStore) -> ConnectConfig {
         config = config.with_download_dir(dir);
     }
     config
+}
+
+/// Parse `--rpc-server [path]` out of the process arguments. Returns
+/// `Some(path)` when the flag is present (using the explicit path or
+/// the aetna default), or `None` when the user hasn't opted in.
+///
+/// Default socket: `$XDG_RUNTIME_DIR/rumble/aetna.sock` (falling back to
+/// `/tmp/rumble/aetna.sock`). Distinct from rumble-egui's `rpc.sock` so
+/// both clients can run side-by-side without one clobbering the other.
+#[cfg(unix)]
+fn rpc_server_socket_path() -> Option<std::path::PathBuf> {
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--rpc-server" {
+            // Next token is an optional explicit socket path.
+            return match args.next() {
+                Some(p) if !p.starts_with("--") => Some(std::path::PathBuf::from(p)),
+                _ => Some(default_aetna_rpc_socket()),
+            };
+        }
+        if let Some(p) = arg.strip_prefix("--rpc-server=") {
+            return Some(std::path::PathBuf::from(p));
+        }
+    }
+    None
+}
+
+#[cfg(unix)]
+fn default_aetna_rpc_socket() -> std::path::PathBuf {
+    let base = std::env::var("XDG_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
+    base.join("rumble").join("aetna.sock")
 }
 
 fn config_dir() -> std::path::PathBuf {

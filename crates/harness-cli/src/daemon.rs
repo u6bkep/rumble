@@ -25,6 +25,7 @@ use tokio::{
 };
 use tracing::{debug, error, info};
 
+use rumble_desktop_shell::{HotkeyData, HotkeyFunction};
 use rumble_egui::{Args, HotkeyBinding, HotkeyModifiers, RumbleApp};
 
 /// A simple wrapper around AccessKitNode that implements NodeT for querying.
@@ -952,21 +953,19 @@ async fn process_command(cmd: Command, state: &Arc<RwLock<DaemonState>>) -> Resp
                 });
 
                 let settings = client.app.persistent_settings_mut();
-                match action.as_str() {
-                    "ptt" => {
-                        settings.keyboard.ptt_hotkey = binding;
-                        Response::ack()
+                let (function, data) = match action.as_str() {
+                    "ptt" => (HotkeyFunction::PushToTalk, HotkeyData::Hold),
+                    "mute" => (HotkeyFunction::MuteSelf, HotkeyData::Toggle),
+                    "deafen" => (HotkeyFunction::DeafenSelf, HotkeyData::Toggle),
+                    _ => {
+                        return Response::error(format!(
+                            "Unknown action '{}'. Use 'ptt', 'mute', or 'deafen'.",
+                            action
+                        ));
                     }
-                    "mute" => {
-                        settings.keyboard.toggle_mute_hotkey = binding;
-                        Response::ack()
-                    }
-                    "deafen" => {
-                        settings.keyboard.toggle_deafen_hotkey = binding;
-                        Response::ack()
-                    }
-                    _ => Response::error(format!("Unknown action '{}'. Use 'ptt', 'mute', or 'deafen'.", action)),
-                }
+                };
+                settings.keyboard.set_primary_binding(function, data, binding);
+                Response::ack()
             } else {
                 Response::error(format!("Client {} not found", id))
             }

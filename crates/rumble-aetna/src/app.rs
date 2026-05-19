@@ -594,6 +594,7 @@ impl<B: UiBackend> App for RumbleApp<B> {
                 &self.identity,
                 &self.selection,
                 &self.processor_registry,
+                &self.hotkeys,
             )
         } else {
             (None, None)
@@ -857,6 +858,7 @@ impl<B: UiBackend> App for RumbleApp<B> {
                 &self.identity,
                 &mut self.selection,
                 &self.processor_registry,
+                &self.hotkeys,
             );
             if self.dispatch_settings_outcome(outcome) {
                 return;
@@ -2053,8 +2055,8 @@ impl<B: UiBackend> RumbleApp<B> {
     }
 
     /// Drain queued global hotkey events and turn them into backend
-    /// commands. Mirrors `rumble-next::App::pump_hotkeys` so PTT / mute /
-    /// deafen behaviour stays consistent across clients.
+    /// commands. PTT (Hold) fires on Pressed / Released; Mute / Deafen
+    /// (Toggle / On / Off) fire on Pressed only.
     ///
     /// All hotkeys are gated on `connection.is_connected()` — toggling
     /// state while disconnected would be confusing and produce stray
@@ -2062,6 +2064,7 @@ impl<B: UiBackend> RumbleApp<B> {
     /// Server-muted users have PTT suppressed (the server would drop the
     /// packets anyway).
     fn pump_hotkeys(&mut self) {
+        use rumble_desktop_shell::{HotkeyData, HotkeyFunction};
         let events = self.hotkeys.poll_events();
         if events.is_empty() {
             return;
@@ -2076,24 +2079,49 @@ impl<B: UiBackend> RumbleApp<B> {
             .is_some_and(|u| u.server_muted);
         for event in events {
             match event {
-                HotkeyEvent::PttPressed => {
+                HotkeyEvent::Pressed {
+                    function: HotkeyFunction::PushToTalk,
+                    data: HotkeyData::Hold,
+                } => {
                     if server_muted {
                         continue;
                     }
                     self.backend.send(Command::StartTransmit);
                 }
-                HotkeyEvent::PttReleased => {
+                HotkeyEvent::Released {
+                    function: HotkeyFunction::PushToTalk,
+                    data: HotkeyData::Hold,
+                } => {
                     self.backend.send(Command::StopTransmit);
                 }
-                HotkeyEvent::ToggleMute => {
-                    self.backend.send(Command::SetMuted {
-                        muted: !state.audio.self_muted,
-                    });
+                HotkeyEvent::Pressed {
+                    function: HotkeyFunction::MuteSelf,
+                    data,
+                } => {
+                    let muted = match data {
+                        HotkeyData::Toggle => !state.audio.self_muted,
+                        HotkeyData::On => true,
+                        HotkeyData::Off => false,
+                        HotkeyData::Hold => continue,
+                    };
+                    self.backend.send(Command::SetMuted { muted });
                 }
-                HotkeyEvent::ToggleDeafen => {
-                    self.backend.send(Command::SetDeafened {
-                        deafened: !state.audio.self_deafened,
-                    });
+                HotkeyEvent::Pressed {
+                    function: HotkeyFunction::DeafenSelf,
+                    data,
+                } => {
+                    let deafened = match data {
+                        HotkeyData::Toggle => !state.audio.self_deafened,
+                        HotkeyData::On => true,
+                        HotkeyData::Off => false,
+                        HotkeyData::Hold => continue,
+                    };
+                    self.backend.send(Command::SetDeafened { deafened });
+                }
+                HotkeyEvent::Pressed { .. } | HotkeyEvent::Released { .. } => {
+                    // Nonsensical combinations (e.g. PTT/Toggle) are
+                    // filtered at the UI layer; ignore any that slip
+                    // through. Non-Hold actions also ignore release.
                 }
             }
         }
@@ -2511,6 +2539,20 @@ impl<B: UiBackend> RumbleApp<B> {
                 }
                 true
             }
+            SettingsOutcome::RegisterHotkeys(keyboard) => {
+                // Live update: re-register against pending keyboard so
+                // the new bindings take effect immediately (the user
+                // can press them without closing the dialog). The
+                // persisted store stays untouched until Save.
+                if let Err(e) = self.hotkeys.register_from_settings(&keyboard) {
+                    tracing::warn!("hotkey re-register failed: {e}");
+                }
+                true
+            }
+            SettingsOutcome::OpenPortalShortcutSettings => {
+                self.hotkeys.open_portal_settings();
+                true
+            }
         }
     }
 
@@ -2583,6 +2625,11 @@ impl<B: UiBackend> RumbleApp<B> {
             s.file_transfer.download_speed_limit = (pending.download_speed_kbps as u64) * 1024;
             s.file_transfer.upload_speed_limit = (pending.upload_speed_kbps as u64) * 1024;
             s.file_transfer.download_dir = pending.download_dir.clone();
+
+            // Shortcuts. Already re-registered on each edit via
+            // RegisterHotkeys; here we just flush the pending snapshot
+            // to disk so the bindings survive a restart.
+            s.keyboard = pending.keyboard.clone();
 
             // Autoconnect: only meaningful once we have a recent server
             // to point at, so reuse the most-recent entry's address. If

@@ -1178,56 +1178,89 @@ impl<B: UiBackend> App<B> {
             self.dispatch_hotkey(event, state);
         }
 
-        // Window-focused fallback. Only fires if global hotkeys aren't
-        // bound — otherwise we'd double-dispatch on every keypress.
-        if !self.hotkeys.is_available()
-            && !self.hotkeys.has_portal_backend()
-            && let Some(binding) = self.settings.settings().keyboard.ptt_hotkey.as_ref()
-            && let Some(key) = HotkeyManager::key_string_to_egui_key(&binding.key)
-        {
+        // Window-focused fallback. Iterate every configured shortcut
+        // with a binding and dispatch on key press / release. Only
+        // fires if global hotkeys aren't bound — otherwise we'd
+        // double-dispatch on every keypress.
+        if self.hotkeys.is_available() || self.hotkeys.has_portal_backend() {
+            return;
+        }
+        for entry in self.settings.settings().keyboard.shortcuts.clone() {
+            let Some(binding) = entry.binding.as_ref() else {
+                continue;
+            };
+            let Some(key) = HotkeyManager::key_string_to_egui_key(&binding.key) else {
+                continue;
+            };
             let (pressed, released) = ctx.input(|i| (i.key_pressed(key), i.key_released(key)));
             if pressed {
-                self.dispatch_hotkey(HotkeyEvent::PttPressed, state);
+                self.dispatch_hotkey(
+                    HotkeyEvent::Pressed {
+                        function: entry.function,
+                        data: entry.data,
+                    },
+                    state,
+                );
             }
             if released {
-                self.dispatch_hotkey(HotkeyEvent::PttReleased, state);
+                self.dispatch_hotkey(
+                    HotkeyEvent::Released {
+                        function: entry.function,
+                        data: entry.data,
+                    },
+                    state,
+                );
             }
         }
     }
 
     fn dispatch_hotkey(&self, event: HotkeyEvent, state: &rumble_protocol::State) {
+        use rumble_desktop_shell::{HotkeyData, HotkeyFunction};
         if !state.connection.is_connected() {
             return;
         }
         let server_muted = crate::adapters::am_i_server_muted(state);
         match event {
-            HotkeyEvent::PttPressed => {
+            HotkeyEvent::Pressed {
+                function: HotkeyFunction::PushToTalk,
+                data: HotkeyData::Hold,
+            } => {
                 if server_muted {
-                    tracing::debug!("hotkey: PTT pressed but server-muted — ignoring");
                     return;
                 }
-                tracing::debug!("hotkey: PTT pressed");
                 self.backend.send(Command::StartTransmit);
             }
-            HotkeyEvent::PttReleased => {
-                tracing::debug!("hotkey: PTT released");
+            HotkeyEvent::Released {
+                function: HotkeyFunction::PushToTalk,
+                data: HotkeyData::Hold,
+            } => {
                 self.backend.send(Command::StopTransmit);
             }
-            HotkeyEvent::ToggleMute => {
-                tracing::debug!("hotkey: toggle mute");
-                self.backend.send(Command::SetMuted {
-                    muted: !state.audio.self_muted,
-                });
-                // SFX fires from `detect_sfx_events` once the state
-                // round-trips through the backend — same path as the
-                // UI mute button.
+            HotkeyEvent::Pressed {
+                function: HotkeyFunction::MuteSelf,
+                data,
+            } => {
+                let muted = match data {
+                    HotkeyData::Toggle => !state.audio.self_muted,
+                    HotkeyData::On => true,
+                    HotkeyData::Off => false,
+                    HotkeyData::Hold => return,
+                };
+                self.backend.send(Command::SetMuted { muted });
             }
-            HotkeyEvent::ToggleDeafen => {
-                tracing::debug!("hotkey: toggle deafen");
-                self.backend.send(Command::SetDeafened {
-                    deafened: !state.audio.self_deafened,
-                });
+            HotkeyEvent::Pressed {
+                function: HotkeyFunction::DeafenSelf,
+                data,
+            } => {
+                let deafened = match data {
+                    HotkeyData::Toggle => !state.audio.self_deafened,
+                    HotkeyData::On => true,
+                    HotkeyData::Off => false,
+                    HotkeyData::Hold => return,
+                };
+                self.backend.send(Command::SetDeafened { deafened });
             }
+            HotkeyEvent::Pressed { .. } | HotkeyEvent::Released { .. } => {}
         }
     }
 

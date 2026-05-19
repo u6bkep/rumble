@@ -16,7 +16,10 @@ use std::path::PathBuf;
 use aetna_core::prelude::*;
 
 use rumble_client::{PipelineConfig, ProcessorRegistry, SfxKind};
-use rumble_desktop_shell::{AutoDownloadRule, PersistentVoiceMode, Settings, TimestampFormat};
+use rumble_desktop_shell::{
+    AutoDownloadRule, HotkeyBinding, HotkeyData, HotkeyFunction, HotkeyManager, HotkeyModifiers, KeyboardSettings,
+    PersistentVoiceMode, Settings, ShortcutEntry, TimestampFormat,
+};
 use rumble_protocol::{AudioSettings, AudioState, State, permissions::Permissions};
 use serde_json::Value as JsonValue;
 
@@ -37,6 +40,7 @@ pub enum SettingsTab {
     Processing,
     Sounds,
     Chat,
+    Shortcuts,
     Files,
     Stats,
     /// Server-administration UI. Rendered only when the connected user
@@ -55,6 +59,7 @@ impl SettingsTab {
         SettingsTab::Processing,
         SettingsTab::Sounds,
         SettingsTab::Chat,
+        SettingsTab::Shortcuts,
         SettingsTab::Files,
         SettingsTab::Stats,
         SettingsTab::Admin,
@@ -69,6 +74,7 @@ impl SettingsTab {
             SettingsTab::Processing => "processing",
             SettingsTab::Sounds => "sounds",
             SettingsTab::Chat => "chat",
+            SettingsTab::Shortcuts => "shortcuts",
             SettingsTab::Files => "files",
             SettingsTab::Stats => "stats",
             SettingsTab::Admin => "admin",
@@ -84,6 +90,7 @@ impl SettingsTab {
             SettingsTab::Processing => "Processing",
             SettingsTab::Sounds => "Sounds",
             SettingsTab::Chat => "Chat",
+            SettingsTab::Shortcuts => "Shortcuts",
             SettingsTab::Files => "Files",
             SettingsTab::Stats => "Stats",
             SettingsTab::Admin => "Admin",
@@ -116,13 +123,21 @@ fn visible_tabs(app_state: &State) -> Vec<SettingsTab> {
 /// At most one select dropdown is open at a time. Tracking it here
 /// avoids one bool per select and gives `handle_event` a single place
 /// to clear it when the user opens a different one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// The shortcuts table carries multiple per-row dropdowns (Function and
+/// Data per shortcut entry), so those variants tag themselves with the
+/// `ShortcutEntry::id` of the row they belong to.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum OpenSelect {
     #[default]
     None,
     InputDevice,
     OutputDevice,
     TimestampFormat,
+    /// Function dropdown open on the shortcut entry with this id.
+    ShortcutFunction(String),
+    /// Data dropdown open on the shortcut entry with this id.
+    ShortcutData(String),
 }
 
 /// Pending edits accumulated while the dialog is open. Initialised
@@ -157,6 +172,13 @@ pub struct PendingSettings {
     pub timestamp_format: TimestampFormat,
     pub auto_sync_history: bool,
     pub gif_autoplay: bool,
+
+    // Shortcuts (keyboard) — full snapshot of the keyboard settings,
+    // edited in place by the Shortcuts tab. Persisted as a whole on
+    // Save and immediately re-registered with the HotkeyManager so
+    // changes take effect live (the user can press the new key without
+    // closing the dialog).
+    pub keyboard: KeyboardSettings,
 
     // Files
     pub auto_download_enabled: bool,
@@ -225,6 +247,7 @@ impl PendingSettings {
             voice_mode: (&audio.voice_mode).into(),
             audio: audio.settings.clone(),
             tx_pipeline: audio.tx_pipeline.clone(),
+            keyboard: settings.keyboard.clone(),
             sfx_enabled: settings.sfx.enabled,
             sfx_volume: settings.sfx.volume,
             sfx_kind_enabled,
@@ -256,6 +279,10 @@ pub struct SettingsState {
     /// accordion / open popover survive across re-opens of the Settings
     /// dialog within one session.
     pub admin: AdminState,
+    /// Entry ID currently capturing a keystroke. While set, the next
+    /// `KeyDown` populates that entry's binding (and clears this).
+    /// Cleared on Escape, tab switch, dialog close, or after a key fires.
+    pub shortcut_capture: Option<String>,
 }
 
 impl SettingsState {
@@ -273,6 +300,7 @@ impl SettingsState {
         self.tab = None;
         self.open_select = OpenSelect::None;
         self.pending = None;
+        self.shortcut_capture = None;
     }
 
     /// Update the download-dir value while the dialog is still open.
@@ -332,6 +360,15 @@ pub enum SettingsOutcome {
     /// Fire-and-forget commands surfaced by the Admin tab. Settings
     /// stays open so the user can keep editing.
     Dispatch(Vec<rumble_protocol::Command>),
+    /// User edited the Shortcuts table — the new `KeyboardSettings`
+    /// should be re-registered with the HotkeyManager so portal /
+    /// global-hotkey bindings stay in sync with the pending edits.
+    /// The App keeps the settings dialog open. Save still flushes to
+    /// disk via the regular [`SettingsOutcome::Save`] path.
+    RegisterHotkeys(KeyboardSettings),
+    /// User clicked a shortcut cell on Wayland; open the compositor's
+    /// configure-shortcuts dialog so the user can assign a key.
+    OpenPortalShortcutSettings,
 }
 
 // ============================================================
@@ -418,6 +455,47 @@ fn parse_rule_route(route: &str) -> Option<(usize, &str)> {
 
 const KEY_STATS_RESET: &str = "settings:stats:reset";
 
+// ---------- Shortcuts tab ----------
+
+const KEY_SHORTCUTS_GLOBAL_ENABLE: &str = "settings:shortcuts:global-enable";
+const KEY_SHORTCUTS_ADD: &str = "settings:shortcuts:add";
+const SHORTCUTS_ROW_PREFIX: &str = "settings:shortcuts:row:";
+
+fn shortcuts_row_key(entry_id: &str) -> String {
+    format!("{SHORTCUTS_ROW_PREFIX}{entry_id}")
+}
+fn shortcut_function_key(entry_id: &str) -> String {
+    format!("{SHORTCUTS_ROW_PREFIX}{entry_id}:function")
+}
+fn shortcut_data_key(entry_id: &str) -> String {
+    format!("{SHORTCUTS_ROW_PREFIX}{entry_id}:data")
+}
+fn shortcut_binding_key(entry_id: &str) -> String {
+    format!("{SHORTCUTS_ROW_PREFIX}{entry_id}:binding")
+}
+fn shortcut_remove_key(entry_id: &str) -> String {
+    format!("{SHORTCUTS_ROW_PREFIX}{entry_id}:remove")
+}
+
+/// Inverse of the shortcut row key constructors. Returns
+/// `(entry_id, field_path)` for any `settings:shortcuts:row:<id>:<field…>`
+/// route. UUIDs contain dashes but no colons, so the first colon after
+/// the prefix is always the entry-id/field boundary. `field_path` may
+/// include further `:`-separated tail (e.g. `function:option:ptt`,
+/// `data:dismiss`) — callers match on the first segment with
+/// [`shortcut_field_kind`].
+fn parse_shortcut_route(route: &str) -> Option<(&str, &str)> {
+    let rest = route.strip_prefix(SHORTCUTS_ROW_PREFIX)?;
+    rest.split_once(':')
+}
+
+/// First `:`-separated segment of a field path — the part that
+/// distinguishes the function dropdown, data dropdown, binding button,
+/// and bare row click.
+fn shortcut_field_kind(field_path: &str) -> &str {
+    field_path.split_once(':').map(|(head, _)| head).unwrap_or(field_path)
+}
+
 /// Processing-tab routed keys are built per-processor / per-field at
 /// render time; see [`proc_enabled_key`] / [`proc_field_key`]. The
 /// shared prefix lets [`handle_event`] cheaply ignore unrelated routes.
@@ -480,6 +558,7 @@ pub fn render(
     identity: &Identity,
     selection: &Selection,
     processor_registry: &ProcessorRegistry,
+    hotkeys: &HotkeyManager,
 ) -> (Option<El>, Option<El>) {
     if !state.open {
         return (None, None);
@@ -504,13 +583,25 @@ pub fn render(
         SettingsTab::Processing => render_processing(pending, &app_state.audio, processor_registry, selection),
         SettingsTab::Sounds => render_sounds(pending),
         SettingsTab::Chat => render_chat(pending),
+        SettingsTab::Shortcuts => render_shortcuts(pending, state, hotkeys),
         SettingsTab::Files => render_files(pending, selection),
         SettingsTab::Stats => render_stats(&app_state.audio),
         SettingsTab::Admin => admin::render(&state.admin, app_state, selection),
         SettingsTab::About => render_about(),
     };
 
-    let tabs_row = tabs_list(KEY_TABS, &tab.slug(), tabs.iter().map(|t| (t.slug(), t.label())));
+    // Vertical nav rail. Reuses the same routed-key format as
+    // `tabs_list` (`{KEY_TABS}:tab:{slug}`) so `tabs::apply_event` in
+    // `handle_event` still routes selections — only the visual shell
+    // changes from a segmented pill to a sidebar.
+    let nav = sidebar(
+        tabs.iter()
+            .map(|t| sidebar_menu_button(t.label(), *t == tab).key(tab_option_key(KEY_TABS, &t.slug()))),
+    )
+    .width(Size::Fixed(196.0))
+    .height(Size::Fill(1.0))
+    .padding(Sides::all(tokens::SPACE_2))
+    .gap(tokens::SPACE_1);
 
     let footer = row([
         button("Close").key(KEY_CLOSE),
@@ -521,41 +612,45 @@ pub fn render(
     .width(Size::Fill(1.0))
     .align(Align::Center);
 
-    // Stock `modal_panel` is fixed at 420 px wide × Hug; the settings
-    // dialog needs a roomier frame so the segmented tabs row fits all
-    // tab labels without truncation. 880 was the right width at
-    // eight tabs; adding "Admin" pushed "Connection" / "Processing"
-    // back over the edge, so 940 leaves a couple of pixels of slack.
-    // "About" was added later, bumping the width up again.
+    // Sidebar nav decouples the dialog width from the tab count, so
+    // the frame stays a fixed size regardless of how many sections we
+    // add. 960 px gives the nav rail ~196 px plus a comfortable
+    // content column for the widest tabs (Shortcuts, Processing).
     let panel = modal_panel(
         "Settings",
         [
-            tabs_row,
-            // Horizontal padding has to live on a wrapper *inside* the
-            // scroll, not on the scroll itself: the scrollbar thumb is
-            // anchored to `scroll.inner.right() - 8`, so padding on
-            // scroll moves the thumb and content together and the
-            // thumb keeps painting on top of full-width children.
-            // Wrapping the body lets content stop short of the
-            // scrollbar gutter (active thumb = 10 px + 2 px track
-            // inset = 12 px).
-            scroll([column([body])
-                .padding(Sides::xy(tokens::SPACE_3, 0.0))
-                .width(Size::Fill(1.0))])
-            .padding(Sides::xy(0.0, tokens::SPACE_2))
+            row([
+                nav,
+                // Horizontal padding has to live on a wrapper *inside* the
+                // scroll, not on the scroll itself: the scrollbar thumb is
+                // anchored to `scroll.inner.right() - 8`, so padding on
+                // scroll moves the thumb and content together and the
+                // thumb keeps painting on top of full-width children.
+                // Wrapping the body lets content stop short of the
+                // scrollbar gutter (active thumb = 10 px + 2 px track
+                // inset = 12 px).
+                scroll([column([body])
+                    .padding(Sides::xy(tokens::SPACE_3, 0.0))
+                    .width(Size::Fill(1.0))])
+                .padding(Sides::xy(0.0, tokens::SPACE_2))
+                .gap(tokens::SPACE_3)
+                .width(Size::Fill(1.0))
+                .height(Size::Fill(1.0)),
+            ])
             .gap(tokens::SPACE_3)
             .width(Size::Fill(1.0))
-            .height(Size::Fill(1.0)),
+            .height(Size::Fill(1.0))
+            .align(Align::Stretch),
             divider(),
             footer,
         ],
     )
-    .width(Size::Fixed(1020.0))
+    .width(Size::Fixed(960.0))
     .height(Size::Fixed(620.0));
 
     let panel_layer = overlay([scrim(KEY_DISMISS), panel.block_pointer()]);
 
-    let select_popover = match state.open_select {
+    let select_popover = match &state.open_select {
         OpenSelect::None => None,
         OpenSelect::InputDevice => Some(select_menu(
             KEY_INPUT_DEVICE,
@@ -584,6 +679,22 @@ pub fn render(
                 .enumerate()
                 .map(|(idx, fmt)| (idx.to_string(), fmt.label().to_string())),
         )),
+        OpenSelect::ShortcutFunction(entry_id) => Some(select_menu(
+            shortcut_function_key(entry_id),
+            HotkeyFunction::ALL
+                .iter()
+                .map(|f| (f.slug().to_string(), f.label().to_string())),
+        )),
+        OpenSelect::ShortcutData(entry_id) => {
+            let entry = pending.keyboard.shortcuts.iter().find(|e| e.id == *entry_id);
+            let options = entry
+                .map(|e| e.function.data_options())
+                .unwrap_or(&[HotkeyData::Toggle]);
+            Some(select_menu(
+                shortcut_data_key(entry_id),
+                options.iter().map(|d| (d.slug().to_string(), d.label().to_string())),
+            ))
+        }
     };
 
     // Admin overlays (action menus, popovers, dialogs) ride above the
@@ -1178,6 +1289,179 @@ fn render_chat(pending: &PendingSettings) -> El {
     .width(Size::Fill(1.0))
 }
 
+/// Mumble-style Shortcuts table. Header checkbox + columns
+/// Function | Data | Shortcut. Function and Data are aetna select
+/// dropdowns; the Shortcut cell is a button that either enters
+/// capture mode (X11 / Windows / macOS) or opens the compositor's
+/// system shortcut dialog (Wayland portal).
+fn render_shortcuts(pending: &PendingSettings, state: &SettingsState, hotkeys: &HotkeyManager) -> El {
+    let mut children: Vec<El> = Vec::new();
+
+    children.push(field_row(
+        "Enable global shortcuts",
+        switch(pending.keyboard.global_hotkeys_enabled).key(KEY_SHORTCUTS_GLOBAL_ENABLE),
+    ));
+
+    let is_wayland = hotkeys.is_wayland();
+    let helper = if is_wayland {
+        "Wayland binds keys through the system shortcut settings — click any Shortcut cell to open it."
+    } else {
+        "Click a Shortcut cell to bind a key combination; press Escape to cancel capture."
+    };
+    children.push(paragraph(helper).muted().font_size(tokens::TEXT_XS.size));
+
+    // Column header. Width budgets match the row body below so the
+    // labels line up against the dropdown triggers / shortcut buttons.
+    children.push(
+        row([
+            text("Function")
+                .muted()
+                .font_size(tokens::TEXT_XS.size)
+                .width(Size::Fixed(SHORTCUT_FN_COL_W)),
+            text("Data")
+                .muted()
+                .font_size(tokens::TEXT_XS.size)
+                .width(Size::Fixed(SHORTCUT_DATA_COL_W)),
+            text("Shortcut")
+                .muted()
+                .font_size(tokens::TEXT_XS.size)
+                .width(Size::Fill(1.0)),
+            spacer().width(Size::Fixed(28.0)),
+        ])
+        .gap(tokens::SPACE_2)
+        .align(Align::Center)
+        .width(Size::Fill(1.0)),
+    );
+
+    if pending.keyboard.shortcuts.is_empty() {
+        children.push(
+            paragraph("No shortcuts configured — click Add to create one.")
+                .muted()
+                .font_size(tokens::TEXT_XS.size),
+        );
+    } else {
+        for entry in &pending.keyboard.shortcuts {
+            children.push(shortcut_row(entry, state, hotkeys, is_wayland));
+        }
+    }
+
+    children.push(
+        row([
+            button_with_icon(IconName::Plus, "Add")
+                .key(KEY_SHORTCUTS_ADD)
+                .secondary(),
+            spacer(),
+        ])
+        .gap(tokens::SPACE_2)
+        .width(Size::Fill(1.0)),
+    );
+
+    if is_wayland {
+        children.push(divider());
+        children.push(section_heading("Use your desktop's shortcut settings (advanced)"));
+        children.push(
+            paragraph(
+                "If the portal flow above doesn't suit your compositor (tiling WMs like Sway / Hyprland, or GNOME's \
+                 Custom Shortcuts), bind any key in your desktop's keyboard settings to a shell command that talks to \
+                 rumble over a Unix socket. Note: most desktop shortcut systems only fire on key press, so this path \
+                 supports toggle / mute / deafen well but isn't ideal for hold-style push-to-talk.",
+            )
+            .muted()
+            .font_size(tokens::TEXT_XS.size),
+        );
+        children.push(
+            paragraph("Start aetna with `--rpc-server` to enable the socket at $XDG_RUNTIME_DIR/rumble/aetna.sock.")
+                .muted()
+                .font_size(tokens::TEXT_XS.size),
+        );
+        children.push(rpc_example_row("Toggle mute", RPC_EXAMPLE_TOGGLE_MUTE));
+        children.push(rpc_example_row("Toggle deafen", RPC_EXAMPLE_TOGGLE_DEAFEN));
+        children.push(rpc_example_row("Start transmit (PTT)", RPC_EXAMPLE_START_TRANSMIT));
+        children.push(rpc_example_row("Stop transmit (PTT)", RPC_EXAMPLE_STOP_TRANSMIT));
+    }
+
+    column(children).gap(tokens::SPACE_2).width(Size::Fill(1.0))
+}
+
+/// Example shell commands the user can paste into their DE's custom-
+/// shortcut configuration. `nc -U` is widely available and matches the
+/// RPC server's newline-delimited JSON protocol.
+const RPC_EXAMPLE_TOGGLE_MUTE: &str =
+    r#"echo '{"method":"set_muted","muted":true}' | nc -UN "$XDG_RUNTIME_DIR/rumble/aetna.sock""#;
+const RPC_EXAMPLE_TOGGLE_DEAFEN: &str =
+    r#"echo '{"method":"set_deafened","deafened":true}' | nc -UN "$XDG_RUNTIME_DIR/rumble/aetna.sock""#;
+const RPC_EXAMPLE_START_TRANSMIT: &str =
+    r#"echo '{"method":"start_transmit"}' | nc -UN "$XDG_RUNTIME_DIR/rumble/aetna.sock""#;
+const RPC_EXAMPLE_STOP_TRANSMIT: &str =
+    r#"echo '{"method":"stop_transmit"}' | nc -UN "$XDG_RUNTIME_DIR/rumble/aetna.sock""#;
+
+/// One example row in the RPC hint: a label on the left, the command
+/// text in monospace on the right (ellipsised; the user can read it in
+/// the labels.txt dump if it wraps off-screen).
+fn rpc_example_row(label: &str, command: &str) -> El {
+    row([
+        text(label)
+            .muted()
+            .font_size(tokens::TEXT_XS.size)
+            .width(Size::Fixed(160.0)),
+        mono(command)
+            .font_size(tokens::TEXT_XS.size)
+            .ellipsis()
+            .width(Size::Fill(1.0)),
+    ])
+    .gap(tokens::SPACE_2)
+    .align(Align::Center)
+    .width(Size::Fill(1.0))
+}
+
+/// Layout constants for the shortcuts table columns. Tuned so labels
+/// like "Push-to-Talk" and the longer data variants fit without
+/// ellipsis.
+const SHORTCUT_FN_COL_W: f32 = 160.0;
+const SHORTCUT_DATA_COL_W: f32 = 110.0;
+
+/// One row of the Shortcuts table. The trailing icon-only button
+/// removes this specific row — there's no separate row-selection step,
+/// which sidesteps the "selecting requires clicking the binding cell,
+/// but that also opens the portal" conflict on Wayland.
+fn shortcut_row(entry: &ShortcutEntry, state: &SettingsState, hotkeys: &HotkeyManager, is_wayland: bool) -> El {
+    let function_trigger =
+        select_trigger(shortcut_function_key(&entry.id), entry.function.label()).width(Size::Fixed(SHORTCUT_FN_COL_W));
+    let data_trigger =
+        select_trigger(shortcut_data_key(&entry.id), entry.data.label()).width(Size::Fixed(SHORTCUT_DATA_COL_W));
+
+    let capturing = state.shortcut_capture.as_deref() == Some(entry.id.as_str());
+    let binding_label = if capturing {
+        "Press a key…".to_string()
+    } else if is_wayland {
+        hotkeys
+            .portal_trigger(&entry.id)
+            .unwrap_or_else(|| "Click to configure…".to_string())
+    } else {
+        entry
+            .binding
+            .as_ref()
+            .map(|b| b.display())
+            .unwrap_or_else(|| "Click to bind".to_string())
+    };
+    let mut binding_btn = button(binding_label).key(shortcut_binding_key(&entry.id)).secondary();
+    if capturing {
+        binding_btn = binding_btn.primary();
+    }
+    let binding_cell = binding_btn.width(Size::Fill(1.0));
+
+    let remove = icon_button(IconName::X)
+        .key(shortcut_remove_key(&entry.id))
+        .ghost()
+        .tooltip("Remove shortcut");
+
+    row([function_trigger, data_trigger, binding_cell, remove])
+        .gap(tokens::SPACE_2)
+        .align(Align::Center)
+        .width(Size::Fill(1.0))
+        .key(shortcuts_row_key(&entry.id))
+}
+
 fn render_files(pending: &PendingSettings, selection: &Selection) -> El {
     let mut children: Vec<El> = vec![
         section_heading("Auto-download"),
@@ -1415,6 +1699,57 @@ fn render_about() -> El {
     column(rows).gap(tokens::SPACE_2).width(Size::Fill(1.0))
 }
 
+/// Convert an aetna `KeyPress` into a `HotkeyBinding` using the same
+/// key string format the `global-hotkey` crate consumes
+/// (`HotkeyManager::key_string_to_code`). Returns `None` for keystrokes
+/// that consist solely of modifier keys (Ctrl, Shift, etc.) or for
+/// keys we don't have a stable name for — those can't be bound as a
+/// global shortcut and capture mode stays open waiting for a real key.
+fn keypress_to_binding(press: &KeyPress) -> Option<HotkeyBinding> {
+    let key = match &press.key {
+        UiKey::Enter => "Enter".to_string(),
+        UiKey::Tab => "Tab".to_string(),
+        UiKey::Space => "Space".to_string(),
+        UiKey::ArrowUp => "ArrowUp".to_string(),
+        UiKey::ArrowDown => "ArrowDown".to_string(),
+        UiKey::ArrowLeft => "ArrowLeft".to_string(),
+        UiKey::ArrowRight => "ArrowRight".to_string(),
+        UiKey::Backspace => "Backspace".to_string(),
+        UiKey::Delete => "Delete".to_string(),
+        UiKey::Home => "Home".to_string(),
+        UiKey::End => "End".to_string(),
+        UiKey::PageUp => "PageUp".to_string(),
+        UiKey::PageDown => "PageDown".to_string(),
+        UiKey::Escape => return None, // Escape is the cancel shortcut.
+        UiKey::Character(s) => {
+            // Strip stray whitespace and normalise to uppercase so
+            // "a"/"A" both round-trip through key_string_to_code.
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            trimmed.to_string()
+        }
+        UiKey::Other(name) => {
+            // F-keys, media keys, etc. show up here as winit-style
+            // names. Pass through verbatim — global-hotkey's
+            // key_string_to_code matches case-insensitively for F1..F12
+            // and we don't try to handle the long tail of media keys.
+            if name.is_empty() {
+                return None;
+            }
+            name.clone()
+        }
+    };
+    let modifiers = HotkeyModifiers {
+        ctrl: press.modifiers.ctrl,
+        shift: press.modifiers.shift,
+        alt: press.modifiers.alt,
+        super_key: press.modifiers.logo,
+    };
+    Some(HotkeyBinding { modifiers, key })
+}
+
 // ---- view helpers ---------------------------------------------------
 
 fn section_heading(label: impl Into<String>) -> El {
@@ -1484,6 +1819,7 @@ pub fn handle_event(
     identity: &Identity,
     selection: &mut Selection,
     processor_registry: &ProcessorRegistry,
+    hotkeys: &HotkeyManager,
 ) -> SettingsOutcome {
     if !state.open {
         return SettingsOutcome::Ignored;
@@ -1503,11 +1839,35 @@ pub fn handle_event(
 
     // Esc unconditionally cancels.
     if matches!(event.kind, UiEventKind::Escape) {
+        // Capture takes priority — Escape cancels capture before
+        // backing out of dropdowns or closing the dialog.
+        if state.shortcut_capture.is_some() {
+            state.shortcut_capture = None;
+            return SettingsOutcome::Handled;
+        }
         if state.open_select != OpenSelect::None {
             state.open_select = OpenSelect::None;
             return SettingsOutcome::Handled;
         }
         return SettingsOutcome::Close;
+    }
+
+    // Key capture for the Shortcuts table — only X11/Win/macOS can grab
+    // keys this way; on Wayland capture is never entered.
+    if state.shortcut_capture.is_some()
+        && matches!(event.kind, UiEventKind::KeyDown)
+        && let Some(press) = event.key_press.as_ref()
+        && let Some(binding) = keypress_to_binding(press)
+    {
+        let entry_id = state.shortcut_capture.take().expect("checked is_some above");
+        if let Some(pending) = state.pending.as_mut()
+            && let Some(slot) = pending.keyboard.shortcuts.iter_mut().find(|e| e.id == entry_id)
+        {
+            slot.binding = Some(binding);
+            let kb = pending.keyboard.clone();
+            return SettingsOutcome::RegisterHotkeys(kb);
+        }
+        return SettingsOutcome::Handled;
     }
 
     // Scrim click + Close button.
@@ -1568,6 +1928,133 @@ pub fn handle_event(
     // Click/Activate; the text inputs land on `target_key`, so check
     // those first to keep the per-row update before any of the
     // free-form text-input handlers further down.
+    // ---------- Shortcuts tab ----------
+
+    // Enable / disable the whole global-hotkeys system.
+    if switch::apply_event(
+        &mut pending.keyboard.global_hotkeys_enabled,
+        event,
+        KEY_SHORTCUTS_GLOBAL_ENABLE,
+    ) {
+        let kb = pending.keyboard.clone();
+        return SettingsOutcome::RegisterHotkeys(kb);
+    }
+
+    if event.is_click_or_activate(KEY_SHORTCUTS_ADD) {
+        // Default new row: Push-to-Talk / Hold / unbound. The user
+        // picks a different function from the dropdown if they want
+        // something else. A fresh PTT entry is the most common case
+        // (e.g. a second key on a controller).
+        let new_entry = ShortcutEntry {
+            id: ShortcutEntry::new_id(),
+            function: HotkeyFunction::PushToTalk,
+            data: HotkeyData::Hold,
+            binding: None,
+        };
+        pending.keyboard.shortcuts.push(new_entry);
+        let kb = pending.keyboard.clone();
+        return SettingsOutcome::RegisterHotkeys(kb);
+    }
+
+    // Per-row events. The route prefix is `settings:shortcuts:row:<id>:<field>`;
+    // matches function dropdown, data dropdown, binding cell, and bare
+    // row clicks (for selection).
+    if let Some(route) = event.route().filter(|r| r.starts_with(SHORTCUTS_ROW_PREFIX))
+        && let Some((entry_id, field_path)) = parse_shortcut_route(route)
+    {
+        let entry_id = entry_id.to_string();
+        match shortcut_field_kind(field_path) {
+            "function" => {
+                let key = shortcut_function_key(&entry_id);
+                if let Some(action) = select::classify_event(event, &key) {
+                    match action {
+                        select::SelectAction::Toggle => {
+                            state.open_select = if state.open_select == OpenSelect::ShortcutFunction(entry_id.clone()) {
+                                OpenSelect::None
+                            } else {
+                                OpenSelect::ShortcutFunction(entry_id.clone())
+                            };
+                        }
+                        select::SelectAction::Dismiss => state.open_select = OpenSelect::None,
+                        select::SelectAction::Pick(value) => {
+                            state.open_select = OpenSelect::None;
+                            if let Some(function) = HotkeyFunction::from_slug(&value)
+                                && let Some(slot) = pending.keyboard.shortcuts.iter_mut().find(|e| e.id == entry_id)
+                            {
+                                slot.function = function;
+                                // Snap Data to a valid variant for the
+                                // new function (e.g. switching to PTT
+                                // forces Data=Hold).
+                                if !function.data_options().contains(&slot.data) {
+                                    slot.data = function.default_data();
+                                }
+                                let kb = pending.keyboard.clone();
+                                return SettingsOutcome::RegisterHotkeys(kb);
+                            }
+                        }
+                        _ => {}
+                    }
+                    return SettingsOutcome::Handled;
+                }
+            }
+            "data" => {
+                let key = shortcut_data_key(&entry_id);
+                if let Some(action) = select::classify_event(event, &key) {
+                    match action {
+                        select::SelectAction::Toggle => {
+                            state.open_select = if state.open_select == OpenSelect::ShortcutData(entry_id.clone()) {
+                                OpenSelect::None
+                            } else {
+                                OpenSelect::ShortcutData(entry_id.clone())
+                            };
+                        }
+                        select::SelectAction::Dismiss => state.open_select = OpenSelect::None,
+                        select::SelectAction::Pick(value) => {
+                            state.open_select = OpenSelect::None;
+                            if let Some(data) = HotkeyData::from_slug(&value)
+                                && let Some(slot) = pending.keyboard.shortcuts.iter_mut().find(|e| e.id == entry_id)
+                                && slot.function.data_options().contains(&data)
+                            {
+                                slot.data = data;
+                                let kb = pending.keyboard.clone();
+                                return SettingsOutcome::RegisterHotkeys(kb);
+                            }
+                        }
+                        _ => {}
+                    }
+                    return SettingsOutcome::Handled;
+                }
+            }
+            "binding" => {
+                if matches!(event.kind, UiEventKind::Click | UiEventKind::Activate) {
+                    if hotkeys.is_wayland() {
+                        // Portal owns key assignment — defer to the
+                        // compositor's settings dialog. We've already
+                        // re-bound the shortcut by calling
+                        // RegisterHotkeys on the prior edit, so the
+                        // entry's id is known to the portal.
+                        return SettingsOutcome::OpenPortalShortcutSettings;
+                    }
+                    state.shortcut_capture = Some(entry_id);
+                    return SettingsOutcome::Handled;
+                }
+            }
+            "remove" => {
+                if matches!(event.kind, UiEventKind::Click | UiEventKind::Activate) {
+                    pending.keyboard.shortcuts.retain(|e| e.id != entry_id);
+                    if state.shortcut_capture.as_deref() == Some(entry_id.as_str()) {
+                        state.shortcut_capture = None;
+                    }
+                    let kb = pending.keyboard.clone();
+                    return SettingsOutcome::RegisterHotkeys(kb);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // ---------- Files: auto-download rules ----------
+
     if event.is_click_or_activate(KEY_FILES_RULE_ADD) {
         // 10 MB matches the egui client's "Add Rule" default. New
         // rows start with an empty pattern so the user types theirs

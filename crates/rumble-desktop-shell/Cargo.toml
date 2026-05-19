@@ -45,6 +45,7 @@ anyhow = { workspace = true }
 async-trait = { workspace = true }
 ed25519-dalek = { workspace = true }
 rand = { workspace = true }
+uuid = { workspace = true }
 rumble-client = { path = "../rumble-client" }
 rumble-client-traits = { path = "../rumble-client-traits" }
 # Tokio is on the hotkey API surface (init_portal_backend takes a Handle)

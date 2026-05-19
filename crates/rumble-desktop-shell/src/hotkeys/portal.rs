@@ -6,21 +6,27 @@
 //! Supported environments: KDE Plasma 5.27+, GNOME 47+, Hyprland.
 //! Older Wayland compositors fail gracefully via `PortalHotkeyBackend::new
 //! → None` and the manager falls back to window-focused shortcuts.
+//!
+//! ## Dynamic shortcut binding
+//!
+//! Shortcuts are not declared once at startup — the user edits the
+//! Shortcuts settings table, which calls `set_shortcuts` with the
+//! new entry list. We then call `BindShortcuts` again on the existing
+//! session; the compositor preserves the user's key assignment against
+//! stable `ShortcutEntry::id` UUIDs across calls. New rows show up in
+//! the system shortcut settings UI tagged with their portal
+//! description (`HotkeyFunction::label() + HotkeyData::label()`).
 
 use std::{collections::HashMap, sync::Arc};
 
-use ashpd::desktop::global_shortcuts::{GlobalShortcuts, NewShortcut};
+use ashpd::desktop::{
+    Session,
+    global_shortcuts::{GlobalShortcuts, NewShortcut},
+};
 use futures_util::StreamExt;
 use tokio::sync::{RwLock, mpsc};
 
-use super::HotkeyEvent;
-
-/// Stable shortcut IDs the portal session knows us by. Don't rename
-/// without a migration — these are the keys the user's compositor
-/// stores their custom bindings under.
-pub const SHORTCUT_PTT: &str = "push-to-talk";
-pub const SHORTCUT_MUTE: &str = "toggle-mute";
-pub const SHORTCUT_DEAFEN: &str = "toggle-deafen";
+use super::{HotkeyData, HotkeyEvent, HotkeyFunction, ShortcutEntry};
 
 #[derive(Debug, Clone)]
 pub struct ShortcutInfo {
@@ -30,29 +36,45 @@ pub struct ShortcutInfo {
     pub trigger_description: String,
 }
 
+/// Shared state between the foreground API and the background listener
+/// task. Updated by `set_shortcuts` (which rewrites both maps) and by
+/// the listener's `ShortcutsChanged` handler (which refreshes
+/// `triggers`).
 #[derive(Default)]
-pub struct PortalShortcutState {
-    pub shortcuts: Vec<ShortcutInfo>,
+struct PortalState {
+    /// Map from portal shortcut id -> (function, data) so the listener
+    /// can post the right `HotkeyEvent` when a shortcut fires.
+    actions: HashMap<String, (HotkeyFunction, HotkeyData)>,
+    /// Map from portal shortcut id -> trigger description string. Kept
+    /// in sync with `BindShortcuts` responses and `ShortcutsChanged`
+    /// signals so the UI shows what the user actually bound.
+    triggers: HashMap<String, String>,
 }
 
 pub struct PortalHotkeyBackend {
     event_rx: mpsc::UnboundedReceiver<HotkeyEvent>,
-    /// Kept around so the listener task's sender stays alive even if
-    /// callers later add a shutdown signal.
+    /// Kept around so the listener task's sender stays alive even when
+    /// the UI hasn't drained recently.
     _event_tx: mpsc::UnboundedSender<HotkeyEvent>,
-    shortcuts_bound: bool,
-    state: Arc<RwLock<PortalShortcutState>>,
+    shortcuts: Arc<GlobalShortcuts<'static>>,
+    session: Arc<Session<'static, GlobalShortcuts<'static>>>,
+    state: Arc<RwLock<PortalState>>,
     runtime_handle: tokio::runtime::Handle,
+    /// True once we've successfully bound at least one shortcut. Drives
+    /// `is_available` for the manager-side fallback decision.
+    has_bound: bool,
 }
 
 impl PortalHotkeyBackend {
-    /// Connect to the portal, create a session, bind our shortcuts, and
-    /// spawn the signal listener. Returns `None` if any step fails.
+    /// Connect to the portal, create a session, and spawn the signal
+    /// listener. The session is empty initially — call `set_shortcuts`
+    /// once the user's settings are loaded to actually bind anything.
+    /// Returns `None` if portal connection / session creation fails.
     pub async fn new(runtime_handle: tokio::runtime::Handle) -> Option<Self> {
         tracing::info!("Attempting to connect to XDG GlobalShortcuts portal");
 
         let shortcuts = match GlobalShortcuts::new().await {
-            Ok(s) => s,
+            Ok(s) => Arc::new(s),
             Err(e) => {
                 tracing::warn!("GlobalShortcuts portal not available: {e}");
                 return None;
@@ -60,139 +82,211 @@ impl PortalHotkeyBackend {
         };
 
         let session = match shortcuts.create_session().await {
-            Ok(s) => s,
+            Ok(s) => Arc::new(s),
             Err(e) => {
                 tracing::warn!("Failed to create GlobalShortcuts session: {e}");
                 return None;
             }
         };
 
-        let shortcut_definitions = shortcut_definitions();
-        let state = Arc::new(RwLock::new(PortalShortcutState::default()));
-
-        let shortcuts_bound = match shortcuts.bind_shortcuts(&session, &shortcut_definitions, None).await {
-            Ok(request) => match request.response() {
-                Ok(response) => {
-                    let bound = response.shortcuts();
-                    tracing::info!("Shortcuts bound: {} entries", bound.len());
-
-                    let mut state_guard = state.write().await;
-                    state_guard.shortcuts = bound
-                        .iter()
-                        .map(|s| ShortcutInfo {
-                            id: s.id().to_string(),
-                            description: shortcut_description(s.id()),
-                            trigger_description: s.trigger_description().to_string(),
-                        })
-                        .collect();
-                    drop(state_guard);
-
-                    !bound.is_empty()
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to get bind_shortcuts response: {e}");
-                    false
-                }
-            },
-            Err(e) => {
-                tracing::warn!("Failed to bind shortcuts: {e}");
-                false
-            }
-        };
-
+        let state = Arc::new(RwLock::new(PortalState::default()));
         let (event_tx, event_rx) = mpsc::unbounded_channel();
 
-        let event_tx_clone = event_tx.clone();
+        let listener_shortcuts = Arc::clone(&shortcuts);
+        let listener_state = Arc::clone(&state);
+        let listener_tx = event_tx.clone();
         runtime_handle.spawn(async move {
-            Self::listen_for_signals(shortcuts, event_tx_clone).await;
+            Self::listen_for_signals(listener_shortcuts, listener_state, listener_tx).await;
         });
 
         Some(Self {
             event_rx,
             _event_tx: event_tx,
-            shortcuts_bound,
+            shortcuts,
+            session,
             state,
             runtime_handle,
+            has_bound: false,
         })
     }
 
-    async fn listen_for_signals(shortcuts: GlobalShortcuts<'static>, event_tx: mpsc::UnboundedSender<HotkeyEvent>) {
+    /// Re-bind the portal session against the user's current shortcut
+    /// list. Stable entry IDs mean the compositor preserves whatever
+    /// key the user has assigned per row, even when rows are added or
+    /// reordered.
+    ///
+    /// Called from the synchronous settings path; dispatches the actual
+    /// `BindShortcuts` D-Bus call to the runtime, since `bind_shortcuts`
+    /// is async and we don't want the UI thread to wait. The state map
+    /// is updated synchronously so subsequent `poll_events` can dispatch
+    /// the new (function, data) mapping immediately.
+    pub fn set_shortcuts(&mut self, entries: &[ShortcutEntry]) {
+        let definitions: Vec<NewShortcut> = entries
+            .iter()
+            .map(|e| NewShortcut::new(&e.id, e.portal_description()))
+            .collect();
+        let new_actions: HashMap<String, (HotkeyFunction, HotkeyData)> =
+            entries.iter().map(|e| (e.id.clone(), (e.function, e.data))).collect();
+
+        self.has_bound = !definitions.is_empty();
+
+        let shortcuts = Arc::clone(&self.shortcuts);
+        let session = Arc::clone(&self.session);
+        let state = Arc::clone(&self.state);
+        self.runtime_handle.spawn(async move {
+            {
+                let mut guard = state.write().await;
+                guard.actions = new_actions;
+                // Preserve existing trigger strings for rows that still
+                // exist; drop entries for removed rows. The compositor
+                // will re-emit `ShortcutsChanged` shortly with the new
+                // authoritative set.
+                let live_ids: std::collections::HashSet<String> = guard.actions.keys().cloned().collect();
+                guard.triggers.retain(|id, _| live_ids.contains(id));
+            }
+
+            if definitions.is_empty() {
+                tracing::debug!("set_shortcuts: empty entry list, skipping BindShortcuts");
+                return;
+            }
+
+            match shortcuts.bind_shortcuts(&session, &definitions, None).await {
+                Ok(request) => match request.response() {
+                    Ok(response) => {
+                        let bound = response.shortcuts();
+                        tracing::info!("BindShortcuts: {} entries bound", bound.len());
+                        let mut guard = state.write().await;
+                        for s in bound {
+                            guard
+                                .triggers
+                                .insert(s.id().to_string(), s.trigger_description().to_string());
+                        }
+                    }
+                    // `Cancelled` is what most compositors return when the
+                    // user dismisses the "this app wants to register new
+                    // global shortcuts" prompt. Not fatal — the user can
+                    // retry by clicking a Shortcut cell, which routes
+                    // back through `open_settings` → BindShortcuts.
+                    Err(e) => {
+                        tracing::info!("BindShortcuts not applied ({e}); reopen the Shortcuts settings cell to retry")
+                    }
+                },
+                Err(e) => tracing::warn!("BindShortcuts call failed: {e}"),
+            }
+        });
+    }
+
+    /// Listen for Activated / Deactivated / ShortcutsChanged signals
+    /// and translate them into `HotkeyEvent`s for the UI thread.
+    async fn listen_for_signals(
+        shortcuts: Arc<GlobalShortcuts<'static>>,
+        state: Arc<RwLock<PortalState>>,
+        event_tx: mpsc::UnboundedSender<HotkeyEvent>,
+    ) {
         tracing::debug!("Starting GlobalShortcuts signal listener");
 
-        // Keys are static so the map can be initialised once. Values
-        // map activation/deactivation onto the corresponding event.
-        let shortcut_map: HashMap<&str, fn(bool) -> Option<HotkeyEvent>> = [
-            (
-                SHORTCUT_PTT,
-                (|pressed| {
-                    Some(if pressed {
-                        HotkeyEvent::PttPressed
-                    } else {
-                        HotkeyEvent::PttReleased
-                    })
-                }) as fn(bool) -> Option<HotkeyEvent>,
-            ),
-            (
-                SHORTCUT_MUTE,
-                (|pressed| if pressed { Some(HotkeyEvent::ToggleMute) } else { None })
-                    as fn(bool) -> Option<HotkeyEvent>,
-            ),
-            (
-                SHORTCUT_DEAFEN,
-                (|pressed| {
-                    if pressed { Some(HotkeyEvent::ToggleDeafen) } else { None }
-                }) as fn(bool) -> Option<HotkeyEvent>,
-            ),
-        ]
-        .into_iter()
-        .collect();
-
-        let mut activated_stream = match shortcuts.receive_activated().await {
-            Ok(stream) => stream,
+        let mut activated = match shortcuts.receive_activated().await {
+            Ok(s) => s,
             Err(e) => {
                 tracing::error!("Failed to subscribe to Activated signals: {e}");
                 return;
             }
         };
 
-        let mut deactivated_stream = match shortcuts.receive_deactivated().await {
-            Ok(stream) => stream,
+        let mut deactivated = match shortcuts.receive_deactivated().await {
+            Ok(s) => s,
             Err(e) => {
                 tracing::error!("Failed to subscribe to Deactivated signals: {e}");
                 return;
             }
         };
 
-        loop {
-            tokio::select! {
-                Some(activated) = activated_stream.next() => {
-                    let id = activated.shortcut_id();
-                    if let Some(handler) = shortcut_map.get(id)
-                        && let Some(event) = handler(true)
-                        && event_tx.send(event).is_err() {
-                            tracing::debug!("Event channel closed, stopping listener");
-                            break;
-                        }
-                }
-                Some(deactivated) = deactivated_stream.next() => {
-                    let id = deactivated.shortcut_id();
-                    if let Some(handler) = shortcut_map.get(id)
-                        && let Some(event) = handler(false)
-                        && event_tx.send(event).is_err() {
-                            tracing::debug!("Event channel closed, stopping listener");
-                            break;
-                        }
-                }
-                else => {
-                    tracing::debug!("Signal streams ended");
-                    break;
-                }
+        // `ShortcutsChanged` is non-fatal — log on failure, then the
+        // listener falls back to leaving triggers cached from the last
+        // `BindShortcuts` response.
+        let changed = match shortcuts.receive_shortcuts_changed().await {
+            Ok(s) => Some(s),
+            Err(e) => {
+                tracing::warn!("Failed to subscribe to ShortcutsChanged signals: {e}");
+                None
             }
+        };
+
+        match changed {
+            Some(mut changed) => loop {
+                tokio::select! {
+                    Some(ev) = activated.next() => {
+                        if Self::handle_activated(&state, &event_tx, ev).await.is_break() {
+                            break;
+                        }
+                    }
+                    Some(ev) = deactivated.next() => {
+                        if Self::handle_deactivated(&state, &event_tx, ev).await.is_break() {
+                            break;
+                        }
+                    }
+                    Some(ev) = changed.next() => {
+                        let mut guard = state.write().await;
+                        guard.triggers.clear();
+                        for s in ev.shortcuts() {
+                            guard.triggers.insert(s.id().to_string(), s.trigger_description().to_string());
+                        }
+                        tracing::debug!("ShortcutsChanged: {} entries", guard.triggers.len());
+                    }
+                    else => break,
+                }
+            },
+            None => loop {
+                tokio::select! {
+                    Some(ev) = activated.next() => {
+                        if Self::handle_activated(&state, &event_tx, ev).await.is_break() {
+                            break;
+                        }
+                    }
+                    Some(ev) = deactivated.next() => {
+                        if Self::handle_deactivated(&state, &event_tx, ev).await.is_break() {
+                            break;
+                        }
+                    }
+                    else => break,
+                }
+            },
         }
+        tracing::debug!("Signal streams ended");
+    }
+
+    async fn handle_activated(
+        state: &Arc<RwLock<PortalState>>,
+        event_tx: &mpsc::UnboundedSender<HotkeyEvent>,
+        ev: ashpd::desktop::global_shortcuts::Activated,
+    ) -> std::ops::ControlFlow<()> {
+        let id = ev.shortcut_id().to_string();
+        let action = state.read().await.actions.get(&id).copied();
+        if let Some((function, data)) = action
+            && event_tx.send(HotkeyEvent::Pressed { function, data }).is_err()
+        {
+            return std::ops::ControlFlow::Break(());
+        }
+        std::ops::ControlFlow::Continue(())
+    }
+
+    async fn handle_deactivated(
+        state: &Arc<RwLock<PortalState>>,
+        event_tx: &mpsc::UnboundedSender<HotkeyEvent>,
+        ev: ashpd::desktop::global_shortcuts::Deactivated,
+    ) -> std::ops::ControlFlow<()> {
+        let id = ev.shortcut_id().to_string();
+        let action = state.read().await.actions.get(&id).copied();
+        if let Some((function, data)) = action
+            && event_tx.send(HotkeyEvent::Released { function, data }).is_err()
+        {
+            return std::ops::ControlFlow::Break(());
+        }
+        std::ops::ControlFlow::Continue(())
     }
 
     pub fn is_available(&self) -> bool {
-        self.shortcuts_bound
+        self.has_bound
     }
 
     pub fn poll_events(&mut self) -> Vec<HotkeyEvent> {
@@ -203,80 +297,112 @@ impl PortalHotkeyBackend {
         events
     }
 
-    /// Snapshot of currently bound shortcuts. `try_read` so the UI
-    /// thread never blocks on the listener task.
-    pub fn get_shortcuts(&self) -> Vec<ShortcutInfo> {
-        self.state
-            .try_read()
-            .map(|guard| guard.shortcuts.clone())
-            .unwrap_or_default()
+    /// Trigger description string the compositor reported for this
+    /// entry id. Returns `None` if the entry isn't bound or the user
+    /// hasn't assigned a key yet (compositor reports empty string).
+    pub fn trigger_for(&self, entry_id: &str) -> Option<String> {
+        let guard = self.state.try_read().ok()?;
+        guard.triggers.get(entry_id).filter(|s| !s.is_empty()).cloned()
     }
 
-    /// Open the system shortcut configuration dialog. On most desktops
-    /// this is the only way for the user to assign keys, since the
-    /// portal does not expose the bindings to us at registration time.
+    /// Snapshot of all currently-bound shortcuts. Used by the rumble-
+    /// egui settings panel that still expects the historical
+    /// `ShortcutInfo` shape.
+    pub fn get_shortcuts(&self) -> Vec<ShortcutInfo> {
+        let guard = match self.state.try_read() {
+            Ok(g) => g,
+            Err(_) => return Vec::new(),
+        };
+        guard
+            .actions
+            .iter()
+            .map(|(id, (function, data))| {
+                let description = format!("{} ({})", function.label(), data.label());
+                let trigger_description = guard.triggers.get(id).cloned().unwrap_or_default();
+                ShortcutInfo {
+                    id: id.clone(),
+                    description,
+                    trigger_description,
+                }
+            })
+            .collect()
+    }
+
+    /// Open the compositor's shortcut configuration dialog.
+    ///
+    /// On portals exposing v2 of the GlobalShortcuts interface this calls
+    /// `ConfigureShortcuts`, which is the proper "show the configuration
+    /// UI again" request. On v1-only portals (Plasma 5.27 / older Plasma
+    /// 6) there's no such method — `BindShortcuts` deliberately *does
+    /// not* re-show the dialog once shortcuts are bound, per the portal
+    /// spec — so we shell out to the desktop environment's own shortcut
+    /// settings application as a best-effort fallback. New shortcut rows
+    /// added from the Shortcuts tab still trigger their own
+    /// `BindShortcuts` prompt via `set_shortcuts`, so this path only
+    /// matters for *re-configuring* already-bound rows.
     pub fn open_settings(&self) {
-        let state = self.state.clone();
+        let shortcuts = Arc::clone(&self.shortcuts);
+        let session = Arc::clone(&self.session);
         self.runtime_handle.spawn(async move {
-            if let Err(e) = open_shortcut_settings_and_update(state).await {
-                tracing::error!("Failed to open shortcut settings: {e}");
+            match shortcuts.configure_shortcuts(&session, None, None).await {
+                Ok(()) => return,
+                Err(e) => {
+                    tracing::info!("ConfigureShortcuts unavailable ({e}); launching DE shortcut settings");
+                }
             }
+            spawn_system_shortcut_settings();
         });
     }
 }
 
-fn shortcut_definitions() -> Vec<NewShortcut> {
-    vec![
-        NewShortcut::new(SHORTCUT_PTT, "Hold to transmit voice (Push-to-Talk)"),
-        NewShortcut::new(SHORTCUT_MUTE, "Toggle microphone mute"),
-        NewShortcut::new(SHORTCUT_DEAFEN, "Toggle speaker mute (deafen)"),
-    ]
-}
+/// Best-effort launch of the desktop environment's keyboard-shortcut
+/// settings page. Used as the v1-portal fallback for re-opening shortcut
+/// configuration — the portal spec doesn't give us a programmatic way to
+/// re-show the dialog there, so we hand control over to the DE.
+///
+/// Spawned children are detached: closing aetna doesn't take them down.
+/// `XDG_CURRENT_DESKTOP` is colon-separated on some setups; lowercase
+/// substring match is sufficient.
+fn spawn_system_shortcut_settings() {
+    let de = std::env::var("XDG_CURRENT_DESKTOP")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
 
-fn shortcut_description(id: &str) -> String {
-    match id {
-        SHORTCUT_PTT => "Push-to-Talk".to_string(),
-        SHORTCUT_MUTE => "Toggle Mute".to_string(),
-        SHORTCUT_DEAFEN => "Toggle Deafen".to_string(),
-        _ => id.to_string(),
-    }
-}
+    // Candidate commands in priority order. `kcm_keys` is the shortcuts
+    // module Plasma 5 and 6 both ship; on Plasma 6 `kcmshell6` is the
+    // launcher, on Plasma 5 it's `kcmshell5`. `systemsettings` opens
+    // the same module inside the full Settings app. We deliberately
+    // don't list speculative kcm names — `Command::spawn` returns Ok
+    // even when the kcm module doesn't exist, so a wrong guess would
+    // flash an error window without falling through to the next entry.
+    let candidates: &[(&str, &[&str])] = if de.contains("kde") || de.contains("plasma") {
+        &[
+            ("kcmshell6", &["kcm_keys"]),
+            ("kcmshell5", &["kcm_keys"]),
+            ("systemsettings", &["kcm_keys"]),
+        ]
+    } else if de.contains("gnome") {
+        &[("gnome-control-center", &["keyboard"])]
+    } else if de.contains("cinnamon") {
+        &[("cinnamon-settings", &["keyboard"])]
+    } else if de.contains("xfce") {
+        &[("xfce4-keyboard-settings", &[])]
+    } else {
+        &[]
+    };
 
-async fn open_shortcut_settings_and_update(state: Arc<RwLock<PortalShortcutState>>) -> Result<(), ashpd::Error> {
-    let shortcuts = GlobalShortcuts::new().await?;
-    let session = shortcuts.create_session().await?;
-    let definitions = shortcut_definitions();
-
-    let request = shortcuts.bind_shortcuts(&session, &definitions, None).await?;
-    match request.response() {
-        Ok(response) => {
-            let bound = response.shortcuts();
-            tracing::info!("Shortcuts reconfigured: {} entries", bound.len());
-
-            let mut state_guard = state.write().await;
-            state_guard.shortcuts = bound
-                .iter()
-                .map(|s| ShortcutInfo {
-                    id: s.id().to_string(),
-                    description: shortcut_description(s.id()),
-                    trigger_description: s.trigger_description().to_string(),
-                })
-                .collect();
+    for (cmd, args) in candidates {
+        match std::process::Command::new(cmd).args(*args).spawn() {
+            Ok(_) => {
+                tracing::info!("Launched {cmd} for system shortcut settings");
+                return;
+            }
+            Err(e) => tracing::debug!("Could not launch {cmd}: {e}"),
         }
-        Err(e) => {
-            tracing::warn!("Failed to get bind_shortcuts response: {e}");
-        }
     }
-
-    Ok(())
-}
-
-/// Stand-alone helper, kept for callers that don't have a backend
-/// instance handy. Prefer `PortalHotkeyBackend::open_settings`.
-pub async fn open_shortcut_settings() -> Result<(), ashpd::Error> {
-    let shortcuts = GlobalShortcuts::new().await?;
-    let session = shortcuts.create_session().await?;
-    let definitions = shortcut_definitions();
-    shortcuts.bind_shortcuts(&session, &definitions, None).await?;
-    Ok(())
+    tracing::warn!(
+        "No known shortcut-settings application found for XDG_CURRENT_DESKTOP={:?}; please open your desktop's \
+         keyboard shortcuts manually.",
+        std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default(),
+    );
 }

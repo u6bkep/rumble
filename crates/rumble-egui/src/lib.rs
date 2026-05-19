@@ -22,8 +22,7 @@ pub type BackendHandle = rumble_client::handle::BackendHandle<rumble_desktop::Na
 pub use app::RumbleApp;
 pub use harness::TestHarness;
 pub use rumble_desktop_shell::{
-    HotkeyAction, HotkeyBinding, HotkeyEvent, HotkeyManager, HotkeyModifiers, HotkeyRegistrationStatus,
-    KeyboardSettings,
+    HotkeyBinding, HotkeyEvent, HotkeyManager, HotkeyModifiers, HotkeyRegistrationStatus, KeyboardSettings,
 };
 pub use settings::{Args, PersistentSettings};
 pub use toasts::{Toast, ToastLevel, ToastManager};

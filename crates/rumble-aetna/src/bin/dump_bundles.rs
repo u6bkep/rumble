@@ -110,6 +110,9 @@ enum Scene {
     SettingsSounds,
     /// Settings dialog — Chat tab with the timestamp-format dropdown open.
     SettingsChat,
+    /// Settings dialog — Shortcuts tab (Mumble-style Function/Data/Shortcut
+    /// table with the default Space-PTT row).
+    SettingsShortcuts,
     /// Settings dialog — Files tab (auto-download + bandwidth).
     SettingsFiles,
     /// Settings dialog — Stats tab (read-only audio metrics).
@@ -161,6 +164,7 @@ impl Scene {
         Scene::SettingsProcessing,
         Scene::SettingsSounds,
         Scene::SettingsChat,
+        Scene::SettingsShortcuts,
         Scene::SettingsFiles,
         Scene::SettingsStats,
         Scene::SettingsAdmin,
@@ -197,6 +201,7 @@ impl Scene {
             Scene::SettingsProcessing => "settings_processing",
             Scene::SettingsSounds => "settings_sounds",
             Scene::SettingsChat => "settings_chat",
+            Scene::SettingsShortcuts => "settings_shortcuts",
             Scene::SettingsFiles => "settings_files",
             Scene::SettingsStats => "settings_stats",
             Scene::SettingsAdmin => "settings_admin",
@@ -246,6 +251,7 @@ impl Scene {
             | Scene::UnlockPrompt
             | Scene::SettingsConnection
             | Scene::SettingsChat
+            | Scene::SettingsShortcuts
             | Scene::SettingsVoice
             | Scene::SettingsSounds
             | Scene::SettingsFiles
@@ -355,6 +361,7 @@ impl Scene {
                 app.open_settings_for_test(SettingsTab::Chat);
                 app.open_settings_dropdown_for_test(SettingsOpenSelect::TimestampFormat);
             }
+            Scene::SettingsShortcuts => app.open_settings_for_test(SettingsTab::Shortcuts),
             Scene::SettingsFiles => app.open_settings_for_test(SettingsTab::Files),
             Scene::SettingsStats => app.open_settings_for_test(SettingsTab::Stats),
             Scene::SettingsAdmin => {

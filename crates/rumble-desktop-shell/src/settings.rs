@@ -517,12 +517,12 @@ impl SettingsStore {
         let Some(path) = path else {
             tracing::debug!("settings: no path configured, running in-memory");
             return Self {
-                settings: Settings::default(),
+                settings: Self::initialised_defaults(),
                 path: None,
             };
         };
 
-        let settings = match fs::read_to_string(&path) {
+        let mut settings = match fs::read_to_string(&path) {
             Ok(text) => match serde_json::from_str::<Settings>(&text) {
                 Ok(s) => {
                     tracing::info!("settings: loaded {}", path.display());
@@ -543,10 +543,26 @@ impl SettingsStore {
             }
         };
 
+        // Drain pre-shortcuts hotkey fields into the new vec. No default
+        // shortcut entries are seeded — that auto-seed used to write a
+        // Space → Push-to-Talk row on first launch, but binding a global
+        // hotkey without the user asking can collide with their existing
+        // keymap (and on Wayland it would also fire the portal prompt at
+        // app startup). Users add their own shortcuts from the Shortcuts
+        // settings tab.
+        settings.keyboard.normalize_legacy();
+
         Self {
             settings,
             path: Some(path),
         }
+    }
+
+    /// Construct the in-memory default `Settings`. Matches the on-disk
+    /// path: legacy fields are drained on the fly elsewhere, no shortcut
+    /// rows are seeded here.
+    fn initialised_defaults() -> Settings {
+        Settings::default()
     }
 
     pub fn settings(&self) -> &Settings {

@@ -6,8 +6,8 @@ pub mod identity;
 pub mod settings;
 
 pub use hotkeys::{
-    HotkeyAction, HotkeyBinding, HotkeyEvent, HotkeyManager, HotkeyModifiers, HotkeyRegistrationStatus,
-    KeyboardSettings,
+    HotkeyBinding, HotkeyData, HotkeyEvent, HotkeyFunction, HotkeyManager, HotkeyModifiers, HotkeyRegistrationStatus,
+    KeyboardSettings, ShortcutEntry,
 };
 pub use identity::{
     KeyConfig, KeyInfo, KeyManager, KeyManagerSigner, KeySource, compute_fingerprint, parse_signing_key,

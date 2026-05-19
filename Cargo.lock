@@ -3034,6 +3034,7 @@ dependencies = [
  "image",
  "rcgen 0.13.2",
  "rumble-client",
+ "rumble-desktop-shell",
  "rumble-egui",
  "rumble-protocol",
  "rustls",
@@ -5880,6 +5881,7 @@ dependencies = [
  "ssh-key",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
