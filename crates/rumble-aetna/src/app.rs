@@ -553,7 +553,17 @@ impl<B: UiBackend> App for RumbleApp<B> {
         // Wizard takes precedence over everything else — until an identity
         // is configured the rest of the UI is read-only.
         let wizard_open = !matches!(self.wizard, WizardState::NotNeeded | WizardState::Complete);
-        let wizard_layer = wizard::render(&self.wizard, self.pending_agent_op.is_some(), &self.selection);
+        // First-run wizard (no identity yet) can't be cancelled — the
+        // rest of the UI is locked behind having an identity. Once an
+        // identity exists (subsequent invocations from Settings), the
+        // wizard offers a Cancel out.
+        let wizard_cancelable = !self.identity.needs_setup();
+        let wizard_layer = wizard::render(
+            &self.wizard,
+            self.pending_agent_op.is_some(),
+            wizard_cancelable,
+            &self.selection,
+        );
 
         let unlock_layer = if !wizard_open && (self.identity.needs_unlock() || self.force_unlock_for_test) {
             Some(wizard::render_unlock(&self.unlock, &self.selection))
@@ -2375,6 +2385,9 @@ impl<B: UiBackend> RumbleApp<B> {
     fn dispatch_wizard_outcome(&mut self, outcome: WizardOutcome) {
         match outcome {
             WizardOutcome::Ignored | WizardOutcome::Handled => {}
+            WizardOutcome::Cancel => {
+                self.wizard = WizardState::NotNeeded;
+            }
             WizardOutcome::SpawnConnect => {
                 self.spawn_connect_op();
             }
@@ -2494,6 +2507,17 @@ impl<B: UiBackend> RumbleApp<B> {
             SettingsOutcome::OpenIdentityWizard => {
                 self.settings_state.close();
                 self.wizard = WizardState::SelectMethod;
+                true
+            }
+            SettingsOutcome::OpenIdentityWizardAgent => {
+                // Skip SelectMethod and kick straight into the
+                // ssh-agent flow. The wizard's existing
+                // SelectAgentKey screen will accept the picked key
+                // via `select_agent_key`, which non-destructively
+                // rewrites identity.json to point at it.
+                self.settings_state.close();
+                self.wizard = WizardState::ConnectingAgent;
+                self.spawn_connect_op();
                 true
             }
             SettingsOutcome::OpenElevate => {
@@ -2671,6 +2695,40 @@ impl<B: UiBackend> RumbleApp<B> {
     /// `dump_bundles` can render every wizard screen for visual review.
     pub fn set_wizard_state_for_test(&mut self, state: WizardState) {
         self.wizard = state;
+    }
+
+    /// Test/scene-dump hook: install a plaintext local identity so
+    /// `dump_bundles` can render the Connection-tab Identity section
+    /// for a non-blank user.
+    pub fn set_local_identity_for_test(&mut self) {
+        let _ = self.identity.generate_local_key(None);
+    }
+
+    /// Test/scene-dump hook: install an ssh-agent–bound identity. No
+    /// real agent is contacted; we just write a `KeySource::SshAgent`
+    /// config so the Connection-tab Identity panel renders its
+    /// ssh-agent branch with a deterministic fingerprint and comment.
+    pub fn set_ssh_agent_identity_for_test(&mut self) {
+        use std::fmt::Write;
+
+        use rumble_desktop_shell::{KeyConfig, KeySource, compute_fingerprint};
+        let pubkey: [u8; 32] = [
+            0x9c, 0xa3, 0x1f, 0x42, 0xb7, 0x6d, 0x5e, 0x11, 0x88, 0x44, 0xfa, 0x21, 0x07, 0xc0, 0x8e, 0x35, 0x6b, 0x52,
+            0x2d, 0xae, 0x91, 0x70, 0xf8, 0x4c, 0xd3, 0x29, 0x66, 0xb5, 0x47, 0x1a, 0x0e, 0xff,
+        ];
+        let mut public_key_hex = String::with_capacity(64);
+        for b in pubkey {
+            let _ = write!(public_key_hex, "{b:02x}");
+        }
+        let config = KeyConfig {
+            source: KeySource::SshAgent {
+                fingerprint: compute_fingerprint(&pubkey),
+                comment: "alice@workstation".to_string(),
+            },
+            public_key_hex,
+        };
+        self.identity.manager_mut().set_config(config, None);
+        self.identity.refresh_public_key();
     }
 
     /// Test/scene-dump hook for the encrypted-key unlock prompt. The

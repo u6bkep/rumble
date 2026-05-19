@@ -60,6 +60,11 @@ pub enum WizardOutcome {
     Ignored,
     /// Event was consumed; no further work for the App.
     Handled,
+    /// User dismissed the wizard from the method picker. Only fires
+    /// when the wizard was entered with `cancelable = true` (i.e. an
+    /// identity already exists). The App should reset the wizard to
+    /// `NotNeeded`.
+    Cancel,
     /// Spawn `connect_and_list_keys` in the runtime; result feeds back
     /// into `WizardState::SelectAgentKey`.
     SpawnConnect,
@@ -83,6 +88,7 @@ const KEY_USE_AGENT: &str = "wizard:use-agent";
 const KEY_BACK: &str = "wizard:back";
 const KEY_SUBMIT: &str = "wizard:submit";
 const KEY_CANCEL_AGENT: &str = "wizard:cancel-agent";
+const KEY_CANCEL_WIZARD: &str = "wizard:cancel";
 const KEY_GEN_AGENT_KEY: &str = "wizard:gen-agent-key";
 const KEY_PWD: &str = "wizard:pwd";
 const KEY_CONFIRM: &str = "wizard:confirm";
@@ -98,10 +104,17 @@ pub fn parse_agent_row_key(key: &str) -> Option<usize> {
     key.strip_prefix("wizard:agent-row:").and_then(|s| s.parse().ok())
 }
 
-pub fn render(state: &WizardState, agent_busy: bool, selection: &Selection) -> Option<El> {
+/// Render the wizard.
+///
+/// `cancelable` controls whether the method picker offers a Cancel
+/// button. First-run flows (no identity configured yet) pass `false`
+/// because the rest of the UI is locked behind having an identity;
+/// in-settings flows (switching source) pass `true` so the user can
+/// back out without committing.
+pub fn render(state: &WizardState, agent_busy: bool, cancelable: bool, selection: &Selection) -> Option<El> {
     match state {
         WizardState::NotNeeded | WizardState::Complete => None,
-        WizardState::SelectMethod => Some(render_select_method()),
+        WizardState::SelectMethod => Some(render_select_method(cancelable)),
         WizardState::GenerateLocal {
             password,
             confirm,
@@ -116,7 +129,7 @@ pub fn render(state: &WizardState, agent_busy: bool, selection: &Selection) -> O
     }
 }
 
-fn render_select_method() -> El {
+fn render_select_method(cancelable: bool) -> El {
     let agent_available = ssh_agent_available();
     let agent_button = if agent_available {
         button("Choose SSH agent key").key(KEY_USE_AGENT).primary()
@@ -144,6 +157,15 @@ fn render_select_method() -> El {
         );
     }
     body.push(row([agent_button]).align(Align::Start));
+
+    if cancelable {
+        body.push(divider());
+        body.push(
+            row([spacer(), button("Cancel").key(KEY_CANCEL_WIZARD)])
+                .width(Size::Fill(1.0))
+                .align(Align::Center),
+        );
+    }
 
     modal("wizard", "Set up your Rumble identity", body)
 }
@@ -343,6 +365,9 @@ pub fn handle_event(state: &mut WizardState, event: &UiEvent, selection: &mut Se
             if event.is_click_or_activate(KEY_USE_AGENT) {
                 *state = WizardState::ConnectingAgent;
                 return WizardOutcome::SpawnConnect;
+            }
+            if event.is_click_or_activate(KEY_CANCEL_WIZARD) {
+                return WizardOutcome::Cancel;
             }
         }
         WizardState::GenerateLocal {

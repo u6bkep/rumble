@@ -136,6 +136,14 @@ enum Scene {
     /// Settings → Connection after a successful elevation — the
     /// button is replaced with the "Elevated this session" notice.
     SettingsConnectionElevated,
+    /// Settings → Connection with a configured plaintext local
+    /// identity. Exercises the per-source detail block + the
+    /// "Switch to SSH agent key…" affordance.
+    SettingsConnectionLocalKey,
+    /// Settings → Connection bound to an ssh-agent key. Exercises the
+    /// agent-reachability badge and the "Re-select SSH agent key…"
+    /// affordance.
+    SettingsConnectionSshAgent,
 }
 
 impl Scene {
@@ -173,6 +181,8 @@ impl Scene {
         Scene::ElevatePrompt,
         Scene::SettingsConnectionSudo,
         Scene::SettingsConnectionElevated,
+        Scene::SettingsConnectionLocalKey,
+        Scene::SettingsConnectionSshAgent,
     ];
 
     fn slug(self) -> &'static str {
@@ -210,6 +220,8 @@ impl Scene {
             Scene::ElevatePrompt => "elevate_prompt",
             Scene::SettingsConnectionSudo => "settings_connection_sudo",
             Scene::SettingsConnectionElevated => "settings_connection_elevated",
+            Scene::SettingsConnectionLocalKey => "settings_connection_local_key",
+            Scene::SettingsConnectionSshAgent => "settings_connection_ssh_agent",
         }
     }
 
@@ -250,6 +262,8 @@ impl Scene {
             | Scene::WizardError
             | Scene::UnlockPrompt
             | Scene::SettingsConnection
+            | Scene::SettingsConnectionLocalKey
+            | Scene::SettingsConnectionSshAgent
             | Scene::SettingsChat
             | Scene::SettingsShortcuts
             | Scene::SettingsVoice
@@ -379,6 +393,14 @@ impl Scene {
                 });
             }
             Scene::SettingsConnectionSudo | Scene::SettingsConnectionElevated => {
+                app.open_settings_for_test(SettingsTab::Connection);
+            }
+            Scene::SettingsConnectionLocalKey => {
+                app.set_local_identity_for_test();
+                app.open_settings_for_test(SettingsTab::Connection);
+            }
+            Scene::SettingsConnectionSshAgent => {
+                app.set_ssh_agent_identity_for_test();
                 app.open_settings_for_test(SettingsTab::Connection);
             }
             Scene::ConnectedImagePreview => {

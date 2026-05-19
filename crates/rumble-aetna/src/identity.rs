@@ -79,6 +79,14 @@ impl Identity {
         Ok(())
     }
 
+    /// Re-read the public key cached on this `Identity` from the
+    /// underlying `KeyManager`. Useful after a test hook mutates the
+    /// manager directly via [`Self::manager_mut`].
+    pub fn refresh_public_key(&mut self) {
+        let km = self.manager.read().expect("identity lock poisoned");
+        self.public_key = km.public_key_bytes();
+    }
+
     pub fn fingerprint(&self) -> String {
         self.public_key
             .map(|key| compute_fingerprint(&key))
