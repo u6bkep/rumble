@@ -73,7 +73,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // speed during transitions, which is what we want here.
     let host_config = HostConfig::default()
         .with_redraw_interval(Duration::from_millis(33))
-        .with_low_latency_present(true);
+        .with_low_latency_present(true)
+        // Reverse-DNS app id (matches our `ProjectDirs` qualifier/org/app)
+        // so the Wayland `xdg_toplevel.app_id` / X11 `WM_CLASS` we present
+        // to the compositor and the XDG GlobalShortcuts portal is a stable
+        // "com.rumble.Rumble" instead of a generic `surface-transient`
+        // placeholder. This is what the system hotkeys UI groups us under.
+        .with_app_id("com.rumble.Rumble");
     aetna_winit_wgpu::run_host_app_with_config("Rumble", viewport, app, host_config)?;
     Ok(())
 }

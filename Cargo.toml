@@ -21,9 +21,9 @@ rand_core = "0.10.0-rc.3"
 # Aetna UI library — pinned by git rev to upstream computer-whisperer/aetna.
 # Override locally with `[patch."https://github.com/computer-whisperer/aetna"]`
 # (or `scripts/aetna-local.sh`) if iterating on aetna alongside rumble.
-aetna-core = { git = "https://github.com/computer-whisperer/aetna", rev = "b8e64bdc4356fb26ea99dab2f0b2493106a9ba71" }
-aetna-wgpu = { git = "https://github.com/computer-whisperer/aetna", rev = "b8e64bdc4356fb26ea99dab2f0b2493106a9ba71" }
-aetna-winit-wgpu = { git = "https://github.com/computer-whisperer/aetna", rev = "b8e64bdc4356fb26ea99dab2f0b2493106a9ba71" }
+aetna-core = { git = "https://github.com/computer-whisperer/aetna", rev = "f9f55660517435afd237889ded2db03514092237" }
+aetna-wgpu = { git = "https://github.com/computer-whisperer/aetna", rev = "f9f55660517435afd237889ded2db03514092237" }
+aetna-winit-wgpu = { git = "https://github.com/computer-whisperer/aetna", rev = "f9f55660517435afd237889ded2db03514092237" }
 
 # Shared third-party deps. Per-crate feature picks live at each consumer
 # so the workspace stays neutral about what each crate actually uses;
