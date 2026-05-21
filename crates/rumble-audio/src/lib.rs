@@ -225,7 +225,7 @@ pub trait ProcessorFactory: Send + Sync {
 ///
 /// This is a serializable representation of a processor's type and settings,
 /// used for persistence and transmission of pipeline configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProcessorConfig {
     /// Processor type identifier (e.g., "builtin.denoise", "builtin.vad").
     pub type_id: String,
@@ -267,7 +267,7 @@ impl ProcessorConfig {
 /// Complete pipeline configuration.
 ///
 /// Defines the ordered list of processors and processing parameters.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PipelineConfig {
     /// Ordered list of processor configs.
     ///

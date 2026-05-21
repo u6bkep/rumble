@@ -5,8 +5,8 @@
 //! via [`handle_event`] and dispatches the resulting [`SettingsOutcome`]
 //! back to the backend / `SettingsStore` / identity wizard.
 //!
-//! Save semantics mirror the rumble-egui dialog: most edits accumulate
-//! in `pending_*` fields and only land when the user clicks Save. A few
+//! Save / Apply semantics mirror the rumble-egui dialog: most edits accumulate
+//! in `pending_*` fields and only land when the user clicks Save or Apply. A few
 //! controls (Refresh devices, Reset stats, Preview sfx, Regenerate
 //! identity) fire immediately because they're side-effecting actions
 //! rather than persisted state.
@@ -143,7 +143,7 @@ pub enum OpenSelect {
 /// Pending edits accumulated while the dialog is open. Initialised
 /// from the live values in [`SettingsState::open_with`] and read back
 /// by [`SettingsOutcome::Save`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PendingSettings {
     // Connection
     pub autoconnect: bool,
@@ -195,7 +195,7 @@ pub struct PendingSettings {
 }
 
 /// One row of the auto-download rules editor.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct PendingAutoDownloadRule {
     pub mime_pattern: String,
     /// Megabytes as user-typed text. Parsed back to `u64` bytes on Save;
@@ -275,6 +275,10 @@ pub struct SettingsState {
     pub tab: Option<SettingsTab>,
     pub open_select: OpenSelect,
     pub pending: Option<PendingSettings>,
+    /// Snapshot of the last settings state that was opened or applied.
+    /// Used to disable Apply when the current pending edits match what
+    /// has already landed.
+    applied: Option<PendingSettings>,
     /// Persistent admin-tab UI state. Lives here so search query / open
     /// accordion / open popover survive across re-opens of the Settings
     /// dialog within one session.
@@ -289,10 +293,12 @@ impl SettingsState {
     /// Snapshot the live settings into pending state and show the
     /// dialog. Defaults the active tab to Connection.
     pub fn open_with(&mut self, audio: &AudioState, settings: &Settings) {
+        let pending = PendingSettings::from_live(audio, settings);
         self.open = true;
         self.tab = Some(SettingsTab::Connection);
         self.open_select = OpenSelect::None;
-        self.pending = Some(PendingSettings::from_live(audio, settings));
+        self.pending = Some(pending.clone());
+        self.applied = Some(pending);
     }
 
     pub fn close(&mut self) {
@@ -300,6 +306,7 @@ impl SettingsState {
         self.tab = None;
         self.open_select = OpenSelect::None;
         self.pending = None;
+        self.applied = None;
         self.shortcut_capture = None;
     }
 
@@ -310,6 +317,18 @@ impl SettingsState {
         if let Some(pending) = self.pending.as_mut() {
             pending.download_dir = dir;
         }
+    }
+
+    fn has_pending_changes(&self) -> bool {
+        match (&self.pending, &self.applied) {
+            (Some(pending), Some(applied)) => pending != applied,
+            (Some(_), None) => true,
+            _ => false,
+        }
+    }
+
+    fn mark_applied(&mut self) {
+        self.applied = self.pending.clone();
     }
 }
 
@@ -333,6 +352,8 @@ pub enum SettingsOutcome {
     /// `PendingSettings` and writes it through to the backend +
     /// `SettingsStore`.
     Save(PendingSettings),
+    /// Apply pending fields without closing the dialog.
+    Apply(PendingSettings),
     /// User clicked "Generate new identity"; close settings and open
     /// the identity wizard at its method picker.
     OpenIdentityWizard,
@@ -382,6 +403,7 @@ pub enum SettingsOutcome {
 const KEY_TABS: &str = "settings:tabs";
 const KEY_DISMISS: &str = "settings:dismiss";
 const KEY_CLOSE: &str = "settings:close";
+const KEY_APPLY: &str = "settings:apply";
 const KEY_SAVE: &str = "settings:save";
 
 const KEY_AUTOCONNECT: &str = "settings:conn:autoconnect";
@@ -608,9 +630,15 @@ pub fn render(
     .padding(Sides::all(tokens::SPACE_2))
     .gap(tokens::SPACE_1);
 
+    let mut apply_button = button("Apply").key(KEY_APPLY).secondary();
+    if !state.has_pending_changes() {
+        apply_button = apply_button.disabled();
+    }
+
     let footer = row([
         button("Close").key(KEY_CLOSE),
         spacer(),
+        apply_button,
         button("Save").key(KEY_SAVE).primary(),
     ])
     .gap(tokens::SPACE_2)
@@ -1951,6 +1979,20 @@ pub fn handle_event(
         || event.is_click_or_activate(KEY_CLOSE)
     {
         return SettingsOutcome::Close;
+    }
+
+    // Apply: hand back the pending state for the App to apply while
+    // keeping the dialog open. Guard here as well as in the disabled
+    // button state so keyboard activation can't apply a clean snapshot.
+    if event.is_click_or_activate(KEY_APPLY) {
+        if !state.has_pending_changes() {
+            return SettingsOutcome::Handled;
+        }
+        if let Some(pending) = state.pending.clone() {
+            state.mark_applied();
+            return SettingsOutcome::Apply(pending);
+        }
+        return SettingsOutcome::Handled;
     }
 
     // Save: hand back the pending state for the App to apply.

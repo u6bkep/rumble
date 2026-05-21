@@ -39,7 +39,7 @@ use portal::PortalHotkeyBackend;
 /// MuteSelf+On / MuteSelf+Off rows). Each entry has a stable `id` used
 /// both as the XDG portal shortcut ID (so the compositor preserves the
 /// user's key assignment across re-binds) and as the UI row key.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct KeyboardSettings {
     /// Whether global hotkeys are enabled (work when window unfocused).
@@ -243,7 +243,7 @@ impl HotkeyData {
 /// after add / remove / function change. UUID-string format to give
 /// the system shortcut dialog something readable when no human label
 /// is available.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ShortcutEntry {
     pub id: String,
     pub function: HotkeyFunction,

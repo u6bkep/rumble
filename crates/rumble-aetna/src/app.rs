@@ -2607,6 +2607,10 @@ impl<B: UiBackend> RumbleApp<B> {
                 self.settings_state.close();
                 true
             }
+            SettingsOutcome::Apply(pending) => {
+                self.apply_settings(pending);
+                true
+            }
             SettingsOutcome::PickDownloadDir => {
                 self.spawn_pick_download_dir();
                 true

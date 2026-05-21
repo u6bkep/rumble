@@ -158,6 +158,7 @@ pub const KEY_PASTE_IMAGE: &str = "chat:paste-image";
 pub const KEY_SYNC_HISTORY: &str = "chat:sync";
 
 /// Routed keys for the file card context menu.
+const KEY_FILE_CTX: &str = "chat:file_ctx";
 pub const KEY_FILE_CTX_DISMISS: &str = "chat:file_ctx:dismiss";
 pub const KEY_FILE_CTX_SAVE_AS: &str = "chat:file_ctx:save_as";
 pub const KEY_FILE_CTX_OPEN_FOLDER: &str = "chat:file_ctx:open_folder";
@@ -184,6 +185,10 @@ pub fn download_key(transfer_id: &str) -> String {
 
 pub fn preview_key(transfer_id: &str) -> String {
     format!("chat:preview:{transfer_id}")
+}
+
+pub fn file_card_key(transfer_id: &str) -> String {
+    format!("chat:file-card:{transfer_id}")
 }
 
 /// Route for the in-flight transfer's cancel button.
@@ -226,12 +231,18 @@ pub fn parse_preview_key(key: &str) -> Option<&str> {
     key.strip_prefix("chat:preview:")
 }
 
+pub fn parse_plain_file_card_key(key: &str) -> Option<&str> {
+    key.strip_prefix("chat:file-card:")
+}
+
 /// Parse a `chat:download:*` or `chat:preview:*` key back to its transfer id.
 /// Used by the SecondaryClick handler to detect right-clicks on either card type.
 /// The icon-overlay routes (`chat:gif:*`) intentionally don't right-click —
 /// they are point actions, not surfaces.
 pub fn parse_file_card_key(key: &str) -> Option<&str> {
-    parse_download_key(key).or_else(|| parse_preview_key(key))
+    parse_plain_file_card_key(key)
+        .or_else(|| parse_download_key(key))
+        .or_else(|| parse_preview_key(key))
 }
 
 /// State for the right-click file context menu.
@@ -259,7 +270,7 @@ pub fn render_file_context_menu(menu: &FileContextMenu) -> El {
     }
 
     context_menu(
-        KEY_FILE_CTX_DISMISS,
+        KEY_FILE_CTX,
         menu.point,
         [
             text(menu.name.clone())
@@ -446,6 +457,7 @@ fn file_offer_card(offer: &FileOfferInfo, status: Option<&TransferStatus>) -> El
     };
 
     column([header, meta, body])
+        .key(file_card_key(&offer.transfer_id))
         .gap(tokens::SPACE_1)
         .padding(Sides::all(tokens::SPACE_2))
         .fill(tokens::SECONDARY)
