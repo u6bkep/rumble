@@ -23,20 +23,15 @@ use rumble_widgets::{ButtonArgs, GroupBox, PressableRole, SurfaceFrame, SurfaceK
 use crate::identity::Identity;
 
 /// What the connect card is currently showing.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum Selection {
     /// Render the list of saved servers + a "new" entry.
+    #[default]
     None,
     /// Render the form populated from `recent_servers[idx]`.
     Saved { idx: usize },
     /// Render an empty form for a brand-new server.
     New,
-}
-
-impl Default for Selection {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 /// In-memory edit buffer for the active form. Flushed back into the
@@ -50,6 +45,7 @@ pub struct ServerDraft {
     pub auto_connect: bool,
 }
 
+#[derive(Default)]
 pub struct ConnectForm {
     pub selection: Selection,
     pub editing: ServerDraft,
@@ -57,16 +53,6 @@ pub struct ConnectForm {
     /// settings store on the first frame. Avoids overwriting the
     /// user's later choices on every render.
     initialised: bool,
-}
-
-impl Default for ConnectForm {
-    fn default() -> Self {
-        Self {
-            selection: Selection::default(),
-            editing: ServerDraft::default(),
-            initialised: false,
-        }
-    }
 }
 
 impl ConnectForm {

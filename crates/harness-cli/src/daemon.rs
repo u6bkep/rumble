@@ -42,7 +42,7 @@ impl std::fmt::Debug for QueryNode<'_> {
 
 impl<'tree> NodeT<'tree> for QueryNode<'tree> {
     fn accesskit_node(&self) -> AccessKitNode<'tree> {
-        self.node.clone()
+        self.node
     }
 
     fn new_related(&self, child_node: AccessKitNode<'tree>) -> Self {
@@ -120,14 +120,23 @@ impl ClientInstance {
         })
     }
 
-    fn run_frame(&mut self) {
-        let screen_rect =
-            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(self.width as f32, self.height as f32));
+    fn screen_rect(&self) -> egui::Rect {
+        egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(self.width as f32, self.height as f32))
+    }
 
-        let mut raw_input = egui::RawInput::default();
-        raw_input.screen_rect = Some(screen_rect);
-        raw_input.max_texture_side = Some(8192);
-        raw_input.time = Some(std::time::Instant::now().elapsed().as_secs_f64());
+    fn raw_input(&self) -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(self.screen_rect()),
+            ..Default::default()
+        }
+    }
+
+    fn run_frame(&mut self) {
+        let raw_input = egui::RawInput {
+            max_texture_side: Some(8192),
+            time: Some(std::time::Instant::now().elapsed().as_secs_f64()),
+            ..self.raw_input()
+        };
 
         let mut output = self.ctx.run(raw_input, |ctx| {
             self.app.render(ctx);
@@ -153,11 +162,7 @@ impl ClientInstance {
         self.mouse_pos = pos;
 
         // Press
-        let mut raw_input = egui::RawInput::default();
-        raw_input.screen_rect = Some(egui::Rect::from_min_size(
-            egui::Pos2::ZERO,
-            egui::vec2(self.width as f32, self.height as f32),
-        ));
+        let mut raw_input = self.raw_input();
         raw_input.events.push(egui::Event::PointerMoved(pos));
         raw_input.events.push(egui::Event::PointerButton {
             pos,
@@ -171,11 +176,7 @@ impl ClientInstance {
         });
 
         // Release
-        let mut raw_input = egui::RawInput::default();
-        raw_input.screen_rect = Some(egui::Rect::from_min_size(
-            egui::Pos2::ZERO,
-            egui::vec2(self.width as f32, self.height as f32),
-        ));
+        let mut raw_input = self.raw_input();
         raw_input.events.push(egui::Event::PointerButton {
             pos,
             button: egui::PointerButton::Primary,
@@ -192,11 +193,7 @@ impl ClientInstance {
         let pos = egui::pos2(x, y);
         self.mouse_pos = pos;
 
-        let mut raw_input = egui::RawInput::default();
-        raw_input.screen_rect = Some(egui::Rect::from_min_size(
-            egui::Pos2::ZERO,
-            egui::vec2(self.width as f32, self.height as f32),
-        ));
+        let mut raw_input = self.raw_input();
         raw_input.events.push(egui::Event::PointerMoved(pos));
 
         let _ = self.ctx.run(raw_input, |ctx| {
@@ -205,11 +202,7 @@ impl ClientInstance {
     }
 
     fn key_event(&mut self, key: egui::Key, pressed: bool) {
-        let mut raw_input = egui::RawInput::default();
-        raw_input.screen_rect = Some(egui::Rect::from_min_size(
-            egui::Pos2::ZERO,
-            egui::vec2(self.width as f32, self.height as f32),
-        ));
+        let mut raw_input = self.raw_input();
         raw_input.events.push(egui::Event::Key {
             key,
             physical_key: None,
@@ -224,11 +217,7 @@ impl ClientInstance {
     }
 
     fn type_text(&mut self, text: &str) {
-        let mut raw_input = egui::RawInput::default();
-        raw_input.screen_rect = Some(egui::Rect::from_min_size(
-            egui::Pos2::ZERO,
-            egui::vec2(self.width as f32, self.height as f32),
-        ));
+        let mut raw_input = self.raw_input();
         raw_input.events.push(egui::Event::Text(text.to_string()));
 
         let _ = self.ctx.run(raw_input, |ctx| {
@@ -603,11 +592,10 @@ async fn handle_connection(stream: UnixStream, state: Arc<RwLock<DaemonState>>) 
             Response::Ok {
                 data: ResponseData::Ack
             }
-        ) {
-            if let Ok(Command::Shutdown) = serde_json::from_str::<Command>(line) {
-                info!("Shutdown requested, exiting...");
-                std::process::exit(0);
-            }
+        ) && let Ok(Command::Shutdown) = serde_json::from_str::<Command>(line)
+        {
+            info!("Shutdown requested, exiting...");
+            std::process::exit(0);
         }
     }
 

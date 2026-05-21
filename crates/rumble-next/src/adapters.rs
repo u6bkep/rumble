@@ -178,8 +178,8 @@ fn render_entry(
             format!("{} → {}", m.sender, other_username)
         }
     };
-    let media = m.attachment.as_ref().and_then(|a| match a {
-        ChatAttachment::FileOffer(fo) => Some(file_offer_media(fo, m.sender.as_str(), my_username)),
+    let media = m.attachment.as_ref().map(|a| match a {
+        ChatAttachment::FileOffer(fo) => file_offer_media(fo, m.sender.as_str(), my_username),
     });
     // When an attachment is present, the `text` field is just a
     // human-readable summary that the file card already conveys —

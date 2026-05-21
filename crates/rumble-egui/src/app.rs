@@ -115,24 +115,13 @@ struct KickModalState {
 }
 
 /// State for the ban user modal
+#[derive(Default)]
 struct BanModalState {
     open: bool,
     target_user_id: u64,
     target_username: String,
     reason: String,
     duration_index: usize,
-}
-
-impl Default for BanModalState {
-    fn default() -> Self {
-        Self {
-            open: false,
-            target_user_id: 0,
-            target_username: String::new(),
-            reason: String::new(),
-            duration_index: 0,
-        }
-    }
 }
 
 /// State for the elevate (sudo) modal
@@ -594,14 +583,13 @@ impl RumbleApp {
 
         // Migration: If we have an old-style key in persistent_settings but no new key config,
         // migrate it to the new key_manager format
-        if key_manager.needs_setup() {
-            if let Some(ref hex_key) = persistent_settings.identity_private_key_hex {
-                if let Some(signing_key) = parse_signing_key(hex_key) {
-                    tracing::info!("Migrating existing identity key to new format");
-                    if let Err(e) = key_manager.import_signing_key(signing_key) {
-                        tracing::error!("Failed to migrate key: {}", e);
-                    }
-                }
+        if key_manager.needs_setup()
+            && let Some(ref hex_key) = persistent_settings.identity_private_key_hex
+            && let Some(signing_key) = parse_signing_key(hex_key)
+        {
+            tracing::info!("Migrating existing identity key to new format");
+            if let Err(e) = key_manager.import_signing_key(signing_key) {
+                tracing::error!("Failed to migrate key: {}", e);
             }
         }
 
@@ -928,18 +916,17 @@ impl RumbleApp {
             img_data.width as u32,
             img_data.height as u32,
             img_data.bytes.into_owned(),
-        ) {
-            if let Ok(temp_dir) = tempfile::tempdir() {
-                let temp_path = temp_dir.path().join("clipboard_image.png");
-                if img.save(&temp_path).is_ok() {
-                    let path = temp_path.clone();
-                    // Keep the temp dir alive (cleaned up on process exit)
-                    std::mem::forget(temp_dir);
-                    self.backend.send(Command::ShareFile { path });
-                    self.show_transfers = true;
-                    self.toast_manager.success("Sharing pasted image");
-                    return;
-                }
+        ) && let Ok(temp_dir) = tempfile::tempdir()
+        {
+            let temp_path = temp_dir.path().join("clipboard_image.png");
+            if img.save(&temp_path).is_ok() {
+                let path = temp_path.clone();
+                // Keep the temp dir alive (cleaned up on process exit)
+                std::mem::forget(temp_dir);
+                self.backend.send(Command::ShareFile { path });
+                self.show_transfers = true;
+                self.toast_manager.success("Sharing pasted image");
+                return;
             }
         }
         self.toast_manager.error("Failed to process clipboard image");
@@ -1090,7 +1077,6 @@ impl RumbleApp {
         self.persistent_settings.voice_mode = self
             .settings_modal
             .pending_voice_mode
-            .clone()
             .map(|m| (&m).into())
             .unwrap_or_else(|| (&audio.voice_mode).into());
         self.persistent_settings.input_device_id = audio.selected_input.clone();
@@ -1232,10 +1218,10 @@ impl RumbleApp {
         }
 
         // Apply pending username
-        if let Some(username) = self.settings_modal.pending_username.clone() {
-            if !username.trim().is_empty() {
-                self.client_name = username;
-            }
+        if let Some(username) = self.settings_modal.pending_username.clone()
+            && !username.trim().is_empty()
+        {
+            self.client_name = username;
         }
 
         // Apply pending audio settings
@@ -1260,10 +1246,10 @@ impl RumbleApp {
         }
 
         // Apply pending voice mode
-        if let Some(mode) = self.settings_modal.pending_voice_mode.clone() {
-            let current = self.backend.state().audio.voice_mode.clone();
+        if let Some(mode) = self.settings_modal.pending_voice_mode {
+            let current = self.backend.state().audio.voice_mode;
             if mode != current {
-                self.backend.send(Command::SetVoiceMode { mode: mode.clone() });
+                self.backend.send(Command::SetVoiceMode { mode });
             }
         }
 
@@ -1536,11 +1522,7 @@ impl RumbleApp {
         let audio = &state.audio;
 
         // Voice mode selector (using pending state)
-        let pending_voice_mode = self
-            .settings_modal
-            .pending_voice_mode
-            .clone()
-            .unwrap_or(audio.voice_mode.clone());
+        let pending_voice_mode = self.settings_modal.pending_voice_mode.unwrap_or(audio.voice_mode);
         ui.horizontal(|ui| {
             if ui
                 .selectable_label(matches!(pending_voice_mode, VoiceMode::PushToTalk), "🎤 Push-to-Talk")
@@ -1736,20 +1718,18 @@ impl RumbleApp {
                 });
 
                 // Show settings if processor is enabled
-                if proc_config.enabled {
-                    if let Some(schema) = self.processor_registry.settings_schema(&proc_config.type_id) {
-                        if let Some(properties) = schema.get("properties").and_then(|p| p.as_object()) {
-                            if !properties.is_empty() {
-                                ui.indent(proc_config.type_id.as_str(), |ui| {
-                                    for (key, prop_schema) in properties {
-                                        if render_schema_field(ui, key, prop_schema, &mut proc_config.settings) {
-                                            pipeline_changed = true;
-                                        }
-                                    }
-                                });
+                if proc_config.enabled
+                    && let Some(schema) = self.processor_registry.settings_schema(&proc_config.type_id)
+                    && let Some(properties) = schema.get("properties").and_then(|p| p.as_object())
+                    && !properties.is_empty()
+                {
+                    ui.indent(proc_config.type_id.as_str(), |ui| {
+                        for (key, prop_schema) in properties {
+                            if render_schema_field(ui, key, prop_schema, &mut proc_config.settings) {
+                                pipeline_changed = true;
                             }
                         }
-                    }
+                    });
                 }
                 ui.add_space(4.0);
             }
@@ -2609,10 +2589,10 @@ impl RumbleApp {
                                 .clicked()
                             {
                                 // Signal to save the selected key
-                                if let Some(idx) = new_selected {
-                                    if let Some(key) = keys.get(idx) {
-                                        select_agent_key = Some(key.clone());
-                                    }
+                                if let Some(idx) = new_selected
+                                    && let Some(key) = keys.get(idx)
+                                {
+                                    select_agent_key = Some(key.clone());
                                 }
                             }
 
@@ -2726,32 +2706,32 @@ impl RumbleApp {
                     }
                 }
                 PendingAgentOp::AddKey(handle) => {
-                    if handle.is_finished() {
-                        if let Some(PendingAgentOp::AddKey(handle)) = self.pending_agent_op.take() {
-                            match self.tokio_handle.block_on(handle) {
-                                Ok(Ok(key_info)) => {
-                                    // Save the key config
-                                    if let Err(e) = self.key_manager.write().unwrap().select_agent_key(&key_info) {
-                                        self.first_run_state = FirstRunState::Error {
-                                            message: format!("Failed to save key config: {}", e),
-                                        };
-                                    } else {
-                                        self.first_run_state = FirstRunState::Complete;
-                                        self.backend.send(Command::LocalMessage {
-                                            text: format!("Added new key to SSH agent: {}", key_info.fingerprint),
-                                        });
-                                    }
-                                }
-                                Ok(Err(e)) => {
+                    if handle.is_finished()
+                        && let Some(PendingAgentOp::AddKey(handle)) = self.pending_agent_op.take()
+                    {
+                        match self.tokio_handle.block_on(handle) {
+                            Ok(Ok(key_info)) => {
+                                // Save the key config
+                                if let Err(e) = self.key_manager.write().unwrap().select_agent_key(&key_info) {
                                     self.first_run_state = FirstRunState::Error {
-                                        message: format!("Failed to add key to agent: {}", e),
+                                        message: format!("Failed to save key config: {}", e),
                                     };
+                                } else {
+                                    self.first_run_state = FirstRunState::Complete;
+                                    self.backend.send(Command::LocalMessage {
+                                        text: format!("Added new key to SSH agent: {}", key_info.fingerprint),
+                                    });
                                 }
-                                Err(e) => {
-                                    self.first_run_state = FirstRunState::Error {
-                                        message: format!("Agent operation panicked: {}", e),
-                                    };
-                                }
+                            }
+                            Ok(Err(e)) => {
+                                self.first_run_state = FirstRunState::Error {
+                                    message: format!("Failed to add key to agent: {}", e),
+                                };
+                            }
+                            Err(e) => {
+                                self.first_run_state = FirstRunState::Error {
+                                    message: format!("Agent operation panicked: {}", e),
+                                };
                             }
                         }
                     }
@@ -2809,11 +2789,11 @@ impl RumbleApp {
         }
 
         // Handle generating and adding a key to the agent
-        if let Some(comment) = generate_agent_key_comment {
-            if self.pending_agent_op.is_none() {
-                let handle = self.tokio_handle.spawn(generate_and_add_to_agent(comment));
-                self.pending_agent_op = Some(PendingAgentOp::AddKey(handle));
-            }
+        if let Some(comment) = generate_agent_key_comment
+            && self.pending_agent_op.is_none()
+        {
+            let handle = self.tokio_handle.spawn(generate_and_add_to_agent(comment));
+            self.pending_agent_op = Some(PendingAgentOp::AddKey(handle));
         }
 
         // Don't allow closing via escape/click outside during first run
@@ -3032,21 +3012,20 @@ impl RumbleApp {
         }
 
         // Poll pending file dialog
-        if let Some(handle) = &self.pending_file_dialog {
-            if handle.is_finished() {
-                if let Some(handle) = self.pending_file_dialog.take() {
-                    match self.tokio_handle.block_on(handle) {
-                        Ok(Some(path)) => {
-                            self.backend.send(Command::ShareFile { path });
-                            self.show_transfers = true;
-                        }
-                        Ok(None) => {
-                            // User cancelled the dialog
-                        }
-                        Err(e) => {
-                            tracing::error!("File dialog task panicked: {}", e);
-                        }
-                    }
+        if let Some(handle) = &self.pending_file_dialog
+            && handle.is_finished()
+            && let Some(handle) = self.pending_file_dialog.take()
+        {
+            match self.tokio_handle.block_on(handle) {
+                Ok(Some(path)) => {
+                    self.backend.send(Command::ShareFile { path });
+                    self.show_transfers = true;
+                }
+                Ok(None) => {
+                    // User cancelled the dialog
+                }
+                Err(e) => {
+                    tracing::error!("File dialog task panicked: {}", e);
                 }
             }
         }
@@ -3188,18 +3167,17 @@ impl RumbleApp {
                         self.show_connect = true;
                         ui.close();
                     }
-                    if state.connection.is_connected() {
-                        if ui.button("Disconnect").clicked() {
-                            self.backend.send(Command::Disconnect);
-                            ui.close();
-                        }
+                    if state.connection.is_connected() && ui.button("Disconnect").clicked() {
+                        self.backend.send(Command::Disconnect);
+                        ui.close();
                     }
                     // Show reconnect option when not connected and we have an address
-                    if !state.connection.is_connected() && !self.connect_address.is_empty() {
-                        if ui.button("Reconnect").clicked() {
-                            self.reconnect();
-                            ui.close();
-                        }
+                    if !state.connection.is_connected()
+                        && !self.connect_address.is_empty()
+                        && ui.button("Reconnect").clicked()
+                    {
+                        self.reconnect();
+                        ui.close();
                     }
                 });
                 ui.menu_button("Settings", |ui| {
@@ -3211,7 +3189,7 @@ impl RumbleApp {
                             pending_settings: Some(audio.settings.clone()),
                             pending_input_device: Some(audio.selected_input.clone()),
                             pending_output_device: Some(audio.selected_output.clone()),
-                            pending_voice_mode: Some(audio.voice_mode.clone()),
+                            pending_voice_mode: Some(audio.voice_mode),
                             pending_autoconnect: Some(self.autoconnect_on_launch),
                             pending_username: Some(self.client_name.clone()),
                             pending_tx_pipeline: Some(audio.tx_pipeline.clone()),
@@ -3386,17 +3364,16 @@ impl RumbleApp {
                         })
                         .map(|u| u.is_elevated)
                         .unwrap_or(false);
-                    if !is_elevated {
-                        if ui
+                    if !is_elevated
+                        && ui
                             .add(egui::Button::new(egui::RichText::new("🔑").size(18.0)))
                             .on_hover_text("Elevate to Superuser")
                             .clicked()
-                        {
-                            self.elevate_modal = ElevateModalState {
-                                open: true,
-                                password: String::new(),
-                            };
-                        }
+                    {
+                        self.elevate_modal = ElevateModalState {
+                            open: true,
+                            password: String::new(),
+                        };
                     }
                 }
 
@@ -3415,7 +3392,7 @@ impl RumbleApp {
                         pending_settings: Some(audio.settings.clone()),
                         pending_input_device: Some(audio.selected_input.clone()),
                         pending_output_device: Some(audio.selected_output.clone()),
-                        pending_voice_mode: Some(audio.voice_mode.clone()),
+                        pending_voice_mode: Some(audio.voice_mode),
                         pending_autoconnect: Some(self.autoconnect_on_launch),
                         pending_username: Some(self.client_name.clone()),
                         pending_tx_pipeline: Some(audio.tx_pipeline.clone()),
@@ -3653,6 +3630,7 @@ impl RumbleApp {
                     .override_indent(Some(20.0))
                     .show(ui, |builder| {
                         // Recursive helper to render a room and its children
+                        #[allow(clippy::too_many_arguments)]
                         fn render_room(
                             room_id: Uuid,
                             state: &rumble_client::State,
@@ -3744,34 +3722,27 @@ impl RumbleApp {
                                             ui.close();
                                         }
                                     }
-                                    if eff.contains(Permissions::MAKE_ROOM) {
-                                        if ui.button("Add Child Room").clicked() {
-                                            pending_commands.push(Command::CreateRoom {
-                                                name: "New Room".to_string(),
-                                                parent_id: Some(room_id),
-                                            });
-                                            ui.close();
-                                        }
+                                    if eff.contains(Permissions::MAKE_ROOM) && ui.button("Add Child Room").clicked() {
+                                        pending_commands.push(Command::CreateRoom {
+                                            name: "New Room".to_string(),
+                                            parent_id: Some(room_id),
+                                        });
+                                        ui.close();
                                     }
-                                    if !is_root && eff.contains(Permissions::MODIFY_ROOM) {
-                                        if ui.button("Delete Room").clicked() {
-                                            *pending_delete = Some((room_id, room_name.clone()));
-                                            ui.close();
-                                        }
+                                    if !is_root
+                                        && eff.contains(Permissions::MODIFY_ROOM)
+                                        && ui.button("Delete Room").clicked()
+                                    {
+                                        *pending_delete = Some((room_id, room_name.clone()));
+                                        ui.close();
                                     }
-                                    if eff.contains(Permissions::WRITE) {
-                                        if ui.button("Edit ACLs").clicked() {
-                                            // Load current ACL data from room
-                                            if let Some(room) = state.get_room(room_id) {
-                                                *pending_acl_edit = Some((
-                                                    room_id,
-                                                    room_name.clone(),
-                                                    room.inherit_acl,
-                                                    room.acls.clone(),
-                                                ));
-                                            }
-                                            ui.close();
+                                    if eff.contains(Permissions::WRITE) && ui.button("Edit ACLs").clicked() {
+                                        // Load current ACL data from room
+                                        if let Some(room) = state.get_room(room_id) {
+                                            *pending_acl_edit =
+                                                Some((room_id, room_name.clone(), room.inherit_acl, room.acls.clone()));
                                         }
+                                        ui.close();
                                     }
                                 });
 
@@ -4031,19 +4002,15 @@ impl RumbleApp {
                                         }
 
                                         // ACL: Kick (requires KICK permission)
-                                        if eff.contains(Permissions::KICK) {
-                                            if ui.button("⚡ Kick").clicked() {
-                                                *pending_kick = Some((user_id, username.clone()));
-                                                ui.close();
-                                            }
+                                        if eff.contains(Permissions::KICK) && ui.button("⚡ Kick").clicked() {
+                                            *pending_kick = Some((user_id, username.clone()));
+                                            ui.close();
                                         }
 
                                         // ACL: Ban (requires BAN permission)
-                                        if eff.contains(Permissions::BAN) {
-                                            if ui.button("🚫 Ban").clicked() {
-                                                *pending_ban = Some((user_id, username.clone()));
-                                                ui.close();
-                                            }
+                                        if eff.contains(Permissions::BAN) && ui.button("🚫 Ban").clicked() {
+                                            *pending_ban = Some((user_id, username.clone()));
+                                            ui.close();
                                         }
 
                                         // Registering others requires REGISTER permission
@@ -4095,29 +4062,28 @@ impl RumbleApp {
                         }
                         Action::Move(drag_drop) => {
                             // Only allow moving rooms (not users) onto rooms
-                            if let Some(TreeNodeId::Room(source_room_id)) = drag_drop.source.first().cloned() {
-                                if let TreeNodeId::Room(target_room_id) = drag_drop.target {
-                                    if source_room_id != target_room_id {
-                                        let source_name = state
-                                            .room_tree
-                                            .get(source_room_id)
-                                            .map(|n| n.name.clone())
-                                            .unwrap_or_else(|| "Unknown".to_string());
-                                        let target_name = state
-                                            .room_tree
-                                            .get(target_room_id)
-                                            .map(|n| n.name.clone())
-                                            .unwrap_or_else(|| "Unknown".to_string());
+                            if let Some(TreeNodeId::Room(source_room_id)) = drag_drop.source.first().cloned()
+                                && let TreeNodeId::Room(target_room_id) = drag_drop.target
+                                && source_room_id != target_room_id
+                            {
+                                let source_name = state
+                                    .room_tree
+                                    .get(source_room_id)
+                                    .map(|n| n.name.clone())
+                                    .unwrap_or_else(|| "Unknown".to_string());
+                                let target_name = state
+                                    .room_tree
+                                    .get(target_room_id)
+                                    .map(|n| n.name.clone())
+                                    .unwrap_or_else(|| "Unknown".to_string());
 
-                                        self.move_room_modal = MoveRoomModalState {
-                                            open: true,
-                                            room_id: Some(source_room_id),
-                                            room_name: source_name,
-                                            new_parent_id: Some(target_room_id),
-                                            new_parent_name: target_name,
-                                        };
-                                    }
-                                }
+                                self.move_room_modal = MoveRoomModalState {
+                                    open: true,
+                                    room_id: Some(source_room_id),
+                                    room_name: source_name,
+                                    new_parent_id: Some(target_room_id),
+                                    new_parent_name: target_name,
+                                };
                             }
                         }
                         _ => {}
@@ -4360,7 +4326,7 @@ impl RumbleApp {
                     pending_settings: Some(audio.settings.clone()),
                     pending_input_device: Some(audio.selected_input.clone()),
                     pending_output_device: Some(audio.selected_output.clone()),
-                    pending_voice_mode: Some(audio.voice_mode.clone()),
+                    pending_voice_mode: Some(audio.voice_mode),
                     pending_autoconnect: Some(self.autoconnect_on_launch),
                     pending_username: Some(self.client_name.clone()),
                     pending_tx_pipeline: Some(audio.tx_pipeline.clone()),
@@ -4544,13 +4510,13 @@ impl RumbleApp {
                     |ui| {
                         if ui.button("Rename").clicked() {
                             let new_name = self.rename_modal.room_name.trim().to_string();
-                            if !new_name.is_empty() {
-                                if let Some(uuid) = self.rename_modal.room_uuid {
-                                    self.backend.send(Command::RenameRoom {
-                                        room_id: uuid,
-                                        new_name,
-                                    });
-                                }
+                            if !new_name.is_empty()
+                                && let Some(uuid) = self.rename_modal.room_uuid
+                            {
+                                self.backend.send(Command::RenameRoom {
+                                    room_id: uuid,
+                                    new_name,
+                                });
                             }
                             ui.close();
                         }
@@ -4945,10 +4911,8 @@ impl RumbleApp {
                 if let Some(ref path) = self.image_view_modal.file_path {
                     let uri = &self.image_view_modal.image_uri;
                     let already_cached = ctx.try_load_bytes(uri).is_ok();
-                    if !already_cached {
-                        if let Ok(bytes) = std::fs::read(path) {
-                            ctx.include_bytes(uri.clone(), bytes);
-                        }
+                    if !already_cached && let Ok(bytes) = std::fs::read(path) {
+                        ctx.include_bytes(uri.clone(), bytes);
                     }
                 }
                 self.image_view_modal.fullsize_loaded = true;

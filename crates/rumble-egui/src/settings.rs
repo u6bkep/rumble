@@ -355,9 +355,10 @@ impl PersistentSettings {
 
         let Some(path) = path else {
             tracing::warn!("Could not determine config directory, using defaults");
-            let mut s = Self::default();
-            s.config_dir_override = config_dir_override;
-            return s;
+            return Self {
+                config_dir_override,
+                ..Self::default()
+            };
         };
 
         let mut settings = match fs::read_to_string(&path) {
@@ -510,16 +511,11 @@ impl From<&PersistentAudioSettings> for AudioSettings {
 // =============================================================================
 
 /// Serializable voice mode.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
 pub enum PersistentVoiceMode {
+    #[default]
     PushToTalk,
     Continuous,
-}
-
-impl Default for PersistentVoiceMode {
-    fn default() -> Self {
-        Self::PushToTalk
-    }
 }
 
 impl From<&VoiceMode> for PersistentVoiceMode {
@@ -588,7 +584,7 @@ impl Default for FileTransferSettings {
                 },
                 AutoDownloadRule {
                     mime_pattern: "text/*".to_string(),
-                    max_size_bytes: 1 * 1024 * 1024, // 1 MB
+                    max_size_bytes: 1024 * 1024, // 1 MB
                 },
             ],
             download_speed_limit: 0, // Unlimited

@@ -65,7 +65,7 @@ fn top_bar<B: UiBackend>(ui: &mut Ui, shell: &mut Shell, state: &State, backend:
 
                 ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                     let avail = ui.available_width();
-                    let search_w = (avail * 0.55).min(360.0).max(180.0);
+                    let search_w = (avail * 0.55).clamp(180.0, 360.0);
                     let side = (avail - search_w) / 2.0 - 20.0;
                     if side > 0.0 {
                         ui.add_space(side);

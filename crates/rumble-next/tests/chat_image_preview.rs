@@ -66,13 +66,15 @@ fn renders_image_preview_for_completed_file_offer() {
     let png = write_test_png();
     let room_id = uuid::Uuid::new_v4();
 
-    let mut state = State::default();
-    state.connection = ConnectionState::Connected {
-        server_name: "test".to_string(),
-        user_id: 1,
+    let mut state = State {
+        connection: ConnectionState::Connected {
+            server_name: "test".to_string(),
+            user_id: 1,
+        },
+        my_user_id: Some(1),
+        my_room_id: Some(room_id),
+        ..Default::default()
     };
-    state.my_user_id = Some(1);
-    state.my_room_id = Some(room_id);
     state.rooms.push(proto::RoomInfo {
         id: Some(room_id_from_uuid(room_id)),
         name: "lobby".to_string(),
@@ -191,13 +193,15 @@ fn setup_harness_with_image_sized(w: u32, h: u32, name: &str) -> (TestHarness, P
     let png = write_test_png_sized(w, h, name);
     let room_id = uuid::Uuid::new_v4();
 
-    let mut state = State::default();
-    state.connection = ConnectionState::Connected {
-        server_name: "test".to_string(),
-        user_id: 1,
+    let mut state = State {
+        connection: ConnectionState::Connected {
+            server_name: "test".to_string(),
+            user_id: 1,
+        },
+        my_user_id: Some(1),
+        my_room_id: Some(room_id),
+        ..Default::default()
     };
-    state.my_user_id = Some(1);
-    state.my_room_id = Some(room_id);
     state.rooms.push(proto::RoomInfo {
         id: Some(room_id_from_uuid(room_id)),
         name: "lobby".to_string(),
@@ -362,13 +366,15 @@ fn click_image_preview_in_overflowing_chat() {
     let png = write_test_png();
     let room_id = uuid::Uuid::new_v4();
 
-    let mut state = State::default();
-    state.connection = ConnectionState::Connected {
-        server_name: "test".to_string(),
-        user_id: 1,
+    let mut state = State {
+        connection: ConnectionState::Connected {
+            server_name: "test".to_string(),
+            user_id: 1,
+        },
+        my_user_id: Some(1),
+        my_room_id: Some(room_id),
+        ..Default::default()
     };
-    state.my_user_id = Some(1);
-    state.my_room_id = Some(room_id);
     state.rooms.push(proto::RoomInfo {
         id: Some(room_id_from_uuid(room_id)),
         name: "lobby".to_string(),
@@ -480,13 +486,15 @@ fn click_image_preview_with_failed_load() {
     ));
     let room_id = uuid::Uuid::new_v4();
 
-    let mut state = State::default();
-    state.connection = ConnectionState::Connected {
-        server_name: "test".to_string(),
-        user_id: 1,
+    let mut state = State {
+        connection: ConnectionState::Connected {
+            server_name: "test".to_string(),
+            user_id: 1,
+        },
+        my_user_id: Some(1),
+        my_room_id: Some(room_id),
+        ..Default::default()
     };
-    state.my_user_id = Some(1);
-    state.my_room_id = Some(room_id);
     state.rooms.push(proto::RoomInfo {
         id: Some(room_id_from_uuid(room_id)),
         name: "lobby".to_string(),

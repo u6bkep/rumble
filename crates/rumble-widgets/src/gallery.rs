@@ -467,13 +467,13 @@ impl Gallery {
             .rows(2)
             .id_salt("chat_composer")
             .show(ui);
-        if let Some(msg) = resp.submitted {
-            if !msg.trim().is_empty() {
-                self.chat_log.push(msg);
-                if self.chat_log.len() > 5 {
-                    let drop = self.chat_log.len() - 5;
-                    self.chat_log.drain(0..drop);
-                }
+        if let Some(msg) = resp.submitted
+            && !msg.trim().is_empty()
+        {
+            self.chat_log.push(msg);
+            if self.chat_log.len() > 5 {
+                let drop = self.chat_log.len() - 5;
+                self.chat_log.drain(0..drop);
             }
         }
 
@@ -906,9 +906,7 @@ fn insert_relative(
     for n in nodes.iter_mut() {
         if let Some(s) = source.take() {
             source = insert_relative(&mut n.children, target, position, s);
-            if source.is_none() {
-                return None;
-            }
+            source.as_ref()?;
         }
     }
     source

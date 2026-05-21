@@ -323,7 +323,7 @@ pub trait TreeImpl: Send + Sync + 'static {
         let x_indent = rect.left() + (row.depth as f32) * args.indent + pad;
         let caret_rect = Rect::from_min_size(
             Pos2::new(x_indent, rect.top()),
-            Vec2::new(caret_w, row.node.is_channel().then_some(args.row_height).unwrap_or(0.0)),
+            Vec2::new(caret_w, if row.node.is_channel() { args.row_height } else { 0.0 }),
         );
 
         if row.node.is_channel() {
@@ -623,12 +623,11 @@ fn handle_keyboard(
         {
             out.toggled = Some(id);
         }
-    } else if consume_key(ui, Key::ArrowRight) {
-        if let Some(id) = selected
-            && rows.iter().any(|(rid, _, ic)| *rid == id && *ic)
-        {
-            out.toggled = Some(id);
-        }
+    } else if consume_key(ui, Key::ArrowRight)
+        && let Some(id) = selected
+        && rows.iter().any(|(rid, _, ic)| *rid == id && *ic)
+    {
+        out.toggled = Some(id);
     }
 }
 

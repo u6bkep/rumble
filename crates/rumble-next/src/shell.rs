@@ -732,7 +732,7 @@ fn draw_image_preview(
     size: &str,
 ) -> ImagePreview {
     ui.add_space(2.0);
-    let max_w = ui.available_width().min(360.0).max(80.0);
+    let max_w = ui.available_width().clamp(80.0, 360.0);
     let max_h = 220.0_f32;
     let uri = file_uri(path);
 
@@ -1298,10 +1298,9 @@ fn transfer_row<B: UiBackend>(
                         .disabled(!is_active)
                         .show(ui)
                         .clicked()
+                        && let Err(e) = backend.cancel_transfer(id, false)
                     {
-                        if let Err(e) = backend.cancel_transfer(id, false) {
-                            tracing::warn!("cancel transfer {} failed: {e}", id.0);
-                        }
+                        tracing::warn!("cancel transfer {} failed: {e}", id.0);
                     }
                     let path = status.local_path.clone();
                     let can_open = status.is_finished && path.is_some();

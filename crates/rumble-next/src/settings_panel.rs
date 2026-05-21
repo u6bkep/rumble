@@ -16,8 +16,9 @@ use rumble_widgets::{
 
 use crate::{backend::UiBackend, shell::Shell};
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub enum SettingsCategory {
+    #[default]
     Connection,
     Voice,
     Devices,
@@ -77,12 +78,7 @@ pub struct SettingsState {
     pub admin: AdminPageState,
 }
 
-impl Default for SettingsCategory {
-    fn default() -> Self {
-        Self::Connection
-    }
-}
-
+#[allow(clippy::too_many_arguments)]
 pub fn render<B: UiBackend>(
     ctx: &egui::Context,
     settings: &mut SettingsState,

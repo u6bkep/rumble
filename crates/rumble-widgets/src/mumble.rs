@@ -373,14 +373,15 @@ impl Theme for MumbleLiteTheme {
             border = blend(border, t.surface_sunken, 0.6);
         }
 
-        let mut shapes: Vec<Shape> = Vec::new();
-        shapes.push(Shape::rect_filled(rect, CornerRadius::from(radius), fill));
-        shapes.push(Shape::Rect(RectShape::stroke(
-            rect,
-            CornerRadius::from(radius),
-            Stroke::new(1.0, border),
-            StrokeKind::Inside,
-        )));
+        let shapes = vec![
+            Shape::rect_filled(rect, CornerRadius::from(radius), fill),
+            Shape::Rect(RectShape::stroke(
+                rect,
+                CornerRadius::from(radius),
+                Stroke::new(1.0, border),
+                StrokeKind::Inside,
+            )),
+        ];
         Shape::Vec(shapes)
     }
 

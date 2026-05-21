@@ -54,8 +54,7 @@ mod windows_fetch {
     /// Pinned mpv-dev release. Bump in lockstep with `URL` and `SHA256`.
     /// Source: https://sourceforge.net/projects/mpv-player-windows/files/libmpv/
     const VERSION: &str = "20260419-git-06f4ce7";
-    const URL: &str =
-        "https://sourceforge.net/projects/mpv-player-windows/files/libmpv/mpv-dev-x86_64-20260419-git-06f4ce7.7z/download";
+    const URL: &str = "https://sourceforge.net/projects/mpv-player-windows/files/libmpv/mpv-dev-x86_64-20260419-git-06f4ce7.7z/download";
     const SHA256: &str = "67cfa44cd7fadefd9248434176fdfa95b4a3ea2896c47b942199f4e2c1d22ec8";
 
     pub fn run() {

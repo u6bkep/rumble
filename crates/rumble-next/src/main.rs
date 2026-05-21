@@ -22,7 +22,7 @@ fn main() -> eframe::Result<()> {
         Box::new(|cc| {
             App::new(cc)
                 .map(|a| Box::new(a) as Box<dyn eframe::App>)
-                .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e))
+                .map_err(Box::<dyn std::error::Error + Send + Sync>::from)
         }),
     )
 }

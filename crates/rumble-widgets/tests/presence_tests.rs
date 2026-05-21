@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use eframe::egui::{self, Rect, Vec2};
+use eframe::egui::{self, Rect};
 use egui_kittest::{Harness, kittest::Queryable};
 use rumble_widgets::{ModernTheme, UserPresence, UserState, install_theme};
 
