@@ -1,6 +1,6 @@
 [package]
 name = "rumble-aetna"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Rumble client built on the aetna UI library"
 default-run = "rumble-aetna"

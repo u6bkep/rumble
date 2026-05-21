@@ -5752,7 +5752,7 @@ dependencies = [
 
 [[package]]
 name = "rumble-aetna"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aetna-core",
  "aetna-wgpu",
