@@ -1097,10 +1097,17 @@ impl<B: UiBackend> App for RumbleApp<B> {
                 lightbox.fit();
                 return;
             }
+            if event.is_click_or_activate(chat::KEY_LIGHTBOX_ZOOM_NATURAL) {
+                lightbox.natural_size();
+                return;
+            }
             // Drag-to-pan on the image surface. Disabled at zoom <= 1.0
             // since there's nothing to pan to — the image is centred
             // and the body already shows everything.
-            if event.route() == Some(chat::KEY_LIGHTBOX_IMAGE) && lightbox.zoom > 1.0 {
+            if event.route() == Some(chat::KEY_LIGHTBOX_IMAGE)
+                && !lightbox.fit_to_window
+                && lightbox.zoom > 1.0
+            {
                 match event.kind {
                     UiEventKind::PointerDown => {
                         if let Some(pos) = event.pointer {
@@ -2941,6 +2948,7 @@ impl<B: UiBackend> RumbleApp<B> {
     /// always stays in range.
     pub fn set_lightbox_zoom_for_test(&mut self, zoom: f32, pan: (f32, f32)) {
         if let Some(lb) = self.image_lightbox.as_mut() {
+            lb.fit_to_window = false;
             lb.zoom = zoom;
             lb.pan = pan;
         }

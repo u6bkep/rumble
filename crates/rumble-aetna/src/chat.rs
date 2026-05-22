@@ -170,11 +170,13 @@ pub const KEY_LIGHTBOX_CLOSE: &str = "chat:lightbox:close";
 pub const KEY_LIGHTBOX_ZOOM_IN: &str = "chat:lightbox:zoom-in";
 pub const KEY_LIGHTBOX_ZOOM_OUT: &str = "chat:lightbox:zoom-out";
 pub const KEY_LIGHTBOX_ZOOM_FIT: &str = "chat:lightbox:zoom-fit";
+pub const KEY_LIGHTBOX_ZOOM_NATURAL: &str = "chat:lightbox:zoom-natural";
 pub const KEY_LIGHTBOX_IMAGE: &str = "chat:lightbox:image";
 
-/// Zoom range and step used by the lightbox controls. Mirrors the
-/// rumble-egui `ImageViewModalState` constants so behaviour ports
-/// cleanly: 25%–1000% range, 1.25× per `−` / `+` click, Fit resets.
+/// Zoom range and step used by the lightbox controls. The numeric zoom
+/// is relative to decoded image pixels: `1.0` paints one image pixel as
+/// one logical pixel. Fit-to-window is a separate mode because its
+/// actual scale depends on the lightbox body's runtime dimensions.
 pub const LIGHTBOX_ZOOM_MIN: f32 = 0.25;
 pub const LIGHTBOX_ZOOM_MAX: f32 = 10.0;
 pub const LIGHTBOX_ZOOM_STEP: f32 = 1.25;
@@ -899,10 +901,14 @@ fn composer(state: &State, chat_input: &str, selection: &Selection) -> El {
 pub struct Lightbox {
     pub transfer_id: String,
     pub name: String,
-    /// Zoom factor applied to the image's painted rect. `1.0` matches
-    /// the Fit-to-frame baseline (image fills the lightbox body via
-    /// `ImageFit::Contain` at its natural aspect).
+    /// Explicit zoom factor relative to decoded image pixels. `1.0`
+    /// paints the image at natural size. Ignored while
+    /// `fit_to_window` is true.
     pub zoom: f32,
+    /// Fit the image into the available lightbox body. This is kept as
+    /// a separate mode so the zoom label never pretends the fit scale
+    /// is a source-pixel percentage without knowing the body rect.
+    pub fit_to_window: bool,
     /// Pan offset in logical pixels. `(0, 0)` keeps the (scaled) image
     /// centred in the body.
     pub pan: (f32, f32),
@@ -919,29 +925,44 @@ impl Lightbox {
             transfer_id: transfer_id.into(),
             name: name.into(),
             zoom: 1.0,
+            fit_to_window: true,
             pan: (0.0, 0.0),
             drag: PanDrag::default(),
         }
     }
 
     pub fn fit(&mut self) {
+        self.fit_to_window = true;
+        self.pan = (0.0, 0.0);
+    }
+
+    pub fn natural_size(&mut self) {
+        self.fit_to_window = false;
         self.zoom = 1.0;
         self.pan = (0.0, 0.0);
     }
 
     pub fn zoom_in(&mut self) {
+        if self.fit_to_window {
+            self.fit_to_window = false;
+            self.zoom = 1.0;
+        }
         self.set_zoom(self.zoom * LIGHTBOX_ZOOM_STEP);
     }
 
     pub fn zoom_out(&mut self) {
+        if self.fit_to_window {
+            self.fit_to_window = false;
+            self.zoom = 1.0;
+        }
         self.set_zoom(self.zoom / LIGHTBOX_ZOOM_STEP);
     }
 
     pub fn set_zoom(&mut self, zoom: f32) {
+        self.fit_to_window = false;
         self.zoom = zoom.clamp(LIGHTBOX_ZOOM_MIN, LIGHTBOX_ZOOM_MAX);
-        // At zoom 1× the image is anchored centre by `Contain`, so any
-        // residual pan would just bias the framing. Reset it for a
-        // predictable Fit result whenever we land back at unity.
+        // At natural size the image is anchored centre by the lightbox
+        // body stack, so residual pan would just bias the framing.
         if (self.zoom - 1.0).abs() < f32::EPSILON {
             self.pan = (0.0, 0.0);
         }
@@ -996,31 +1017,44 @@ pub fn render_lightbox(
 
 fn lightbox_header(lightbox: &Lightbox) -> El {
     let zoom_pct = (lightbox.zoom * 100.0).round() as i32;
+    let zoom_label = if lightbox.fit_to_window {
+        "Fit".to_string()
+    } else {
+        format!("{zoom_pct}%")
+    };
 
     let mut zoom_out = button("−").key(KEY_LIGHTBOX_ZOOM_OUT).ghost();
-    if lightbox.zoom <= LIGHTBOX_ZOOM_MIN + f32::EPSILON {
+    if !lightbox.fit_to_window && lightbox.zoom <= LIGHTBOX_ZOOM_MIN + f32::EPSILON {
         zoom_out = zoom_out.disabled();
     }
     let mut zoom_in = button("+").key(KEY_LIGHTBOX_ZOOM_IN).ghost();
-    if lightbox.zoom >= LIGHTBOX_ZOOM_MAX - f32::EPSILON {
+    if !lightbox.fit_to_window && lightbox.zoom >= LIGHTBOX_ZOOM_MAX - f32::EPSILON {
         zoom_in = zoom_in.disabled();
     }
     let mut fit = button("Fit").key(KEY_LIGHTBOX_ZOOM_FIT).ghost();
-    if (lightbox.zoom - 1.0).abs() < f32::EPSILON && lightbox.pan == (0.0, 0.0) {
+    if lightbox.fit_to_window && lightbox.pan == (0.0, 0.0) {
         fit = fit.disabled();
+    }
+    let mut natural = button("100%").key(KEY_LIGHTBOX_ZOOM_NATURAL).ghost();
+    if !lightbox.fit_to_window
+        && (lightbox.zoom - 1.0).abs() < f32::EPSILON
+        && lightbox.pan == (0.0, 0.0)
+    {
+        natural = natural.disabled();
     }
 
     row([
         text(lightbox.name.clone()).title().ellipsis(),
         spacer(),
         zoom_out,
-        text(format!("{zoom_pct}%"))
+        text(zoom_label)
             .muted()
             .font_size(tokens::TEXT_SM.size)
             .width(Size::Fixed(56.0))
             .text_align(TextAlign::Center),
         zoom_in,
         fit,
+        natural,
         button("Close").key(KEY_LIGHTBOX_CLOSE),
     ])
     .gap(tokens::SPACE_2)
@@ -1034,45 +1068,56 @@ fn lightbox_body(
     playback: Option<&GifPlayback>,
     gpu: Option<&AnimatedGpu>,
 ) -> El {
-    // Inner element: `Contain` fit at base size; `.scale(zoom)` zooms
-    // around its centre, `.translate(pan)` then offsets the result.
-    // Both transforms are paint-time so layout stays stable as the
-    // user drags / zooms — no re-layout cost per frame, and the
-    // body's allocated rect stays the lightbox body so subsequent
-    // pointer events still target the same region.
+    let frame = cached.current_frame(playback);
+    let natural_w = frame.width() as f32;
+    let natural_h = frame.height() as f32;
+
+    // In Fit mode the image/surface fills the body and `Contain`
+    // computes the runtime scale from the available window. In explicit
+    // zoom mode the element's layout rect is the decoded image's natural
+    // pixel size and `.scale(zoom)` paints relative to that, so `100%`
+    // means one source pixel per logical pixel.
     //
     // For animated entries with a live GPU mirror we re-use the same
     // `surface()` texture the inline preview is already updating in
-    // `before_paint`, with `surface_fit(Contain)` doing the
-    // letterbox into the dynamic Fill×Fill body rect. Avoids a
-    // second copy through aetna's image content-hash cache and keeps
-    // the lightbox in lockstep with the inline playhead at zero
-    // additional GPU cost. Static images and the one-frame race
-    // before the GPU mirror is allocated fall through to `image()`.
+    // `before_paint`. Static images and the one-frame race before the
+    // GPU mirror is allocated fall through to `image()`.
     let inner = match (cached, gpu) {
         (CachedImage::Animated { frames, .. }, Some(gpu)) => {
-            let mut el = surface(gpu.app_texture().clone())
-                .surface_alpha(SurfaceAlpha::Straight)
-                .surface_fit(ImageFit::Contain)
-                .radius(tokens::RADIUS_MD)
-                .width(Size::Fill(1.0))
-                .height(Size::Fill(1.0))
-                .scale(lightbox.zoom)
-                .translate(lightbox.pan.0, lightbox.pan.1);
+            let mut el = surface(gpu.app_texture().clone()).surface_alpha(SurfaceAlpha::Straight);
+            if lightbox.fit_to_window {
+                el = el
+                    .surface_fit(ImageFit::Contain)
+                    .width(Size::Fill(1.0))
+                    .height(Size::Fill(1.0));
+            } else {
+                el = el
+                    .width(Size::Fixed(natural_w))
+                    .height(Size::Fixed(natural_h))
+                    .scale(lightbox.zoom)
+                    .translate(lightbox.pan.0, lightbox.pan.1);
+            }
+            el = el.radius(tokens::RADIUS_MD);
             if let Some(deadline) = playback.and_then(|pb| next_frame_deadline(frames, pb)) {
                 el = el.redraw_within(deadline);
             }
             el
         }
         _ => {
-            let img = cached.current_frame(playback);
-            image(img.clone())
-                .image_fit(ImageFit::Contain)
-                .radius(tokens::RADIUS_MD)
-                .width(Size::Fill(1.0))
-                .height(Size::Fill(1.0))
-                .scale(lightbox.zoom)
-                .translate(lightbox.pan.0, lightbox.pan.1)
+            let mut el = image(frame.clone()).radius(tokens::RADIUS_MD);
+            if lightbox.fit_to_window {
+                el = el
+                    .image_fit(ImageFit::Contain)
+                    .width(Size::Fill(1.0))
+                    .height(Size::Fill(1.0));
+            } else {
+                el = el
+                    .width(Size::Fixed(natural_w))
+                    .height(Size::Fixed(natural_h))
+                    .scale(lightbox.zoom)
+                    .translate(lightbox.pan.0, lightbox.pan.1);
+            }
+            el
         }
     };
 
@@ -1084,9 +1129,11 @@ fn lightbox_body(
         .clip()
         .fill(tokens::CARD)
         .radius(tokens::RADIUS_MD)
+        .align(Align::Center)
+        .justify(Justify::Center)
         .cursor(if lightbox.drag.anchor.is_some() {
             Cursor::Grabbing
-        } else if lightbox.zoom > 1.0 {
+        } else if !lightbox.fit_to_window && lightbox.zoom > 1.0 {
             Cursor::Grab
         } else {
             Cursor::Default
