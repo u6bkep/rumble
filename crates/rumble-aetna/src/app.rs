@@ -1084,13 +1084,21 @@ impl<B: UiBackend> App for RumbleApp<B> {
             self.close_lightbox();
             return;
         }
+        let lightbox_image_size = self.image_lightbox.as_ref().and_then(|lightbox| {
+            let cached = self
+                .lightbox_full
+                .as_ref()
+                .or_else(|| self.image_cache.get(&lightbox.transfer_id))?;
+            let playback = self.gif_playback.get(&lightbox.transfer_id);
+            Some(cached.current_frame_size(playback))
+        });
         if let Some(lightbox) = self.image_lightbox.as_mut() {
             if event.is_click_or_activate(chat::KEY_LIGHTBOX_ZOOM_IN) {
-                lightbox.zoom_in();
+                lightbox.zoom_in(lightbox_image_size);
                 return;
             }
             if event.is_click_or_activate(chat::KEY_LIGHTBOX_ZOOM_OUT) {
-                lightbox.zoom_out();
+                lightbox.zoom_out(lightbox_image_size);
                 return;
             }
             if event.is_click_or_activate(chat::KEY_LIGHTBOX_ZOOM_FIT) {
@@ -1104,10 +1112,7 @@ impl<B: UiBackend> App for RumbleApp<B> {
             // Drag-to-pan on the image surface. Disabled at zoom <= 1.0
             // since there's nothing to pan to — the image is centred
             // and the body already shows everything.
-            if event.route() == Some(chat::KEY_LIGHTBOX_IMAGE)
-                && !lightbox.fit_to_window
-                && lightbox.zoom > 1.0
-            {
+            if event.route() == Some(chat::KEY_LIGHTBOX_IMAGE) && !lightbox.fit_to_window && lightbox.zoom > 1.0 {
                 match event.kind {
                     UiEventKind::PointerDown => {
                         if let Some(pos) = event.pointer {

@@ -12,7 +12,7 @@
 
 use std::{
     collections::HashMap,
-    sync::LazyLock,
+    sync::{Arc, LazyLock, Mutex},
     time::{Duration, Instant},
 };
 
@@ -131,6 +131,12 @@ impl CachedImage {
             }
         }
     }
+
+    /// Natural dimensions of the frame currently shown in the lightbox.
+    pub fn current_frame_size(&self, playback: Option<&GifPlayback>) -> (u32, u32) {
+        let frame = self.current_frame(playback);
+        (frame.width(), frame.height())
+    }
 }
 
 // Player-control SVG icons. Loaded once via `parse_current_color` so
@@ -179,7 +185,7 @@ pub const KEY_LIGHTBOX_IMAGE: &str = "chat:lightbox:image";
 /// actual scale depends on the lightbox body's runtime dimensions.
 pub const LIGHTBOX_ZOOM_MIN: f32 = 0.25;
 pub const LIGHTBOX_ZOOM_MAX: f32 = 10.0;
-pub const LIGHTBOX_ZOOM_STEP: f32 = 1.25;
+pub const LIGHTBOX_ZOOM_STEP: f32 = 0.20;
 
 pub fn download_key(transfer_id: &str) -> String {
     format!("chat:download:{transfer_id}")
@@ -912,6 +918,10 @@ pub struct Lightbox {
     /// Pan offset in logical pixels. `(0, 0)` keeps the (scaled) image
     /// centred in the body.
     pub pan: (f32, f32),
+    /// Last laid-out body size in logical pixels. Written during the
+    /// lightbox body's layout pass and read by Fit -> explicit zoom
+    /// transitions so `+`/`-` can start from the actual fitted scale.
+    pub body_size: Arc<Mutex<Option<(f32, f32)>>>,
     /// Ephemeral pan-drag state, cleared on `PointerUp`. Captured at
     /// `PointerDown`: the pointer position + the pan value at that
     /// moment, so subsequent `Drag` events can compute a delta without
@@ -927,6 +937,7 @@ impl Lightbox {
             zoom: 1.0,
             fit_to_window: true,
             pan: (0.0, 0.0),
+            body_size: Arc::new(Mutex::new(None)),
             drag: PanDrag::default(),
         }
     }
@@ -942,20 +953,20 @@ impl Lightbox {
         self.pan = (0.0, 0.0);
     }
 
-    pub fn zoom_in(&mut self) {
+    pub fn zoom_in(&mut self, image_size: Option<(u32, u32)>) {
         if self.fit_to_window {
-            self.fit_to_window = false;
-            self.zoom = 1.0;
+            self.set_zoom(self.fit_step_zoom(image_size, ZoomDirection::In));
+            return;
         }
-        self.set_zoom(self.zoom * LIGHTBOX_ZOOM_STEP);
+        self.set_zoom(next_zoom_step(self.zoom, ZoomDirection::In));
     }
 
-    pub fn zoom_out(&mut self) {
+    pub fn zoom_out(&mut self, image_size: Option<(u32, u32)>) {
         if self.fit_to_window {
-            self.fit_to_window = false;
-            self.zoom = 1.0;
+            self.set_zoom(self.fit_step_zoom(image_size, ZoomDirection::Out));
+            return;
         }
-        self.set_zoom(self.zoom / LIGHTBOX_ZOOM_STEP);
+        self.set_zoom(next_zoom_step(self.zoom, ZoomDirection::Out));
     }
 
     pub fn set_zoom(&mut self, zoom: f32) {
@@ -967,6 +978,53 @@ impl Lightbox {
             self.pan = (0.0, 0.0);
         }
     }
+
+    fn fit_step_zoom(&self, image_size: Option<(u32, u32)>, direction: ZoomDirection) -> f32 {
+        fit_scale(self.body_size(), image_size)
+            .map(|scale| next_zoom_step(scale, direction))
+            .unwrap_or_else(|| next_zoom_step(1.0, direction))
+    }
+
+    fn body_size(&self) -> Option<(f32, f32)> {
+        self.body_size.lock().ok().and_then(|size| *size)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum ZoomDirection {
+    In,
+    Out,
+}
+
+fn fit_scale(body_size: Option<(f32, f32)>, image_size: Option<(u32, u32)>) -> Option<f32> {
+    let ((body_w, body_h), (image_w, image_h)) = (body_size?, image_size?);
+    if body_w <= 0.0 || body_h <= 0.0 || image_w == 0 || image_h == 0 {
+        return None;
+    }
+    Some((body_w / image_w as f32).min(body_h / image_h as f32))
+}
+
+fn next_zoom_step(zoom: f32, direction: ZoomDirection) -> f32 {
+    let step = LIGHTBOX_ZOOM_STEP;
+    let stepped = match direction {
+        ZoomDirection::In => {
+            let next = (zoom / step).ceil() * step;
+            if (next - zoom).abs() < f32::EPSILON {
+                next + step
+            } else {
+                next
+            }
+        }
+        ZoomDirection::Out => {
+            let next = (zoom / step).floor() * step;
+            if (next - zoom).abs() < f32::EPSILON {
+                next - step
+            } else {
+                next
+            }
+        }
+    };
+    stepped.clamp(LIGHTBOX_ZOOM_MIN, LIGHTBOX_ZOOM_MAX)
 }
 
 /// Ephemeral pan-drag state: anchor pointer + pan value at
@@ -1036,10 +1094,7 @@ fn lightbox_header(lightbox: &Lightbox) -> El {
         fit = fit.disabled();
     }
     let mut natural = button("100%").key(KEY_LIGHTBOX_ZOOM_NATURAL).ghost();
-    if !lightbox.fit_to_window
-        && (lightbox.zoom - 1.0).abs() < f32::EPSILON
-        && lightbox.pan == (0.0, 0.0)
-    {
+    if !lightbox.fit_to_window && (lightbox.zoom - 1.0).abs() < f32::EPSILON && lightbox.pan == (0.0, 0.0) {
         natural = natural.disabled();
     }
 
@@ -1071,6 +1126,8 @@ fn lightbox_body(
     let frame = cached.current_frame(playback);
     let natural_w = frame.width() as f32;
     let natural_h = frame.height() as f32;
+    let fit_to_window = lightbox.fit_to_window;
+    let body_size = lightbox.body_size.clone();
 
     // In Fit mode the image/surface fills the body and `Contain`
     // computes the runtime scale from the available window. In explicit
@@ -1126,11 +1183,22 @@ fn lightbox_body(
     // pointer events so the App's drag handler can update `pan`.
     stack([inner])
         .key(KEY_LIGHTBOX_IMAGE)
+        .layout(move |ctx: LayoutCtx| {
+            if let Ok(mut size) = body_size.lock() {
+                *size = Some((ctx.container.w, ctx.container.h));
+            }
+
+            if fit_to_window {
+                return vec![ctx.container];
+            }
+
+            let x = ctx.container.x + (ctx.container.w - natural_w) * 0.5;
+            let y = ctx.container.y + (ctx.container.h - natural_h) * 0.5;
+            vec![Rect::new(x, y, natural_w, natural_h)]
+        })
         .clip()
         .fill(tokens::CARD)
         .radius(tokens::RADIUS_MD)
-        .align(Align::Center)
-        .justify(Justify::Center)
         .cursor(if lightbox.drag.anchor.is_some() {
             Cursor::Grabbing
         } else if !lightbox.fit_to_window && lightbox.zoom > 1.0 {
@@ -1156,5 +1224,25 @@ fn format_size(bytes: u64) -> String {
         format!("{:.1} KB", bytes as f64 / KB as f64)
     } else {
         format!("{bytes} B")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fit_zoom_buttons_step_from_current_fit_scale() {
+        let large_body = Some((900.0, 600.0));
+        let small_image = Some((300, 200));
+        let large_fit = fit_scale(large_body, small_image).expect("fit scale");
+        assert!((large_fit - 3.0).abs() < f32::EPSILON);
+        assert!((next_zoom_step(large_fit, ZoomDirection::In) - 3.2).abs() < 0.001);
+        assert!((next_zoom_step(large_fit, ZoomDirection::Out) - 2.8).abs() < 0.001);
+
+        let uneven_fit = fit_scale(Some((111.0, 100.0)), small_image).expect("fit scale");
+        assert!((uneven_fit - 0.37).abs() < 0.001);
+        assert!((next_zoom_step(uneven_fit, ZoomDirection::In) - 0.4).abs() < 0.001);
+        assert_eq!(next_zoom_step(uneven_fit, ZoomDirection::Out), LIGHTBOX_ZOOM_MIN);
     }
 }
