@@ -914,7 +914,14 @@ pub enum SfxKind {
     Disconnect,
     Mute,
     Unmute,
+    Deafen,
+    Undeafen,
     Message,
+    PrivateMessage,
+    SelfChannelJoin,
+    SelfChannelMoved,
+    ServerMute,
+    Kicked,
 }
 
 impl SfxKind {
@@ -926,7 +933,14 @@ impl SfxKind {
             SfxKind::Disconnect,
             SfxKind::Mute,
             SfxKind::Unmute,
+            SfxKind::Deafen,
+            SfxKind::Undeafen,
             SfxKind::Message,
+            SfxKind::PrivateMessage,
+            SfxKind::SelfChannelJoin,
+            SfxKind::SelfChannelMoved,
+            SfxKind::ServerMute,
+            SfxKind::Kicked,
         ]
     }
 
@@ -938,7 +952,14 @@ impl SfxKind {
             SfxKind::Disconnect => "Disconnect",
             SfxKind::Mute => "Mute",
             SfxKind::Unmute => "Unmute",
+            SfxKind::Deafen => "Deafen",
+            SfxKind::Undeafen => "Undeafen",
             SfxKind::Message => "Message",
+            SfxKind::PrivateMessage => "Private Message",
+            SfxKind::SelfChannelJoin => "Channel Switch",
+            SfxKind::SelfChannelMoved => "Moved by Another",
+            SfxKind::ServerMute => "Server Muted",
+            SfxKind::Kicked => "Kicked",
         }
     }
 }

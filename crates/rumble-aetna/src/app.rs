@@ -133,6 +133,15 @@ pub struct RumbleApp<B: UiBackend = crate::backend::NativeUiBackend> {
     prev_room_id: Option<uuid::Uuid>,
     prev_room_members: HashSet<u64>,
 
+    /// Room id of a locally-initiated `JoinRoom` awaiting confirmation, so
+    /// `pump_sfx` can tell our own channel switch (`SelfChannelJoin`) apart
+    /// from being relocated by an admin/other user (`SelfChannelMoved`).
+    pending_self_join: Option<uuid::Uuid>,
+
+    /// Our `server_muted` flag at the previous frame, to fire
+    /// `SfxKind::ServerMute` when an admin mutes us server-side.
+    prev_server_muted: bool,
+
     /// In-flight OS file picker, spawned on `runtime` when the user
     /// clicks the share-file button. `Some(handle)` while the dialog is
     /// open; `before_build` polls and dispatches `Command::ShareFile`
@@ -336,6 +345,8 @@ impl<B: UiBackend> RumbleApp<B> {
             prev_connected: false,
             prev_room_id: None,
             prev_room_members: HashSet::new(),
+            pending_self_join: None,
+            prev_server_muted: false,
             pending_file_dialog: None,
             auto_handled_offers: HashSet::new(),
             image_cache: HashMap::new(),
@@ -1196,7 +1207,7 @@ impl<B: UiBackend> App for RumbleApp<B> {
         }
         if event.is_click_or_activate("toolbar:deafen") {
             let deafened = self.backend.state().audio.self_deafened;
-            self.play_sfx(if deafened { SfxKind::Unmute } else { SfxKind::Mute });
+            self.play_sfx(if deafened { SfxKind::Undeafen } else { SfxKind::Deafen });
             self.backend.send(Command::SetDeafened { deafened: !deafened });
             return;
         }
@@ -1245,6 +1256,11 @@ impl<B: UiBackend> App for RumbleApp<B> {
             RoomTreeOutcome::Dispatch(commands) => {
                 let auto_sync = self.settings.settings().chat.auto_sync_history;
                 let has_join = commands.iter().any(|c| matches!(c, Command::JoinRoom { .. }));
+                for cmd in &commands {
+                    if let Command::JoinRoom { room_id } = cmd {
+                        self.pending_self_join = Some(*room_id);
+                    }
+                }
                 for cmd in commands {
                     // Skip the auto-triggered RequestChatHistory when the
                     // setting is off (manual sync button bypasses this gate).
@@ -2054,32 +2070,55 @@ impl<B: UiBackend> RumbleApp<B> {
     fn pump_sfx(&mut self) {
         let snapshot = self.backend.state();
 
-        // New remote chat messages.
+        // New remote chat messages. Direct messages get a distinct cue.
         let count = snapshot.chat_messages.len();
-        if count > self.prev_chat_count
-            && self.prev_chat_count > 0
-            && snapshot.chat_messages[self.prev_chat_count..]
+        if count > self.prev_chat_count && self.prev_chat_count > 0 {
+            let mut had_dm = false;
+            let mut had_room = false;
+            for m in snapshot.chat_messages[self.prev_chat_count..]
                 .iter()
-                .any(|m| !m.is_local)
-        {
-            self.play_sfx(SfxKind::Message);
+                .filter(|m| !m.is_local)
+            {
+                match m.kind {
+                    rumble_protocol::ChatMessageKind::DirectMessage { .. } => had_dm = true,
+                    _ => had_room = true,
+                }
+            }
+            if had_dm {
+                self.play_sfx(SfxKind::PrivateMessage);
+            }
+            if had_room {
+                self.play_sfx(SfxKind::Message);
+            }
         }
         self.prev_chat_count = count;
 
-        // Connect / disconnect transitions.
+        // Connect / disconnect transitions. A kick produces a disconnect
+        // with `kicked` set — play the harsher Kicked cue instead.
         let connected = snapshot.connection.is_connected();
         if connected != self.prev_connected {
             self.play_sfx(if connected {
                 SfxKind::Connect
+            } else if snapshot.kicked.is_some() {
+                SfxKind::Kicked
             } else {
                 SfxKind::Disconnect
             });
             self.prev_connected = connected;
         }
 
-        // Remote users entering / leaving our room. Reseed without
-        // firing when our room id changes (room switch, connect,
-        // disconnect) so we don't beep for the whole existing roster.
+        // Server-side mute by an admin (distinct from our own self-mute).
+        let server_muted = snapshot
+            .my_user_id
+            .and_then(|id| snapshot.get_user(id))
+            .is_some_and(|u| u.server_muted);
+        if server_muted && !self.prev_server_muted {
+            self.play_sfx(SfxKind::ServerMute);
+        }
+        self.prev_server_muted = server_muted;
+
+        // Our own room changes (SelfChannelJoin / SelfChannelMoved) and
+        // remote users entering / leaving our room (UserJoin / UserLeave).
         let my_id = snapshot.my_user_id;
         let members: HashSet<u64> = match snapshot.my_room_id {
             Some(room) => snapshot
@@ -2097,6 +2136,19 @@ impl<B: UiBackend> RumbleApp<B> {
             if self.prev_room_members.difference(&members).next().is_some() {
                 self.play_sfx(SfxKind::UserLeave);
             }
+        } else {
+            // Our room id changed. Skip connect/disconnect transitions
+            // (prev or current room is None) — Connect/Disconnect cover
+            // those. A switch to the room we just asked to join is our own
+            // action; anything else means we were relocated.
+            if self.prev_room_id.is_some() && snapshot.my_room_id.is_some() {
+                if snapshot.my_room_id == self.pending_self_join {
+                    self.play_sfx(SfxKind::SelfChannelJoin);
+                } else {
+                    self.play_sfx(SfxKind::SelfChannelMoved);
+                }
+            }
+            self.pending_self_join = None;
         }
         self.prev_room_id = snapshot.my_room_id;
         self.prev_room_members = members;
@@ -2185,7 +2237,7 @@ impl<B: UiBackend> RumbleApp<B> {
                         HotkeyData::Hold => continue,
                     };
                     if deafened != state.audio.self_deafened {
-                        self.play_sfx(if deafened { SfxKind::Mute } else { SfxKind::Unmute });
+                        self.play_sfx(if deafened { SfxKind::Deafen } else { SfxKind::Undeafen });
                     }
                     self.backend.send(Command::SetDeafened { deafened });
                 }

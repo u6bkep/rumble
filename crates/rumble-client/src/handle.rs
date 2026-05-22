@@ -591,6 +591,7 @@ async fn run_connection_task<P: Platform>(
                                         server_name: "Rumble Server".to_string(),
                                         user_id,
                                     };
+                                    s.kicked = None;
                                     s.my_user_id = Some(user_id);
                                     // Find our user in the users list and get their current room
                                     s.my_room_id = users.iter()
@@ -752,6 +753,7 @@ async fn run_connection_task<P: Platform>(
                                             server_name: "Rumble Server".to_string(),
                                             user_id,
                                         };
+                                        s.kicked = None;
                                         s.my_user_id = Some(user_id);
                                         s.my_room_id = users.iter()
                                             .find(|u| u.user_id.as_ref().map(|id| id.value) == Some(user_id))
