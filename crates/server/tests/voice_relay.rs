@@ -290,6 +290,51 @@ fn voice_relay_end_to_end() {
     );
 }
 
+#[test]
+fn live_input_reconfiguration_keeps_capture_active() {
+    let port = next_test_port();
+    let server = start_server(port);
+    std::thread::sleep(Duration::from_millis(500));
+
+    let (handle, audio, pk) = make_backend(&server.cert_path);
+
+    handle.send(BackendCommand::Connect {
+        addr: format!("127.0.0.1:{port}"),
+        name: "reconfig-sender".into(),
+        public_key: pk,
+        password: None,
+    });
+
+    assert!(
+        wait_for(&handle, Duration::from_secs(5), |s| s.connection.is_connected()),
+        "client should connect"
+    );
+
+    handle.send(BackendCommand::SetVoiceMode {
+        mode: VoiceMode::Continuous,
+    });
+    assert!(
+        audio.wait_for_capture_active(Duration::from_secs(2)),
+        "capture should activate before reconfiguration"
+    );
+
+    handle.send(BackendCommand::UpdateAudioSettings {
+        settings: rumble_client::AudioSettings::default(),
+    });
+    assert!(
+        audio.wait_for_capture_active(Duration::from_secs(2)),
+        "capture should reactivate after audio settings rebuild the stream"
+    );
+
+    handle.send(BackendCommand::SetInputDevice {
+        device_id: Some("mock-input".into()),
+    });
+    assert!(
+        audio.wait_for_capture_active(Duration::from_secs(2)),
+        "capture should reactivate after input device changes"
+    );
+}
+
 /// Sanity: with capture inactive (PTT mode, button not held), no datagrams
 /// flow. This catches regressions where mute / PTT gating breaks.
 #[test]

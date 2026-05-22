@@ -815,6 +815,7 @@ async fn run_audio_task<P: Platform>(
                         // Restart input stream if connected (need to use new device)
                         if audio_input.is_some() {
                             stop_transmission::<P>(&mut audio_input, &state, &repaint);
+                            capture_is_active = false;
                         }
                         if connection.is_some() {
                             start_transmission::<P>(
@@ -969,6 +970,7 @@ async fn run_audio_task<P: Platform>(
                         // Recreate stream with new settings if connected
                         if audio_input.is_some() {
                             stop_transmission::<P>(&mut audio_input, &state, &repaint);
+                            capture_is_active = false;
                         }
                         if connection.is_some() {
                             start_transmission::<P>(
@@ -1021,6 +1023,7 @@ async fn run_audio_task<P: Platform>(
                         // Recreate stream to rebuild pipeline with new config
                         if audio_input.is_some() {
                             stop_transmission::<P>(&mut audio_input, &state, &repaint);
+                            capture_is_active = false;
                         }
                         if connection.is_some() {
                             start_transmission::<P>(

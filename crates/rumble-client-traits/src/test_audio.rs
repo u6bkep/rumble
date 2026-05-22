@@ -19,9 +19,7 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
-        mpsc,
     },
-    thread,
     time::Duration,
 };
 
@@ -37,8 +35,8 @@ pub const MOCK_FRAME_SIZE: usize = 960;
 /// so multiple test threads can interact with the same backend.
 #[derive(Clone)]
 pub struct MockAudio {
-    inject_tx: mpsc::Sender<Vec<f32>>,
     capture_active: Arc<AtomicBool>,
+    capture_callback: Arc<Mutex<Option<OnFrameFn>>>,
     playback: Arc<Mutex<Option<FillBufferFn>>>,
 }
 
@@ -50,7 +48,14 @@ impl MockAudio {
     /// The engine expects 960-sample 48 kHz mono frames; other sizes still
     /// flow through but may not encode cleanly.
     pub fn inject_capture(&self, frame: Vec<f32>) {
-        let _ = self.inject_tx.send(frame);
+        if !self.capture_active.load(Ordering::Relaxed) {
+            return;
+        }
+        if let Ok(mut guard) = self.capture_callback.lock()
+            && let Some(on_frame) = guard.as_mut()
+        {
+            on_frame(&frame);
+        }
     }
 
     /// Inject `count` 960-sample frames of silence — useful for warming up
@@ -88,7 +93,7 @@ impl MockAudio {
             if self.is_capture_active() {
                 return true;
             }
-            thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(Duration::from_millis(10));
         }
         false
     }
@@ -97,8 +102,8 @@ impl MockAudio {
 /// Mock backend that implements [`AudioBackend`] without touching real audio
 /// devices. Construct via [`MockAudioBackend::new`].
 pub struct MockAudioBackend {
-    inject_rx: Mutex<Option<mpsc::Receiver<Vec<f32>>>>,
     capture_active: Arc<AtomicBool>,
+    capture_callback: Arc<Mutex<Option<OnFrameFn>>>,
     playback: Arc<Mutex<Option<FillBufferFn>>>,
 }
 
@@ -106,18 +111,18 @@ impl MockAudioBackend {
     /// Create a paired `(backend, handle)`. Hand the backend to the engine and
     /// keep the handle in the test for `inject_capture` / `pump_playback`.
     pub fn new() -> (Self, MockAudio) {
-        let (inject_tx, inject_rx) = mpsc::channel();
         let capture_active = Arc::new(AtomicBool::new(false));
+        let capture_callback: Arc<Mutex<Option<OnFrameFn>>> = Arc::new(Mutex::new(None));
         let playback: Arc<Mutex<Option<FillBufferFn>>> = Arc::new(Mutex::new(None));
 
         let backend = Self {
-            inject_rx: Mutex::new(Some(inject_rx)),
             capture_active: capture_active.clone(),
+            capture_callback: capture_callback.clone(),
             playback: playback.clone(),
         };
         let audio = MockAudio {
-            inject_tx,
             capture_active,
+            capture_callback,
             playback,
         };
         (backend, audio)
@@ -152,29 +157,16 @@ impl AudioBackend for MockAudioBackend {
         }]
     }
 
-    fn open_input(&self, _device_id: Option<&str>, mut on_frame: OnFrameFn) -> anyhow::Result<MockCaptureStream> {
-        let rx = self
-            .inject_rx
+    fn open_input(&self, _device_id: Option<&str>, on_frame: OnFrameFn) -> anyhow::Result<MockCaptureStream> {
+        let mut guard = self
+            .capture_callback
             .lock()
-            .map_err(|_| anyhow::anyhow!("MockAudioBackend mutex poisoned"))?
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("MockAudioBackend::open_input called more than once"))?;
-
-        let active = self.capture_active.clone();
-        let active_for_worker = active.clone();
-        let worker = thread::spawn(move || {
-            // Block on the channel; deliver only while capture is active so
-            // gating via `set_active` matches what cpal does in production.
-            while let Ok(frame) = rx.recv() {
-                if active_for_worker.load(Ordering::Relaxed) {
-                    on_frame(&frame);
-                }
-            }
-        });
+            .map_err(|_| anyhow::anyhow!("MockAudioBackend mutex poisoned"))?;
+        *guard = Some(on_frame);
 
         Ok(MockCaptureStream {
-            active,
-            _worker: Some(worker),
+            active: self.capture_active.clone(),
+            capture_callback: self.capture_callback.clone(),
         })
     }
 
@@ -193,15 +185,21 @@ impl AudioBackend for MockAudioBackend {
 /// Capture stream produced by [`MockAudioBackend::open_input`].
 pub struct MockCaptureStream {
     active: Arc<AtomicBool>,
-    // Worker thread is detached on drop — its sender side closes when
-    // `MockAudioBackend` (and any `MockAudio` clones) are dropped, which lets
-    // the worker exit cleanly.
-    _worker: Option<thread::JoinHandle<()>>,
+    capture_callback: Arc<Mutex<Option<OnFrameFn>>>,
 }
 
 impl AudioCaptureStream for MockCaptureStream {
     fn set_active(&self, active: bool) {
         self.active.store(active, Ordering::Relaxed);
+    }
+}
+
+impl Drop for MockCaptureStream {
+    fn drop(&mut self) {
+        self.active.store(false, Ordering::Relaxed);
+        if let Ok(mut guard) = self.capture_callback.lock() {
+            *guard = None;
+        }
     }
 }
 
@@ -240,13 +238,13 @@ mod tests {
 
         // Inactive: frame dropped
         audio.inject_capture(vec![1.0; 4]);
-        thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(20));
         assert_eq!(received.lock().unwrap().len(), 0);
 
         // Activate; frame delivered
         stream.set_active(true);
         audio.inject_capture(vec![0.5; 4]);
-        thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(20));
         assert_eq!(received.lock().unwrap().len(), 1);
         assert_eq!(received.lock().unwrap()[0], vec![0.5; 4]);
     }
