@@ -1,5 +1,5 @@
 //! Chat sidebar: history rendering, FileOffer attachment cards, and
-//! the composer (single-line text input + paperclip + sync button).
+//! the composer (multi-line text area + paperclip + sync button).
 //!
 //! This module is the aetna port of `rumble-egui`'s chat panel
 //! (see `docs/rumble-egui-feature-spec/12-chat-panel.md`) plus the
@@ -406,9 +406,7 @@ fn render_message(
     // Sender header: "{prefix}SenderName:" in semibold, selectable.
     let (header_text, header_color) = match &msg.kind {
         ChatMessageKind::Room => (format!("{prefix}{}:", msg.sender), None),
-        ChatMessageKind::DirectMessage { .. } => {
-            (format!("{prefix}[DM] {}:", msg.sender), Some(palette::CHAT_DM))
-        }
+        ChatMessageKind::DirectMessage { .. } => (format!("{prefix}[DM] {}:", msg.sender), Some(palette::CHAT_DM)),
         ChatMessageKind::Tree => (format!("{prefix}[Tree] {}:", msg.sender), Some(palette::CHAT_TREE)),
     };
     let mut header = text(header_text)
@@ -428,17 +426,15 @@ fn render_message(
     // Image previews take priority over video previews when both
     // happen to materialise at the same time.
     let attachment: Option<El> = match msg.attachment.as_ref() {
-        Some(ChatAttachment::FileOffer(offer)) => Some(
-            if let Some(cached) = image_cache.get(&offer.transfer_id) {
-                let playback = gif_playback.get(&offer.transfer_id);
-                let gpu = animated_textures.get(&offer.transfer_id);
-                image_preview(offer, cached, playback, gpu)
-            } else if let Some(thumb) = video_thumbs.get(&offer.transfer_id) {
-                video_preview(offer, thumb)
-            } else {
-                file_offer_card(offer, transfers.get(&offer.transfer_id))
-            },
-        ),
+        Some(ChatAttachment::FileOffer(offer)) => Some(if let Some(cached) = image_cache.get(&offer.transfer_id) {
+            let playback = gif_playback.get(&offer.transfer_id);
+            let gpu = animated_textures.get(&offer.transfer_id);
+            image_preview(offer, cached, playback, gpu)
+        } else if let Some(thumb) = video_thumbs.get(&offer.transfer_id) {
+            video_preview(offer, thumb)
+        } else {
+            file_offer_card(offer, transfers.get(&offer.transfer_id))
+        }),
         None => None,
     };
 
@@ -867,10 +863,10 @@ fn composer(state: &State, chat_input: &str, selection: &Selection) -> El {
     };
 
     let opts = match placeholder {
-        Some(p) => text_input::TextInputOpts::default().placeholder(p),
-        None => text_input::TextInputOpts::default(),
+        Some(p) => text_area::TextAreaOpts::default().placeholder(p),
+        None => text_area::TextAreaOpts::default(),
     };
-    let mut input = text_input::text_input_with(chat_input, selection, KEY_INPUT, opts).width(Size::Fill(1.0));
+    let mut input = text_area::text_area_with(chat_input, selection, KEY_INPUT, opts).width(Size::Fill(1.0));
     if !connected || !can_chat {
         input = input.disabled();
     }

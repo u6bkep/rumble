@@ -572,8 +572,7 @@ impl<B: UiBackend> App for RumbleApp<B> {
                 )
                 .width(Size::Fill(self.chat_weights[0])),
                 resize_handle(Axis::Row).key(CHAT_SIDEBAR_HANDLE),
-                center_area(&state, &shell.recent_servers, &self.room_tree)
-                    .width(Size::Fill(self.chat_weights[1])),
+                center_area(&state, &shell.recent_servers, &self.room_tree).width(Size::Fill(self.chat_weights[1])),
             ])
             .width(Size::Fill(1.0))
             .height(Size::Fill(1.0))
@@ -972,13 +971,17 @@ impl<B: UiBackend> App for RumbleApp<B> {
 
         // Chat composer.
         if event.target_key() == Some(chat::KEY_INPUT) {
-            // Send on Enter when not Shift-held. Slash commands route
-            // through `parse_and_send_chat`; plain text falls through
-            // to a `Command::SendChat`.
+            // Send on bare Enter. Shift+Enter and Ctrl+J fall through
+            // to `text_area::apply_event` for newline insertion; slash
+            // commands route through `parse_and_send_chat`, plain text
+            // falls through to a `Command::SendChat`.
             if let UiEventKind::KeyDown = event.kind
                 && let Some(kp) = event.key_press.as_ref()
                 && matches!(kp.key, UiKey::Enter)
                 && !kp.modifiers.shift
+                && !kp.modifiers.ctrl
+                && !kp.modifiers.alt
+                && !kp.modifiers.logo
             {
                 let trimmed = self.chat_input.trim().to_string();
                 if !trimmed.is_empty() {
@@ -988,7 +991,7 @@ impl<B: UiBackend> App for RumbleApp<B> {
                 }
                 return;
             }
-            text_input::apply_event(&mut self.chat_input, &mut self.selection, chat::KEY_INPUT, &event);
+            text_area::apply_event(&mut self.chat_input, &mut self.selection, chat::KEY_INPUT, &event);
             return;
         }
         if event.is_click_or_activate(chat::KEY_PASTE_IMAGE) {
