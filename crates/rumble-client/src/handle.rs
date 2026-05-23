@@ -1454,9 +1454,20 @@ async fn run_connection_task<P: Platform>(
 
                     Command::CancelTransfer { transfer_id } => {
                         if let Some(ref ft) = file_transfer {
+                            let name = ft
+                                .transfers()
+                                .into_iter()
+                                .find(|s| s.id.0 == transfer_id)
+                                .map(|s| s.name)
+                                .unwrap_or_else(|| transfer_id.clone());
                             let id = rumble_client_traits::file_transfer::TransferId(transfer_id);
                             if let Err(e) = ft.cancel(&id, false) {
                                 warn!("Cancel failed for {}: {}", id.0, e);
+                            } else {
+                                let _ = event_tx.send(BackendEvent::Toast {
+                                    level: NotificationLevel::Info,
+                                    text: format!("Transfer cancelled: {name}"),
+                                });
                             }
                         }
                     }

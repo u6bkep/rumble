@@ -271,6 +271,12 @@ pub struct RumbleApp<B: UiBackend = crate::backend::NativeUiBackend> {
     /// Drained by [`App::drain_toasts`] so aetna's runtime synthesizes
     /// the toast stack overlay automatically.
     pending_toasts: Vec<ToastSpec>,
+
+    /// Transfer ids whose cancel button has been clicked once and is
+    /// awaiting confirmation. Second click fires the actual cancel.
+    /// Entries expire after 3 seconds so a stray click doesn't leave
+    /// the button stuck on "Cancel?".
+    pending_cancel_confirm: HashMap<String, Instant>,
 }
 
 impl<B: UiBackend> RumbleApp<B> {
@@ -379,6 +385,7 @@ impl<B: UiBackend> RumbleApp<B> {
             failed_video_thumbs: HashSet::new(),
             pending_video_thumbs: HashMap::new(),
             pending_toasts: Vec::new(),
+            pending_cancel_confirm: HashMap::new(),
         }
     }
 }
@@ -546,6 +553,9 @@ impl<B: UiBackend> App for RumbleApp<B> {
         self.poll_video_open();
         self.pump_hotkeys();
         self.drain_backend_events();
+        let now = Instant::now();
+        self.pending_cancel_confirm
+            .retain(|_, t| now.duration_since(*t).as_secs() < 3);
         if let Some(active) = self.active_video.as_mut() {
             active.refresh_scrub_value();
         }
@@ -584,6 +594,7 @@ impl<B: UiBackend> App for RumbleApp<B> {
                     &self.animated_gpu,
                     &self.video_thumbs,
                     &transfers,
+                    &self.pending_cancel_confirm,
                     &self.chat_input,
                     &self.selection,
                     own_username,
@@ -1068,9 +1079,15 @@ impl<B: UiBackend> App for RumbleApp<B> {
             && let Some(route) = event.route()
             && let Some(transfer_id) = chat::parse_cancel_key(route)
         {
-            self.backend.send(Command::CancelTransfer {
-                transfer_id: transfer_id.to_string(),
-            });
+            if self.pending_cancel_confirm.contains_key(transfer_id) {
+                self.pending_cancel_confirm.remove(transfer_id);
+                self.backend.send(Command::CancelTransfer {
+                    transfer_id: transfer_id.to_string(),
+                });
+            } else {
+                self.pending_cancel_confirm
+                    .insert(transfer_id.to_string(), Instant::now());
+            }
             return;
         }
 
@@ -1906,6 +1923,14 @@ impl<B: UiBackend> RumbleApp<B> {
         let (src, handle) = self.pending_save_as.take().unwrap();
         match self.runtime.block_on(handle) {
             Ok(Some(dest)) => {
+                if !src.exists() {
+                    tracing::error!("Save As: source file no longer exists: {}", src.display());
+                    self.pending_toasts.push(aetna_core::toast::ToastSpec::new(
+                        aetna_core::toast::ToastLevel::Error,
+                        "Source file no longer exists".to_string(),
+                    ));
+                    return;
+                }
                 if let Err(e) = std::fs::copy(&src, &dest) {
                     tracing::error!("Save As copy failed: {e}");
                     self.backend.send(Command::LocalMessage {
