@@ -148,7 +148,6 @@ dependencies = [
 [[package]]
 name = "aetna-core"
 version = "0.3.6"
-source = "git+https://github.com/computer-whisperer/aetna?rev=f9f55660517435afd237889ded2db03514092237#f9f55660517435afd237889ded2db03514092237"
 dependencies = [
  "aetna-fonts",
  "bytemuck",
@@ -171,7 +170,6 @@ dependencies = [
 [[package]]
 name = "aetna-fonts"
 version = "0.3.6"
-source = "git+https://github.com/computer-whisperer/aetna?rev=f9f55660517435afd237889ded2db03514092237#f9f55660517435afd237889ded2db03514092237"
 dependencies = [
  "aetna-fonts-emoji",
  "aetna-fonts-inter",
@@ -182,22 +180,18 @@ dependencies = [
 [[package]]
 name = "aetna-fonts-emoji"
 version = "0.1.0"
-source = "git+https://github.com/computer-whisperer/aetna?rev=f9f55660517435afd237889ded2db03514092237#f9f55660517435afd237889ded2db03514092237"
 
 [[package]]
 name = "aetna-fonts-inter"
 version = "0.1.0"
-source = "git+https://github.com/computer-whisperer/aetna?rev=f9f55660517435afd237889ded2db03514092237#f9f55660517435afd237889ded2db03514092237"
 
 [[package]]
 name = "aetna-fonts-jetbrains-mono"
 version = "0.1.0"
-source = "git+https://github.com/computer-whisperer/aetna?rev=f9f55660517435afd237889ded2db03514092237#f9f55660517435afd237889ded2db03514092237"
 
 [[package]]
 name = "aetna-fonts-symbols"
 version = "0.1.0"
-source = "git+https://github.com/computer-whisperer/aetna?rev=f9f55660517435afd237889ded2db03514092237#f9f55660517435afd237889ded2db03514092237"
 
 [[package]]
 name = "aetna-markdown"
@@ -213,7 +207,6 @@ dependencies = [
 [[package]]
 name = "aetna-wgpu"
 version = "0.3.6"
-source = "git+https://github.com/computer-whisperer/aetna?rev=f9f55660517435afd237889ded2db03514092237#f9f55660517435afd237889ded2db03514092237"
 dependencies = [
  "aetna-core",
  "bytemuck",
@@ -226,7 +219,6 @@ dependencies = [
 [[package]]
 name = "aetna-winit-wgpu"
 version = "0.3.6"
-source = "git+https://github.com/computer-whisperer/aetna?rev=f9f55660517435afd237889ded2db03514092237#f9f55660517435afd237889ded2db03514092237"
 dependencies = [
  "aetna-core",
  "aetna-wgpu",
