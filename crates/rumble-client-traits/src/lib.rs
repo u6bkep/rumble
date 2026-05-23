@@ -23,7 +23,7 @@ pub use cert::{
 pub use codec::{VoiceCodec, VoiceDecoder, VoiceEncoder};
 pub use file_transfer::{
     FileOffer, FileTransferPlugin, PluginPeerConnectionType, PluginPeerInfo, PluginPeerState, PluginTransferState,
-    TransferId, TransferStatus,
+    TransferDirection, TransferId, TransferStatus,
 };
 pub use keys::KeySigning;
 pub use platform::Platform;
