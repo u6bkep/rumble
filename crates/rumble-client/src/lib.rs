@@ -85,6 +85,7 @@ pub use events::*;
 
 // Backend handle (generic over Platform)
 pub mod handle;
+pub use handle::{BackendEvent, NotificationLevel};
 
 // RPC server for external process control (Unix only — uses Unix domain sockets)
 #[cfg(unix)]

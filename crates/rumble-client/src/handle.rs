@@ -67,6 +67,29 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+/// Severity level for a [`BackendEvent::Toast`] notification.
+///
+/// Neutral type defined here so `rumble-client` doesn't depend on the
+/// aetna UI library. Callers (aetna, tests) map this to their own
+/// `ToastLevel` / colour token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotificationLevel {
+    Info,
+    Warn,
+    Error,
+}
+
+/// One-way events that background tasks push to the UI.
+///
+/// Produced by internal client code via [`BackendHandle::push_event`];
+/// consumed by the UI layer (aetna) by draining
+/// [`BackendHandle::take_event_receiver`] once at startup and polling
+/// it each frame.
+#[derive(Debug, Clone)]
+pub enum BackendEvent {
+    Toast { level: NotificationLevel, text: String },
+}
+
 /// A handle to the backend that can be used from UI code.
 ///
 /// This type manages the tokio runtime, async connection, audio subsystem,
@@ -93,6 +116,13 @@ pub struct BackendHandle<P: Platform> {
     _connect_config: ConnectConfig,
     /// Pre-generated sound effects library.
     sfx_library: crate::sfx::SfxLibrary,
+    /// Sender half of the backend-event channel. Internal client code
+    /// calls `push_event` to enqueue a [`BackendEvent`]; the UI drains
+    /// the receiver each frame.
+    event_tx: mpsc::UnboundedSender<BackendEvent>,
+    /// Receiver half, wrapped in an `Option` so `take_event_receiver`
+    /// can hand ownership to the UI on first call.
+    event_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<BackendEvent>>>,
     /// Marker for the platform type parameter.
     _phantom: std::marker::PhantomData<P>,
 }
@@ -187,6 +217,7 @@ impl<P: Platform> BackendHandle<P> {
 
         let repaint_callback = Arc::new(repaint_callback);
         let (command_tx, command_rx) = mpsc::unbounded_channel();
+        let (event_tx, event_rx) = mpsc::unbounded_channel::<BackendEvent>();
 
         // Snapshot device lists from the supplied backend before handing it
         // to the audio task.
@@ -275,6 +306,8 @@ impl<P: Platform> BackendHandle<P> {
             runtime_thread: Some(runtime_thread),
             _connect_config: connect_config,
             sfx_library: crate::sfx::SfxLibrary::new(),
+            event_tx,
+            event_rx: std::sync::Mutex::new(Some(event_rx)),
             _phantom: std::marker::PhantomData,
         }
     }
@@ -462,6 +495,27 @@ impl<P: Platform> BackendHandle<P> {
             Err(p) => p.into_inner(),
         };
         guard.as_ref().and_then(|ft| ft.get_file_path(id).ok())
+    }
+
+    /// Push a [`BackendEvent`] onto the UI-facing event channel.
+    ///
+    /// Background tasks call this to surface errors, progress notices,
+    /// or other non-blocking notifications to the UI. The UI drains the
+    /// channel each frame via the receiver obtained from
+    /// [`Self::take_event_receiver`].
+    pub fn push_event(&self, event: BackendEvent) {
+        let _ = self.event_tx.send(event);
+    }
+
+    /// Hand ownership of the event receiver to the caller.
+    ///
+    /// Should be called once at UI startup. Subsequent calls return
+    /// `None` (the receiver has already been moved out).
+    pub fn take_event_receiver(&self) -> Option<mpsc::UnboundedReceiver<BackendEvent>> {
+        match self.event_rx.lock() {
+            Ok(mut g) => g.take(),
+            Err(p) => p.into_inner().take(),
+        }
     }
 }
 

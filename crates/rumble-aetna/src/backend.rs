@@ -3,9 +3,10 @@
 //! Same shape as `rumble-next`'s `UiBackend`: the renderer reads `State`
 //! snapshots and pushes `Command`s; tests can swap a mock in.
 
-use rumble_client::handle::BackendHandle;
+use rumble_client::{BackendEvent, handle::BackendHandle};
 use rumble_client_traits::file_transfer::TransferStatus;
 use rumble_protocol::{Command, State};
+use tokio::sync::mpsc;
 
 pub trait UiBackend: 'static {
     fn state(&self) -> State;
@@ -16,15 +17,25 @@ pub trait UiBackend: 'static {
     fn transfers(&self) -> Vec<TransferStatus> {
         Vec::new()
     }
+    /// Drain pending backend events produced since the last frame.
+    /// The default returns an empty vec for mock backends.
+    fn drain_events(&self) -> Vec<BackendEvent> {
+        Vec::new()
+    }
 }
 
 pub struct NativeUiBackend {
     inner: BackendHandle<rumble_desktop::NativePlatform>,
+    event_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<BackendEvent>>>,
 }
 
 impl NativeUiBackend {
     pub fn new(inner: BackendHandle<rumble_desktop::NativePlatform>) -> Self {
-        Self { inner }
+        let event_rx = inner.take_event_receiver();
+        Self {
+            inner,
+            event_rx: std::sync::Mutex::new(event_rx),
+        }
     }
 
     pub fn inner(&self) -> &BackendHandle<rumble_desktop::NativePlatform> {
@@ -43,5 +54,20 @@ impl UiBackend for NativeUiBackend {
 
     fn transfers(&self) -> Vec<TransferStatus> {
         self.inner.transfers()
+    }
+
+    fn drain_events(&self) -> Vec<BackendEvent> {
+        let mut rx = match self.event_rx.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let Some(rx) = rx.as_mut() else {
+            return Vec::new();
+        };
+        let mut events = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+        events
     }
 }
