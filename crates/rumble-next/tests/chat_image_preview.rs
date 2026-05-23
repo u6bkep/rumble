@@ -10,7 +10,7 @@
 
 use eframe::egui::{self, Event, Modifiers, PointerButton, Pos2};
 use image::{ImageBuffer, Rgba};
-use rumble_client_traits::file_transfer::{PluginTransferState, TransferId, TransferStatus};
+use rumble_client_traits::file_transfer::{PluginTransferState, TransferDirection, TransferId, TransferStatus};
 use rumble_next::TestHarness;
 use rumble_protocol::{
     ChatAttachment, ChatMessage, ChatMessageKind, ConnectionState, FileOfferInfo, State, proto, room_id_from_uuid,
@@ -120,6 +120,7 @@ fn renders_image_preview_for_completed_file_offer() {
         id: TransferId("tx-1".to_string()),
         name: "hello.png".to_string(),
         size: 256,
+        direction: TransferDirection::Download,
         progress: 1.0,
         download_speed: 0,
         upload_speed: 0,
@@ -246,6 +247,7 @@ fn setup_harness_with_image_sized(w: u32, h: u32, name: &str) -> (TestHarness, P
         id: TransferId("tx-1".to_string()),
         name: "hello.png".to_string(),
         size: 256,
+        direction: TransferDirection::Download,
         progress: 1.0,
         download_speed: 0,
         upload_speed: 0,
@@ -434,6 +436,7 @@ fn click_image_preview_in_overflowing_chat() {
         id: TransferId("tx-1".to_string()),
         name: "hello.png".to_string(),
         size: 256,
+        direction: TransferDirection::Download,
         progress: 1.0,
         download_speed: 0,
         upload_speed: 0,
@@ -533,6 +536,7 @@ fn click_image_preview_with_failed_load() {
         id: TransferId("tx-1".to_string()),
         name: "bogus.png".to_string(),
         size: 256,
+        direction: TransferDirection::Download,
         progress: 1.0,
         download_speed: 0,
         upload_speed: 0,

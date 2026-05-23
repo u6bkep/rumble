@@ -21,7 +21,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use prost::Message;
 use rumble_client_traits::{
-    file_transfer::{FileOffer, FileTransferPlugin, TransferId, TransferStatus},
+    file_transfer::{FileOffer, FileTransferPlugin, TransferDirection, TransferId, TransferStatus},
     transport::{
         BiRecvStream, BiSendStream, PluginAck, StreamOpener, read_length_prefixed, read_plugin_ack,
         write_length_prefixed,
@@ -85,6 +85,11 @@ impl TransferEntry {
             id: self.id.clone(),
             name: self.name.clone(),
             size: self.size,
+            direction: if self.is_upload {
+                TransferDirection::Upload
+            } else {
+                TransferDirection::Download
+            },
             progress: self.progress,
             download_speed,
             upload_speed,

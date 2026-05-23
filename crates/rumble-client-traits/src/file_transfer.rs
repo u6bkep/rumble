@@ -21,6 +21,13 @@ pub struct FileOffer {
     pub share_data: String,
 }
 
+/// Whether a transfer is an upload or download from the local client's perspective.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferDirection {
+    Upload,
+    Download,
+}
+
 /// State of a transfer from the plugin's perspective.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PluginTransferState {
@@ -65,6 +72,8 @@ pub struct TransferStatus {
     pub id: TransferId,
     pub name: String,
     pub size: u64,
+    /// Whether this is an upload or download from the local client's perspective.
+    pub direction: TransferDirection,
     /// Progress as a fraction in [0.0, 1.0].
     pub progress: f32,
     /// Download speed in bytes per second.
