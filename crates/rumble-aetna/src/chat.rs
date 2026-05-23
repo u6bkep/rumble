@@ -18,9 +18,11 @@ use std::{
 
 use aetna_core::{prelude::*, surface::SurfaceAlpha};
 use aetna_markdown::md;
-use rumble_client_traits::file_transfer::{PluginTransferState, TransferStatus};
+use rumble_client_traits::file_transfer::{PluginTransferState, TransferDirection, TransferStatus};
 use rumble_desktop_shell::ChatSettings;
-use rumble_protocol::{ChatAttachment, ChatMessage, ChatMessageKind, FileOfferInfo, State, permissions::Permissions};
+use rumble_protocol::{
+    ChatAttachment, ChatMessage, ChatMessageKind, FileOfferInfo, LifecyclePhase, State, permissions::Permissions,
+};
 
 use crate::{animated_gpu::AnimatedGpu, theme as palette};
 
@@ -210,6 +212,26 @@ pub fn parse_cancel_key(key: &str) -> Option<&str> {
     key.strip_prefix("chat:cancel:")
 }
 
+/// Route for the inline "Open" button on a completed sender/receiver card.
+pub fn open_key(transfer_id: &str) -> String {
+    format!("chat:open:{transfer_id}")
+}
+
+/// Inverse of [`open_key`].
+pub fn parse_open_key(key: &str) -> Option<&str> {
+    key.strip_prefix("chat:open:")
+}
+
+/// Route for the inline "Reveal in folder" button on a completed card.
+pub fn reveal_key(transfer_id: &str) -> String {
+    format!("chat:reveal:{transfer_id}")
+}
+
+/// Inverse of [`reveal_key`].
+pub fn parse_reveal_key(key: &str) -> Option<&str> {
+    key.strip_prefix("chat:reveal:")
+}
+
 /// Routed key for the play/pause icon overlaid on an animated preview.
 pub fn gif_play_key(transfer_id: &str) -> String {
     format!("chat:gif:play:{transfer_id}")
@@ -306,6 +328,7 @@ pub fn render(
     transfers: &TransferMap,
     chat_input: &str,
     selection: &Selection,
+    own_username: &str,
 ) -> El {
     column([
         text("Chat")
@@ -320,6 +343,7 @@ pub fn render(
             animated_textures,
             video_thumbs,
             transfers,
+            own_username,
         ),
         divider(),
         composer(state, chat_input, selection),
@@ -336,6 +360,7 @@ fn history(
     animated_textures: &AnimatedTextureMap,
     video_thumbs: &VideoThumbMap,
     transfers: &TransferMap,
+    own_username: &str,
 ) -> El {
     if state.chat_messages.is_empty() {
         let placeholder = text(if state.connection.is_connected() {
@@ -365,6 +390,7 @@ fn history(
                 animated_textures,
                 video_thumbs,
                 transfers,
+                own_username,
             )
         })
         .collect();
@@ -385,8 +411,10 @@ fn render_message(
     animated_textures: &AnimatedTextureMap,
     video_thumbs: &VideoThumbMap,
     transfers: &TransferMap,
+    own_username: &str,
 ) -> El {
     let msg_key = u128::from_le_bytes(msg.id);
+    let is_own = !msg.is_local && msg.sender == own_username;
     let prefix = if chat_settings.show_timestamps {
         format!("[{}] ", chat_settings.timestamp_format.format(msg.timestamp))
     } else {
@@ -433,7 +461,7 @@ fn render_message(
         } else if let Some(thumb) = video_thumbs.get(&offer.transfer_id) {
             video_preview(offer, thumb)
         } else {
-            file_offer_card(offer, transfers.get(&offer.transfer_id))
+            file_offer_card(offer, transfers.get(&offer.transfer_id), is_own, msg.phase)
         }),
         None => None,
     };
@@ -442,13 +470,43 @@ fn render_message(
     if let Some(att) = attachment {
         parts.push(att);
     }
-    column(parts).gap(tokens::SPACE_1).width(Size::Fill(1.0))
+    let content = column(parts).gap(tokens::SPACE_1).width(Size::Fill(1.0));
+
+    // Own messages: subtle left accent stripe for visual differentiation.
+    if is_own {
+        let accent_stripe = spacer()
+            .width(Size::Fixed(2.0))
+            .height(Size::Fill(1.0))
+            .fill(tokens::PRIMARY);
+        row([
+            accent_stripe,
+            content.padding(Sides {
+                left: tokens::SPACE_2,
+                right: 0.0,
+                top: 0.0,
+                bottom: 0.0,
+            }),
+        ])
+        .gap(0.0)
+        .width(Size::Fill(1.0))
+        .align(Align::Stretch)
+    } else {
+        content
+    }
 }
 
-fn file_offer_card(offer: &FileOfferInfo, status: Option<&TransferStatus>) -> El {
+fn file_offer_card(
+    offer: &FileOfferInfo,
+    status: Option<&TransferStatus>,
+    is_local_sender: bool,
+    phase: LifecyclePhase,
+) -> El {
     let header = row([
         icon(IconName::FileText).text_color(tokens::MUTED_FOREGROUND),
-        text(offer.name.clone()).semibold().ellipsis(),
+        text(offer.name.clone())
+            .semibold()
+            .ellipsis()
+            .tooltip(offer.name.clone()),
     ])
     .gap(tokens::SPACE_1)
     .align(Align::Center)
@@ -463,14 +521,7 @@ fn file_offer_card(offer: &FileOfferInfo, status: Option<&TransferStatus>) -> El
         .muted()
         .font_size(tokens::TEXT_XS.size);
 
-    // Active transfer (downloading or uploading and not yet finished):
-    // show progress + speed + ETA in place of the Download button. If
-    // the underlying TransferStatus reports an error, fall back to the
-    // standard Download button so the user can retry.
-    let body = match status {
-        Some(s) if !s.is_finished && s.error.is_none() && is_in_flight(s.state) => transfer_progress_block(s),
-        _ => action_row(offer, status),
-    };
+    let body = file_card_body(offer, status, is_local_sender, phase);
 
     column([header, meta, body])
         .key(file_card_key(&offer.transfer_id))
@@ -483,6 +534,125 @@ fn file_offer_card(offer: &FileOfferInfo, status: Option<&TransferStatus>) -> El
         .width(Size::Fill(1.0))
 }
 
+/// Determine the action/progress body for a file card based on the
+/// user's relationship to the file (sender vs receiver), upload phase,
+/// and transfer status.
+fn file_card_body(
+    offer: &FileOfferInfo,
+    status: Option<&TransferStatus>,
+    is_local_sender: bool,
+    phase: LifecyclePhase,
+) -> El {
+    // In-flight transfer (upload or download): show progress regardless of sender/receiver.
+    if let Some(s) = status {
+        if !s.is_finished && s.error.is_none() && is_in_flight(s.state) {
+            return transfer_progress_block(s);
+        }
+    }
+
+    if is_local_sender {
+        match phase {
+            LifecyclePhase::PendingUpload => {
+                // Show an indeterminate upload progress block while the upload is queued
+                // but no active TransferStatus exists yet.
+                let bar = progress_indeterminate(tokens::PRIMARY);
+                let label = text("Uploading…").muted().font_size(tokens::TEXT_XS.size);
+                return column([bar, label]).gap(tokens::SPACE_1).width(Size::Fill(1.0));
+            }
+            LifecyclePhase::FailedUpload => {
+                let error_text = text("Upload failed")
+                    .text_color(palette::MUTED_SERVER)
+                    .font_size(tokens::TEXT_XS.size);
+                // Retry is a stub: no local_path available on the offer, so we
+                // can't re-share the same file without user re-selection.
+                let retry_label = text("Retry by sharing the file again")
+                    .muted()
+                    .font_size(tokens::TEXT_XS.size);
+                return column([
+                    row([error_text.width(Size::Fill(1.0))]).width(Size::Fill(1.0)),
+                    retry_label,
+                ])
+                .gap(tokens::SPACE_1)
+                .width(Size::Fill(1.0));
+            }
+            LifecyclePhase::Live => {
+                // Sender + live: file was uploaded. Show Open/Reveal if we have a local_path.
+                if let Some(s) = status
+                    && s.is_finished
+                    && s.local_path.is_some()
+                {
+                    return sender_complete_row(&offer.transfer_id);
+                }
+                // Sender + live but no completed status: show nothing actionable.
+                return row([spacer()]).width(Size::Fill(1.0));
+            }
+        }
+    }
+
+    // Receiver side.
+    if let Some(s) = status {
+        if s.is_finished && s.local_path.is_some() {
+            // Receiver completed download.
+            return receiver_complete_row(offer, s);
+        }
+        // Status exists but not finished/error — fall through to Download.
+    }
+
+    // Default: receiver hasn't downloaded yet.
+    row([
+        spacer(),
+        button_with_icon(IconName::Download, "Download")
+            .key(download_key(&offer.transfer_id))
+            .primary(),
+    ])
+    .gap(tokens::SPACE_2)
+    .width(Size::Fill(1.0))
+    .align(Align::Center)
+}
+
+/// Open + Reveal buttons for a sender whose upload completed.
+fn sender_complete_row(transfer_id: &str) -> El {
+    row([
+        spacer(),
+        button_with_icon(IconName::Folder, "Reveal")
+            .key(reveal_key(transfer_id))
+            .ghost(),
+        button_with_icon(IconName::FileText, "Open")
+            .key(open_key(transfer_id))
+            .primary(),
+    ])
+    .gap(tokens::SPACE_2)
+    .width(Size::Fill(1.0))
+    .align(Align::Center)
+}
+
+/// Open + Reveal buttons for a receiver whose download completed.
+fn receiver_complete_row(offer: &FileOfferInfo, status: &TransferStatus) -> El {
+    let is_playable_video = status.local_path.is_some() && crate::video::is_video_name(&offer.name);
+    let mut btns: Vec<El> = vec![spacer()];
+    if is_playable_video {
+        btns.push(
+            button_with_icon(IconName::Activity, "Play")
+                .key(crate::video::open_video_key(&offer.transfer_id))
+                .primary(),
+        );
+    }
+    btns.push(
+        button_with_icon(IconName::Folder, "Reveal")
+            .key(reveal_key(&offer.transfer_id))
+            .ghost(),
+    );
+    btns.push(
+        button_with_icon(IconName::FileText, "Open")
+            .key(open_key(&offer.transfer_id))
+            .primary(),
+    );
+    row(btns)
+        .gap(tokens::SPACE_2)
+        .width(Size::Fill(1.0))
+        .align(Align::Center)
+}
+
 /// True when a transfer is active enough that we should render a
 /// progress bar rather than a Download button.
 fn is_in_flight(state: PluginTransferState) -> bool {
@@ -492,44 +662,20 @@ fn is_in_flight(state: PluginTransferState) -> bool {
     )
 }
 
-fn action_row(offer: &FileOfferInfo, status: Option<&TransferStatus>) -> El {
-    let mut buttons: Vec<El> = vec![spacer()];
-
-    // Downloaded video files get a Play button that opens the
-    // video lightbox. Same look as Download but routes through
-    // the video module's open key.
-    let is_playable_video = matches!(
-        status,
-        Some(s) if s.is_finished && s.error.is_none() && s.local_path.is_some(),
-    ) && crate::video::is_video_name(&offer.name);
-    if is_playable_video {
-        buttons.push(
-            button_with_icon(IconName::Activity, "Play")
-                .key(crate::video::open_video_key(&offer.transfer_id))
-                .primary(),
-        );
-    }
-
-    buttons.push(
-        button_with_icon(IconName::Download, "Download")
-            .key(download_key(&offer.transfer_id))
-            .primary(),
-    );
-
-    row(buttons)
-        .gap(tokens::SPACE_2)
-        .width(Size::Fill(1.0))
-        .align(Align::Center)
-}
-
 /// Progress bar + bytes-transferred + speed/ETA line for an in-flight
-/// transfer. The bar is determinate when we know the file size,
-/// indeterminate otherwise (size==0 sentinel).
+/// transfer. Shows "Uploading" or "Downloading" prefix based on direction.
+/// Zero-byte files show a full progress bar rather than indeterminate.
 fn transfer_progress_block(status: &TransferStatus) -> El {
+    // Zero-byte files: show a complete bar rather than indeterminate progress.
     let bar: El = if status.size == 0 {
-        progress_indeterminate(tokens::PRIMARY)
+        progress(1.0, tokens::PRIMARY)
     } else {
         progress(status.progress.clamp(0.0, 1.0), tokens::PRIMARY)
+    };
+
+    let direction_label = match status.direction {
+        TransferDirection::Upload => "Uploading",
+        TransferDirection::Download => "Downloading",
     };
 
     let speed = if status.state == PluginTransferState::Paused {
@@ -542,7 +688,9 @@ fn transfer_progress_block(status: &TransferStatus) -> El {
 
     let pct = (status.progress.clamp(0.0, 1.0) * 100.0).round() as i32;
     let transferred = (status.size as f32 * status.progress.clamp(0.0, 1.0)) as u64;
-    let bytes_label = if status.size > 0 {
+    let bytes_label = if status.size == 0 {
+        "0 B".to_string()
+    } else if status.size > 0 {
         format!("{} / {}", format_size(transferred), format_size(status.size))
     } else {
         format_size(transferred)
@@ -561,9 +709,11 @@ fn transfer_progress_block(status: &TransferStatus) -> El {
         _ => String::new(),
     };
 
-    let info_text = text(format!("{pct}% · {bytes_label} · {speed_label}{eta_label}"))
-        .muted()
-        .font_size(tokens::TEXT_XS.size);
+    let info_text = text(format!(
+        "{direction_label} · {pct}% · {bytes_label} · {speed_label}{eta_label}"
+    ))
+    .muted()
+    .font_size(tokens::TEXT_XS.size);
     // Cancel sits on the right of the info line so it stays at a
     // predictable place across upload + download cards. The relay
     // backend doesn't support pause/resume yet, so we don't render
@@ -655,7 +805,8 @@ fn image_preview(
     let caption = text(format!("{} · {}", offer.name, format_size(offer.size)))
         .muted()
         .font_size(tokens::TEXT_XS.size)
-        .ellipsis();
+        .ellipsis()
+        .tooltip(offer.name.clone());
 
     column([preview_layer, caption])
         .key(preview_key(&offer.transfer_id))
@@ -721,7 +872,8 @@ fn video_preview(offer: &FileOfferInfo, thumb: &Image) -> El {
     let caption = text(format!("{} · {}", offer.name, format_size(offer.size)))
         .muted()
         .font_size(tokens::TEXT_XS.size)
-        .ellipsis();
+        .ellipsis()
+        .tooltip(offer.name.clone());
 
     column([preview_layer, caption])
         .key(crate::video::open_video_key(&offer.transfer_id))
@@ -1107,7 +1259,10 @@ fn lightbox_header(lightbox: &Lightbox) -> El {
     }
 
     row([
-        text(lightbox.name.clone()).title().ellipsis(),
+        text(lightbox.name.clone())
+            .title()
+            .ellipsis()
+            .tooltip(lightbox.name.clone()),
         spacer(),
         zoom_out,
         text(zoom_label)

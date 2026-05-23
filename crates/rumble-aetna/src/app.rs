@@ -567,6 +567,12 @@ impl<B: UiBackend> App for RumbleApp<B> {
             .map(|t| (t.id.0.clone(), t))
             .collect();
 
+        let own_username = state
+            .my_user_id
+            .and_then(|id| state.get_user(id))
+            .map(|u| u.username.as_str())
+            .unwrap_or("");
+
         let main = column([
             top_toolbar(&state),
             row([
@@ -580,6 +586,7 @@ impl<B: UiBackend> App for RumbleApp<B> {
                     &transfers,
                     &self.chat_input,
                     &self.selection,
+                    own_username,
                 )
                 .width(Size::Fill(self.chat_weights[0])),
                 resize_handle(Axis::Row).key(CHAT_SIDEBAR_HANDLE),
@@ -1065,6 +1072,20 @@ impl<B: UiBackend> App for RumbleApp<B> {
                 transfer_id: transfer_id.to_string(),
             });
             return;
+        }
+
+        // Inline Open / Reveal buttons on completed sender and receiver cards.
+        if matches!(event.kind, UiEventKind::Click | UiEventKind::Activate)
+            && let Some(route) = event.route()
+        {
+            if let Some(transfer_id) = chat::parse_open_key(route) {
+                self.open_transfer_file(transfer_id);
+                return;
+            }
+            if let Some(transfer_id) = chat::parse_reveal_key(route) {
+                self.reveal_transfer_file(transfer_id);
+                return;
+            }
         }
 
         // Per-GIF play/pause and explicit-open-lightbox icons live on
@@ -1822,6 +1843,33 @@ impl<B: UiBackend> RumbleApp<B> {
             && let Some(path) = &menu.local_path
         {
             let folder = path.parent().unwrap_or(path);
+            open_path(folder);
+        }
+    }
+
+    /// Open a completed transfer file by transfer_id using the OS default application.
+    fn open_transfer_file(&mut self, transfer_id: &str) {
+        if let Some(path) = self
+            .backend
+            .transfers()
+            .into_iter()
+            .find(|t| t.id.0 == transfer_id)
+            .and_then(|t| t.local_path)
+        {
+            open_path(&path);
+        }
+    }
+
+    /// Open the folder containing a completed transfer file.
+    fn reveal_transfer_file(&mut self, transfer_id: &str) {
+        if let Some(path) = self
+            .backend
+            .transfers()
+            .into_iter()
+            .find(|t| t.id.0 == transfer_id)
+            .and_then(|t| t.local_path)
+        {
+            let folder = path.parent().unwrap_or(&path);
             open_path(folder);
         }
     }
