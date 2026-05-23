@@ -9,10 +9,76 @@ use crate::{
     state::{ClientHandle, ServerState},
 };
 use anyhow::Result;
+use prost::Message;
 use quinn::{RecvStream, SendStream};
-use rumble_protocol::proto::Envelope;
+use rumble_protocol::proto::{self, Envelope};
 use std::sync::Arc;
 use uuid::Uuid;
+
+/// Maximum length-prefixed plugin frame the server will accept on a plugin
+/// stream. Frames are length-prefixed with `u32 BE`; this caps the prefix so
+/// a malicious client can't make us allocate gigabytes for the frame buffer.
+pub const MAX_PLUGIN_FRAME_BYTES: usize = 64 * 1024;
+
+/// Read a length-prefixed (`u32 BE`) byte frame from a plugin stream.
+///
+/// Errors if the framed length exceeds [`MAX_PLUGIN_FRAME_BYTES`].
+pub async fn read_length_prefixed(recv: &mut RecvStream) -> Result<Vec<u8>> {
+    let mut len_buf = [0u8; 4];
+    recv.read_exact(&mut len_buf).await?;
+    let msg_len = u32::from_be_bytes(len_buf) as usize;
+    if msg_len > MAX_PLUGIN_FRAME_BYTES {
+        anyhow::bail!("plugin frame too large ({msg_len} bytes, max {MAX_PLUGIN_FRAME_BYTES})");
+    }
+    let mut buf = vec![0u8; msg_len];
+    recv.read_exact(&mut buf).await?;
+    Ok(buf)
+}
+
+/// Write a length-prefixed (`u32 BE`) byte frame to a plugin stream.
+pub async fn write_length_prefixed(send: &mut SendStream, data: &[u8]) -> Result<()> {
+    let len_bytes = (data.len() as u32).to_be_bytes();
+    send.write_all(&len_bytes).await?;
+    send.write_all(data).await?;
+    Ok(())
+}
+
+/// Send an `OK` [`proto::PluginStreamAck`] frame, accepting the incoming
+/// payload that follows on the same stream.
+pub async fn send_plugin_ack_ok(send: &mut SendStream) -> Result<()> {
+    let ack = proto::PluginStreamAck {
+        status: proto::PluginAckStatus::Ok.into(),
+        code: 0,
+        error: String::new(),
+    };
+    write_length_prefixed(send, &ack.encode_to_vec()).await
+}
+
+/// Send a `REJECTED` [`proto::PluginStreamAck`] frame and gracefully stop the
+/// recv side so the peer doesn't keep streaming a body the server doesn't want.
+///
+/// The peer's pending body writes get a clean `STOP_SENDING(code)`. Because we
+/// flush the ack first and then call `recv.stop`, well-behaved clients can
+/// read the typed rejection reason before observing the stop on their write
+/// half.
+pub async fn reject_plugin_stream(
+    send: &mut SendStream,
+    recv: &mut RecvStream,
+    code: u32,
+    error: impl Into<String>,
+) -> Result<()> {
+    let ack = proto::PluginStreamAck {
+        status: proto::PluginAckStatus::Rejected.into(),
+        code,
+        error: error.into(),
+    };
+    let encoded = ack.encode_to_vec();
+    write_length_prefixed(send, &encoded).await?;
+    // Stop the body half. Errors here mean the client already gave up
+    // (stream finished or reset), which is fine — we still delivered the ack.
+    let _ = recv.stop(quinn::VarInt::from_u32(code));
+    Ok(())
+}
 
 /// First frame on a plugin-owned QUIC stream.
 /// The server reads this to dispatch the stream to the correct plugin.

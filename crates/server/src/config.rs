@@ -75,8 +75,8 @@ domain = "localhost"
 
 # [plugins.file-relay]
 # ttl = "30m"                    # Cache entry lifetime
-# max_file_size = "100 MB"       # Max single file upload
-# max_total_size = "500 MB"      # Max total cache size
+# max_file_size = "256 MiB"      # Max single file upload
+# max_total_size = "1 GiB"       # Max total cache size
 # evict_on_room_clear = true     # Evict when room empties
 "#;
 

@@ -22,7 +22,10 @@ use async_trait::async_trait;
 use prost::Message;
 use rumble_client_traits::{
     file_transfer::{FileOffer, FileTransferPlugin, TransferId, TransferStatus},
-    transport::{BiRecvStream, BiSendStream, StreamOpener},
+    transport::{
+        BiRecvStream, BiSendStream, PluginAck, StreamOpener, read_length_prefixed, read_plugin_ack,
+        write_length_prefixed,
+    },
 };
 use rumble_protocol::proto;
 use tokio_util::sync::CancellationToken;
@@ -180,27 +183,6 @@ async fn write_file_relay_header(send: &mut dyn BiSendStream) -> Result<()> {
     header.write_to(send).await
 }
 
-/// Write a length-prefixed protobuf message to a send stream.
-async fn write_length_prefixed(send: &mut dyn BiSendStream, data: &[u8]) -> Result<()> {
-    let len_bytes = (data.len() as u32).to_be_bytes();
-    send.write_all(&len_bytes).await?;
-    send.write_all(data).await?;
-    Ok(())
-}
-
-/// Read a length-prefixed protobuf message from a recv stream.
-async fn read_length_prefixed(recv: &mut dyn BiRecvStream, max_len: usize) -> Result<Vec<u8>> {
-    let mut len_buf = [0u8; 4];
-    rumble_client_traits::read_exact(recv, &mut len_buf).await?;
-    let msg_len = u32::from_be_bytes(len_buf) as usize;
-    if msg_len > max_len {
-        anyhow::bail!("response too large ({msg_len} bytes, max {max_len})");
-    }
-    let mut buf = vec![0u8; msg_len];
-    rumble_client_traits::read_exact(recv, &mut buf).await?;
-    Ok(buf)
-}
-
 /// Upload a file to the server's relay cache.
 #[allow(clippy::too_many_arguments)]
 async fn run_upload(
@@ -254,7 +236,7 @@ async fn do_upload(
 ) -> Result<()> {
     let (mut send, mut recv) = opener.open_bi().await?;
 
-    // Write StreamHeader + type discriminator + RelayUpload.
+    // --- Phase 1: send request metadata. ---
     write_file_relay_header(&mut *send).await?;
     send.write_all(&[0x01]).await?; // upload type
 
@@ -267,7 +249,18 @@ async fn do_upload(
     };
     write_length_prefixed(&mut *send, &upload_msg.encode_to_vec()).await?;
 
-    // Stream file data.
+    // --- Phase 2: wait for admission ack before streaming the body. ---
+    // Reading the ack *before* writing any body bytes is the whole point of
+    // the phased handshake: it lets the server reject the request (size,
+    // quota, ACL) without us shipping the file across the wire.
+    match read_plugin_ack(&mut *recv).await? {
+        PluginAck::Ok => {}
+        PluginAck::Rejected { code, error } => {
+            anyhow::bail!("upload rejected by server (code {code}): {error}");
+        }
+    }
+
+    // --- Phase 3: stream body. ---
     let file = tokio::fs::File::open(path).await?;
     let mut reader = tokio::io::BufReader::new(file);
     let mut buf = vec![0u8; 64 * 1024];
@@ -298,8 +291,8 @@ async fn do_upload(
     // Signal end of upload data.
     send.finish().await?;
 
-    // Read server's response.
-    let resp_bytes = read_length_prefixed(&mut *recv, 64 * 1024).await?;
+    // --- Phase 4: read completion response. ---
+    let resp_bytes = read_length_prefixed(&mut *recv).await?;
     let resp = proto::RelayUploadResponse::decode(&resp_bytes[..])?;
 
     let status = proto::RelayResult::try_from(resp.status).unwrap_or(proto::RelayResult::Error);
@@ -365,7 +358,7 @@ async fn do_fetch(
     send.finish().await?;
 
     // Read server's response header.
-    let resp_bytes = read_length_prefixed(&mut *recv, 64 * 1024).await?;
+    let resp_bytes = read_length_prefixed(&mut *recv).await?;
     let resp = proto::RelayFetchResponse::decode(&resp_bytes[..])?;
 
     let status = proto::RelayResult::try_from(resp.status).unwrap_or(proto::RelayResult::Error);

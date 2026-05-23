@@ -1,8 +1,68 @@
 //! Transport abstraction for reliable + unreliable messaging.
 
+use anyhow::Result;
 use async_trait::async_trait;
+use prost::Message;
+use rumble_protocol::proto;
 
 use crate::cert::CapturedCert;
+
+/// Maximum length-prefixed plugin frame the client will accept on a plugin
+/// stream. Mirrors the server-side cap so neither side can be coerced into
+/// allocating an unbounded buffer.
+pub const MAX_PLUGIN_FRAME_BYTES: usize = 64 * 1024;
+
+/// Outcome of reading a [`proto::PluginStreamAck`] from a plugin stream.
+#[derive(Debug)]
+pub enum PluginAck {
+    /// Server accepted the request; proceed with the body.
+    Ok,
+    /// Server rejected the request. `code` and `error` are plugin-defined.
+    Rejected { code: u32, error: String },
+}
+
+/// Write a length-prefixed (`u32 BE`) byte frame to a plugin stream.
+pub async fn write_length_prefixed(send: &mut (impl BiSendStream + ?Sized), data: &[u8]) -> Result<()> {
+    let len_bytes = (data.len() as u32).to_be_bytes();
+    send.write_all(&len_bytes).await?;
+    send.write_all(data).await?;
+    Ok(())
+}
+
+/// Read a length-prefixed (`u32 BE`) byte frame from a plugin stream.
+///
+/// Errors if the framed length exceeds [`MAX_PLUGIN_FRAME_BYTES`].
+pub async fn read_length_prefixed(recv: &mut (impl BiRecvStream + ?Sized)) -> Result<Vec<u8>> {
+    let mut len_buf = [0u8; 4];
+    read_exact(recv, &mut len_buf).await?;
+    let msg_len = u32::from_be_bytes(len_buf) as usize;
+    if msg_len > MAX_PLUGIN_FRAME_BYTES {
+        anyhow::bail!("plugin frame too large ({msg_len} bytes, max {MAX_PLUGIN_FRAME_BYTES})");
+    }
+    let mut buf = vec![0u8; msg_len];
+    read_exact(recv, &mut buf).await?;
+    Ok(buf)
+}
+
+/// Read a [`proto::PluginStreamAck`] from a plugin stream and translate it
+/// into a [`PluginAck`].
+///
+/// Use this on the client after sending request metadata that the server is
+/// expected to validate before accepting a body. If `Ok` is returned, the
+/// client may proceed to stream the body; on `Rejected` the body must not be
+/// sent (the server has already stopped the recv side).
+pub async fn read_plugin_ack(recv: &mut (impl BiRecvStream + ?Sized)) -> Result<PluginAck> {
+    let bytes = read_length_prefixed(recv).await?;
+    let ack = proto::PluginStreamAck::decode(&bytes[..])?;
+    let status = proto::PluginAckStatus::try_from(ack.status).unwrap_or(proto::PluginAckStatus::Unspecified);
+    match status {
+        proto::PluginAckStatus::Ok => Ok(PluginAck::Ok),
+        _ => Ok(PluginAck::Rejected {
+            code: ack.code,
+            error: ack.error,
+        }),
+    }
+}
 
 /// Send half of a server-initiated bi-directional stream.
 #[async_trait]

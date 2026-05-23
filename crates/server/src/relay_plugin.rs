@@ -3,20 +3,25 @@
 //! Clients upload files to the server, which caches them per-room.
 //! Other clients in the room can then fetch cached files by transfer ID.
 //!
-//! ## Upload flow
+//! ## Upload flow (phased handshake)
 //!
-//! 1. Client opens a `"file-relay"` stream to the server.
-//! 2. Sends type discriminator `0x01`, then length-prefixed [`RelayUpload`],
-//!    then raw file bytes.
-//! 3. Server stores in room-scoped cache.
-//! 4. Server responds with length-prefixed [`RelayUploadResponse`].
+//! 1. Client opens a `"file-relay"` stream, writes type discriminator `0x01`,
+//!    then a length-prefixed [`proto::RelayUpload`] with the file metadata.
+//! 2. Server validates size limits, quota, and room membership, then sends a
+//!    length-prefixed [`proto::PluginStreamAck`]. On rejection the server
+//!    also calls `recv.stop` so the client does not stream the body.
+//! 3. On `Ok` ack, the client streams the raw file bytes and finishes the
+//!    send side.
+//! 4. Server stores in the room-scoped cache and writes a length-prefixed
+//!    [`proto::RelayUploadResponse`] as the final completion result.
 //!
 //! ## Fetch flow
 //!
 //! 1. Client opens a `"file-relay"` stream to the server.
-//! 2. Sends type discriminator `0x02`, then length-prefixed [`RelayFetch`].
-//! 3. Server responds with length-prefixed [`RelayFetchResponse`], then raw
-//!    file bytes (if found).
+//! 2. Sends type discriminator `0x02`, then length-prefixed
+//!    [`proto::RelayFetch`].
+//! 3. Server responds with length-prefixed [`proto::RelayFetchResponse`],
+//!    then raw file bytes (if found).
 
 use std::{
     sync::{
@@ -34,9 +39,17 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::{
-    plugin::{ServerCtx, ServerPlugin, StreamHeader},
+    plugin::{
+        ServerCtx, ServerPlugin, StreamHeader, read_length_prefixed, reject_plugin_stream, send_plugin_ack_ok,
+        write_length_prefixed,
+    },
     state::ClientHandle,
 };
+
+/// Plugin-specific ack rejection codes for the file relay.
+const REJECT_CODE_TOO_LARGE: u32 = 1;
+const REJECT_CODE_CACHE_FULL: u32 = 2;
+const REJECT_CODE_ROOM_MISMATCH: u32 = 3;
 
 /// A cached file entry.
 struct CachedFile {
@@ -77,11 +90,11 @@ fn default_evict_on_room_clear() -> bool {
 }
 
 fn default_max_total_size() -> bytesize::ByteSize {
-    bytesize::ByteSize::mb(500)
+    bytesize::ByteSize::mib(1024)
 }
 
 fn default_max_file_size() -> bytesize::ByteSize {
-    bytesize::ByteSize::mb(100)
+    bytesize::ByteSize::mib(256)
 }
 
 impl Default for RelayCacheConfig {
@@ -134,16 +147,8 @@ impl FileTransferRelayPlugin {
         sender: &Arc<ClientHandle>,
         ctx: &ServerCtx,
     ) -> Result<()> {
-        // Read length-prefixed RelayUpload proto.
-        let mut len_buf = [0u8; 4];
-        recv.read_exact(&mut len_buf).await?;
-        let msg_len = u32::from_be_bytes(len_buf) as usize;
-        if msg_len > 64 * 1024 {
-            anyhow::bail!("RelayUpload message too large ({msg_len} bytes)");
-        }
-
-        let mut msg_buf = vec![0u8; msg_len];
-        recv.read_exact(&mut msg_buf).await?;
+        // Read length-prefixed RelayUpload proto (request metadata).
+        let msg_buf = read_length_prefixed(&mut recv).await?;
         let upload = proto::RelayUpload::decode(&msg_buf[..])?;
 
         let user_id = sender.user_id;
@@ -158,44 +163,40 @@ impl FileTransferRelayPlugin {
             "file relay upload request"
         );
 
-        // Validate file size limit.
+        // --- Phase 1: admission control. Reject before the client streams a body. ---
+
         if upload.file_size > self.config.max_file_size.as_u64() {
-            let resp = proto::RelayUploadResponse {
-                status: proto::RelayResult::TooLarge.into(),
-                error: format!(
-                    "file too large: {} bytes (max {})",
-                    upload.file_size, self.config.max_file_size
-                ),
-            };
-            Self::write_response(&mut send, &resp.encode_to_vec()).await?;
+            let reason = format!(
+                "file too large: {} bytes (max {})",
+                upload.file_size, self.config.max_file_size
+            );
+            info!(transfer_id = %transfer_id, "{reason}");
+            reject_plugin_stream(&mut send, &mut recv, REJECT_CODE_TOO_LARGE, reason).await?;
             return Ok(());
         }
 
-        // Check total cache quota (approximate — race-free enough for our purposes).
         let current_total = self.total_cached.load(Ordering::Relaxed);
         if current_total + upload.file_size > self.config.max_total_size.as_u64() {
-            let resp = proto::RelayUploadResponse {
-                status: proto::RelayResult::TooLarge.into(),
-                error: "server cache full".to_owned(),
-            };
-            Self::write_response(&mut send, &resp.encode_to_vec()).await?;
+            info!(transfer_id = %transfer_id, "rejecting upload: cache full");
+            reject_plugin_stream(&mut send, &mut recv, REJECT_CODE_CACHE_FULL, "server cache full").await?;
             return Ok(());
         }
 
-        // Validate that the user is in the claimed room.
         if let Some(actual_room) = ctx.get_user_room(user_id) {
             let actual_room_str = actual_room.to_string();
             if actual_room_str != upload.room_id {
-                let resp = proto::RelayUploadResponse {
-                    status: proto::RelayResult::Error.into(),
-                    error: format!("room mismatch: you are in {actual_room_str}, not {}", upload.room_id),
-                };
-                Self::write_response(&mut send, &resp.encode_to_vec()).await?;
+                let reason = format!("room mismatch: you are in {actual_room_str}, not {}", upload.room_id);
+                info!(transfer_id = %transfer_id, "{reason}");
+                reject_plugin_stream(&mut send, &mut recv, REJECT_CODE_ROOM_MISMATCH, reason).await?;
                 return Ok(());
             }
         }
 
-        // Read raw file data from the stream.
+        // Admit. The client waits for this ack before sending body bytes.
+        send_plugin_ack_ok(&mut send).await?;
+
+        // --- Phase 2: read the body. ---
+
         let file_size = upload.file_size as usize;
         let mut data = Vec::with_capacity(file_size.min(32 * 1024 * 1024)); // pre-alloc capped at 32MB
         let mut remaining = file_size;
@@ -210,12 +211,11 @@ impl FileTransferRelayPlugin {
                 }
                 Ok(Some(_)) => continue, // zero-length read, retry
                 Ok(None) => {
-                    // Stream closed early.
                     let resp = proto::RelayUploadResponse {
                         status: proto::RelayResult::Error.into(),
                         error: format!("stream closed after {} of {} bytes", data.len(), file_size),
                     };
-                    Self::write_response(&mut send, &resp.encode_to_vec()).await?;
+                    write_length_prefixed(&mut send, &resp.encode_to_vec()).await?;
                     return Ok(());
                 }
                 Err(e) => {
@@ -227,7 +227,6 @@ impl FileTransferRelayPlugin {
 
         // Store in cache.
         let actual_size = data.len() as u64;
-        // If overwriting an existing entry, subtract its size first
         if let Some(old) = self.cache.get(&transfer_id) {
             self.total_cached.fetch_sub(old.file_size, Ordering::Relaxed);
         }
@@ -250,28 +249,19 @@ impl FileTransferRelayPlugin {
             "file cached"
         );
 
-        // Send success response.
+        // --- Phase 3: completion response. ---
         let resp = proto::RelayUploadResponse {
             status: proto::RelayResult::Ok.into(),
             error: String::new(),
         };
-        Self::write_response(&mut send, &resp.encode_to_vec()).await?;
+        write_length_prefixed(&mut send, &resp.encode_to_vec()).await?;
 
         Ok(())
     }
 
     /// Handle a fetch stream.
     async fn handle_fetch(&self, mut send: quinn::SendStream, mut recv: quinn::RecvStream) -> Result<()> {
-        // Read length-prefixed RelayFetch proto.
-        let mut len_buf = [0u8; 4];
-        recv.read_exact(&mut len_buf).await?;
-        let msg_len = u32::from_be_bytes(len_buf) as usize;
-        if msg_len > 64 * 1024 {
-            anyhow::bail!("RelayFetch message too large ({msg_len} bytes)");
-        }
-
-        let mut msg_buf = vec![0u8; msg_len];
-        recv.read_exact(&mut msg_buf).await?;
+        let msg_buf = read_length_prefixed(&mut recv).await?;
         let fetch = proto::RelayFetch::decode(&msg_buf[..])?;
 
         let transfer_id = fetch.transfer_id.clone();
@@ -289,8 +279,7 @@ impl FileTransferRelayPlugin {
                     mime: cached.mime.clone(),
                     error: String::new(),
                 };
-                let resp_bytes = resp.encode_to_vec();
-                Self::write_response(&mut send, &resp_bytes).await?;
+                write_length_prefixed(&mut send, &resp.encode_to_vec()).await?;
 
                 // Write raw file bytes.
                 send.write_all(&cached.data).await?;
@@ -310,21 +299,13 @@ impl FileTransferRelayPlugin {
                     mime: String::new(),
                     error: "transfer not found or expired".to_owned(),
                 };
-                Self::write_response(&mut send, &resp.encode_to_vec()).await?;
+                write_length_prefixed(&mut send, &resp.encode_to_vec()).await?;
                 send.finish()?;
 
                 debug!(transfer_id = %transfer_id, "fetch: not found");
             }
         }
 
-        Ok(())
-    }
-
-    /// Write a length-prefixed protobuf response on a send stream.
-    async fn write_response(send: &mut quinn::SendStream, data: &[u8]) -> Result<()> {
-        let len_bytes = (data.len() as u32).to_be_bytes();
-        send.write_all(&len_bytes).await?;
-        send.write_all(data).await?;
         Ok(())
     }
 

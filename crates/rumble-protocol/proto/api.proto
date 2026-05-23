@@ -704,3 +704,29 @@ enum RelayResult {
   RELAY_RESULT_TOO_LARGE = 3;
   RELAY_RESULT_ERROR = 4;
 }
+
+// Generic admission-control ack used as the first server→client frame on
+// plugin streams that need to validate request metadata before accepting a
+// large body. Plugins encode their own reason in `code`/`error`.
+//
+// Wire pattern (client-initiated stream with body):
+//   client → server : [StreamHeader][plugin-specific request metadata]
+//   server → client : [length-prefixed PluginStreamAck]
+//   if status == OK:
+//     client → server : [body...]
+//     server → client : [length-prefixed plugin-specific completion response]
+//   else:
+//     server stops the recv side and closes; client surfaces the ack reason.
+message PluginStreamAck {
+  PluginAckStatus status = 1;
+  // Plugin-specific error code. Meaningful only when status != OK.
+  uint32 code = 2;
+  // Human-readable detail. Set on rejection.
+  string error = 3;
+}
+
+enum PluginAckStatus {
+  PLUGIN_ACK_STATUS_UNSPECIFIED = 0;
+  PLUGIN_ACK_STATUS_OK = 1;
+  PLUGIN_ACK_STATUS_REJECTED = 2;
+}
