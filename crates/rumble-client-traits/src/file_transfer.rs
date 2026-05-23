@@ -6,6 +6,30 @@ use async_trait::async_trait;
 
 use crate::transport::{BiRecvStream, BiSendStream};
 
+/// Client-side maximum upload size, mirroring the server's default
+/// `RelayCacheConfig::max_file_size`. Used for fast-failing oversized
+/// shares before any bytes hit the wire. Servers configured higher
+/// than this still work; lower-configured servers will reject the
+/// upload downstream with their own error.
+pub const MAX_UPLOAD_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Severity level for plugin-emitted toast events. Mirrors
+/// `rumble_client::NotificationLevel` so the traits crate doesn't need a
+/// reverse dependency on `rumble-client`. Consumers map this onto their
+/// own toast severity type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PluginNotificationLevel {
+    Info,
+    Warn,
+    Error,
+}
+
+/// Sink for plugin-emitted toast notifications. Construction-time
+/// callback passed in via the Platform factory — the plugin invokes it
+/// when something noteworthy happens (rejected upload, duplicate share,
+/// room-change cancellation, etc.) so the UI can surface it.
+pub type PluginEventSink = std::sync::Arc<dyn Fn(PluginNotificationLevel, String) + Send + Sync>;
+
 /// Unique identifier for a file transfer (typically a UUID string).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TransferId(pub String);

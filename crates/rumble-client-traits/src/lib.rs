@@ -22,8 +22,9 @@ pub use cert::{
 };
 pub use codec::{VoiceCodec, VoiceDecoder, VoiceEncoder};
 pub use file_transfer::{
-    FileOffer, FileTransferPlugin, PluginPeerConnectionType, PluginPeerInfo, PluginPeerState, PluginTransferState,
-    TransferDirection, TransferId, TransferStatus,
+    FileOffer, FileTransferPlugin, MAX_UPLOAD_BYTES, PluginEventSink, PluginNotificationLevel,
+    PluginPeerConnectionType, PluginPeerInfo, PluginPeerState, PluginTransferState, TransferDirection, TransferId,
+    TransferStatus,
 };
 pub use keys::KeySigning;
 pub use platform::Platform;

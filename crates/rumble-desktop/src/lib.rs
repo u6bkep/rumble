@@ -57,7 +57,12 @@ impl Platform for NativePlatform {
     fn create_file_transfer_plugin(
         opener: Arc<dyn rumble_client_traits::StreamOpener>,
         downloads_dir: PathBuf,
+        event_sink: Option<rumble_client_traits::PluginEventSink>,
     ) -> Option<Arc<dyn rumble_client_traits::FileTransferPlugin>> {
-        Some(Arc::new(crate::FileTransferRelayPlugin::new(opener, downloads_dir)))
+        Some(Arc::new(crate::FileTransferRelayPlugin::new(
+            opener,
+            downloads_dir,
+            event_sink,
+        )))
     }
 }
