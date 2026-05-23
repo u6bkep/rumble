@@ -35,6 +35,7 @@ impl rumble_client_traits::Platform for TestPlatform {
     fn create_file_transfer_plugin(
         _opener: Arc<dyn rumble_client_traits::StreamOpener>,
         _downloads_dir: PathBuf,
+        _event_sink: Option<rumble_client_traits::PluginEventSink>,
     ) -> Option<Arc<dyn rumble_client_traits::FileTransferPlugin>> {
         None
     }
