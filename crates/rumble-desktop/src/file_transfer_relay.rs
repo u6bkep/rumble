@@ -21,7 +21,10 @@ use anyhow::Result;
 use async_trait::async_trait;
 use prost::Message;
 use rumble_client_traits::{
-    file_transfer::{FileOffer, FileTransferPlugin, TransferDirection, TransferId, TransferStatus},
+    file_transfer::{
+        FileOffer, FileTransferPlugin, PluginEventSink, PluginNotificationLevel, TransferDirection, TransferId,
+        TransferStatus,
+    },
     transport::{
         BiRecvStream, BiSendStream, PluginAck, StreamOpener, read_length_prefixed, read_plugin_ack,
         write_length_prefixed,
@@ -46,8 +49,17 @@ struct TransferEntry {
     id: TransferId,
     name: String,
     size: u64,
+    mime: String,
     /// Local path (for completed downloads or outgoing uploads).
     path: Option<PathBuf>,
+    /// Opaque share_data string (uploads only). Cached so a duplicate
+    /// in-flight share can return the existing offer instead of
+    /// re-uploading.
+    share_data: Option<String>,
+    /// Room ID the upload was tagged with at start. Used to detect
+    /// in-flight uploads that need to be cancelled when the user
+    /// switches rooms.
+    room_id: Option<String>,
     progress: f32,
     is_complete: bool,
     is_upload: bool,
@@ -163,6 +175,10 @@ pub struct FileTransferRelayPlugin {
     transfers: TransferMap,
     /// Room ID (hex UUID string) for the current room. Updated externally.
     room_id: parking_lot::Mutex<String>,
+    /// Optional sink for surfacing user-visible toasts (rejection,
+    /// duplicate share, room-change cancel, etc.). Set to `None` for
+    /// tests or environments without a UI.
+    event_sink: Option<PluginEventSink>,
 }
 
 impl FileTransferRelayPlugin {
@@ -170,12 +186,20 @@ impl FileTransferRelayPlugin {
     ///
     /// - `opener`: Transport-agnostic stream opener for opening streams to the server.
     /// - `downloads_dir`: Directory where fetched files are saved.
-    pub fn new(opener: Arc<dyn StreamOpener>, downloads_dir: PathBuf) -> Self {
+    /// - `event_sink`: Optional callback for user-visible toast events.
+    pub fn new(opener: Arc<dyn StreamOpener>, downloads_dir: PathBuf, event_sink: Option<PluginEventSink>) -> Self {
         Self {
             opener,
             downloads_dir,
             transfers: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             room_id: parking_lot::Mutex::new(String::new()),
+            event_sink,
+        }
+    }
+
+    fn emit(&self, level: PluginNotificationLevel, msg: impl Into<String>) {
+        if let Some(sink) = &self.event_sink {
+            (sink)(level, msg.into());
         }
     }
 }
@@ -200,6 +224,7 @@ async fn run_upload(
     path: PathBuf,
     transfers: TransferMap,
     cancel: CancellationToken,
+    event_sink: Option<PluginEventSink>,
 ) {
     let result = tokio::select! {
         _ = cancel.cancelled() => Err(anyhow::anyhow!("cancelled")),
@@ -219,11 +244,19 @@ async fn run_upload(
         }
         Err(e) => {
             let msg = e.to_string();
+            // Cancellation is expected (user navigated away, room
+            // change, explicit cancel); don't toast for those — the
+            // failure card carries enough signal already.
+            let cancelled = cancel.is_cancelled() || msg == "cancelled";
             let mut t = transfers.lock();
             if let Some(entry) = t.get_mut(&transfer_id) {
                 entry.error = Some(msg.clone());
             }
+            drop(t);
             warn!(transfer_id, error = %msg, "relay upload failed");
+            if !cancelled && let Some(sink) = &event_sink {
+                (sink)(PluginNotificationLevel::Error, format!("Upload failed: {msg}"));
+            }
         }
     }
 }
@@ -315,6 +348,7 @@ async fn run_fetch(
     downloads_dir: PathBuf,
     transfers: TransferMap,
     cancel: CancellationToken,
+    event_sink: Option<PluginEventSink>,
 ) {
     let result = tokio::select! {
         _ = cancel.cancelled() => Err(anyhow::anyhow!("cancelled")),
@@ -333,11 +367,16 @@ async fn run_fetch(
         }
         Err(e) => {
             let msg = e.to_string();
+            let cancelled = cancel.is_cancelled() || msg == "cancelled";
             let mut t = transfers.lock();
             if let Some(entry) = t.get_mut(&transfer_id) {
                 entry.error = Some(msg.clone());
             }
+            drop(t);
             warn!(transfer_id, error = %msg, "relay fetch failed");
+            if !cancelled && let Some(sink) = &event_sink {
+                (sink)(PluginNotificationLevel::Error, format!("Download failed: {msg}"));
+            }
         }
     }
 }
@@ -431,16 +470,94 @@ async fn do_fetch(
 #[async_trait]
 impl FileTransferPlugin for FileTransferRelayPlugin {
     fn set_room_id(&self, room_id: String) {
-        *self.room_id.lock() = room_id;
+        let new_room = room_id.clone();
+        let old_room = {
+            let mut guard = self.room_id.lock();
+            let old = guard.clone();
+            *guard = room_id;
+            old
+        };
+        if old_room == new_room {
+            return;
+        }
+
+        // Cancel any in-flight uploads still tagged with the previous
+        // room — receivers in the old room won't see the offer broadcast
+        // anyway, and the bytes shouldn't keep flowing.
+        let cancelled = {
+            let mut t = self.transfers.lock();
+            let mut n = 0;
+            for entry in t.values_mut() {
+                if entry.is_upload
+                    && !entry.is_complete
+                    && entry.error.is_none()
+                    && entry.room_id.as_deref() == Some(old_room.as_str())
+                {
+                    entry.cancel.cancel();
+                    entry.error = Some("room changed".to_owned());
+                    n += 1;
+                }
+            }
+            n
+        };
+
+        if cancelled > 0 {
+            let noun = if cancelled == 1 { "upload" } else { "uploads" };
+            self.emit(
+                PluginNotificationLevel::Warn,
+                format!("{cancelled} {noun} cancelled due to room change"),
+            );
+        }
     }
 
     fn share(&self, path: PathBuf) -> Result<FileOffer> {
         let metadata = std::fs::metadata(&path)?;
+        let file_size = metadata.len();
+
+        if file_size > rumble_client_traits::MAX_UPLOAD_BYTES {
+            self.emit(
+                PluginNotificationLevel::Error,
+                format!(
+                    "File too large ({}); limit is {}",
+                    format_bytes_simple(file_size),
+                    format_bytes_simple(rumble_client_traits::MAX_UPLOAD_BYTES),
+                ),
+            );
+            anyhow::bail!(
+                "file exceeds max upload size of {} bytes",
+                rumble_client_traits::MAX_UPLOAD_BYTES
+            );
+        }
+
+        // Duplicate-in-flight detection: if the same path is already
+        // uploading and not yet complete, return the existing FileOffer
+        // instead of re-uploading. This dedups e.g. double-click on the
+        // share button or a paste while the previous paste is still in
+        // flight.
+        {
+            let t = self.transfers.lock();
+            if let Some(existing) = t.values().find(|e| {
+                e.is_upload && !e.is_complete && e.error.is_none() && e.path.as_deref() == Some(path.as_path())
+            }) && let Some(share_data) = existing.share_data.clone()
+            {
+                self.emit(
+                    PluginNotificationLevel::Warn,
+                    format!("Already uploading \"{}\"", existing.name),
+                );
+                return Ok(FileOffer {
+                    id: existing.id.clone(),
+                    name: existing.name.clone(),
+                    size: existing.size,
+                    mime: existing.mime.clone(),
+                    share_data,
+                });
+            }
+        }
+
         let file_name = path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "unnamed".to_owned());
-        let file_size = metadata.len();
         let transfer_id = uuid::Uuid::new_v4().to_string();
         let mime = mime_guess::from_path(&file_name).first_or_octet_stream().to_string();
         let room_id = self.room_id.lock().clone();
@@ -451,13 +568,21 @@ impl FileTransferPlugin for FileTransferRelayPlugin {
             file_size,
             mime: mime.clone(),
         };
+        let share_data_json = serde_json::to_string(&share_data)?;
 
         let cancel = CancellationToken::new();
         let entry = TransferEntry {
             id: TransferId(transfer_id.clone()),
             name: file_name.clone(),
             size: file_size,
+            mime: mime.clone(),
             path: Some(path.clone()),
+            share_data: Some(share_data_json.clone()),
+            room_id: if room_id.is_empty() {
+                None
+            } else {
+                Some(room_id.clone())
+            },
             progress: 0.0,
             is_complete: false,
             is_upload: true,
@@ -474,6 +599,7 @@ impl FileTransferPlugin for FileTransferRelayPlugin {
         let opener = self.opener.clone();
         let transfers = self.transfers.clone();
         let tid = transfer_id.clone();
+        let sink = self.event_sink.clone();
         tokio::spawn(run_upload(
             opener,
             tid,
@@ -484,6 +610,7 @@ impl FileTransferPlugin for FileTransferRelayPlugin {
             path,
             transfers,
             cancel,
+            sink,
         ));
 
         Ok(FileOffer {
@@ -491,7 +618,7 @@ impl FileTransferPlugin for FileTransferRelayPlugin {
             name: file_name,
             size: file_size,
             mime,
-            share_data: serde_json::to_string(&share_data)?,
+            share_data: share_data_json,
         })
     }
 
@@ -506,7 +633,10 @@ impl FileTransferPlugin for FileTransferRelayPlugin {
             id: TransferId(transfer_id.clone()),
             name: relay_data.file_name,
             size: relay_data.file_size,
+            mime: relay_data.mime,
             path: None,
+            share_data: None,
+            room_id: None,
             progress: 0.0,
             is_complete: false,
             is_upload: false,
@@ -524,7 +654,8 @@ impl FileTransferPlugin for FileTransferRelayPlugin {
         let downloads_dir = self.downloads_dir.clone();
         let transfers = self.transfers.clone();
         let tid = transfer_id.clone();
-        tokio::spawn(run_fetch(opener, tid, downloads_dir, transfers, cancel));
+        let sink = self.event_sink.clone();
+        tokio::spawn(run_fetch(opener, tid, downloads_dir, transfers, cancel, sink));
 
         Ok(TransferId(transfer_id))
     }
@@ -560,6 +691,24 @@ impl FileTransferPlugin for FileTransferRelayPlugin {
         // In the cache model, the client always initiates streams.
         // Server-initiated streams are not expected.
         warn!("unexpected incoming file-relay stream from server (cache model)");
+    }
+}
+
+/// Compact human-readable byte size for toast strings. Plain enough to
+/// avoid a `bytesize` dep here; mirrors the formatting used elsewhere in
+/// the UI ("1.4 MiB").
+fn format_bytes_simple(bytes: u64) -> String {
+    const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB"];
+    let mut size = bytes as f64;
+    let mut unit = 0;
+    while size >= 1024.0 && unit < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{size:.1} {}", UNITS[unit])
     }
 }
 
