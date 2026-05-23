@@ -854,7 +854,19 @@ fn composer(state: &State, chat_input: &str, selection: &Selection) -> El {
     let connected = state.connection.is_connected();
     let can_chat = Permissions::from_bits_truncate(state.effective_permissions).contains(Permissions::TEXT_MESSAGE);
 
-    let mut input = text_area::text_area(chat_input, selection, KEY_INPUT).width(Size::Fill(1.0));
+    let placeholder = if !connected {
+        Some("Connect to a server to chat")
+    } else if !can_chat {
+        Some("You don't have permission to chat in this room")
+    } else {
+        None
+    };
+
+    let opts = match placeholder {
+        Some(p) => text_area::TextAreaOpts::default().placeholder(p),
+        None => text_area::TextAreaOpts::default(),
+    };
+    let mut input = text_area::text_area_with(chat_input, selection, KEY_INPUT, opts).width(Size::Fill(1.0));
     if !connected || !can_chat {
         input = input.disabled();
     }
