@@ -113,6 +113,7 @@ fn renders_image_preview_for_completed_file_offer() {
             mime: "image/png".to_string(),
             share_data: "{}".to_string(),
         })),
+        phase: Default::default(),
     });
 
     let mut harness = TestHarness::with_state(state);
@@ -240,6 +241,7 @@ fn setup_harness_with_image_sized(w: u32, h: u32, name: &str) -> (TestHarness, P
             mime: "image/png".to_string(),
             share_data: "{}".to_string(),
         })),
+        phase: Default::default(),
     });
 
     let harness = TestHarness::with_state(state);
@@ -410,6 +412,7 @@ fn click_image_preview_in_overflowing_chat() {
             is_local: false,
             kind: ChatMessageKind::Room,
             attachment: None,
+            phase: Default::default(),
         });
     }
     // Image FileOffer at the end — that's where stick-to-bottom keeps
@@ -429,6 +432,7 @@ fn click_image_preview_in_overflowing_chat() {
             mime: "image/png".to_string(),
             share_data: "{}".to_string(),
         })),
+        phase: Default::default(),
     });
 
     let mut harness = TestHarness::with_state(state);
@@ -529,6 +533,7 @@ fn click_image_preview_with_failed_load() {
             mime: "image/png".to_string(),
             share_data: "{}".to_string(),
         })),
+        phase: Default::default(),
     });
 
     let mut harness = TestHarness::with_state(state);

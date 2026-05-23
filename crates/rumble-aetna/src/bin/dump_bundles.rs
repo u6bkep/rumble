@@ -502,6 +502,7 @@ fn make_chat_full(
         is_local,
         kind,
         attachment,
+        phase: Default::default(),
     }
 }
 

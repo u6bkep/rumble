@@ -699,6 +699,19 @@ pub fn chat_attachment_to_proto(att: &ChatAttachment) -> crate::proto::ChatAttac
     }
 }
 
+/// Upload lifecycle phase for a locally-stored chat message carrying a FileOffer.
+/// This is purely client-side state — never sent over the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LifecyclePhase {
+    /// Message is live (upload complete, or no upload involved).
+    #[default]
+    Live,
+    /// File upload is in progress; the offer is not yet visible to recipients.
+    PendingUpload,
+    /// Upload failed; the offer should be shown as errored.
+    FailedUpload,
+}
+
 /// A chat message.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ChatMessage {
@@ -719,6 +732,9 @@ pub struct ChatMessage {
     /// understand the attachment kind fall back to displaying `text`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attachment: Option<ChatAttachment>,
+    /// Client-only upload lifecycle phase. Always `Live` for received messages.
+    #[serde(skip)]
+    pub phase: LifecyclePhase,
 }
 
 // =============================================================================
@@ -863,6 +879,7 @@ impl ChatHistoryContent {
                     is_local: false,
                     kind: ChatMessageKind::default(),
                     attachment: e.attachment.clone(),
+                    phase: LifecyclePhase::default(),
                 })
             })
             .collect()
@@ -1130,6 +1147,20 @@ impl State {
         self.users
             .iter()
             .find(|u| u.user_id.as_ref().map(|id| id.value) == Some(user_id))
+    }
+
+    /// Update the lifecycle phase of the chat message whose FileOffer attachment
+    /// has the given `transfer_id`. Returns `true` if a matching message was found.
+    pub fn set_message_phase(&mut self, transfer_id: &str, phase: LifecyclePhase) -> bool {
+        for msg in &mut self.chat_messages {
+            if let Some(ChatAttachment::FileOffer(fo)) = &msg.attachment {
+                if fo.transfer_id == transfer_id {
+                    msg.phase = phase;
+                    return true;
+                }
+            }
+        }
+        false
     }
 }
 

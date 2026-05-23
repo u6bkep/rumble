@@ -1065,6 +1065,7 @@ async fn run_connection_task<P: Platform>(
                                     other_username: target_username,
                                 },
                                 attachment: None,
+                                phase: Default::default(),
                             });
                             if s.chat_messages.len() > 100 {
                                 s.chat_messages.remove(0);
@@ -1084,6 +1085,7 @@ async fn run_connection_task<P: Platform>(
                             is_local: true,
                             kind: Default::default(),
                             attachment: None,
+                            phase: Default::default(),
                         });
                         // Keep only recent messages
                         if s.chat_messages.len() > 100 {
@@ -1285,6 +1287,7 @@ async fn run_connection_task<P: Platform>(
                                     is_local: true,
                                     kind: Default::default(),
                                     attachment: None,
+                                    phase: Default::default(),
                                 });
                                 repaint();
                             }
@@ -1739,6 +1742,7 @@ fn add_local_message(state: &Arc<RwLock<State>>, text: String, repaint: &Arc<dyn
         is_local: true,
         kind: Default::default(),
         attachment: None,
+        phase: Default::default(),
     });
     // Keep only recent messages
     if s.chat_messages.len() > 100 {
@@ -1903,6 +1907,7 @@ fn handle_server_message(
                             is_local: false,
                             kind,
                             attachment,
+                            phase: Default::default(),
                         });
                         // Keep only recent messages
                         if s.chat_messages.len() > 100 {
@@ -1932,6 +1937,7 @@ fn handle_server_message(
                                 other_username: dm.sender_name,
                             },
                             attachment: None,
+                            phase: Default::default(),
                         });
                         if s.chat_messages.len() > 100 {
                             s.chat_messages.remove(0);
@@ -1952,6 +1958,7 @@ fn handle_server_message(
                             is_local: true,
                             kind: Default::default(),
                             attachment: None,
+                            phase: Default::default(),
                         });
                         if s.chat_messages.len() > 100 {
                             s.chat_messages.remove(0);
