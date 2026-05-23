@@ -12,7 +12,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use aetna_core::prelude::*;
+use aetna_core::{prelude::*, toast::ToastSpec};
 use aetna_winit_wgpu::WinitWgpuApp;
 
 use rumble_client::{
@@ -266,6 +266,11 @@ pub struct RumbleApp<B: UiBackend = crate::backend::NativeUiBackend> {
     /// result lands in either `video_thumbs` (Ok) or
     /// `failed_video_thumbs` (Err).
     pending_video_thumbs: HashMap<String, JoinHandle<Result<Image, rumble_video::Error>>>,
+
+    /// Queued toasts collected from backend events each frame.
+    /// Drained by [`App::drain_toasts`] so aetna's runtime synthesizes
+    /// the toast stack overlay automatically.
+    pending_toasts: Vec<ToastSpec>,
 }
 
 impl<B: UiBackend> RumbleApp<B> {
@@ -373,6 +378,7 @@ impl<B: UiBackend> RumbleApp<B> {
             video_thumbs: HashMap::new(),
             failed_video_thumbs: HashSet::new(),
             pending_video_thumbs: HashMap::new(),
+            pending_toasts: Vec::new(),
         }
     }
 }
@@ -539,9 +545,14 @@ impl<B: UiBackend> App for RumbleApp<B> {
         self.pump_video_thumbs();
         self.poll_video_open();
         self.pump_hotkeys();
+        self.drain_backend_events();
         if let Some(active) = self.active_video.as_mut() {
             active.refresh_scrub_value();
         }
+    }
+
+    fn drain_toasts(&mut self) -> Vec<ToastSpec> {
+        std::mem::take(&mut self.pending_toasts)
     }
 
     fn build(&self, cx: &BuildCx) -> El {
@@ -2267,6 +2278,27 @@ impl<B: UiBackend> RumbleApp<B> {
                     // Nonsensical combinations (e.g. PTT/Toggle) are
                     // filtered at the UI layer; ignore any that slip
                     // through. Non-Hold actions also ignore release.
+                }
+            }
+        }
+    }
+
+    /// Drain pending [`rumble_client::BackendEvent`]s and convert them
+    /// into [`ToastSpec`]s buffered in `pending_toasts`. The aetna
+    /// runtime picks these up via [`App::drain_toasts`] and synthesizes
+    /// the toast overlay layer automatically.
+    fn drain_backend_events(&mut self) {
+        use aetna_core::toast::ToastLevel;
+        use rumble_client::NotificationLevel;
+        for event in self.backend.drain_events() {
+            match event {
+                rumble_client::BackendEvent::Toast { level, text } => {
+                    let tl = match level {
+                        NotificationLevel::Info => ToastLevel::Info,
+                        NotificationLevel::Warn => ToastLevel::Warning,
+                        NotificationLevel::Error => ToastLevel::Error,
+                    };
+                    self.pending_toasts.push(ToastSpec::new(tl, text));
                 }
             }
         }
