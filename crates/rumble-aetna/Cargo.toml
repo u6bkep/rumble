@@ -16,6 +16,7 @@ path = "src/main.rs"
 [dependencies]
 # Aetna UI. Pin lives in the workspace [workspace.dependencies] block.
 aetna-core = { workspace = true }
+aetna-markdown = { workspace = true }
 aetna-winit-wgpu = { workspace = true }
 aetna-wgpu = { workspace = true }
 wgpu = { workspace = true }

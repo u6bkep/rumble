@@ -22,6 +22,7 @@ rand_core = "0.10.0-rc.3"
 # Override locally with `[patch."https://github.com/computer-whisperer/aetna"]`
 # (or `scripts/aetna-local.sh`) if iterating on aetna alongside rumble.
 aetna-core = { git = "https://github.com/computer-whisperer/aetna", rev = "f9f55660517435afd237889ded2db03514092237" }
+aetna-markdown = { git = "https://github.com/computer-whisperer/aetna", rev = "f9f55660517435afd237889ded2db03514092237" }
 aetna-wgpu = { git = "https://github.com/computer-whisperer/aetna", rev = "f9f55660517435afd237889ded2db03514092237" }
 aetna-winit-wgpu = { git = "https://github.com/computer-whisperer/aetna", rev = "f9f55660517435afd237889ded2db03514092237" }
 

@@ -4,6 +4,7 @@
 //! room) and projects `(state, ui_state) -> El` on every frame.
 
 use std::{
+    cell::Cell,
     collections::{HashMap, HashSet},
     io::BufReader,
     path::{Path, PathBuf},
@@ -101,13 +102,17 @@ pub struct RumbleApp<B: UiBackend = crate::backend::NativeUiBackend> {
 
     chat_input: String,
 
-    /// Chat sidebar width in logical pixels — adjusted by dragging
-    /// the divider on its right edge. Initialized from
-    /// [`tokens::SIDEBAR_WIDTH`] (the conventional ~256px starting
-    /// point) and clamped to [`tokens::SIDEBAR_WIDTH_MIN`] /
-    /// `_MAX` by the resize handler.
-    chat_sidebar_w: f32,
-    chat_sidebar_drag: ResizeDrag,
+    /// Proportional split weights `[chat, tree]` for the main row divider.
+    /// Dragging the handle redistributes between the two; each panel
+    /// keeps at least 15% of the row. Default `[1.0, 2.5]` gives the
+    /// chat pane roughly 28% on a fresh launch.
+    chat_weights: [f32; 2],
+    chat_sidebar_drag: ResizeWeightsDrag,
+    /// Row pixel width captured last frame via `BuildCx::viewport()`.
+    /// Used by `apply_event_weights` to convert pointer deltas to
+    /// weight deltas.  Stored in a `Cell` so `build(&self)` can
+    /// refresh it without requiring `&mut self`.
+    chat_row_w: Cell<f32>,
 
     /// Audio-processor factory registry. Owned by the App so the
     /// settings dialog can read each processor's display name,
@@ -337,8 +342,9 @@ impl<B: UiBackend> RumbleApp<B> {
             default_username: default_username(),
             selection: Selection::default(),
             chat_input: String::new(),
-            chat_sidebar_w: tokens::SIDEBAR_WIDTH,
-            chat_sidebar_drag: ResizeDrag::default(),
+            chat_weights: [1.0, 2.5],
+            chat_sidebar_drag: ResizeWeightsDrag::default(),
+            chat_row_w: Cell::new(0.0),
             processor_registry,
             room_tree: RoomTreeState::default(),
             prev_chat_count: 0,
@@ -538,7 +544,8 @@ impl<B: UiBackend> App for RumbleApp<B> {
         }
     }
 
-    fn build(&self, _cx: &BuildCx) -> El {
+    fn build(&self, cx: &BuildCx) -> El {
+        self.chat_row_w.set(cx.viewport().map(|(w, _)| w).unwrap_or(0.0));
         let state = self.backend.state();
         let shell = self.settings.settings();
 
@@ -562,10 +569,11 @@ impl<B: UiBackend> App for RumbleApp<B> {
                     &transfers,
                     &self.chat_input,
                     &self.selection,
-                    self.chat_sidebar_w,
-                ),
+                )
+                .width(Size::Fill(self.chat_weights[0])),
                 resize_handle(Axis::Row).key(CHAT_SIDEBAR_HANDLE),
-                center_area(&state, &shell.recent_servers, &self.room_tree),
+                center_area(&state, &shell.recent_servers, &self.room_tree)
+                    .width(Size::Fill(self.chat_weights[1])),
             ])
             .width(Size::Fill(1.0))
             .height(Size::Fill(1.0))
@@ -902,15 +910,14 @@ impl<B: UiBackend> App for RumbleApp<B> {
         // Chat sidebar resize. Routed events return early so the
         // handle's drag stream doesn't fall through to other matchers.
         if event.route() == Some(CHAT_SIDEBAR_HANDLE) {
-            resize_handle::apply_event_fixed(
-                &mut self.chat_sidebar_w,
+            resize_handle::apply_event_weights(
+                &mut self.chat_weights,
                 &mut self.chat_sidebar_drag,
                 &event,
                 CHAT_SIDEBAR_HANDLE,
                 Axis::Row,
-                resize_handle::Side::Start,
-                tokens::SIDEBAR_WIDTH_MIN,
-                tokens::SIDEBAR_WIDTH_MAX,
+                self.chat_row_w.get(),
+                0.15,
             );
             return;
         }

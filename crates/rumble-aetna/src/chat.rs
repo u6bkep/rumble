@@ -17,6 +17,7 @@ use std::{
 };
 
 use aetna_core::{prelude::*, surface::SurfaceAlpha};
+use aetna_markdown::md;
 use rumble_client_traits::file_transfer::{PluginTransferState, TransferStatus};
 use rumble_desktop_shell::ChatSettings;
 use rumble_protocol::{ChatAttachment, ChatMessage, ChatMessageKind, FileOfferInfo, State, permissions::Permissions};
@@ -305,7 +306,6 @@ pub fn render(
     transfers: &TransferMap,
     chat_input: &str,
     selection: &Selection,
-    width: f32,
 ) -> El {
     column([
         text("Chat")
@@ -324,7 +324,6 @@ pub fn render(
         divider(),
         composer(state, chat_input, selection),
     ])
-    .width(Size::Fixed(width))
     .height(Size::Fill(1.0))
     .fill(tokens::CARD)
 }
@@ -350,7 +349,8 @@ fn history(
             .padding(Sides::xy(tokens::SPACE_4, tokens::SPACE_2))
             .gap(tokens::SPACE_1)
             .width(Size::Fill(1.0))
-            .height(Size::Fill(1.0));
+            .height(Size::Fill(1.0))
+            .pin_end();
     }
 
     let lines: Vec<El> = state
@@ -374,6 +374,7 @@ fn history(
         .gap(tokens::SPACE_1)
         .width(Size::Fill(1.0))
         .height(Size::Fill(1.0))
+        .pin_end()
 }
 
 fn render_message(
@@ -385,44 +386,50 @@ fn render_message(
     video_thumbs: &VideoThumbMap,
     transfers: &TransferMap,
 ) -> El {
+    let msg_key = u128::from_le_bytes(msg.id);
     let prefix = if chat_settings.show_timestamps {
         format!("[{}] ", chat_settings.timestamp_format.format(msg.timestamp))
     } else {
         String::new()
     };
 
-    let body_text = if msg.is_local {
-        format!("{}{}", prefix, msg.text)
-    } else {
-        match &msg.kind {
-            ChatMessageKind::Room => format!("{}{}: {}", prefix, msg.sender, msg.text),
-            ChatMessageKind::DirectMessage { .. } => {
-                format!("{}[DM] {}: {}", prefix, msg.sender, msg.text)
-            }
-            ChatMessageKind::Tree => format!("{}[Tree] {}: {}", prefix, msg.sender, msg.text),
-        }
-    };
+    // Local system messages: plain selectable text, no markdown.
+    if msg.is_local {
+        return paragraph(format!("{prefix}{}", msg.text))
+            .font_size(tokens::TEXT_XS.size)
+            .text_color(palette::CHAT_SYS)
+            .italic()
+            .key(format!("chat:msg:{msg_key}:sys"))
+            .selectable();
+    }
 
-    let mut line = paragraph(body_text).font_size(tokens::TEXT_XS.size);
-    line = if msg.is_local {
-        line.text_color(palette::CHAT_SYS).italic()
-    } else {
-        match &msg.kind {
-            ChatMessageKind::Room => line,
-            ChatMessageKind::DirectMessage { .. } => line.text_color(palette::CHAT_DM),
-            ChatMessageKind::Tree => line.text_color(palette::CHAT_TREE),
+    // Sender header: "{prefix}SenderName:" in semibold, selectable.
+    let (header_text, header_color) = match &msg.kind {
+        ChatMessageKind::Room => (format!("{prefix}{}:", msg.sender), None),
+        ChatMessageKind::DirectMessage { .. } => {
+            (format!("{prefix}[DM] {}:", msg.sender), Some(palette::CHAT_DM))
         }
+        ChatMessageKind::Tree => (format!("{prefix}[Tree] {}:", msg.sender), Some(palette::CHAT_TREE)),
     };
+    let mut header = text(header_text)
+        .semibold()
+        .wrap_text()
+        .font_size(tokens::TEXT_XS.size)
+        .key(format!("chat:msg:{msg_key}:hdr"))
+        .selectable();
+    if let Some(color) = header_color {
+        header = header.text_color(color);
+    }
 
-    // Attachments render below the text line as their own cards. Local
-    // messages don't carry attachments, but check `attachment` first so
-    // a future variant slots in cleanly. Image previews take priority
-    // over video previews when both happen to materialise (the image
-    // cache only tracks image extensions today, so this is moot, but
-    // matters if the format detection ever overlaps).
-    match msg.attachment.as_ref() {
-        Some(ChatAttachment::FileOffer(offer)) => {
-            let attachment = if let Some(cached) = image_cache.get(&offer.transfer_id) {
+    // Markdown body — aetna-markdown marks all text nodes selectable.
+    let body = md(&msg.text).width(Size::Fill(1.0));
+
+    // Attachment card (image preview, video poster, or file card).
+    // Image previews take priority over video previews when both
+    // happen to materialise at the same time.
+    let attachment: Option<El> = match msg.attachment.as_ref() {
+        Some(ChatAttachment::FileOffer(offer)) => Some(
+            if let Some(cached) = image_cache.get(&offer.transfer_id) {
                 let playback = gif_playback.get(&offer.transfer_id);
                 let gpu = animated_textures.get(&offer.transfer_id);
                 image_preview(offer, cached, playback, gpu)
@@ -430,11 +437,16 @@ fn render_message(
                 video_preview(offer, thumb)
             } else {
                 file_offer_card(offer, transfers.get(&offer.transfer_id))
-            };
-            column([line, attachment]).gap(tokens::SPACE_1).width(Size::Fill(1.0))
-        }
-        None => line,
+            },
+        ),
+        None => None,
+    };
+
+    let mut parts: Vec<El> = vec![header, body];
+    if let Some(att) = attachment {
+        parts.push(att);
     }
+    column(parts).gap(tokens::SPACE_1).width(Size::Fill(1.0))
 }
 
 fn file_offer_card(offer: &FileOfferInfo, status: Option<&TransferStatus>) -> El {
@@ -614,7 +626,7 @@ fn image_preview(
     playback: Option<&GifPlayback>,
     gpu: Option<&AnimatedGpu>,
 ) -> El {
-    const PREVIEW_HEIGHT: f32 = 220.0;
+    const PREVIEW_HEIGHT: f32 = 400.0;
 
     let preview_layer: El = match (cached, gpu) {
         (CachedImage::Animated { frames, .. }, Some(gpu)) => {
@@ -668,7 +680,7 @@ fn image_preview(
 /// activating it routes through [`crate::video::open_video_key`]
 /// the same way the file-card "Play" button does.
 fn video_preview(offer: &FileOfferInfo, thumb: &Image) -> El {
-    const PREVIEW_HEIGHT: f32 = 220.0;
+    const PREVIEW_HEIGHT: f32 = 400.0;
 
     let poster = image(thumb.clone())
         .image_fit(ImageFit::Contain)
