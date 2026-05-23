@@ -538,6 +538,7 @@ impl<B: UiBackend> App for RumbleApp<B> {
         self.poll_file_dialog();
         self.poll_save_as();
         self.poll_pick_download_dir();
+        self.pump_auto_download();
         self.pump_sfx();
         self.pump_image_cache();
         self.poll_lightbox_decode();
@@ -2151,6 +2152,52 @@ impl<B: UiBackend> RumbleApp<B> {
             Err(e) if e.is_cancelled() => {}
             Err(e) => {
                 tracing::error!("lightbox decode task panicked: {e}");
+            }
+        }
+    }
+
+    /// Scan newly-arrived chat messages and auto-download any `FileOffer`
+    /// attachments that pass the user's auto-download rules. Called before
+    /// `pump_sfx` so `prev_chat_count` still points at the previous frame's
+    /// watermark.
+    fn pump_auto_download(&mut self) {
+        let prev = self.prev_chat_count;
+        let snapshot = self.backend.state();
+        let count = snapshot.chat_messages.len();
+        // Cold-connect gate: skip the historical backlog replayed on first connect.
+        if prev == 0 || count <= prev {
+            return;
+        }
+        let settings = self.settings.settings().file_transfer.clone();
+        let my_username = snapshot
+            .my_user_id
+            .and_then(|id| snapshot.get_user(id))
+            .map(|u| u.username.clone());
+
+        for msg in &snapshot.chat_messages[prev..] {
+            if msg.is_local {
+                continue;
+            }
+            let Some(rumble_protocol::ChatAttachment::FileOffer(offer)) = msg.attachment.as_ref() else {
+                continue;
+            };
+            if my_username.as_deref() == Some(msg.sender.as_str()) {
+                continue;
+            }
+            // Idempotency guard for mid-session history replays.
+            if !self.auto_handled_offers.insert(offer.transfer_id.clone()) {
+                continue;
+            }
+            if settings.should_auto_download(&offer.mime, offer.size) {
+                tracing::info!(
+                    "auto-download: accepting offer {} ({} bytes, mime={})",
+                    offer.name,
+                    offer.size,
+                    offer.mime
+                );
+                self.backend.send(Command::DownloadFile {
+                    share_data: offer.share_data.clone(),
+                });
             }
         }
     }
