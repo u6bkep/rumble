@@ -326,6 +326,7 @@ pub fn render(
     animated_textures: &AnimatedTextureMap,
     video_thumbs: &VideoThumbMap,
     transfers: &TransferMap,
+    pending_cancel_confirm: &HashMap<String, Instant>,
     chat_input: &str,
     selection: &Selection,
     own_username: &str,
@@ -343,6 +344,7 @@ pub fn render(
             animated_textures,
             video_thumbs,
             transfers,
+            pending_cancel_confirm,
             own_username,
         ),
         divider(),
@@ -360,6 +362,7 @@ fn history(
     animated_textures: &AnimatedTextureMap,
     video_thumbs: &VideoThumbMap,
     transfers: &TransferMap,
+    pending_cancel_confirm: &HashMap<String, Instant>,
     own_username: &str,
 ) -> El {
     if state.chat_messages.is_empty() {
@@ -390,6 +393,7 @@ fn history(
                 animated_textures,
                 video_thumbs,
                 transfers,
+                pending_cancel_confirm,
                 own_username,
             )
         })
@@ -411,6 +415,7 @@ fn render_message(
     animated_textures: &AnimatedTextureMap,
     video_thumbs: &VideoThumbMap,
     transfers: &TransferMap,
+    pending_cancel_confirm: &HashMap<String, Instant>,
     own_username: &str,
 ) -> El {
     let msg_key = u128::from_le_bytes(msg.id);
@@ -461,7 +466,13 @@ fn render_message(
         } else if let Some(thumb) = video_thumbs.get(&offer.transfer_id) {
             video_preview(offer, thumb)
         } else {
-            file_offer_card(offer, transfers.get(&offer.transfer_id), is_own, msg.phase)
+            file_offer_card(
+                offer,
+                transfers.get(&offer.transfer_id),
+                is_own,
+                msg.phase,
+                pending_cancel_confirm,
+            )
         }),
         None => None,
     };
@@ -500,6 +511,7 @@ fn file_offer_card(
     status: Option<&TransferStatus>,
     is_local_sender: bool,
     phase: LifecyclePhase,
+    pending_cancel_confirm: &HashMap<String, Instant>,
 ) -> El {
     let header = row([
         icon(IconName::FileText).text_color(tokens::MUTED_FOREGROUND),
@@ -521,7 +533,7 @@ fn file_offer_card(
         .muted()
         .font_size(tokens::TEXT_XS.size);
 
-    let body = file_card_body(offer, status, is_local_sender, phase);
+    let body = file_card_body(offer, status, is_local_sender, phase, pending_cancel_confirm);
 
     column([header, meta, body])
         .key(file_card_key(&offer.transfer_id))
@@ -542,11 +554,13 @@ fn file_card_body(
     status: Option<&TransferStatus>,
     is_local_sender: bool,
     phase: LifecyclePhase,
+    pending_cancel_confirm: &HashMap<String, Instant>,
 ) -> El {
     // In-flight transfer (upload or download): show progress regardless of sender/receiver.
     if let Some(s) = status {
         if !s.is_finished && s.error.is_none() && is_in_flight(s.state) {
-            return transfer_progress_block(s);
+            let confirm_pending = pending_cancel_confirm.contains_key(&s.id.0);
+            return transfer_progress_block(s, confirm_pending);
         }
     }
 
@@ -665,7 +679,9 @@ fn is_in_flight(state: PluginTransferState) -> bool {
 /// Progress bar + bytes-transferred + speed/ETA line for an in-flight
 /// transfer. Shows "Uploading" or "Downloading" prefix based on direction.
 /// Zero-byte files show a full progress bar rather than indeterminate.
-fn transfer_progress_block(status: &TransferStatus) -> El {
+/// `confirm_pending` is true when the first cancel click has been received
+/// and the button should show "Cancel?" to prompt confirmation.
+fn transfer_progress_block(status: &TransferStatus, confirm_pending: bool) -> El {
     // Zero-byte files: show a complete bar rather than indeterminate progress.
     let bar: El = if status.size == 0 {
         progress(1.0, tokens::PRIMARY)
@@ -678,50 +694,59 @@ fn transfer_progress_block(status: &TransferStatus) -> El {
         TransferDirection::Download => "Downloading",
     };
 
-    let speed = if status.state == PluginTransferState::Paused {
-        0
-    } else if status.download_speed > 0 {
-        status.download_speed
+    let info_text: El = if status.size == 0 {
+        text(format!("{direction_label} · 0 B (empty file)"))
+            .muted()
+            .font_size(tokens::TEXT_XS.size)
     } else {
-        status.upload_speed
+        let speed = if status.state == PluginTransferState::Paused {
+            0
+        } else if status.download_speed > 0 {
+            status.download_speed
+        } else {
+            status.upload_speed
+        };
+
+        let pct = (status.progress.clamp(0.0, 1.0) * 100.0).round() as i32;
+        let transferred = (status.size as f32 * status.progress.clamp(0.0, 1.0)) as u64;
+        let bytes_label = format!("{} / {}", format_size(transferred), format_size(status.size));
+        let speed_label = match status.state {
+            PluginTransferState::Paused => "Paused".to_string(),
+            _ if speed > 0 => format!("{}/s", format_size(speed)),
+            _ => "…".to_string(),
+        };
+        let eta_label = match status.state {
+            PluginTransferState::Paused => String::new(),
+            _ if speed > 0 && status.size > transferred => {
+                let remaining = status.size - transferred;
+                format!(" · {} left", format_eta(remaining, speed))
+            }
+            _ => String::new(),
+        };
+
+        text(format!(
+            "{direction_label} · {pct}% · {bytes_label} · {speed_label}{eta_label}"
+        ))
+        .muted()
+        .font_size(tokens::TEXT_XS.size)
     };
 
-    let pct = (status.progress.clamp(0.0, 1.0) * 100.0).round() as i32;
-    let transferred = (status.size as f32 * status.progress.clamp(0.0, 1.0)) as u64;
-    let bytes_label = if status.size == 0 {
-        "0 B".to_string()
-    } else if status.size > 0 {
-        format!("{} / {}", format_size(transferred), format_size(status.size))
-    } else {
-        format_size(transferred)
-    };
-    let speed_label = match status.state {
-        PluginTransferState::Paused => "Paused".to_string(),
-        _ if speed > 0 => format!("{}/s", format_size(speed)),
-        _ => "…".to_string(),
-    };
-    let eta_label = match status.state {
-        PluginTransferState::Paused => String::new(),
-        _ if speed > 0 && status.size > transferred => {
-            let remaining = status.size - transferred;
-            format!(" · {} left", format_eta(remaining, speed))
-        }
-        _ => String::new(),
-    };
-
-    let info_text = text(format!(
-        "{direction_label} · {pct}% · {bytes_label} · {speed_label}{eta_label}"
-    ))
-    .muted()
-    .font_size(tokens::TEXT_XS.size);
     // Cancel sits on the right of the info line so it stays at a
     // predictable place across upload + download cards. The relay
     // backend doesn't support pause/resume yet, so we don't render
     // those buttons — they'd just bail.
-    let cancel_btn = icon_button(IconName::X)
-        .key(cancel_key(&status.id.0))
-        .ghost()
-        .tooltip("Cancel");
+    // Two-click cancel: first click shows "Cancel?" in red; second fires the command.
+    let cancel_btn: El = if confirm_pending {
+        button("Cancel?")
+            .key(cancel_key(&status.id.0))
+            .destructive()
+            .font_size(tokens::TEXT_XS.size)
+    } else {
+        icon_button(IconName::X)
+            .key(cancel_key(&status.id.0))
+            .ghost()
+            .tooltip("Cancel")
+    };
     let info_line = row([info_text.width(Size::Fill(1.0)), cancel_btn])
         .gap(tokens::SPACE_1)
         .align(Align::Center)
