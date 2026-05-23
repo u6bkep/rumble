@@ -1678,6 +1678,20 @@ impl<B: UiBackend> RumbleApp<B> {
             });
             return;
         }
+        // Fast-fail oversized PNGs before dispatching ShareFile. The
+        // backend re-validates and is the source of truth; this just
+        // surfaces the error a beat sooner and avoids a spurious
+        // pending card flash.
+        match std::fs::metadata(&temp_path) {
+            Ok(md) if md.len() > rumble_client_traits::MAX_UPLOAD_BYTES => {
+                self.pending_toasts.push(aetna_core::toast::ToastSpec::new(
+                    aetna_core::toast::ToastLevel::Error,
+                    "Pasted image is too large to share".to_string(),
+                ));
+                return;
+            }
+            _ => {}
+        }
         // Keep the temp dir alive for the lifetime of the share —
         // ShareFile copies the bytes into the relay stream, but the
         // file must still exist when the relay task picks it up.
