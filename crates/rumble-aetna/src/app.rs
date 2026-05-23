@@ -560,12 +560,20 @@ impl<B: UiBackend> App for RumbleApp<B> {
         let state = self.backend.state();
         let shell = self.settings.settings();
 
-        let transfers: chat::TransferMap = self
-            .backend
-            .transfers()
-            .into_iter()
-            .map(|t| (t.id.0.clone(), t))
-            .collect();
+        let all_transfers = self.backend.transfers();
+
+        let transfers: chat::TransferMap = all_transfers.iter().map(|t| (t.id.0.clone(), t.clone())).collect();
+
+        let (in_flight_uploads, in_flight_downloads) = {
+            use rumble_client_traits::file_transfer::TransferDirection;
+            all_transfers
+                .iter()
+                .filter(|t| !t.is_finished && t.error.is_none())
+                .fold((0usize, 0usize), |(up, dn), t| match t.direction {
+                    TransferDirection::Upload => (up + 1, dn),
+                    TransferDirection::Download => (up, dn + 1),
+                })
+        };
 
         let own_username = state
             .my_user_id
@@ -574,7 +582,7 @@ impl<B: UiBackend> App for RumbleApp<B> {
             .unwrap_or("");
 
         let main = column([
-            top_toolbar(&state),
+            top_toolbar(&state, in_flight_uploads, in_flight_downloads),
             row([
                 chat::render(
                     &state,
@@ -3092,7 +3100,7 @@ static SVG_TB_DISCONNECT: LazyLock<SvgIcon> =
 
 const KEY_TB_VOICE_MODE: &str = "toolbar:voice-mode";
 
-fn top_toolbar(state: &State) -> El {
+fn top_toolbar(state: &State, in_flight_uploads: usize, in_flight_downloads: usize) -> El {
     let connected = matches!(state.connection, ConnectionState::Connected { .. });
 
     let status = match &state.connection {
@@ -3106,6 +3114,25 @@ fn top_toolbar(state: &State) -> El {
     };
 
     let mut children: Vec<El> = vec![text("Rumble").title(), status, spacer()];
+
+    let total_in_flight = in_flight_uploads + in_flight_downloads;
+    if total_in_flight > 0 {
+        let tooltip_text = match (in_flight_uploads, in_flight_downloads) {
+            (u, 0) => format!("{u} upload(s)"),
+            (0, d) => format!("{d} download(s)"),
+            (u, d) => format!("{u} upload(s), {d} download(s)"),
+        };
+        let transfer_badge = row([
+            icon(IconName::Upload).icon_size(tokens::ICON_SM),
+            text(total_in_flight.to_string()).font_size(tokens::TEXT_SM.size),
+        ])
+        .key("toolbar:transfers")
+        .gap(tokens::SPACE_1)
+        .align(Align::Center)
+        .padding(Sides::xy(tokens::SPACE_2, 0.0))
+        .tooltip(tooltip_text);
+        children.push(transfer_badge);
+    }
 
     if connected {
         let (mute_icon, mute_tip) = if state.audio.self_muted {
