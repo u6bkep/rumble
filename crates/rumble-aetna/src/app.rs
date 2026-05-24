@@ -606,6 +606,7 @@ impl<B: UiBackend> App for RumbleApp<B> {
                     &self.pending_cancel_confirm,
                     &self.chat_input,
                     &self.selection,
+                    state.my_user_id,
                     own_username,
                 )
                 .width(Size::Fill(self.chat_weights[0])),
@@ -2202,8 +2203,12 @@ impl<B: UiBackend> RumbleApp<B> {
             return;
         }
         let settings = self.settings.settings().file_transfer.clone();
-        let my_username = snapshot
-            .my_user_id
+        let my_user_id = snapshot.my_user_id;
+        // Username fallback for messages from older peers/servers that
+        // don't populate `sender_id`. Unreliable when two clients share
+        // a username (e.g. same-machine `$USER`), so `sender_id` is
+        // preferred whenever it's present.
+        let my_username = my_user_id
             .and_then(|id| snapshot.get_user(id))
             .map(|u| u.username.clone());
 
@@ -2214,7 +2219,11 @@ impl<B: UiBackend> RumbleApp<B> {
             let Some(rumble_protocol::ChatAttachment::FileOffer(offer)) = msg.attachment.as_ref() else {
                 continue;
             };
-            if my_username.as_deref() == Some(msg.sender.as_str()) {
+            let is_from_self = match (my_user_id, msg.sender_id) {
+                (Some(mine), Some(theirs)) => mine == theirs,
+                _ => my_username.as_deref() == Some(msg.sender.as_str()),
+            };
+            if is_from_self {
                 continue;
             }
             // Idempotency guard for mid-session history replays.

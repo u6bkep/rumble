@@ -497,6 +497,7 @@ fn make_chat_full(
     ChatMessage {
         id: bytes,
         sender: sender.into(),
+        sender_id: None,
         text: text.into(),
         timestamp: SystemTime::UNIX_EPOCH,
         is_local,

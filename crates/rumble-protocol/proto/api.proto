@@ -357,6 +357,10 @@ message ChatBroadcast {
   optional bool tree = 5;
   // Optional typed payload (e.g. file offer). Forwarded from ChatMessage unchanged.
   optional ChatAttachment attachment = 6;
+  // Server-assigned user_id of the authenticated sender (set by server,
+  // ignored if sent by client). 0 means "unset" — older servers omit this
+  // and clients should fall back to the legacy username comparison.
+  uint64 sender_id = 7;
 }
 
 // Empty keep-alive message with optional timestamp.

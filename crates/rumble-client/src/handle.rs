@@ -1201,9 +1201,11 @@ async fn run_connection_task<P: Platform>(
                             }
                             // Add local message so the sender sees their own DM
                             let mut s = write_state(&state);
+                            let my_uid = s.my_user_id;
                             s.chat_messages.push(crate::events::ChatMessage {
                                 id: message_id,
                                 sender: client_name.clone(),
+                                sender_id: my_uid,
                                 text,
                                 timestamp,
                                 is_local: false,
@@ -1227,6 +1229,7 @@ async fn run_connection_task<P: Platform>(
                         s.chat_messages.push(crate::events::ChatMessage {
                             id: uuid::Uuid::new_v4().into_bytes(),
                             sender: String::new(),
+                            sender_id: None,
                             text,
                             timestamp: std::time::SystemTime::now(),
                             is_local: true,
@@ -1387,6 +1390,7 @@ async fn run_connection_task<P: Platform>(
                                         s.chat_messages.push(crate::events::ChatMessage {
                                             id: uuid::Uuid::new_v4().into_bytes(),
                                             sender: client_name.clone(),
+                                            sender_id: None,
                                             text: summary.clone(),
                                             timestamp: std::time::SystemTime::now(),
                                             is_local: true,
@@ -1501,6 +1505,7 @@ async fn run_connection_task<P: Platform>(
                                 s.chat_messages.push(crate::events::ChatMessage {
                                     id: uuid::Uuid::new_v4().into_bytes(),
                                     sender: "System".to_string(),
+                                    sender_id: None,
                                     text: "Requesting chat history from peers...".to_string(),
                                     timestamp: SystemTime::now(),
                                     is_local: true,
@@ -2007,6 +2012,7 @@ fn add_local_message(state: &Arc<RwLock<State>>, text: String, repaint: &Arc<dyn
     s.chat_messages.push(crate::events::ChatMessage {
         id: uuid::Uuid::new_v4().into_bytes(),
         sender: String::new(),
+        sender_id: None,
         text,
         timestamp: std::time::SystemTime::now(),
         is_local: true,
@@ -2172,6 +2178,9 @@ fn handle_server_message(
                         s.chat_messages.push(crate::events::ChatMessage {
                             id,
                             sender: cb.sender,
+                            // Server populates sender_id from the authenticated
+                            // connection; 0 means a legacy server didn't set it.
+                            sender_id: if cb.sender_id != 0 { Some(cb.sender_id) } else { None },
                             text: cb.text,
                             timestamp,
                             is_local: false,
@@ -2199,6 +2208,7 @@ fn handle_server_message(
                         s.chat_messages.push(crate::events::ChatMessage {
                             id,
                             sender: dm.sender_name.clone(),
+                            sender_id: Some(dm.sender_id),
                             text: dm.text,
                             timestamp,
                             is_local: false,
@@ -2223,6 +2233,7 @@ fn handle_server_message(
                         s.chat_messages.push(crate::events::ChatMessage {
                             id: uuid::Uuid::new_v4().into_bytes(),
                             sender: "Server".to_string(),
+                            sender_id: None,
                             text: wm.text,
                             timestamp: std::time::SystemTime::now(),
                             is_local: true,

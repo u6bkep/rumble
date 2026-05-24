@@ -329,6 +329,7 @@ pub fn render(
     pending_cancel_confirm: &HashMap<String, Instant>,
     chat_input: &str,
     selection: &Selection,
+    my_user_id: Option<u64>,
     own_username: &str,
 ) -> El {
     column([
@@ -345,6 +346,7 @@ pub fn render(
             video_thumbs,
             transfers,
             pending_cancel_confirm,
+            my_user_id,
             own_username,
         ),
         divider(),
@@ -363,6 +365,7 @@ fn history(
     video_thumbs: &VideoThumbMap,
     transfers: &TransferMap,
     pending_cancel_confirm: &HashMap<String, Instant>,
+    my_user_id: Option<u64>,
     own_username: &str,
 ) -> El {
     if state.chat_messages.is_empty() {
@@ -394,6 +397,7 @@ fn history(
                 video_thumbs,
                 transfers,
                 pending_cancel_confirm,
+                my_user_id,
                 own_username,
             )
         })
@@ -416,10 +420,22 @@ fn render_message(
     video_thumbs: &VideoThumbMap,
     transfers: &TransferMap,
     pending_cancel_confirm: &HashMap<String, Instant>,
+    my_user_id: Option<u64>,
     own_username: &str,
 ) -> El {
     let msg_key = u128::from_le_bytes(msg.id);
-    let is_own = !msg.is_local && msg.sender == own_username;
+    // Prefer server-assigned `sender_id` for identity matching — usernames
+    // are client-supplied, not unique (two clients on one machine share
+    // `$USER` by default), and would mis-classify the receiver as the
+    // sender. Fall back to username only when `sender_id` is absent (older
+    // peers in chat-history sync, legacy servers).
+    let is_own = if msg.is_local {
+        false
+    } else if let (Some(mine), Some(theirs)) = (my_user_id, msg.sender_id) {
+        mine == theirs
+    } else {
+        msg.sender_id.is_none() && msg.sender == own_username
+    };
     let prefix = if chat_settings.show_timestamps {
         format!("[{}] ", chat_settings.timestamp_format.format(msg.timestamp))
     } else {

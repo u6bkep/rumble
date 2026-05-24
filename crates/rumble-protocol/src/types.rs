@@ -719,6 +719,13 @@ pub struct ChatMessage {
     #[serde(serialize_with = "serialize_id_hex")]
     pub id: [u8; 16],
     pub sender: String,
+    /// Server-assigned `user_id` of the authenticated sender. `None` for
+    /// system/local messages and for messages received from peers running
+    /// older clients/servers that don't populate the field. Identity
+    /// matching ("is this my own message?") must prefer `sender_id` over
+    /// `sender` because usernames are not unique and are client-supplied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_id: Option<u64>,
     pub text: String,
     /// Wall-clock time when the message was received/created.
     #[serde(serialize_with = "serialize_system_time")]
@@ -797,6 +804,11 @@ pub struct ChatHistoryEntry {
     pub id: String,
     /// Sender username.
     pub sender: String,
+    /// Server-assigned `user_id` of the authenticated sender. Absent on
+    /// entries received from older peers; absence falls back to legacy
+    /// username-based identity matching on the receiving client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_id: Option<u64>,
     /// Message text.
     pub text: String,
     /// Unix timestamp in milliseconds.
@@ -831,6 +843,7 @@ impl ChatHistoryContent {
             .map(|m| ChatHistoryEntry {
                 id: hex::encode(m.id),
                 sender: m.sender.clone(),
+                sender_id: m.sender_id,
                 text: m.text.clone(),
                 timestamp: m
                     .timestamp
@@ -874,6 +887,7 @@ impl ChatHistoryContent {
                 Some(ChatMessage {
                     id,
                     sender: e.sender.clone(),
+                    sender_id: e.sender_id,
                     text: e.text.clone(),
                     timestamp,
                     is_local: false,

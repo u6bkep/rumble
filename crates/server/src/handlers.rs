@@ -784,7 +784,14 @@ async fn handle_chat_message(
         return Ok(());
     }
 
-    info!("chat from {}: {} (tree={})", msg.sender, msg.text, is_tree);
+    // Identity comes from the authenticated connection, NOT the client's
+    // `msg.sender` field — otherwise a client could broadcast as anyone.
+    // `msg.sender` is logged for debugging but discarded for the broadcast.
+    let authenticated_sender = sender.get_username().await;
+    info!(
+        "chat from {} (uid={}): {} (tree={})",
+        authenticated_sender, sender.user_id, msg.text, is_tree
+    );
 
     // Use provided message ID and timestamp, or generate new ones if not provided
     let message_id = if msg.id.len() == 16 {
@@ -805,7 +812,8 @@ async fn handle_chat_message(
             kind: Some(proto::server_event::Kind::ChatBroadcast(proto::ChatBroadcast {
                 id: message_id,
                 timestamp_ms,
-                sender: msg.sender,
+                sender: authenticated_sender,
+                sender_id: sender.user_id,
                 text: msg.text,
                 tree: if is_tree { Some(true) } else { None },
                 attachment: msg.attachment,
@@ -2703,6 +2711,7 @@ async fn handle_bridge_chat_message(
                 id: message_id,
                 timestamp_ms,
                 sender: vu.username,
+                sender_id: bcm.user_id,
                 text: bcm.text,
                 tree: None,
                 attachment: None,
