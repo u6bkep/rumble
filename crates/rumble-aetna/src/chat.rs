@@ -852,22 +852,41 @@ fn image_preview(
                 .current_frame(playback)
                 .expect("non-svg variant always has a raster frame")
                 .clone();
-            let preview = image(frame)
-                .image_fit(ImageFit::Contain)
-                .radius(tokens::RADIUS_SM)
-                .width(Size::Fill(1.0))
-                .height(Size::Fixed(PREVIEW_HEIGHT));
+            // Card hugs the frame's aspect ratio (Size::Aspect derives
+            // height from the filled width) so landscape frames don't
+            // letterbox top/bottom inside a fixed-tall rect; max_height
+            // caps the worst-case portrait, and ImageFit::Contain handles
+            // the residual aspect mismatch when that cap engages.
+            let (nw, nh) = cached.current_frame_size(playback);
+            let aspect_h_over_w = nh as f32 / nw.max(1) as f32;
+            let aspect_w_over_h = nw.max(1) as f32 / nh.max(1) as f32;
             if cached.is_animated() {
                 // Animated cache entry whose GPU mirror hasn't
                 // materialized yet (one-frame race after decode).
                 // Fall through to image()-based playback for this
-                // frame; the next frame swaps to surface().
-                let is_playing = playback.map(|p| p.playing).unwrap_or(false);
-                stack([preview, gif_controls_overlay(&offer.transfer_id, is_playing)])
+                // frame; the next frame swaps to surface(). Uses the
+                // same nested-Aspect Contain as
+                // [`animated_surface_preview`] so the controls pill
+                // parks on the visible image, not on letterbox bands.
+                let preview = image(frame)
+                    .radius(tokens::RADIUS_SM)
                     .width(Size::Fill(1.0))
-                    .height(Size::Fixed(PREVIEW_HEIGHT))
+                    .height(Size::Fill(1.0));
+                let is_playing = playback.map(|p| p.playing).unwrap_or(false);
+                column([stack([preview, gif_controls_overlay(&offer.transfer_id, is_playing)])
+                    .height(Size::Fill(1.0))
+                    .width(Size::Aspect(aspect_w_over_h))])
+                .width(Size::Fill(1.0))
+                .height(Size::Aspect(aspect_h_over_w))
+                .max_height(PREVIEW_HEIGHT)
+                .align(Align::Center)
             } else {
-                preview
+                image(frame)
+                    .image_fit(ImageFit::Contain)
+                    .radius(tokens::RADIUS_SM)
+                    .width(Size::Fill(1.0))
+                    .height(Size::Aspect(aspect_h_over_w))
+                    .max_height(PREVIEW_HEIGHT)
             }
         }
     };
@@ -891,47 +910,53 @@ fn image_preview(
         .width(Size::Fill(1.0))
 }
 
-/// SVG preview layer for inline cards. The vector widget paints into
-/// whatever rect we give it without any built-in aspect handling
-/// (`vector()` scales view-box → rect independently on each axis),
-/// so we wrap it in a fill-width × fixed-height stack and use a
-/// layout override to compute a contain-fit rect at layout time.
-/// The result is letterboxed exactly like the raster `image()` path
-/// — vector geometry, no rasterization, crisp at any zoom.
+/// SVG preview layer for inline cards. The `vector()` widget paints into
+/// whatever rect it's given without any built-in aspect handling
+/// (no `vector_fit` analog to `image_fit`/`surface_fit`), so we
+/// re-express Contain via nested `Size::Aspect`:
+///
+///   - The outer column carries the height cap as a `Fill × Aspect`
+///     rect. If the natural ratio asks for more height than `height`
+///     allows, `max_height` clamps and the outer rect ends up with a
+///     non-natural aspect.
+///   - The inner vector locks back to the natural aspect with
+///     `height: Fill, width: Aspect(w/h)`. `align(Center)` then
+///     centres it horizontally, producing letterbox bands when the
+///     outer's aspect was clamped.
+///
+/// Equivalent to the old layout override for every aspect ratio
+/// that fits inside the chat panel's effective width.
 fn svg_contain_preview(icon: SvgIcon, height: f32) -> El {
     let [_, _, vw, vh] = icon.vector_asset().view_box;
     let nat_w = vw.max(1.0);
     let nat_h = vh.max(1.0);
-
-    // Inner vector el sized to natural view-box; the wrapping stack's
-    // layout override resizes it each frame to fit the container.
+    let aspect_h_over_w = nat_h / nat_w;
+    let aspect_w_over_h = nat_w / nat_h;
     let asset = icon.vector_asset().clone();
-    let vec_el = vector(asset).width(Size::Fixed(nat_w)).height(Size::Fixed(nat_h));
 
-    stack([vec_el])
-        .width(Size::Fill(1.0))
-        .height(Size::Fixed(height))
-        .radius(tokens::RADIUS_SM)
-        .layout(move |ctx: LayoutCtx| {
-            let cw = ctx.container.w.max(0.0);
-            let ch = ctx.container.h.max(0.0);
-            if cw <= 0.0 || ch <= 0.0 {
-                return vec![Rect::new(ctx.container.x, ctx.container.y, 0.0, 0.0)];
-            }
-            let scale = (cw / nat_w).min(ch / nat_h);
-            let w = nat_w * scale;
-            let h = nat_h * scale;
-            let x = ctx.container.x + (cw - w) * 0.5;
-            let y = ctx.container.y + (ch - h) * 0.5;
-            vec![Rect::new(x, y, w, h)]
-        })
+    column([vector(asset)
+        .height(Size::Fill(1.0))
+        .width(Size::Aspect(aspect_w_over_h))])
+    .width(Size::Fill(1.0))
+    .height(Size::Aspect(aspect_h_over_w))
+    .max_height(height)
+    .align(Align::Center)
+    .radius(tokens::RADIUS_SM)
 }
 
 /// Fit-to-window SVG variant for the lightbox: fills the available
 /// rect on both axes, contain-fits the view-box inside it at layout
-/// time. Same letterbox math as [`svg_contain_preview`] but the
-/// outer rect is `Fill(1.0)` on both sides (the lightbox body sizes
-/// its child to the panel area).
+/// time.
+///
+/// Unlike [`svg_contain_preview`] we *can't* swap the layout override
+/// for the nested-`Size::Aspect` pattern here: that pattern needs a
+/// static cap on at least one axis to anchor the outer rect, and the
+/// lightbox body's actual size is only known at layout time. With
+/// `Fill × Fill` parent dimensions and no cap, a `Fill × Aspect`
+/// outer derives its height from the parent's full width, which
+/// overflows when the SVG is wider than the body. So the layout
+/// override stays — it has access to the runtime container rect and
+/// can do a true min-of-two contain.
 fn svg_contain_fill(icon: SvgIcon) -> El {
     let [_, _, vw, vh] = icon.vector_asset().view_box;
     let nat_w = vw.max(1.0);
@@ -965,11 +990,17 @@ fn svg_contain_fill(icon: SvgIcon) -> El {
 fn video_preview(offer: &FileOfferInfo, thumb: &Image) -> El {
     const PREVIEW_HEIGHT: f32 = 400.0;
 
+    // See [`image_preview`] / [`animated_surface_preview`] for the
+    // Size::Aspect rationale — the poster card hugs the thumbnail's
+    // aspect ratio, capped by max_height. The badge is centred on the
+    // *visible* image rect (not on letterbox bands when max_height
+    // engages), so the inner stack carries the natural aspect lock.
+    let aspect_h_over_w = thumb.height() as f32 / thumb.width().max(1) as f32;
+    let aspect_w_over_h = thumb.width() as f32 / thumb.height().max(1) as f32;
     let poster = image(thumb.clone())
-        .image_fit(ImageFit::Contain)
         .radius(tokens::RADIUS_SM)
         .width(Size::Fill(1.0))
-        .height(Size::Fixed(PREVIEW_HEIGHT));
+        .height(Size::Fill(1.0));
 
     // Centered play badge: a translucent dark backplate with the
     // existing play SVG centred on top. Sized to feel inviting
@@ -1001,9 +1032,13 @@ fn video_preview(offer: &FileOfferInfo, thumb: &Image) -> El {
     .width(Size::Fill(1.0))
     .height(Size::Fill(1.0));
 
-    let preview_layer = stack([poster, centred_badge])
-        .width(Size::Fill(1.0))
-        .height(Size::Fixed(PREVIEW_HEIGHT));
+    let preview_layer = column([stack([poster, centred_badge])
+        .height(Size::Fill(1.0))
+        .width(Size::Aspect(aspect_w_over_h))])
+    .width(Size::Fill(1.0))
+    .height(Size::Aspect(aspect_h_over_w))
+    .max_height(PREVIEW_HEIGHT)
+    .align(Align::Center);
 
     let caption = text(format!("{} · {}", offer.name, format_size(offer.size)))
         .muted()
@@ -1045,18 +1080,13 @@ fn animated_surface_preview(
     const PREVIEW_MAX_WIDTH: f32 = 480.0;
 
     let (tw, th) = gpu.size();
-    let aspect = (tw as f32) / (th.max(1) as f32);
-    let mut w = preview_height * aspect;
-    let mut h = preview_height;
-    if w > PREVIEW_MAX_WIDTH {
-        w = PREVIEW_MAX_WIDTH;
-        h = w / aspect;
-    }
+    let aspect_h_over_w = th as f32 / tw.max(1) as f32;
+    let aspect_w_over_h = tw as f32 / th.max(1) as f32;
 
     let mut surface_el = surface(gpu.app_texture().clone())
         .surface_alpha(SurfaceAlpha::Straight)
-        .width(Size::Fixed(w))
-        .height(Size::Fixed(h))
+        .width(Size::Fill(1.0))
+        .height(Size::Fill(1.0))
         .radius(tokens::RADIUS_SM);
     if let Some(deadline) = next_frame_in {
         // Aetna's runtime aggregates this with every other visible
@@ -1066,17 +1096,20 @@ fn animated_surface_preview(
         surface_el = surface_el.redraw_within(deadline);
     }
 
-    let inscribed = stack([surface_el, gif_controls_overlay(transfer_id, is_playing)])
-        .width(Size::Fixed(w))
-        .height(Size::Fixed(h));
-
-    row([
-        spacer().width(Size::Fill(1.0)),
-        inscribed,
-        spacer().width(Size::Fill(1.0)),
-    ])
+    // Nested `Size::Aspect` Contain (see [`svg_contain_preview`]). The
+    // inner stack re-locks the natural aspect so that the surface and
+    // the controls overlay share the *visible* aspect-correct rect —
+    // crucial here, since the play/lightbox pill must park in the
+    // bottom-right of the painted image, not the bounding rect's
+    // letterbox bands.
+    column([stack([surface_el, gif_controls_overlay(transfer_id, is_playing)])
+        .height(Size::Fill(1.0))
+        .width(Size::Aspect(aspect_w_over_h))])
     .width(Size::Fill(1.0))
-    .height(Size::Fixed(h))
+    .height(Size::Aspect(aspect_h_over_w))
+    .max_height(preview_height)
+    .max_width(PREVIEW_MAX_WIDTH)
+    .align(Align::Center)
 }
 
 /// Bottom-right pill of icon buttons overlaid on an animated image

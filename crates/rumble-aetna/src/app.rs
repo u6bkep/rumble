@@ -256,11 +256,14 @@ pub struct RumbleApp<B: UiBackend = crate::backend::NativeUiBackend> {
     /// consults this to swap a `file_offer_card` for a
     /// `video_preview` card when the entry is ready.
     video_thumbs: HashMap<String, Image>,
-    /// Transfer ids whose thumbnail extraction has failed at
-    /// least once (file format unsupported, decoder timeout,
-    /// etc.). Mirrors [`Self::image_failed`] — keeps the pump
-    /// from re-attempting on every frame.
-    failed_video_thumbs: HashSet<String>,
+    /// Failed extraction bookkeeping: how many times we've tried
+    /// and when we last tried. Transient failures (libmpv
+    /// cold-start timeout, brief file contention while the upload
+    /// reader is still active) self-recover via backoff. Only
+    /// after [`THUMB_MAX_ATTEMPTS`] failures do we give up — past
+    /// that the file probably really isn't decodable and re-trying
+    /// every few seconds would just churn libmpv.
+    failed_video_thumbs: HashMap<String, ThumbFailure>,
     /// In-flight thumbnail-decode tasks keyed by `transfer_id`.
     /// Polled in [`Self::pump_video_thumbs`]; on completion the
     /// result lands in either `video_thumbs` (Ok) or
@@ -382,7 +385,7 @@ impl<B: UiBackend> RumbleApp<B> {
             active_video: None,
             pending_video_open: None,
             video_thumbs: HashMap::new(),
-            failed_video_thumbs: HashSet::new(),
+            failed_video_thumbs: HashMap::new(),
             pending_video_thumbs: HashMap::new(),
             pending_toasts: Vec::new(),
             pending_cancel_confirm: HashMap::new(),
@@ -413,6 +416,30 @@ const MAX_PREVIEW_PX: u32 = 1024;
 /// untouched but defensive against pathological inputs (and well
 /// under the typical 8192 GPU texture limit).
 const MAX_LIGHTBOX_PX: u32 = 4096;
+
+/// Max attempts before giving up on a video thumbnail. Three tries
+/// covers the common transient cases (libmpv cold-start timeout on
+/// the first try, brief file-contention with an in-flight upload
+/// reader) without churning libmpv forever on files that genuinely
+/// won't decode.
+const THUMB_MAX_ATTEMPTS: u8 = 3;
+
+/// Per-attempt delay schedule between video-thumbnail retries.
+/// Indexed by completed-attempt count: after the 1st failure wait
+/// 2s, after the 2nd wait 8s. Hits long enough to outlast a busy
+/// upload reader while staying interactive on the cold-start path.
+const THUMB_RETRY_DELAYS: &[Duration] = &[Duration::from_secs(2), Duration::from_secs(8)];
+
+/// Per-id retry bookkeeping written by [`RumbleApp::pump_video_thumbs`]
+/// and consulted on subsequent frames. `attempts` counts completed
+/// failures (incremented on drain), `last_attempt` is the most
+/// recent spawn instant (so the backoff timer measures since that,
+/// not since the failure landed).
+#[derive(Clone, Copy, Debug)]
+struct ThumbFailure {
+    attempts: u8,
+    last_attempt: Instant,
+}
 
 /// Decode `path` into a [`chat::CachedImage`]. `max_px` caps the
 /// longest edge of every emitted frame — `Some(n)` downsamples, `None`
@@ -1377,6 +1404,36 @@ impl<B: UiBackend> App for RumbleApp<B> {
                 }
             }
         }
+    }
+
+    /// Image lightbox claims the wheel: dy < 0 zooms in, dy > 0 zooms
+    /// out. Consumes the event so aetna's default scroll routing
+    /// doesn't move the chat list underneath the overlay. Other modes
+    /// fall through to the default (forward to `on_event`, no consume),
+    /// so chat / room-tree / settings scrolling all keep working.
+    fn on_wheel_event(&mut self, event: UiEvent) -> bool {
+        if self.image_lightbox.is_some() {
+            let image_size = self.image_lightbox.as_ref().and_then(|lightbox| {
+                let cached = self
+                    .lightbox_full
+                    .as_ref()
+                    .or_else(|| self.image_cache.get(&lightbox.transfer_id))?;
+                let playback = self.gif_playback.get(&lightbox.transfer_id);
+                Some(cached.current_frame_size(playback))
+            });
+            if let Some(lightbox) = self.image_lightbox.as_mut()
+                && let Some((_, dy)) = event.wheel_delta
+            {
+                if dy < 0.0 {
+                    lightbox.zoom_in(image_size);
+                } else if dy > 0.0 {
+                    lightbox.zoom_out(image_size);
+                }
+            }
+            return true;
+        }
+        self.on_event(event);
+        false
     }
 }
 
@@ -2566,19 +2623,35 @@ impl<B: UiBackend> RumbleApp<B> {
         // ids that just landed.
         self.drain_finished_video_thumbs();
 
+        let now = Instant::now();
         for status in self.backend.transfers() {
             if !status.is_finished {
                 continue;
             }
             let Some(path) = status.local_path.clone() else {
+                tracing::debug!(
+                    "pump_video_thumbs: skip {} ({}): finished but no local_path",
+                    status.id.0,
+                    status.name,
+                );
                 continue;
             };
             let id = status.id.0.clone();
-            if self.video_thumbs.contains_key(&id)
-                || self.failed_video_thumbs.contains(&id)
-                || self.pending_video_thumbs.contains_key(&id)
-            {
+            if self.video_thumbs.contains_key(&id) || self.pending_video_thumbs.contains_key(&id) {
                 continue;
+            }
+            // Previous failures: skip permanently once we've burned
+            // [`THUMB_MAX_ATTEMPTS`], otherwise wait out the
+            // per-attempt backoff before respawning.
+            if let Some(fail) = self.failed_video_thumbs.get(&id) {
+                if fail.attempts >= THUMB_MAX_ATTEMPTS {
+                    continue;
+                }
+                let idx = (fail.attempts as usize).saturating_sub(1).min(THUMB_RETRY_DELAYS.len() - 1);
+                let delay = THUMB_RETRY_DELAYS[idx];
+                if now.saturating_duration_since(fail.last_attempt) < delay {
+                    continue;
+                }
             }
             if !video::is_video_name(&status.name) {
                 // Not a video — leave the file card alone. We
@@ -2586,8 +2659,23 @@ impl<B: UiBackend> RumbleApp<B> {
                 // to retry.
                 continue;
             }
+            let attempt_no = self.failed_video_thumbs.get(&id).map(|f| f.attempts + 1).unwrap_or(1);
+            tracing::debug!(
+                "pump_video_thumbs: spawn extract for {} ({}) direction={:?} attempt={}/{} path={}",
+                id,
+                status.name,
+                status.direction,
+                attempt_no,
+                THUMB_MAX_ATTEMPTS,
+                path.display(),
+            );
             let handle = self.runtime.spawn_blocking(move || video::extract_thumbnail(&path));
-            self.pending_video_thumbs.insert(id, handle);
+            self.pending_video_thumbs.insert(id.clone(), handle);
+            // Update last_attempt so backoff measures from the spawn,
+            // not from when the failure eventually lands on drain.
+            if let Some(fail) = self.failed_video_thumbs.get_mut(&id) {
+                fail.last_attempt = now;
+            }
         }
     }
 
@@ -2602,19 +2690,51 @@ impl<B: UiBackend> RumbleApp<B> {
             .filter(|(_, h)| h.is_finished())
             .map(|(id, _)| id.clone())
             .collect();
+        let now = Instant::now();
         for id in finished {
             let handle = self.pending_video_thumbs.remove(&id).unwrap();
             match self.runtime.block_on(handle) {
                 Ok(Ok(image)) => {
+                    tracing::debug!(
+                        "video thumbnail decoded for {id}: {}x{}",
+                        image.width(),
+                        image.height(),
+                    );
+                    // Clear any prior failure record so a recovered
+                    // file moves cleanly into the video_thumbs map.
+                    self.failed_video_thumbs.remove(&id);
                     self.video_thumbs.insert(id, image);
                 }
                 Ok(Err(e)) => {
-                    tracing::debug!("video thumbnail decode failed for {id}: {e}");
-                    self.failed_video_thumbs.insert(id);
+                    let entry = self
+                        .failed_video_thumbs
+                        .entry(id.clone())
+                        .or_insert(ThumbFailure { attempts: 0, last_attempt: now });
+                    entry.attempts = entry.attempts.saturating_add(1);
+                    entry.last_attempt = now;
+                    if entry.attempts >= THUMB_MAX_ATTEMPTS {
+                        tracing::warn!(
+                            "video thumbnail decode failed for {id} (attempt {}/{}, giving up): {e}",
+                            entry.attempts,
+                            THUMB_MAX_ATTEMPTS,
+                        );
+                    } else {
+                        tracing::debug!(
+                            "video thumbnail decode failed for {id} (attempt {}/{}, will retry): {e}",
+                            entry.attempts,
+                            THUMB_MAX_ATTEMPTS,
+                        );
+                    }
                 }
                 Err(join_err) => {
+                    // Panic in the spawn_blocking closure — treat as a
+                    // hard failure (don't retry), since panicking
+                    // again on the same input is the likely outcome.
                     tracing::warn!("video thumbnail decode task panicked for {id}: {join_err}");
-                    self.failed_video_thumbs.insert(id);
+                    self.failed_video_thumbs.insert(
+                        id,
+                        ThumbFailure { attempts: THUMB_MAX_ATTEMPTS, last_attempt: now },
+                    );
                 }
             }
         }

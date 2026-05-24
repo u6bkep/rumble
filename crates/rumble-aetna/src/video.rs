@@ -86,10 +86,14 @@ pub fn extract_thumbnail(path: &Path) -> Result<Image, VideoError> {
     let stride = (w as usize) * 4;
     let mut buf = vec![0u8; stride * h as usize];
 
-    // First frame should land within a few hundred ms in the
-    // worst case (slow disk, complex header). Anything past 5s
-    // is a stuck decoder we don't want to wait on.
-    if !player.wait_for_frame(Duration::from_secs(5))? {
+    // First frame typically lands within a few hundred ms. The
+    // ceiling has to cover libmpv's cold-start: on the very first
+    // extraction after process launch, codec init can take a few
+    // seconds on its own before the file even opens. 15s gives
+    // that headroom without inviting a truly stuck decoder to
+    // block forever — the pump retries on failure now, so a
+    // tighter cap doesn't buy us much.
+    if !player.wait_for_frame(Duration::from_secs(15))? {
         return Err(VideoError::Timeout("first frame for thumbnail"));
     }
     player.render_sw(&mut buf, w, h, stride)?;
