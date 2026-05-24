@@ -103,7 +103,9 @@ fn next_frame_deadline(frames: &[(Image, Duration)], pb: &GifPlayback) -> Option
 /// One entry in the chat image cache. `Static` is a single decoded
 /// frame; `Animated` carries every frame of a GIF along with the
 /// per-frame display delay so the App's pump can advance an
-/// independent playhead per message.
+/// independent playhead per message; `Svg` is a parsed vector asset
+/// rendered natively by aetna at any size (no rasterization, crisp
+/// at any zoom in the lightbox).
 #[derive(Clone, Debug)]
 pub enum CachedImage {
     Static(Image),
@@ -113,6 +115,9 @@ pub enum CachedImage {
         /// GIFs collapse to `Static` at decode time.
         frames: Vec<(Image, Duration)>,
     },
+    /// Parsed SVG. Identity-hashed inside `SvgIcon` so cache lookups
+    /// dedup; clone is a cheap `Arc` bump.
+    Svg(SvgIcon),
 }
 
 impl CachedImage {
@@ -122,23 +127,43 @@ impl CachedImage {
         matches!(self, Self::Animated { .. })
     }
 
-    /// Pick the frame to render. For `Static`, returns the only frame
-    /// regardless of `playback`. For `Animated`, returns the frame at
-    /// `playback.frame_idx` if supplied, otherwise the first frame.
-    pub fn current_frame(&self, playback: Option<&GifPlayback>) -> &Image {
+    /// True when the entry is a vector asset rendered via aetna's
+    /// vector path rather than a raster `image()`.
+    pub fn is_vector(&self) -> bool {
+        matches!(self, Self::Svg(_))
+    }
+
+    /// Pick the raster frame to render. Returns `None` for vector
+    /// entries since they have no decoded raster representation —
+    /// callers must branch on [`Self::is_vector`] first and emit
+    /// `vector(..)` instead of `image(..)`.
+    pub fn current_frame(&self, playback: Option<&GifPlayback>) -> Option<&Image> {
         match self {
-            Self::Static(img) => img,
+            Self::Static(img) => Some(img),
             Self::Animated { frames, .. } => {
                 let idx = playback.map(|p| p.frame_idx).unwrap_or(0);
-                &frames[idx.min(frames.len() - 1)].0
+                Some(&frames[idx.min(frames.len() - 1)].0)
             }
+            Self::Svg(_) => None,
         }
     }
 
-    /// Natural dimensions of the frame currently shown in the lightbox.
+    /// Natural dimensions of the entry. Raster entries report the
+    /// frame's pixel size; vector entries report the SVG view-box
+    /// extents rounded to the nearest integer.
     pub fn current_frame_size(&self, playback: Option<&GifPlayback>) -> (u32, u32) {
-        let frame = self.current_frame(playback);
-        (frame.width(), frame.height())
+        match self {
+            Self::Static(img) => (img.width(), img.height()),
+            Self::Animated { frames, .. } => {
+                let idx = playback.map(|p| p.frame_idx).unwrap_or(0);
+                let frame = &frames[idx.min(frames.len() - 1)].0;
+                (frame.width(), frame.height())
+            }
+            Self::Svg(icon) => {
+                let [_, _, w, h] = icon.vector_asset().view_box;
+                (w.round().max(1.0) as u32, h.round().max(1.0) as u32)
+            }
+        }
     }
 }
 
@@ -821,9 +846,13 @@ fn image_preview(
             let deadline = playback.and_then(|pb| next_frame_deadline(frames, pb));
             animated_surface_preview(&offer.transfer_id, gpu, is_playing, deadline, PREVIEW_HEIGHT)
         }
+        (CachedImage::Svg(icon), _) => svg_contain_preview(icon.clone(), PREVIEW_HEIGHT),
         _ => {
-            let frame = cached.current_frame(playback);
-            let preview = image(frame.clone())
+            let frame = cached
+                .current_frame(playback)
+                .expect("non-svg variant always has a raster frame")
+                .clone();
+            let preview = image(frame)
                 .image_fit(ImageFit::Contain)
                 .radius(tokens::RADIUS_SM)
                 .width(Size::Fill(1.0))
@@ -860,6 +889,72 @@ fn image_preview(
         .stroke_width(1.0)
         .radius(tokens::RADIUS_MD)
         .width(Size::Fill(1.0))
+}
+
+/// SVG preview layer for inline cards. The vector widget paints into
+/// whatever rect we give it without any built-in aspect handling
+/// (`vector()` scales view-box → rect independently on each axis),
+/// so we wrap it in a fill-width × fixed-height stack and use a
+/// layout override to compute a contain-fit rect at layout time.
+/// The result is letterboxed exactly like the raster `image()` path
+/// — vector geometry, no rasterization, crisp at any zoom.
+fn svg_contain_preview(icon: SvgIcon, height: f32) -> El {
+    let [_, _, vw, vh] = icon.vector_asset().view_box;
+    let nat_w = vw.max(1.0);
+    let nat_h = vh.max(1.0);
+
+    // Inner vector el sized to natural view-box; the wrapping stack's
+    // layout override resizes it each frame to fit the container.
+    let asset = icon.vector_asset().clone();
+    let vec_el = vector(asset).width(Size::Fixed(nat_w)).height(Size::Fixed(nat_h));
+
+    stack([vec_el])
+        .width(Size::Fill(1.0))
+        .height(Size::Fixed(height))
+        .radius(tokens::RADIUS_SM)
+        .layout(move |ctx: LayoutCtx| {
+            let cw = ctx.container.w.max(0.0);
+            let ch = ctx.container.h.max(0.0);
+            if cw <= 0.0 || ch <= 0.0 {
+                return vec![Rect::new(ctx.container.x, ctx.container.y, 0.0, 0.0)];
+            }
+            let scale = (cw / nat_w).min(ch / nat_h);
+            let w = nat_w * scale;
+            let h = nat_h * scale;
+            let x = ctx.container.x + (cw - w) * 0.5;
+            let y = ctx.container.y + (ch - h) * 0.5;
+            vec![Rect::new(x, y, w, h)]
+        })
+}
+
+/// Fit-to-window SVG variant for the lightbox: fills the available
+/// rect on both axes, contain-fits the view-box inside it at layout
+/// time. Same letterbox math as [`svg_contain_preview`] but the
+/// outer rect is `Fill(1.0)` on both sides (the lightbox body sizes
+/// its child to the panel area).
+fn svg_contain_fill(icon: SvgIcon) -> El {
+    let [_, _, vw, vh] = icon.vector_asset().view_box;
+    let nat_w = vw.max(1.0);
+    let nat_h = vh.max(1.0);
+    let asset = icon.vector_asset().clone();
+    let vec_el = vector(asset).width(Size::Fixed(nat_w)).height(Size::Fixed(nat_h));
+    stack([vec_el])
+        .width(Size::Fill(1.0))
+        .height(Size::Fill(1.0))
+        .radius(tokens::RADIUS_MD)
+        .layout(move |ctx: LayoutCtx| {
+            let cw = ctx.container.w.max(0.0);
+            let ch = ctx.container.h.max(0.0);
+            if cw <= 0.0 || ch <= 0.0 {
+                return vec![Rect::new(ctx.container.x, ctx.container.y, 0.0, 0.0)];
+            }
+            let scale = (cw / nat_w).min(ch / nat_h);
+            let w = nat_w * scale;
+            let h = nat_h * scale;
+            let x = ctx.container.x + (cw - w) * 0.5;
+            let y = ctx.container.y + (ch - h) * 0.5;
+            vec![Rect::new(x, y, w, h)]
+        })
 }
 
 /// Inline preview card for a downloaded video: poster thumbnail
@@ -1039,8 +1134,16 @@ pub fn is_image_name(name: &str) -> bool {
     let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
     matches!(
         ext.as_str(),
-        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico" | "tif" | "tiff"
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico" | "tif" | "tiff" | "svg"
     )
+}
+
+/// True when the file extension marks an SVG. The decoder branches on
+/// this so it can take the vector-native path instead of the raster
+/// `image` crate.
+pub fn is_svg_name(name: &str) -> bool {
+    let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    ext == "svg"
 }
 
 fn composer(state: &State, chat_input: &str, selection: &Selection) -> El {
@@ -1327,9 +1430,10 @@ fn lightbox_body(
     playback: Option<&GifPlayback>,
     gpu: Option<&AnimatedGpu>,
 ) -> El {
-    let frame = cached.current_frame(playback);
-    let natural_w = frame.width() as f32;
-    let natural_h = frame.height() as f32;
+    let (natural_w, natural_h) = {
+        let (w, h) = cached.current_frame_size(playback);
+        (w as f32, h as f32)
+    };
     let fit_to_window = lightbox.fit_to_window;
     let body_size = lightbox.body_size.clone();
 
@@ -1364,8 +1468,30 @@ fn lightbox_body(
             }
             el
         }
+        (CachedImage::Svg(icon), _) => {
+            // Vector path: aetna re-tessellates per frame so zoom is
+            // crisp at any scale. There's no `vector_fit`, so the Fit
+            // branch uses a layout-time contain-fit; the explicit-zoom
+            // branch fixes the rect to the natural view-box size and
+            // lets the El's scale/translate transform paint at the
+            // requested zoom — mirrors the raster `image` path.
+            if lightbox.fit_to_window {
+                svg_contain_fill(icon.clone())
+            } else {
+                vector(icon.vector_asset().clone())
+                    .width(Size::Fixed(natural_w))
+                    .height(Size::Fixed(natural_h))
+                    .radius(tokens::RADIUS_MD)
+                    .scale(lightbox.zoom)
+                    .translate(lightbox.pan.0, lightbox.pan.1)
+            }
+        }
         _ => {
-            let mut el = image(frame.clone()).radius(tokens::RADIUS_MD);
+            let frame = cached
+                .current_frame(playback)
+                .expect("non-svg lightbox path always has a raster frame")
+                .clone();
+            let mut el = image(frame).radius(tokens::RADIUS_MD);
             if lightbox.fit_to_window {
                 el = el
                     .image_fit(ImageFit::Contain)
@@ -1434,6 +1560,27 @@ fn format_size(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_image_name_accepts_svg() {
+        assert!(is_image_name("logo.svg"));
+        assert!(is_image_name("Logo.SVG"));
+        assert!(is_svg_name("logo.svg"));
+        assert!(!is_svg_name("logo.png"));
+    }
+
+    #[test]
+    fn cached_image_svg_reports_view_box_as_natural_size() {
+        let icon = SvgIcon::parse(
+            r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 64"><rect width="32" height="64" fill="red"/></svg>"##,
+        )
+        .expect("parse");
+        let cached = CachedImage::Svg(icon);
+        assert!(cached.is_vector());
+        assert!(!cached.is_animated());
+        assert!(cached.current_frame(None).is_none());
+        assert_eq!(cached.current_frame_size(None), (32, 64));
+    }
 
     #[test]
     fn fit_zoom_buttons_step_from_current_fit_scale() {

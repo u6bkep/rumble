@@ -427,6 +427,26 @@ fn decode_image(path: &Path, max_px: Option<u32>) -> Result<chat::CachedImage, i
         codecs::{gif::GifDecoder, png::PngDecoder, webp::WebPDecoder},
     };
 
+    // SVG isn't a raster format — `image::ImageReader` doesn't know it.
+    // Detect by extension first, then read the file as text and hand it
+    // to aetna's vector parser. The resulting `SvgIcon` clones cheaply
+    // and renders crisp at any size via aetna's vector tessellator.
+    if path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("svg"))
+        .unwrap_or(false)
+    {
+        let svg_text = std::fs::read_to_string(path).map_err(image::ImageError::IoError)?;
+        let icon = aetna_core::SvgIcon::parse(&svg_text).map_err(|e| {
+            image::ImageError::Decoding(image::error::DecodingError::new(
+                image::error::ImageFormatHint::Name("svg".into()),
+                e.to_string(),
+            ))
+        })?;
+        return Ok(chat::CachedImage::Svg(icon));
+    }
+
     let reader = image::ImageReader::open(path)?.with_guessed_format()?;
     match reader.format() {
         Some(ImageFormat::Gif) => {
