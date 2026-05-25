@@ -570,6 +570,7 @@ fn file_offer_card(
         text(offer.name.clone())
             .semibold()
             .ellipsis()
+            .key(format!("chat:file-card:{}.name", offer.transfer_id))
             .tooltip(offer.name.clone()),
     ])
     .gap(tokens::SPACE_1)
@@ -906,6 +907,7 @@ fn image_preview(
         .muted()
         .font_size(tokens::TEXT_XS.size)
         .ellipsis()
+        .key(format!("chat:preview:{}.caption", offer.transfer_id))
         .tooltip(offer.name.clone());
 
     column([preview_layer, caption])
@@ -1055,6 +1057,7 @@ fn video_preview(offer: &FileOfferInfo, thumb: &Image) -> El {
         .muted()
         .font_size(tokens::TEXT_XS.size)
         .ellipsis()
+        .key(format!("chat:video-preview:{}.caption", offer.transfer_id))
         .tooltip(offer.name.clone());
 
     column([preview_layer, caption])
@@ -1450,6 +1453,7 @@ fn lightbox_header(lightbox: &Lightbox) -> El {
         text(lightbox.name.clone())
             .title()
             .ellipsis()
+            .key("chat:lightbox:title")
             .tooltip(lightbox.name.clone()),
         spacer(),
         zoom_out,
