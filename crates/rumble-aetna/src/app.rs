@@ -275,6 +275,11 @@ pub struct RumbleApp<B: UiBackend = crate::backend::NativeUiBackend> {
     /// the toast stack overlay automatically.
     pending_toasts: Vec<ToastSpec>,
 
+    /// URLs captured from `UiEventKind::LinkActivated` since the last
+    /// frame. Drained by [`App::drain_link_opens`]; the host
+    /// (aetna-winit-wgpu) routes each one through the OS opener.
+    pending_link_opens: Vec<String>,
+
     /// Transfer ids whose cancel button has been clicked once and is
     /// awaiting confirmation. Second click fires the actual cancel.
     /// Entries expire after 3 seconds so a stray click doesn't leave
@@ -388,6 +393,7 @@ impl<B: UiBackend> RumbleApp<B> {
             failed_video_thumbs: HashMap::new(),
             pending_video_thumbs: HashMap::new(),
             pending_toasts: Vec::new(),
+            pending_link_opens: Vec::new(),
             pending_cancel_confirm: HashMap::new(),
         }
     }
@@ -611,6 +617,10 @@ impl<B: UiBackend> App for RumbleApp<B> {
 
     fn drain_toasts(&mut self) -> Vec<ToastSpec> {
         std::mem::take(&mut self.pending_toasts)
+    }
+
+    fn drain_link_opens(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.pending_link_opens)
     }
 
     fn build(&self, cx: &BuildCx) -> El {
@@ -878,6 +888,17 @@ impl<B: UiBackend> App for RumbleApp<B> {
             && let Some(sel) = event.selection.as_ref()
         {
             self.selection = sel.clone();
+            return;
+        }
+
+        // Link clicks: the runtime emits `LinkActivated` with the URL in
+        // `event.key` whenever a click lands on a text run carrying a
+        // `text_link`. Queue it; the host drains the queue and opens
+        // each URL through the OS opener.
+        if event.kind == UiEventKind::LinkActivated
+            && let Some(url) = event.key.as_ref()
+        {
+            self.pending_link_opens.push(url.clone());
             return;
         }
 
@@ -2647,7 +2668,9 @@ impl<B: UiBackend> RumbleApp<B> {
                 if fail.attempts >= THUMB_MAX_ATTEMPTS {
                     continue;
                 }
-                let idx = (fail.attempts as usize).saturating_sub(1).min(THUMB_RETRY_DELAYS.len() - 1);
+                let idx = (fail.attempts as usize)
+                    .saturating_sub(1)
+                    .min(THUMB_RETRY_DELAYS.len() - 1);
                 let delay = THUMB_RETRY_DELAYS[idx];
                 if now.saturating_duration_since(fail.last_attempt) < delay {
                     continue;
@@ -2695,21 +2718,17 @@ impl<B: UiBackend> RumbleApp<B> {
             let handle = self.pending_video_thumbs.remove(&id).unwrap();
             match self.runtime.block_on(handle) {
                 Ok(Ok(image)) => {
-                    tracing::debug!(
-                        "video thumbnail decoded for {id}: {}x{}",
-                        image.width(),
-                        image.height(),
-                    );
+                    tracing::debug!("video thumbnail decoded for {id}: {}x{}", image.width(), image.height(),);
                     // Clear any prior failure record so a recovered
                     // file moves cleanly into the video_thumbs map.
                     self.failed_video_thumbs.remove(&id);
                     self.video_thumbs.insert(id, image);
                 }
                 Ok(Err(e)) => {
-                    let entry = self
-                        .failed_video_thumbs
-                        .entry(id.clone())
-                        .or_insert(ThumbFailure { attempts: 0, last_attempt: now });
+                    let entry = self.failed_video_thumbs.entry(id.clone()).or_insert(ThumbFailure {
+                        attempts: 0,
+                        last_attempt: now,
+                    });
                     entry.attempts = entry.attempts.saturating_add(1);
                     entry.last_attempt = now;
                     if entry.attempts >= THUMB_MAX_ATTEMPTS {
@@ -2733,7 +2752,10 @@ impl<B: UiBackend> RumbleApp<B> {
                     tracing::warn!("video thumbnail decode task panicked for {id}: {join_err}");
                     self.failed_video_thumbs.insert(
                         id,
-                        ThumbFailure { attempts: THUMB_MAX_ATTEMPTS, last_attempt: now },
+                        ThumbFailure {
+                            attempts: THUMB_MAX_ATTEMPTS,
+                            last_attempt: now,
+                        },
                     );
                 }
             }

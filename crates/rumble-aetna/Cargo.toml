@@ -44,6 +44,7 @@ image = { version = "0.25", default-features = false, features = ["bmp", "gif", 
 arboard = "3"
 tempfile = "3"
 base64 = { workspace = true }
+linkify = "0.10"
 
 # Platform-conditional feature opt-ins. Linux-only PulseAudio output
 # (rumble-desktop::pulse) + XDG GlobalShortcuts portal

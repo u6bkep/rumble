@@ -18,6 +18,7 @@ use std::{
 
 use aetna_core::{prelude::*, surface::SurfaceAlpha};
 use aetna_markdown::md;
+use linkify::{LinkFinder, LinkKind};
 use rumble_client_traits::file_transfer::{PluginTransferState, TransferDirection, TransferStatus};
 use rumble_desktop_shell::ChatSettings;
 use rumble_protocol::{
@@ -493,8 +494,18 @@ fn render_message(
         header = header.text_color(color);
     }
 
-    // Markdown body — aetna-markdown marks all text nodes selectable.
-    let body = md(&msg.text).width(Size::Fill(1.0));
+    // Body. Messages that use markdown syntax go through the markdown
+    // renderer (which already produces clickable `[label](url)` links).
+    // Everything else takes a plain-text path that linkifies bare URLs
+    // into the same `text_link` runs aetna-markdown emits, so the
+    // user-visible behavior is consistent without paying the
+    // false-positive cost of running pulldown-cmark over casual chat
+    // text (stray `*` italicizing, etc.).
+    let body = if looks_like_markdown(&msg.text) {
+        md(&msg.text).width(Size::Fill(1.0))
+    } else {
+        plain_with_links(&msg.text, msg_key).width(Size::Fill(1.0))
+    };
 
     // Attachment card (image preview, video poster, or file card).
     // Image previews take priority over video previews when both
@@ -1588,6 +1599,105 @@ fn format_size(bytes: u64) -> String {
     } else {
         format!("{bytes} B")
     }
+}
+
+/// Heuristic markdown detector. Returns `true` only when the message
+/// contains unambiguous markdown syntax — paired bold/strike delimiters,
+/// inline / fenced code, headings, blockquotes, lists, tables, or an
+/// explicit `[label](url)` link. Stray single `*` / `_` are deliberately
+/// NOT a signal (multiplication, snake_case, emphatic chat punctuation
+/// trip the parser too easily) — text with only those falls through to
+/// the plain-text path and still gets URL linkification.
+fn looks_like_markdown(s: &str) -> bool {
+    // Block-level signals, scanned per-line.
+    for line in s.lines() {
+        let trimmed = line.trim_start();
+        // ATX heading: `# ` through `###### `.
+        if let Some(rest) = trimmed.strip_prefix('#') {
+            let hashes = 1 + rest.bytes().take_while(|&b| b == b'#').count();
+            if hashes <= 6 && rest[hashes - 1..].starts_with(' ') {
+                return true;
+            }
+        }
+        // Blockquote / lists.
+        if trimmed.starts_with("> ")
+            || trimmed.starts_with("- ")
+            || trimmed.starts_with("* ")
+            || trimmed.starts_with("+ ")
+        {
+            return true;
+        }
+        // Ordered list: digits then ". " (or "). ").
+        if let Some(idx) = trimmed.find(|c: char| !c.is_ascii_digit())
+            && idx > 0
+            && (trimmed[idx..].starts_with(". ") || trimmed[idx..].starts_with(") "))
+        {
+            return true;
+        }
+        // Fenced code block.
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            return true;
+        }
+        // Table row: at least two `|` on one line. Cheap and good
+        // enough; the parser will reject malformed tables anyway.
+        if trimmed.matches('|').count() >= 2 {
+            return true;
+        }
+    }
+    // Inline link: `[anything](anything)`. Crude scan — a literal `](`
+    // outside link context is rare enough in chat to accept the false
+    // positive rate.
+    if s.contains("](") && s.contains('[') {
+        return true;
+    }
+    // Paired multi-char inline delimiters.
+    if has_paired(s, "**") || has_paired(s, "__") || has_paired(s, "~~") {
+        return true;
+    }
+    // Inline code: at least one matched backtick pair.
+    if s.matches('`').count() >= 2 {
+        return true;
+    }
+    false
+}
+
+fn has_paired(s: &str, delim: &str) -> bool {
+    s.matches(delim).count() >= 2
+}
+
+/// Build a body El for non-markdown chat text. Splits the input on
+/// `linkify`-detected URLs and emails, emitting `text(slice).link(url)`
+/// runs that the renderer underlines and reports clicks for via
+/// `UiEventKind::LinkActivated`. Falls back to a single selectable
+/// paragraph when no links are present (visually identical to the
+/// pre-link rendering).
+fn plain_with_links(input: &str, msg_key: u128) -> El {
+    let finder = LinkFinder::new();
+    let spans: Vec<_> = finder.spans(input).collect();
+    let has_link = spans.iter().any(|s| s.kind().is_some());
+    let key = format!("chat:msg:{msg_key}:body");
+
+    if !has_link {
+        return paragraph(input.to_string()).key(key).selectable();
+    }
+
+    let runs: Vec<El> = spans
+        .into_iter()
+        .map(|span| {
+            let s = span.as_str().to_string();
+            match span.kind() {
+                Some(&LinkKind::Url) => text(s.clone()).link(s),
+                Some(&LinkKind::Email) => text(s.clone()).link(format!("mailto:{s}")),
+                _ => text(s),
+            }
+        })
+        .collect();
+    text_runs(runs)
+        .wrap_text()
+        .width(Size::Fill(1.0))
+        .height(Size::Hug)
+        .key(key)
+        .selectable()
 }
 
 #[cfg(test)]
