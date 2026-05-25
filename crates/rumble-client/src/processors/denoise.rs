@@ -1,64 +1,171 @@
-//! RNNoise-based noise suppression processor.
+//! RNNoise-based noise suppression and voice gating.
 //!
-//! This processor uses the nnnoiseless library (a Rust port of RNNoise) to
-//! remove background noise from audio. It's particularly effective at
-//! removing constant background noise like fans, air conditioning, and
-//! keyboard sounds.
+//! Uses the nnnoiseless port of RNNoise to do two things in a single
+//! forward pass per 10 ms chunk: produce a denoised audio frame and a
+//! voice-probability score. The denoised samples optionally replace the
+//! input; the probability optionally drives the [`VadShaper`] for
+//! voice-activated transmission.
 //!
-//! Note: RNNoise operates on 10ms frames (480 samples at 48kHz), so this
-//! processor buffers internally to handle arbitrary frame sizes.
+//! Why one processor for both: RNNoise computes the VAD score from the
+//! same internal features it uses to derive the denoise gains — the two
+//! were never independent. Bundling them lets us pay for inference once
+//! and gives users a single "speech cleanup" stage instead of two whose
+//! ordering and pairing they'd otherwise have to reason about.
+//!
+//! Note: RNNoise operates on 10 ms frames (480 samples at 48 kHz), so
+//! the processor buffers internally to handle arbitrary outer frame
+//! sizes. The very first 10 ms output is muted to hide fade-in artifacts.
 
 use nnnoiseless::DenoiseState;
 use rumble_audio::{AudioProcessor, ProcessorFactory, ProcessorResult};
 use serde::{Deserialize, Serialize};
 
-use super::type_ids;
+use super::{
+    type_ids,
+    vad_shaper::{VadShaper, VadShaperSettings},
+};
 
-/// Frame size used by nnnoiseless (480 samples = 10ms at 48kHz).
+/// Frame size used by nnnoiseless (480 samples = 10 ms at 48 kHz).
 const DENOISE_FRAME_SIZE: usize = DenoiseState::FRAME_SIZE;
 
-/// Settings for the denoise processor.
+/// Settings for the denoise/voice-gate processor.
 ///
-/// Currently nnnoiseless has no configurable parameters, but we include
-/// this struct for consistency and future extensibility.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+/// All fields use serde defaults so old persisted configs (which only
+/// stored an empty object) deserialize cleanly. The serde defaults
+/// represent **legacy behavior**: denoising on, voice gate off — so
+/// existing users don't suddenly get auto-muted on upgrade. New
+/// installs built via the factory's `default_settings` go through
+/// `DenoiseSettings::default()` which enables the voice gate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DenoiseSettings {
-    // No configurable parameters currently
-    // Future: could add strength, attenuation floor, etc.
+    /// When true, replace the input audio with the denoised output.
+    /// When false, samples pass through untouched but inference still
+    /// runs if `vad_enabled` is true.
+    #[serde(default = "default_denoise_enabled")]
+    pub denoise_enabled: bool,
+
+    /// When true, drive a `suppress` decision off the RNNoise VAD
+    /// probability. Default off for legacy configs (preserves existing
+    /// behavior on upgrade); default on for fresh configs.
+    #[serde(default = "legacy_false")]
+    pub vad_enabled: bool,
+
+    /// Voice probability above which transmission starts (0..1).
+    #[serde(default = "default_vad_trigger")]
+    pub vad_trigger: f32,
+
+    /// Voice probability the score must drop below — together with
+    /// holdoff expiring — for transmission to stop. Set lower than
+    /// `vad_trigger` for hysteresis.
+    #[serde(default = "default_vad_release")]
+    pub vad_release: f32,
+
+    /// Minimum sustained-over-trigger duration before activating.
+    /// 0 = activate on first chunk above trigger.
+    #[serde(default = "default_vad_attack_ms")]
+    pub vad_attack_ms: u32,
+
+    /// After dropping below release, continue transmitting for this
+    /// long. Prevents cutting off word endings.
+    #[serde(default = "default_vad_holdoff_ms")]
+    pub vad_holdoff_ms: u32,
 }
 
-/// RNNoise-based noise suppression processor.
-///
-/// Uses the nnnoiseless library to suppress background noise. The processor
-/// internally buffers audio to process in 10ms chunks as required by RNNoise.
-///
-/// Note: The first 10ms frame after reset is discarded due to RNNoise
-/// fade-in artifacts.
+fn default_denoise_enabled() -> bool {
+    true
+}
+
+fn legacy_false() -> bool {
+    false
+}
+
+fn default_vad_trigger() -> f32 {
+    0.5
+}
+
+fn default_vad_release() -> f32 {
+    0.35
+}
+
+fn default_vad_attack_ms() -> u32 {
+    0
+}
+
+fn default_vad_holdoff_ms() -> u32 {
+    300
+}
+
+impl Default for DenoiseSettings {
+    /// Defaults used for fresh installs and for the factory's
+    /// `default_settings()` — voice gate on. Distinct from the serde
+    /// default applied when deserializing a legacy persisted config
+    /// (gate off there to preserve existing user behavior).
+    fn default() -> Self {
+        Self {
+            denoise_enabled: true,
+            vad_enabled: true,
+            vad_trigger: default_vad_trigger(),
+            vad_release: default_vad_release(),
+            vad_attack_ms: default_vad_attack_ms(),
+            vad_holdoff_ms: default_vad_holdoff_ms(),
+        }
+    }
+}
+
+/// RNNoise denoiser + ML voice gate.
 pub struct DenoiseProcessor {
-    /// RNNoise denoiser state.
     denoise_state: Box<DenoiseState<'static>>,
-    /// Buffer for incomplete input frames.
+    /// Buffer of input samples waiting to be assembled into 10 ms chunks.
     input_buffer: Vec<f32>,
-    /// Buffer for denoised output waiting to be returned.
+    /// Buffer of denoised samples waiting to be copied back to the caller.
     output_buffer: Vec<f32>,
-    /// Whether we've processed the first frame (which is discarded).
+    /// True once the first chunk has run; that chunk's output is
+    /// substituted with silence to mask RNNoise fade-in artifacts.
     first_frame_done: bool,
-    /// Settings (currently unused but kept for consistency).
+    /// Cached VAD probability from the most-recent processed chunk.
+    /// Surfaces via [`DenoiseProcessor::last_vad_probability`] for UI.
+    last_vad_prob: f32,
     settings: DenoiseSettings,
-    /// Whether the processor is enabled.
+    shaper: VadShaper,
     enabled: bool,
 }
 
 impl DenoiseProcessor {
-    /// Create a new denoise processor.
     pub fn new() -> Self {
+        Self::with_settings(DenoiseSettings::default())
+    }
+
+    pub fn with_settings(settings: DenoiseSettings) -> Self {
         Self {
             denoise_state: DenoiseState::new(),
             input_buffer: Vec::with_capacity(DENOISE_FRAME_SIZE * 2),
             output_buffer: Vec::with_capacity(DENOISE_FRAME_SIZE * 4),
             first_frame_done: false,
-            settings: DenoiseSettings::default(),
+            last_vad_prob: 0.0,
+            settings,
+            shaper: VadShaper::new(),
             enabled: true,
+        }
+    }
+
+    /// VAD probability from the most-recent 10 ms chunk processed.
+    /// Useful for surfacing a live probability bar in the UI.
+    pub fn last_vad_probability(&self) -> f32 {
+        self.last_vad_prob
+    }
+
+    /// Whether the voice gate currently considers the speaker active.
+    /// Only meaningful when `vad_enabled` is true.
+    pub fn is_voice_active(&self) -> bool {
+        self.shaper.is_active()
+    }
+
+    fn shaper_settings(&self) -> VadShaperSettings {
+        VadShaperSettings {
+            trigger: self.settings.vad_trigger,
+            release: self.settings.vad_release,
+            attack_ms: self.settings.vad_attack_ms,
+            holdoff_ms: self.settings.vad_holdoff_ms,
         }
     }
 }
@@ -70,63 +177,86 @@ impl Default for DenoiseProcessor {
 }
 
 impl AudioProcessor for DenoiseProcessor {
-    fn process(&mut self, samples: &mut [f32], _sample_rate: u32) -> ProcessorResult {
-        // Add incoming samples to input buffer
+    fn process(&mut self, samples: &mut [f32], sample_rate: u32) -> ProcessorResult {
+        let want_denoise = self.settings.denoise_enabled;
+        let want_vad = self.settings.vad_enabled;
+
+        // If neither output is wanted, skip inference and the buffering
+        // dance entirely — cheap fast path for "stage enabled but doing
+        // nothing." Returns pass through unchanged samples.
+        if !want_denoise && !want_vad {
+            return ProcessorResult::pass();
+        }
+
+        // Snapshot the pre-denoise input for the pass-through case
+        // before the output_buffer drain overwrites samples. Only used
+        // when we run inference for VAD but don't want denoised audio.
+        let original: Option<Vec<f32>> = if !want_denoise { Some(samples.to_vec()) } else { None };
+
         self.input_buffer.extend_from_slice(samples);
 
-        // Process complete 480-sample chunks
-        while self.input_buffer.len() >= DENOISE_FRAME_SIZE {
-            // Extract a chunk
-            let chunk: Vec<f32> = self.input_buffer.drain(..DENOISE_FRAME_SIZE).collect();
+        let shaper_settings = self.shaper_settings();
 
-            // Scale to i16 range for nnnoiseless (it expects samples in [-32768, 32767])
+        while self.input_buffer.len() >= DENOISE_FRAME_SIZE {
+            let chunk: Vec<f32> = self.input_buffer.drain(..DENOISE_FRAME_SIZE).collect();
             let scaled: Vec<f32> = chunk.iter().map(|&s| s * 32767.0).collect();
 
-            // Process through RNNoise
             let mut out_buf = [0.0f32; DENOISE_FRAME_SIZE];
-            self.denoise_state.process_frame(&mut out_buf, &scaled);
+            let vad_prob = self.denoise_state.process_frame(&mut out_buf, &scaled);
+            self.last_vad_prob = vad_prob;
 
-            // Skip the first frame due to fade-in artifacts
+            if want_vad {
+                self.shaper
+                    .update(vad_prob, DENOISE_FRAME_SIZE as u32, sample_rate, &shaper_settings);
+            }
+
             if !self.first_frame_done {
                 self.first_frame_done = true;
-                // Fill with zeros to maintain timing
                 self.output_buffer.extend(std::iter::repeat_n(0.0, DENOISE_FRAME_SIZE));
                 continue;
             }
 
-            // Scale back to [-1.0, 1.0] and add to output buffer
             for &sample in &out_buf {
                 self.output_buffer.push(sample / 32767.0);
             }
         }
 
-        // Copy processed samples back to the input slice
-        // We need to handle the case where output buffer might be smaller than input
-        // due to the first-frame discard
+        // Drain the denoised buffer back into the caller's slice. We always
+        // do this so the buffer doesn't grow unboundedly; if the caller
+        // wanted pass-through, we then overwrite with the original input.
         let copy_len = samples.len().min(self.output_buffer.len());
         if copy_len > 0 {
             let output: Vec<f32> = self.output_buffer.drain(..copy_len).collect();
             samples[..copy_len].copy_from_slice(&output);
         }
-
-        // Zero any remaining samples if we don't have enough output
         if copy_len < samples.len() {
             samples[copy_len..].fill(0.0);
         }
 
-        ProcessorResult::pass()
+        if let Some(original) = original {
+            // VAD-only mode: restore the unmodified input. Inference still
+            // ran above so the shaper gets updated and the buffers stay
+            // healthy if denoise is toggled back on later.
+            samples.copy_from_slice(&original);
+        }
+
+        ProcessorResult {
+            suppress: want_vad && !self.shaper.is_active(),
+            level_db: None,
+        }
     }
 
     fn name(&self) -> &'static str {
-        "Denoise (RNNoise)"
+        "Denoise + Voice Gate (RNNoise)"
     }
 
     fn reset(&mut self) {
-        // Reset the denoiser state
         self.denoise_state = DenoiseState::new();
         self.input_buffer.clear();
         self.output_buffer.clear();
         self.first_frame_done = false;
+        self.last_vad_prob = 0.0;
+        self.shaper.reset();
     }
 
     fn config(&self) -> serde_json::Value {
@@ -146,13 +276,12 @@ impl AudioProcessor for DenoiseProcessor {
     fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
         if enabled {
-            // Reset state when re-enabled
             self.reset();
         }
     }
 }
 
-/// Factory for creating DenoiseProcessor instances.
+/// Factory for creating [`DenoiseProcessor`] instances.
 pub struct DenoiseProcessorFactory;
 
 impl ProcessorFactory for DenoiseProcessorFactory {
@@ -161,7 +290,7 @@ impl ProcessorFactory for DenoiseProcessorFactory {
     }
 
     fn display_name(&self) -> &'static str {
-        "Denoise (RNNoise)"
+        "Denoise + Voice Gate (RNNoise)"
     }
 
     fn create_default(&self) -> Box<dyn AudioProcessor> {
@@ -169,22 +298,64 @@ impl ProcessorFactory for DenoiseProcessorFactory {
     }
 
     fn create_from_config(&self, config: &serde_json::Value) -> Result<Box<dyn AudioProcessor>, String> {
-        // Currently no configurable parameters
-        let _settings: DenoiseSettings = serde_json::from_value(config.clone()).unwrap_or_default();
-
-        Ok(Box::new(DenoiseProcessor::new()))
+        let settings: DenoiseSettings = serde_json::from_value(config.clone()).unwrap_or_default();
+        Ok(Box::new(DenoiseProcessor::with_settings(settings)))
     }
 
     fn settings_schema(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",
-            "properties": {},
-            "description": "RNNoise has no configurable parameters"
+            "properties": {
+                "denoise_enabled": {
+                    "type": "boolean",
+                    "title": "Apply noise suppression",
+                    "description": "Replace the input audio with the denoised output.",
+                    "default": true
+                },
+                "vad_enabled": {
+                    "type": "boolean",
+                    "title": "Gate transmission on voice",
+                    "description": "Use the RNNoise voice probability to suppress silence and non-speech.",
+                    "default": true
+                },
+                "vad_trigger": {
+                    "type": "number",
+                    "title": "Voice trigger (probability)",
+                    "description": "Voice probability above which transmission starts.",
+                    "default": 0.5,
+                    "minimum": 0.0,
+                    "maximum": 1.0
+                },
+                "vad_release": {
+                    "type": "number",
+                    "title": "Voice release (probability)",
+                    "description": "Once active, stay active until probability drops below this. Set lower than the trigger for hysteresis.",
+                    "default": 0.35,
+                    "minimum": 0.0,
+                    "maximum": 1.0
+                },
+                "vad_attack_ms": {
+                    "type": "integer",
+                    "title": "Voice attack (ms)",
+                    "description": "Probability must stay above trigger for this long before activating.",
+                    "default": 0,
+                    "minimum": 0,
+                    "maximum": 200
+                },
+                "vad_holdoff_ms": {
+                    "type": "integer",
+                    "title": "Voice holdoff (ms)",
+                    "description": "Keep transmitting for this long after the probability drops below release.",
+                    "default": 300,
+                    "minimum": 0,
+                    "maximum": 2000
+                }
+            }
         })
     }
 
     fn description(&self) -> &'static str {
-        "AI-powered noise suppression using RNNoise neural network"
+        "RNNoise neural-network noise suppression with an integrated voice-activity gate"
     }
 }
 
@@ -196,47 +367,117 @@ mod tests {
     fn test_denoise_creation() {
         let processor = DenoiseProcessor::new();
         assert!(processor.is_enabled());
-        assert_eq!(processor.name(), "Denoise (RNNoise)");
+        assert_eq!(processor.name(), "Denoise + Voice Gate (RNNoise)");
     }
 
     #[test]
     fn test_denoise_process_single_frame() {
-        let mut processor = DenoiseProcessor::new();
+        let mut processor = DenoiseProcessor::with_settings(DenoiseSettings {
+            denoise_enabled: true,
+            vad_enabled: false, // isolate denoise behavior from VAD gating
+            ..DenoiseSettings::default()
+        });
 
-        // Create a 960-sample frame (20ms at 48kHz)
         let mut samples = vec![0.1f32; 960];
-
-        // Process - first 480 samples will be zeroed due to first-frame discard
         let result = processor.process(&mut samples, 48000);
 
         assert!(!result.suppress);
-        // First chunk should be zeroed
+        // First chunk gets zeroed by fade-in suppression.
         assert!(samples[..480].iter().all(|&s| s.abs() < 0.001));
+    }
+
+    #[test]
+    fn test_denoise_pass_through_when_disabled() {
+        // denoise off, VAD off → stage is a no-op, samples untouched
+        // and no inference is run.
+        let mut processor = DenoiseProcessor::with_settings(DenoiseSettings {
+            denoise_enabled: false,
+            vad_enabled: false,
+            ..DenoiseSettings::default()
+        });
+        let original = vec![0.25f32; 960];
+        let mut samples = original.clone();
+        let result = processor.process(&mut samples, 48000);
+        assert!(!result.suppress);
+        assert_eq!(samples, original);
+    }
+
+    #[test]
+    fn test_vad_only_preserves_input_audio() {
+        // VAD on, denoise off → input audio passes through unchanged,
+        // but inference still runs (we can observe last_vad_probability
+        // gets populated).
+        let mut processor = DenoiseProcessor::with_settings(DenoiseSettings {
+            denoise_enabled: false,
+            vad_enabled: true,
+            ..DenoiseSettings::default()
+        });
+        let original: Vec<f32> = (0..960).map(|i| (i as f32 * 0.01).sin() * 0.3).collect();
+        let mut samples = original.clone();
+        processor.process(&mut samples, 48000);
+        // Input bytes unchanged.
+        for (a, b) in original.iter().zip(samples.iter()) {
+            assert!((a - b).abs() < f32::EPSILON);
+        }
     }
 
     #[test]
     fn test_denoise_reset() {
         let mut processor = DenoiseProcessor::new();
-
-        // Process some audio
         let mut samples = vec![0.5f32; 960];
         processor.process(&mut samples, 48000);
-
-        // Reset
         processor.reset();
-
-        // Buffer should be cleared
         assert!(processor.input_buffer.is_empty());
         assert!(processor.output_buffer.is_empty());
         assert!(!processor.first_frame_done);
+        assert!(!processor.is_voice_active());
+    }
+
+    /// Legacy persisted configs (which carried only an empty `{}`) must
+    /// deserialize with the voice gate OFF — we don't want existing
+    /// users to suddenly start getting muted on upgrade. New installs
+    /// built via the factory go through `DenoiseSettings::default()`,
+    /// which has the gate on.
+    #[test]
+    fn test_legacy_empty_config_keeps_vad_off() {
+        let settings: DenoiseSettings = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(settings.denoise_enabled);
+        assert!(!settings.vad_enabled, "legacy configs must default vad_enabled=false");
     }
 
     #[test]
-    fn test_factory_create() {
+    fn test_factory_default_enables_vad() {
         let factory = DenoiseProcessorFactory;
-        let config = serde_json::json!({});
+        let default_settings = factory.default_settings();
+        let settings: DenoiseSettings = serde_json::from_value(default_settings).unwrap();
+        assert!(settings.denoise_enabled);
+        assert!(settings.vad_enabled, "fresh configs must default vad_enabled=true");
+    }
 
-        let processor = factory.create_from_config(&config).unwrap();
-        assert_eq!(processor.name(), "Denoise (RNNoise)");
+    #[test]
+    fn test_factory_create_from_legacy_config() {
+        let factory = DenoiseProcessorFactory;
+        let processor = factory.create_from_config(&serde_json::json!({})).unwrap();
+        assert_eq!(processor.name(), "Denoise + Voice Gate (RNNoise)");
+    }
+
+    #[test]
+    fn test_config_roundtrip() {
+        let processor = DenoiseProcessor::with_settings(DenoiseSettings {
+            denoise_enabled: false,
+            vad_enabled: true,
+            vad_trigger: 0.7,
+            vad_release: 0.4,
+            vad_attack_ms: 30,
+            vad_holdoff_ms: 250,
+        });
+        let json = processor.config();
+        let parsed: DenoiseSettings = serde_json::from_value(json).unwrap();
+        assert!(!parsed.denoise_enabled);
+        assert!(parsed.vad_enabled);
+        assert!((parsed.vad_trigger - 0.7).abs() < 1e-6);
+        assert!((parsed.vad_release - 0.4).abs() < 1e-6);
+        assert_eq!(parsed.vad_attack_ms, 30);
+        assert_eq!(parsed.vad_holdoff_ms, 250);
     }
 }

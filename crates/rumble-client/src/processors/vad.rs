@@ -11,26 +11,54 @@
 use rumble_audio::{AudioProcessor, ProcessorFactory, ProcessorResult, calculate_rms_db};
 use serde::{Deserialize, Serialize};
 
-use super::type_ids;
+use super::{
+    type_ids,
+    vad_shaper::{VadShaper, VadShaperSettings},
+};
 
 /// Settings for the VAD processor.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VadSettings {
-    /// Threshold in dB RMS. Frames below this are considered silence.
+    /// Trigger threshold in dB RMS. Signal must exceed this (for at least
+    /// `attack_ms`) to activate transmission.
     /// Typical values: -40 to -30 dB for quiet environments,
     /// -50 to -40 dB for noisy environments.
     #[serde(default = "default_threshold_db")]
     pub threshold_db: f32,
 
+    /// Release (hold) threshold in dB RMS. Once active, the signal must
+    /// drop below this — *and* the holdoff timer must expire — before
+    /// transmission stops. Should be set lower than `threshold_db` to
+    /// provide hysteresis (typical: 5–10 dB below the trigger). If
+    /// configured above `threshold_db` it is clamped at runtime, which
+    /// disables hysteresis.
+    #[serde(default = "default_release_threshold_db")]
+    pub release_threshold_db: f32,
+
+    /// Minimum attack duration in milliseconds. The signal must remain
+    /// above `threshold_db` for this long before activating. Rejects
+    /// short transients (keyboard clicks, pops). 0 = activate on first
+    /// frame above threshold (original behavior).
+    #[serde(default = "default_attack_ms")]
+    pub attack_ms: u32,
+
     /// Holdoff time in milliseconds.
-    /// After voice is detected, continue for this duration even if
-    /// the signal drops below threshold. Prevents cutting off word endings.
+    /// After the signal drops below `release_threshold_db`, continue
+    /// transmitting for this duration. Prevents cutting off word endings.
     #[serde(default = "default_holdoff_ms")]
     pub holdoff_ms: u32,
 }
 
 fn default_threshold_db() -> f32 {
     -40.0
+}
+
+fn default_release_threshold_db() -> f32 {
+    -45.0
+}
+
+fn default_attack_ms() -> u32 {
+    0
 }
 
 fn default_holdoff_ms() -> u32 {
@@ -41,6 +69,8 @@ impl Default for VadSettings {
     fn default() -> Self {
         Self {
             threshold_db: default_threshold_db(),
+            release_threshold_db: default_release_threshold_db(),
+            attack_ms: default_attack_ms(),
             holdoff_ms: default_holdoff_ms(),
         }
     }
@@ -59,14 +89,7 @@ impl Default for VadSettings {
 pub struct VadProcessor {
     settings: VadSettings,
     enabled: bool,
-
-    // State
-    /// Whether we're currently in "voice active" state
-    voice_active: bool,
-    /// Samples remaining in holdoff period (converted from ms at runtime)
-    holdoff_samples_remaining: u32,
-    /// Current sample rate (for holdoff calculation)
-    current_sample_rate: u32,
+    shaper: VadShaper,
 }
 
 impl VadProcessor {
@@ -80,9 +103,7 @@ impl VadProcessor {
         Self {
             settings,
             enabled: true,
-            voice_active: false,
-            holdoff_samples_remaining: 0,
-            current_sample_rate: 48000,
+            shaper: VadShaper::new(),
         }
     }
 
@@ -106,14 +127,38 @@ impl VadProcessor {
         self.settings.holdoff_ms = holdoff_ms;
     }
 
-    /// Check if voice is currently detected as active.
-    pub fn is_voice_active(&self) -> bool {
-        self.voice_active
+    /// Get the release (hold) threshold in dB.
+    pub fn release_threshold_db(&self) -> f32 {
+        self.settings.release_threshold_db
     }
 
-    /// Convert holdoff_ms to samples at the given sample rate.
-    fn holdoff_samples(&self, sample_rate: u32) -> u32 {
-        (self.settings.holdoff_ms as u64 * sample_rate as u64 / 1000) as u32
+    /// Set the release (hold) threshold in dB.
+    pub fn set_release_threshold_db(&mut self, release_threshold_db: f32) {
+        self.settings.release_threshold_db = release_threshold_db;
+    }
+
+    /// Get the minimum attack duration in milliseconds.
+    pub fn attack_ms(&self) -> u32 {
+        self.settings.attack_ms
+    }
+
+    /// Set the minimum attack duration in milliseconds.
+    pub fn set_attack_ms(&mut self, attack_ms: u32) {
+        self.settings.attack_ms = attack_ms;
+    }
+
+    /// Check if voice is currently detected as active.
+    pub fn is_voice_active(&self) -> bool {
+        self.shaper.is_active()
+    }
+
+    fn shaper_settings(&self) -> VadShaperSettings {
+        VadShaperSettings {
+            trigger: self.settings.threshold_db,
+            release: self.settings.release_threshold_db,
+            attack_ms: self.settings.attack_ms,
+            holdoff_ms: self.settings.holdoff_ms,
+        }
     }
 }
 
@@ -125,30 +170,12 @@ impl Default for VadProcessor {
 
 impl AudioProcessor for VadProcessor {
     fn process(&mut self, samples: &mut [f32], sample_rate: u32) -> ProcessorResult {
-        self.current_sample_rate = sample_rate;
-
-        // Calculate RMS level in dB
         let level_db = calculate_rms_db(samples);
-
-        // Check if current frame exceeds threshold
-        let above_threshold = level_db > self.settings.threshold_db;
-
-        if above_threshold {
-            // Voice detected - activate and reset holdoff
-            self.voice_active = true;
-            self.holdoff_samples_remaining = self.holdoff_samples(sample_rate);
-        } else if self.holdoff_samples_remaining > 0 {
-            // Below threshold but in holdoff period
-            let frame_samples = samples.len() as u32;
-            self.holdoff_samples_remaining = self.holdoff_samples_remaining.saturating_sub(frame_samples);
-        } else {
-            // Below threshold and holdoff expired
-            self.voice_active = false;
-        }
-
-        // Return result with level for UI metering
+        let active = self
+            .shaper
+            .update(level_db, samples.len() as u32, sample_rate, &self.shaper_settings());
         ProcessorResult {
-            suppress: !self.voice_active,
+            suppress: !active,
             level_db: Some(level_db),
         }
     }
@@ -158,8 +185,7 @@ impl AudioProcessor for VadProcessor {
     }
 
     fn reset(&mut self) {
-        self.voice_active = false;
-        self.holdoff_samples_remaining = 0;
+        self.shaper.reset();
     }
 
     fn config(&self) -> serde_json::Value {
@@ -213,16 +239,32 @@ impl ProcessorFactory for VadProcessorFactory {
             "properties": {
                 "threshold_db": {
                     "type": "number",
-                    "title": "Threshold (dB)",
-                    "description": "Audio level threshold in dB RMS. Frames below this are considered silence.",
+                    "title": "Trigger threshold (dB)",
+                    "description": "Audio level required to start transmitting.",
                     "default": -40.0,
                     "minimum": -60.0,
                     "maximum": 0.0
                 },
+                "release_threshold_db": {
+                    "type": "number",
+                    "title": "Release threshold (dB)",
+                    "description": "Once active, stay active until level drops below this. Set lower than the trigger threshold for hysteresis.",
+                    "default": -45.0,
+                    "minimum": -60.0,
+                    "maximum": 0.0
+                },
+                "attack_ms": {
+                    "type": "integer",
+                    "title": "Attack (ms)",
+                    "description": "Signal must stay above the trigger threshold for this long before activating. Rejects short transients.",
+                    "default": 0,
+                    "minimum": 0,
+                    "maximum": 200
+                },
                 "holdoff_ms": {
                     "type": "integer",
                     "title": "Holdoff (ms)",
-                    "description": "Time to continue transmitting after voice drops below threshold. Prevents cutting off word endings.",
+                    "description": "Time to keep transmitting after the level drops below the release threshold. Prevents cutting off word endings.",
                     "default": 300,
                     "minimum": 0,
                     "maximum": 2000
@@ -246,6 +288,8 @@ mod tests {
         assert!(processor.is_enabled());
         assert!(!processor.is_voice_active());
         assert_eq!(processor.threshold_db(), -40.0);
+        assert_eq!(processor.release_threshold_db(), -45.0);
+        assert_eq!(processor.attack_ms(), 0);
         assert_eq!(processor.holdoff_ms(), 300);
     }
 
@@ -279,6 +323,8 @@ mod tests {
     fn test_vad_holdoff() {
         let mut processor = VadProcessor::with_settings(VadSettings {
             threshold_db: -40.0,
+            release_threshold_db: -40.0, // disable hysteresis for this test
+            attack_ms: 0,
             holdoff_ms: 100, // 100ms holdoff = ~4800 samples at 48kHz
         });
 
@@ -350,6 +396,8 @@ mod tests {
     fn test_config_roundtrip() {
         let processor = VadProcessor::with_settings(VadSettings {
             threshold_db: -45.0,
+            release_threshold_db: -52.0,
+            attack_ms: 40,
             holdoff_ms: 500,
         });
         let config = processor.config();
@@ -358,6 +406,119 @@ mod tests {
         processor2.set_config(&config);
 
         assert!((processor2.threshold_db() - (-45.0)).abs() < 0.001);
+        assert!((processor2.release_threshold_db() - (-52.0)).abs() < 0.001);
+        assert_eq!(processor2.attack_ms(), 40);
         assert_eq!(processor2.holdoff_ms(), 500);
+    }
+
+    /// Old configs (saved before hysteresis/attack were added) should
+    /// deserialize cleanly with sensible defaults for the new fields.
+    #[test]
+    fn test_vad_legacy_config_compat() {
+        let config = serde_json::json!({
+            "threshold_db": -38.0,
+            "holdoff_ms": 250
+        });
+        let mut processor = VadProcessor::new();
+        processor.set_config(&config);
+
+        assert!((processor.threshold_db() - (-38.0)).abs() < 0.001);
+        assert_eq!(processor.holdoff_ms(), 250);
+        assert_eq!(processor.release_threshold_db(), -45.0);
+        assert_eq!(processor.attack_ms(), 0);
+    }
+
+    /// With hysteresis configured, once active the level can drop below
+    /// the trigger but stay above the release threshold and remain active
+    /// indefinitely (holdoff never starts counting down).
+    #[test]
+    fn test_vad_hysteresis_holds_between_thresholds() {
+        let mut processor = VadProcessor::with_settings(VadSettings {
+            threshold_db: -20.0,
+            release_threshold_db: -40.0,
+            attack_ms: 0,
+            holdoff_ms: 20, // short — would expire quickly if it actually counted down
+        });
+
+        // Activate with a loud frame (~0 dB).
+        let mut loud = vec![0.5f32; 960];
+        processor.process(&mut loud, 48000);
+        assert!(processor.is_voice_active());
+
+        // Frame between thresholds: ~-26 dB (above -40 release, below -20 trigger).
+        // Should stay active across many frames without the holdoff expiring.
+        for _ in 0..50 {
+            let mut mid = vec![0.05f32; 960];
+            let r = processor.process(&mut mid, 48000);
+            assert!(!r.suppress, "frame above release threshold must not suppress");
+            assert!(processor.is_voice_active());
+        }
+
+        // Now drop below release: holdoff begins, then deactivates.
+        for _ in 0..10 {
+            let mut quiet = vec![0.0001f32; 960];
+            processor.process(&mut quiet, 48000);
+        }
+        let mut quiet = vec![0.0001f32; 960];
+        let r = processor.process(&mut quiet, 48000);
+        assert!(r.suppress);
+        assert!(!processor.is_voice_active());
+    }
+
+    /// A loud frame shorter than `attack_ms` must not trigger activation;
+    /// activation requires the level to stay above trigger across the
+    /// full attack window.
+    #[test]
+    fn test_vad_attack_rejects_short_transient() {
+        // attack_ms = 50ms ≈ 2400 samples at 48kHz → needs ~3 frames of 960.
+        let mut processor = VadProcessor::with_settings(VadSettings {
+            threshold_db: -40.0,
+            release_threshold_db: -45.0,
+            attack_ms: 50,
+            holdoff_ms: 300,
+        });
+
+        // Single loud frame (~20ms) — below the 50ms attack window.
+        let mut loud = vec![0.3f32; 960];
+        let r = processor.process(&mut loud, 48000);
+        assert!(r.suppress, "single short transient must not activate");
+        assert!(!processor.is_voice_active());
+
+        // Followed by quiet: accumulator resets.
+        let mut quiet = vec![0.0001f32; 960];
+        processor.process(&mut quiet, 48000);
+        assert!(!processor.is_voice_active());
+
+        // Now sustained loud across multiple frames — should activate
+        // once cumulative loud time crosses the attack window.
+        for _ in 0..3 {
+            let mut loud = vec![0.3f32; 960];
+            processor.process(&mut loud, 48000);
+        }
+        assert!(processor.is_voice_active());
+    }
+
+    /// A release threshold configured above the trigger threshold would
+    /// be unreachable for the inactive→active transition. The processor
+    /// clamps it to the trigger, which collapses to the no-hysteresis
+    /// (original) behavior.
+    #[test]
+    fn test_vad_release_clamped_to_trigger() {
+        let mut processor = VadProcessor::with_settings(VadSettings {
+            threshold_db: -40.0,
+            release_threshold_db: -20.0, // nonsensical: above trigger
+            attack_ms: 0,
+            holdoff_ms: 0,
+        });
+
+        let mut loud = vec![0.3f32; 960];
+        processor.process(&mut loud, 48000);
+        assert!(processor.is_voice_active());
+
+        // With release clamped to -40, a frame just below trigger deactivates.
+        let mut quiet = vec![0.0001f32; 960];
+        let r = processor.process(&mut quiet, 48000);
+        assert!(r.suppress);
+        assert!(!processor.is_voice_active());
     }
 }

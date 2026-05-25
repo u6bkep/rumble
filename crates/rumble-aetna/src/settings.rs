@@ -15,7 +15,7 @@ use std::path::PathBuf;
 
 use aetna_core::prelude::*;
 
-use rumble_client::{PipelineConfig, ProcessorRegistry, SfxKind};
+use rumble_client::{PipelineConfig, ProcessorConfig, ProcessorRegistry, SfxKind};
 use rumble_desktop_shell::{
     AutoDownloadRule, HotkeyBinding, HotkeyData, HotkeyFunction, HotkeyManager, HotkeyModifiers, KeyboardSettings,
     PersistentVoiceMode, Settings, ShortcutEntry, TimestampFormat,
@@ -1231,6 +1231,10 @@ fn render_schema_field(
 /// When the VAD processor is disabled there's no threshold to break
 /// against, so the meter falls back to a plain green/yellow/red
 /// loudness display via [`progress`].
+fn bool_setting(proc: &ProcessorConfig, key: &str) -> bool {
+    proc.settings.get(key).and_then(|v| v.as_bool()).unwrap_or(false)
+}
+
 fn input_level_meter(pipeline: &PipelineConfig, audio: &AudioState) -> El {
     const MIN_DB: f32 = -60.0;
     const MAX_DB: f32 = 0.0;
@@ -1242,25 +1246,50 @@ fn input_level_meter(pipeline: &PipelineConfig, audio: &AudioState) -> El {
     let normalize = |db: f32| ((db - MIN_DB) / SPAN_DB).clamp(0.0, 1.0);
     let value_n = level_db.map(normalize).unwrap_or(0.0);
 
-    let vad_threshold_db = pipeline
+    let vad_proc = pipeline
         .processors
         .iter()
-        .find(|p| p.type_id == "builtin.vad" && p.enabled)
+        .find(|p| p.type_id == "builtin.vad" && p.enabled);
+    let vad_threshold_db = vad_proc
         .and_then(|p| p.settings.get("threshold_db"))
         .and_then(|v| v.as_f64())
         .map(|t| t as f32);
+    // Only surface a separate release tick when hysteresis is actually
+    // configured (release strictly below trigger); equal/above collapses
+    // to the no-hysteresis case the processor clamps to at runtime.
+    let vad_release_db = vad_proc
+        .and_then(|p| p.settings.get("release_threshold_db"))
+        .and_then(|v| v.as_f64())
+        .map(|t| t as f32)
+        .zip(vad_threshold_db)
+        .filter(|(release, trigger)| release < trigger)
+        .map(|(release, _)| release);
+
+    // The denoise stage runs its own voice gate (RNNoise probability),
+    // which doesn't map onto the dB meter's axis. We still want users
+    // to know it's the one gating, so label it but skip the threshold
+    // tick. Energy VAD wins the visualization if both are enabled.
+    let rnnoise_vad_gating = vad_threshold_db.is_none()
+        && pipeline
+            .processors
+            .iter()
+            .any(|p| p.type_id == "builtin.denoise" && p.enabled && bool_setting(p, "vad_enabled"));
 
     let level_label = match level_db {
         Some(db) => format!("{db:.0} dB"),
         None => "—".to_string(),
     };
-    let threshold_label = match vad_threshold_db {
-        Some(db) => format!("VAD threshold: {db:.0} dB"),
-        None => "VAD disabled — bar shows mic loudness only".to_string(),
+    let threshold_label = match (vad_threshold_db, vad_release_db, rnnoise_vad_gating) {
+        (Some(trigger), Some(release), _) => {
+            format!("VAD: trigger {trigger:.0} dB · release {release:.0} dB")
+        }
+        (Some(trigger), None, _) => format!("VAD threshold: {trigger:.0} dB"),
+        (None, _, true) => "Voice gate active (RNNoise) — bar shows mic loudness".to_string(),
+        (None, _, false) => "VAD disabled — bar shows mic loudness only".to_string(),
     };
 
     let bar = match vad_threshold_db {
-        Some(t_db) => threshold_bar(value_n, normalize(t_db), BAR_W, BAR_H),
+        Some(t_db) => threshold_bar(value_n, normalize(t_db), vad_release_db.map(normalize), BAR_W, BAR_H),
         None => {
             // No threshold to break against — fall back to a plain
             // loudness meter coloured by current level.
@@ -1292,12 +1321,21 @@ fn input_level_meter(pipeline: &PipelineConfig, audio: &AudioState) -> El {
 /// proportional to the current level. The colour change at the
 /// threshold position is the user's main visual cue when tuning the
 /// VAD.
-fn threshold_bar(value_n: f32, threshold_n: f32, bar_w: f32, bar_h: f32) -> El {
+///
+/// When `release_n` is `Some` (hysteresis configured, release < trigger)
+/// a thin vertical tick is drawn at the release position inside the
+/// red zone, marking where an already-active session would start
+/// counting down its holdoff.
+fn threshold_bar(value_n: f32, threshold_n: f32, release_n: Option<f32>, bar_w: f32, bar_h: f32) -> El {
+    const TICK_W: f32 = 2.0;
+
     let value_n = value_n.clamp(0.0, 1.0);
     let threshold_n = threshold_n.clamp(0.0, 1.0);
+    let release_n = release_n.map(|r| r.clamp(0.0, 1.0));
 
     let below_color = tokens::DESTRUCTIVE;
     let above_color = tokens::SUCCESS;
+    let release_tick_color = tokens::WARNING;
     // Mumble darkens unfilled segments to ~1/3 brightness via Qt's
     // `darker(300)`; matching that with `darken(0.7)` keeps a hint of
     // the zone's hue on the unfilled portion so the threshold position
@@ -1311,11 +1349,22 @@ fn threshold_bar(value_n: f32, threshold_n: f32, bar_w: f32, bar_h: f32) -> El {
         let threshold_x = r.w * threshold_n;
         let below_fill_w = value_x.min(threshold_x).max(0.0);
         let above_fill_w = (value_x - threshold_x).max(0.0);
+        // Tick is sized 0 when no release threshold is configured so the
+        // stack child collapses out of view without affecting layout.
+        let (tick_x, tick_w) = match release_n {
+            Some(rn) => {
+                let center = r.w * rn;
+                let x = (center - TICK_W * 0.5).clamp(0.0, (r.w - TICK_W).max(0.0));
+                (r.x + x, TICK_W)
+            }
+            None => (r.x, 0.0),
+        };
         vec![
             Rect::new(r.x, r.y, threshold_x, r.h),
             Rect::new(r.x + threshold_x, r.y, (r.w - threshold_x).max(0.0), r.h),
             Rect::new(r.x, r.y, below_fill_w, r.h),
             Rect::new(r.x + threshold_x, r.y, above_fill_w, r.h),
+            Rect::new(tick_x, r.y, tick_w, r.h),
         ]
     };
 
@@ -1324,6 +1373,7 @@ fn threshold_bar(value_n: f32, threshold_n: f32, bar_w: f32, bar_h: f32) -> El {
         El::new(Kind::Custom("vu-above-track")).fill(above_track),
         El::new(Kind::Custom("vu-below-fill")).fill(below_color),
         El::new(Kind::Custom("vu-above-fill")).fill(above_color),
+        El::new(Kind::Custom("vu-release-tick")).fill(release_tick_color),
     ])
     .layout(layout)
     .width(Size::Fixed(bar_w))

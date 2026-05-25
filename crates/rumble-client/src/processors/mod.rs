@@ -6,9 +6,10 @@
 //!
 //! # Available Processors
 //!
-//! - [`GainProcessor`] (`builtin.gain`) - Volume adjustment
-//! - [`DenoiseProcessor`] (`builtin.denoise`) - RNNoise-based noise suppression
-//! - [`VadProcessor`] (`builtin.vad`) - Voice activity detection
+//! - [`GainProcessor`] (`builtin.gain`) — Volume adjustment
+//! - [`DenoiseProcessor`] (`builtin.denoise`) — RNNoise denoise + ML voice gate
+//! - [`VadProcessor`] (`builtin.vad`) — Energy-only voice activity detection
+//!   (legacy; kept for users who want zero ML in the chain)
 //!
 //! # Usage
 //!
@@ -23,6 +24,7 @@
 mod denoise;
 mod gain;
 mod vad;
+mod vad_shaper;
 
 pub use denoise::{DenoiseProcessor, DenoiseProcessorFactory};
 pub use gain::{GainProcessor, GainProcessorFactory};
@@ -41,10 +43,16 @@ pub fn register_builtin_processors(registry: &mut ProcessorRegistry) {
 ///
 /// Each entry is (type_id, default_enabled).
 /// Order matters - processors are applied in this order.
+///
+/// The denoise stage handles both noise suppression and voice gating (its
+/// `vad_enabled` setting defaults to true for fresh configs), so new users
+/// get RNNoise as their voice gate out of the box. The standalone energy
+/// VAD stays registered and listed in the pipeline but disabled, available
+/// for users who want an ML-free gate.
 pub const DEFAULT_TX_PIPELINE: &[(&str, bool)] = &[
-    (type_ids::GAIN, true),    // Mic input level adjustment - always on
-    (type_ids::DENOISE, true), // Noise suppression - enabled by default
-    (type_ids::VAD, false),    // Voice activity detection - off by default (user enables for voice-activated mode)
+    (type_ids::GAIN, true),
+    (type_ids::DENOISE, true),
+    (type_ids::VAD, false),
 ];
 
 /// Build the default TX pipeline configuration.
