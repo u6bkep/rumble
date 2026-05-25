@@ -25,7 +25,11 @@ pub use audio::{
 };
 #[cfg(feature = "codec")]
 pub use codec::{NativeOpusCodec, NativeOpusDecoder, NativeOpusEncoder};
-pub use file_transfer_relay::FileTransferRelayPlugin;
+pub use file_transfer_relay::{
+    FileTransferRelayPlugin, NAMESPACE as FILE_TRANSFER_RELAY_NAMESPACE,
+    PAYLOAD_SCHEMA_VERSION as FILE_TRANSFER_RELAY_PAYLOAD_SCHEMA_VERSION, decode_payload as decode_relay_payload,
+    encode_payload as encode_relay_payload,
+};
 pub use transport::{
     QuinnBiRecvStream, QuinnBiSendStream, QuinnBiStreamHandle, QuinnDatagramHandle, QuinnRecvStream, QuinnTransport,
 };

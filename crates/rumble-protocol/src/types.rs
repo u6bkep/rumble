@@ -642,74 +642,38 @@ pub enum ChatMessageKind {
     Tree,
 }
 
-/// File-offer payload mirrored from `proto::FileOffer` so the UI doesn't depend
-/// on prost-generated types. Populated when a chat message carries an
-/// attachment of kind `FileOffer`.
+/// Plugin-namespaced sidecar attached to a chat message. The server
+/// forwards this unchanged; receivers dispatch by `namespace` to find a
+/// matching plugin renderer/handler. Clients without a matching plugin
+/// display `fallback_text`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct FileOfferInfo {
+pub struct ChatAttachment {
+    /// Reverse-DNS plugin identifier (e.g. "rumble.file_transfer.relay").
+    pub namespace: String,
+    /// Schema version for the payload format, plugin-defined.
     pub schema_version: u32,
-    pub transfer_id: String,
-    pub name: String,
-    pub size: u64,
-    pub mime: String,
-    pub share_data: String,
+    /// Opaque plugin-encoded payload (consumed by the matching plugin).
+    pub payload: Vec<u8>,
+    /// Text shown when no plugin matches `namespace`.
+    pub fallback_text: String,
 }
 
-/// Typed sidecar attached to a chat message. New variants can be added without
-/// breaking older clients — they will simply ignore the `attachment` field and
-/// render the message's `text` summary.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum ChatAttachment {
-    FileOffer(FileOfferInfo),
-}
-
-/// Convert a wire `ChatAttachment` (prost-generated) into the client-side
-/// `ChatAttachment`. Returns `None` for empty / unknown variants so older
-/// receivers tolerate future kinds gracefully.
-pub fn chat_attachment_from_proto(att: crate::proto::ChatAttachment) -> Option<ChatAttachment> {
-    use crate::proto::chat_attachment::Kind;
-    match att.kind? {
-        Kind::FileOffer(fo) => Some(ChatAttachment::FileOffer(FileOfferInfo {
-            schema_version: fo.schema_version,
-            transfer_id: fo.transfer_id,
-            name: fo.name,
-            size: fo.size,
-            mime: fo.mime,
-            share_data: fo.share_data,
-        })),
+pub fn chat_attachment_from_proto(att: crate::proto::ChatAttachment) -> ChatAttachment {
+    ChatAttachment {
+        namespace: att.namespace,
+        schema_version: att.schema_version,
+        payload: att.payload,
+        fallback_text: att.fallback_text,
     }
 }
 
-/// Encode a client-side `ChatAttachment` into the wire form for outbound
-/// `ChatMessage` envelopes.
 pub fn chat_attachment_to_proto(att: &ChatAttachment) -> crate::proto::ChatAttachment {
-    use crate::proto::chat_attachment::Kind;
-    match att {
-        ChatAttachment::FileOffer(fo) => crate::proto::ChatAttachment {
-            kind: Some(Kind::FileOffer(crate::proto::FileOffer {
-                schema_version: fo.schema_version,
-                transfer_id: fo.transfer_id.clone(),
-                name: fo.name.clone(),
-                size: fo.size,
-                mime: fo.mime.clone(),
-                share_data: fo.share_data.clone(),
-            })),
-        },
+    crate::proto::ChatAttachment {
+        namespace: att.namespace.clone(),
+        schema_version: att.schema_version,
+        payload: att.payload.clone(),
+        fallback_text: att.fallback_text.clone(),
     }
-}
-
-/// Upload lifecycle phase for a locally-stored chat message carrying a FileOffer.
-/// This is purely client-side state — never sent over the wire.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum LifecyclePhase {
-    /// Message is live (upload complete, or no upload involved).
-    #[default]
-    Live,
-    /// File upload is in progress; the offer is not yet visible to recipients.
-    PendingUpload,
-    /// Upload failed; the offer should be shown as errored.
-    FailedUpload,
 }
 
 /// A chat message.
@@ -735,13 +699,24 @@ pub struct ChatMessage {
     /// The kind of message (room chat, DM, or tree broadcast).
     #[serde(default)]
     pub kind: ChatMessageKind,
-    /// Optional typed attachment (e.g. file offer). Receivers that don't
-    /// understand the attachment kind fall back to displaying `text`.
+    /// Optional plugin-namespaced attachment. Receivers without a
+    /// matching plugin fall back to `attachment.fallback_text` (or the
+    /// message's `text` if no attachment).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attachment: Option<ChatAttachment>,
-    /// Client-only upload lifecycle phase. Always `Live` for received messages.
+    /// Client-only: sender's view-only message. Never goes on the wire,
+    /// never included in chat-history-sync shares. Used for the
+    /// sender's in-flight file-share card (driven by plugin transfer
+    /// state).
     #[serde(skip)]
-    pub phase: LifecyclePhase,
+    pub local_only: bool,
+    /// Client-only: sender's local copy of a broadcast they sent.
+    /// NOT rendered to the sender (they have the local_only card for
+    /// the same thing). IS included in history-sync shares so late
+    /// peers can fetch it from the sender; the flag itself is stripped
+    /// on egress.
+    #[serde(skip)]
+    pub remote_only: bool,
 }
 
 // =============================================================================
@@ -835,11 +810,17 @@ impl ChatHistoryContent {
 
     /// Create a new chat history content from chat messages.
     ///
-    /// Filters out local messages (system messages, etc.).
+    /// Filters out:
+    /// - `is_local` system messages (preamble lines, "Connect first" notices)
+    /// - `local_only` sender-private cards (in-flight file shares)
+    ///
+    /// `remote_only` messages ARE included — that's the entire reason for
+    /// the flag. The flag itself is sender-local and not serialized over
+    /// the wire; peers receive a clean copy and render normally.
     pub fn from_messages(messages: &[ChatMessage]) -> Self {
         let entries = messages
             .iter()
-            .filter(|m| !m.is_local)
+            .filter(|m| !m.is_local && !m.local_only)
             .map(|m| ChatHistoryEntry {
                 id: hex::encode(m.id),
                 sender: m.sender.clone(),
@@ -893,7 +874,8 @@ impl ChatHistoryContent {
                     is_local: false,
                     kind: ChatMessageKind::default(),
                     attachment: e.attachment.clone(),
-                    phase: LifecyclePhase::default(),
+                    local_only: false,
+                    remote_only: false,
                 })
             })
             .collect()
@@ -1161,20 +1143,6 @@ impl State {
         self.users
             .iter()
             .find(|u| u.user_id.as_ref().map(|id| id.value) == Some(user_id))
-    }
-
-    /// Update the lifecycle phase of the chat message whose FileOffer attachment
-    /// has the given `transfer_id`. Returns `true` if a matching message was found.
-    pub fn set_message_phase(&mut self, transfer_id: &str, phase: LifecyclePhase) -> bool {
-        for msg in &mut self.chat_messages {
-            if let Some(ChatAttachment::FileOffer(fo)) = &msg.attachment {
-                if fo.transfer_id == transfer_id {
-                    msg.phase = phase;
-                    return true;
-                }
-            }
-        }
-        false
     }
 }
 

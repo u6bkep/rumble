@@ -998,7 +998,12 @@ impl<B: UiBackend> App<B> {
             if msg.is_local {
                 continue;
             }
-            let Some(rumble_protocol::ChatAttachment::FileOffer(offer)) = msg.attachment.as_ref() else {
+            let Some(att) = msg.attachment.as_ref() else {
+                continue;
+            };
+            let Ok(offer) =
+                <rumble_protocol::proto::RelayFileSharePayload as prost::Message>::decode(att.payload.as_slice())
+            else {
                 continue;
             };
             if my_username.as_deref() == Some(msg.sender.as_str()) {

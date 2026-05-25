@@ -932,9 +932,6 @@ impl<B: UiBackend> App for RumbleApp<B> {
                     });
                     return;
                 }
-                self.backend.send(Command::LocalMessage {
-                    text: format!("Sharing {}", path.display()),
-                });
                 self.backend.send(Command::ShareFile { path });
                 return;
             }
@@ -1848,9 +1845,6 @@ impl<B: UiBackend> RumbleApp<B> {
         // Process exit cleans the OS temp dir; an explicit cleanup
         // belongs with the broader transfer-history work.
         std::mem::forget(temp_dir);
-        self.backend.send(Command::LocalMessage {
-            text: "Sharing pasted image".to_string(),
-        });
         self.backend.send(Command::ShareFile { path: temp_path });
     }
 
@@ -1907,9 +1901,6 @@ impl<B: UiBackend> RumbleApp<B> {
         let handle = self.pending_file_dialog.take().unwrap();
         match self.runtime.block_on(handle) {
             Ok(Some(path)) => {
-                self.backend.send(Command::LocalMessage {
-                    text: format!("Sharing {}", path.display()),
-                });
                 self.backend.send(Command::ShareFile { path });
             }
             Ok(None) => {
@@ -1932,15 +1923,8 @@ impl<B: UiBackend> RumbleApp<B> {
         // Find name and local_path from the offer in chat history.
         let snapshot = self.backend.state();
         let offer = snapshot.chat_messages.iter().find_map(|m| {
-            if let Some(rumble_protocol::ChatAttachment::FileOffer(o)) = &m.attachment {
-                if o.transfer_id == transfer_id {
-                    Some(o.clone())
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
+            let o = chat::relay_payload(m)?;
+            (o.transfer_id == transfer_id).then_some(o)
         });
         let name = offer.map(|o| o.name).unwrap_or_else(|| transfer_id.to_string());
         let local_path = self
@@ -2061,14 +2045,10 @@ impl<B: UiBackend> RumbleApp<B> {
     /// history-replay doesn't re-prompt or re-trigger the download.
     fn download_offer(&mut self, transfer_id: &str) {
         let snapshot = self.backend.state();
-        let offer = snapshot
-            .chat_messages
-            .iter()
-            .rev()
-            .find_map(|m| match m.attachment.as_ref() {
-                Some(rumble_protocol::ChatAttachment::FileOffer(o)) if o.transfer_id == transfer_id => Some(o.clone()),
-                _ => None,
-            });
+        let offer = snapshot.chat_messages.iter().rev().find_map(|m| {
+            let o = chat::relay_payload(m)?;
+            (o.transfer_id == transfer_id).then_some(o)
+        });
         let Some(offer) = offer else {
             tracing::warn!("download_offer: offer {transfer_id} no longer in history");
             return;
@@ -2099,11 +2079,9 @@ impl<B: UiBackend> RumbleApp<B> {
             .chat_messages
             .iter()
             .rev()
-            .find_map(|m| match m.attachment.as_ref() {
-                Some(rumble_protocol::ChatAttachment::FileOffer(o)) if o.transfer_id == transfer_id => {
-                    Some(o.name.clone())
-                }
-                _ => None,
+            .find_map(|m| {
+                let o = chat::relay_payload(m)?;
+                (o.transfer_id == transfer_id).then_some(o.name)
             })
             .unwrap_or_else(|| transfer_id.to_string());
         self.image_lightbox = Some(chat::Lightbox::new(transfer_id, name));
@@ -2315,10 +2293,10 @@ impl<B: UiBackend> RumbleApp<B> {
             .map(|u| u.username.clone());
 
         for msg in &snapshot.chat_messages[prev..] {
-            if msg.is_local {
+            if msg.is_local || msg.remote_only {
                 continue;
             }
-            let Some(rumble_protocol::ChatAttachment::FileOffer(offer)) = msg.attachment.as_ref() else {
+            let Some(offer) = chat::relay_payload(msg) else {
                 continue;
             };
             let is_from_self = match (my_user_id, msg.sender_id) {
@@ -2340,7 +2318,7 @@ impl<B: UiBackend> RumbleApp<B> {
                     offer.mime
                 );
                 self.backend.send(Command::DownloadFile {
-                    share_data: offer.share_data.clone(),
+                    share_data: offer.share_data,
                 });
             }
         }
@@ -2363,7 +2341,7 @@ impl<B: UiBackend> RumbleApp<B> {
             let mut had_room = false;
             for m in snapshot.chat_messages[self.prev_chat_count..]
                 .iter()
-                .filter(|m| !m.is_local)
+                .filter(|m| !m.is_local && !m.remote_only)
             {
                 match m.kind {
                     rumble_protocol::ChatMessageKind::DirectMessage { .. } => had_dm = true,

@@ -580,24 +580,23 @@ async fn send_disconnect_envelope<T: rumble_client_traits::transport::Transport>
 /// - State synchronization
 ///
 /// Internal feedback channel from upload-watcher tasks back into the
-/// connection task. The watcher polls `ft.transfers()` and, once the
-/// transfer is finished, asks the connection task to either broadcast
-/// the FileOffer envelope (success) or flip the local card to
-/// `FailedUpload` (failure). Lives entirely inside
+/// connection task. The watcher polls `ft.transfers()` and, once an
+/// upload finishes successfully, asks the connection task to broadcast
+/// the corresponding chat message. Failure does not flow through this
+/// channel: the sender's local_only card reads the error directly from
+/// the plugin's TransferStatus. Lives entirely inside
 /// [`run_connection_task`].
 #[derive(Debug)]
 enum DeferredAction {
-    /// Upload finished successfully — broadcast the offer envelope and
-    /// flip the local card from `PendingUpload` to `Live`.
+    /// Upload finished successfully — broadcast the chat envelope and
+    /// insert a remote_only mirror of the message in local state so
+    /// late-joining peers can fetch it via history sync.
     FinalizeShareUpload {
-        transfer_id: String,
-        offer: rumble_client_traits::FileOffer,
-        summary: String,
+        message_id: [u8; 16],
+        attachment: rumble_protocol::types::ChatAttachment,
+        sender: String,
+        timestamp: std::time::SystemTime,
     },
-    /// Upload failed (rejected, cancelled, network) — flip the local
-    /// card to `FailedUpload`. The toast is emitted by the plugin's
-    /// event sink, not here.
-    FailShareUpload { transfer_id: String },
 }
 
 /// It notifies the audio task when a connection is established or closed.
@@ -638,63 +637,66 @@ async fn run_connection_task<P: Platform>(
         tokio::select! {
             Some(action) = deferred_rx.recv() => {
                 match action {
-                    DeferredAction::FinalizeShareUpload { transfer_id, offer, summary } => {
-                        if let Some(t) = &mut transport {
-                            let env = proto::Envelope {
-                                state_hash: Vec::new(),
-                                payload: Some(Payload::ChatMessage(proto::ChatMessage {
-                                    id: uuid::Uuid::new_v4().into_bytes().to_vec(),
-                                    sender: client_name.clone(),
-                                    text: summary,
-                                    timestamp_ms: std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .unwrap_or_default()
-                                        .as_millis() as i64,
-                                    tree: None,
-                                    attachment: Some(proto::ChatAttachment {
-                                        kind: Some(proto::chat_attachment::Kind::FileOffer(proto::FileOffer {
-                                            schema_version: 1,
-                                            transfer_id: offer.id.0.clone(),
-                                            name: offer.name.clone(),
-                                            size: offer.size,
-                                            mime: offer.mime.clone(),
-                                            share_data: offer.share_data,
-                                        })),
-                                    }),
-                                })),
-                            };
-                            if let Err(e) = send_envelope(t, &env).await {
-                                error!("Failed to send file share message: {}", e);
-                                let _ = event_tx.send(BackendEvent::Toast {
-                                    level: NotificationLevel::Error,
-                                    text: format!("Failed to broadcast share: {e}"),
-                                });
-                                // Flip the local card to failed so the
-                                // user sees that nobody else got it.
-                                if let Ok(mut s) = state.write() {
-                                    s.set_message_phase(&transfer_id, rumble_protocol::types::LifecyclePhase::FailedUpload);
-                                }
-                                repaint();
-                            } else if let Ok(mut s) = state.write() {
-                                s.set_message_phase(&transfer_id, rumble_protocol::types::LifecyclePhase::Live);
-                                drop(s);
-                                repaint();
+                    DeferredAction::FinalizeShareUpload { message_id, attachment, sender, timestamp } => {
+                        let Some(t) = &mut transport else {
+                            // Disconnected between upload start and completion.
+                            // The file is in the server cache but nobody knows
+                            // about it; the sender's local_only card still
+                            // shows complete from plugin state. Drop the
+                            // broadcast — no peers to deliver to anyway.
+                            warn!("FinalizeShareUpload: transport gone, dropping broadcast");
+                            continue;
+                        };
+                        let timestamp_ms = timestamp
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as i64;
+                        let env = proto::Envelope {
+                            state_hash: Vec::new(),
+                            payload: Some(Payload::ChatMessage(proto::ChatMessage {
+                                id: message_id.to_vec(),
+                                sender: sender.clone(),
+                                text: attachment.fallback_text.clone(),
+                                timestamp_ms,
+                                tree: None,
+                                attachment: Some(rumble_protocol::chat_attachment_to_proto(&attachment)),
+                            })),
+                        };
+                        if let Err(e) = send_envelope(t, &env).await {
+                            error!("Failed to broadcast file share message: {}", e);
+                            // Per design: don't try to surface this on the
+                            // chat card — the user's local_only card reads
+                            // upload state from the plugin (which shows
+                            // complete). A toast keeps them informed that
+                            // nobody else got it.
+                            let _ = event_tx.send(BackendEvent::Toast {
+                                level: NotificationLevel::Error,
+                                text: format!("Failed to broadcast share: {e}"),
+                            });
+                            continue;
+                        }
+                        // Mirror the broadcast into local chat_messages as a
+                        // remote_only entry so history-sync requests from
+                        // late peers receive it.
+                        if let Ok(mut s) = state.write() {
+                            s.chat_messages.push(crate::events::ChatMessage {
+                                id: message_id,
+                                sender,
+                                sender_id: None,
+                                text: attachment.fallback_text.clone(),
+                                timestamp,
+                                is_local: false,
+                                kind: Default::default(),
+                                attachment: Some(attachment),
+                                local_only: false,
+                                remote_only: true,
+                            });
+                            if s.chat_messages.len() > 100 {
+                                s.chat_messages.remove(0);
                             }
-                        } else {
-                            // Disconnected between upload start and
-                            // completion — drop the broadcast and mark
-                            // failed.
-                            if let Ok(mut s) = state.write() {
-                                s.set_message_phase(&transfer_id, rumble_protocol::types::LifecyclePhase::FailedUpload);
-                            }
+                            drop(s);
                             repaint();
                         }
-                    }
-                    DeferredAction::FailShareUpload { transfer_id } => {
-                        if let Ok(mut s) = state.write() {
-                            s.set_message_phase(&transfer_id, rumble_protocol::types::LifecyclePhase::FailedUpload);
-                        }
-                        repaint();
                     }
                 }
             }
@@ -1133,18 +1135,19 @@ async fn run_connection_task<P: Platform>(
 
                     Command::SendChat { text } => {
                         if let Some(t) = &mut transport {
-                            let message_id = uuid::Uuid::new_v4().into_bytes().to_vec();
-                            let timestamp_ms = std::time::SystemTime::now()
+                            let message_id = uuid::Uuid::new_v4().into_bytes();
+                            let timestamp = std::time::SystemTime::now();
+                            let timestamp_ms = timestamp
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
                                 .as_millis() as i64;
                             let env = proto::Envelope {
                                 state_hash: Vec::new(),
                                 payload: Some(Payload::ChatMessage(proto::ChatMessage {
-                                    id: message_id,
+                                    id: message_id.to_vec(),
                                     timestamp_ms,
                                     sender: client_name.clone(),
-                                    text,
+                                    text: text.clone(),
                                     tree: None,
                                     attachment: None,
                                 })),
@@ -1152,23 +1155,45 @@ async fn run_connection_task<P: Platform>(
                             if let Err(e) = send_envelope(t, &env).await {
                                 error!("Failed to send ChatMessage: {}", e);
                             }
+                            // Insert locally — server no longer echoes chat
+                            // back to the sender.
+                            let mut s = write_state(&state);
+                            let my_uid = s.my_user_id;
+                            s.chat_messages.push(crate::events::ChatMessage {
+                                id: message_id,
+                                sender: client_name.clone(),
+                                sender_id: my_uid,
+                                text,
+                                timestamp,
+                                is_local: false,
+                                kind: crate::events::ChatMessageKind::Room,
+                                attachment: None,
+                                local_only: false,
+                                remote_only: false,
+                            });
+                            if s.chat_messages.len() > 100 {
+                                s.chat_messages.remove(0);
+                            }
+                            drop(s);
+                            repaint();
                         }
                     }
 
                     Command::SendTreeChat { text } => {
                         if let Some(t) = &mut transport {
-                            let message_id = uuid::Uuid::new_v4().into_bytes().to_vec();
-                            let timestamp_ms = std::time::SystemTime::now()
+                            let message_id = uuid::Uuid::new_v4().into_bytes();
+                            let timestamp = std::time::SystemTime::now();
+                            let timestamp_ms = timestamp
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
                                 .as_millis() as i64;
                             let env = proto::Envelope {
                                 state_hash: Vec::new(),
                                 payload: Some(Payload::ChatMessage(proto::ChatMessage {
-                                    id: message_id,
+                                    id: message_id.to_vec(),
                                     timestamp_ms,
                                     sender: client_name.clone(),
-                                    text,
+                                    text: text.clone(),
                                     tree: Some(true),
                                     attachment: None,
                                 })),
@@ -1176,6 +1201,27 @@ async fn run_connection_task<P: Platform>(
                             if let Err(e) = send_envelope(t, &env).await {
                                 error!("Failed to send tree ChatMessage: {}", e);
                             }
+                            // Insert locally — server no longer echoes chat
+                            // back to the sender.
+                            let mut s = write_state(&state);
+                            let my_uid = s.my_user_id;
+                            s.chat_messages.push(crate::events::ChatMessage {
+                                id: message_id,
+                                sender: client_name.clone(),
+                                sender_id: my_uid,
+                                text,
+                                timestamp,
+                                is_local: false,
+                                kind: crate::events::ChatMessageKind::Tree,
+                                attachment: None,
+                                local_only: false,
+                                remote_only: false,
+                            });
+                            if s.chat_messages.len() > 100 {
+                                s.chat_messages.remove(0);
+                            }
+                            drop(s);
+                            repaint();
                         }
                     }
 
@@ -1214,7 +1260,8 @@ async fn run_connection_task<P: Platform>(
                                     other_username: target_username,
                                 },
                                 attachment: None,
-                                phase: Default::default(),
+                                local_only: false,
+                                remote_only: false,
                             });
                             if s.chat_messages.len() > 100 {
                                 s.chat_messages.remove(0);
@@ -1235,7 +1282,8 @@ async fn run_connection_task<P: Platform>(
                             is_local: true,
                             kind: Default::default(),
                             attachment: None,
-                            phase: Default::default(),
+                            local_only: false,
+                            remote_only: false,
                         });
                         // Keep only recent messages
                         if s.chat_messages.len() > 100 {
@@ -1329,109 +1377,75 @@ async fn run_connection_task<P: Platform>(
                     }
 
                     Command::ShareFile { path } => {
-                        // Fast-fail oversized files before opening a relay
-                        // stream — matches the server's default max so the
-                        // user sees the error immediately rather than after
-                        // a phased-handshake rejection.
-                        match std::fs::metadata(&path) {
-                            Ok(md) if md.len() > rumble_client_traits::MAX_UPLOAD_BYTES => {
-                                warn!(
-                                    size = md.len(),
-                                    "ShareFile: file exceeds {} byte limit",
-                                    rumble_client_traits::MAX_UPLOAD_BYTES
-                                );
-                                let _ = event_tx.send(BackendEvent::Toast {
-                                    level: NotificationLevel::Error,
-                                    text: format!(
-                                        "File too large ({} max)",
-                                        format_bytes(rumble_client_traits::MAX_UPLOAD_BYTES),
-                                    ),
-                                });
-                                continue;
-                            }
-                            Err(e) => {
-                                warn!(path = ?path, error = %e, "ShareFile: stat failed");
-                                let _ = event_tx.send(BackendEvent::Toast {
-                                    level: NotificationLevel::Error,
-                                    text: format!("Could not read file: {e}"),
-                                });
-                                continue;
-                            }
-                            Ok(_) => {}
-                        }
-
-                        if let Some(ref ft) = file_transfer {
-                            match ft.share(path) {
-                                Ok(offer) => {
-                                    info!("File share started via relay: {} ({})", offer.name, offer.id.0);
-                                    let transfer_id = offer.id.0.clone();
-                                    let summary = format!(
-                                        "shared file \"{}\" ({})",
-                                        offer.name,
-                                        format_bytes(offer.size),
-                                    );
-
-                                    // Insert a local-only PendingUpload card
-                                    // so the sender sees feedback immediately.
-                                    // The card flips to Live (and the offer
-                                    // broadcasts) once the upload completes.
-                                    {
-                                        let attachment = rumble_protocol::types::ChatAttachment::FileOffer(
-                                            rumble_protocol::types::FileOfferInfo {
-                                                schema_version: 1,
-                                                transfer_id: transfer_id.clone(),
-                                                name: offer.name.clone(),
-                                                size: offer.size,
-                                                mime: offer.mime.clone(),
-                                                share_data: offer.share_data.clone(),
-                                            },
-                                        );
-                                        let mut s = write_state(&state);
-                                        s.chat_messages.push(crate::events::ChatMessage {
-                                            id: uuid::Uuid::new_v4().into_bytes(),
-                                            sender: client_name.clone(),
-                                            sender_id: None,
-                                            text: summary.clone(),
-                                            timestamp: std::time::SystemTime::now(),
-                                            is_local: true,
-                                            kind: Default::default(),
-                                            attachment: Some(attachment),
-                                            phase: rumble_protocol::types::LifecyclePhase::PendingUpload,
-                                        });
-                                        if s.chat_messages.len() > 100 {
-                                            s.chat_messages.remove(0);
-                                        }
-                                    }
-                                    repaint();
-
-                                    // Spawn watcher: when the plugin reports
-                                    // the transfer finished (or errored),
-                                    // notify the connection task to broadcast
-                                    // or flip-to-failed via DeferredAction.
-                                    let ft_for_watch = ft.clone();
-                                    let deferred_tx_for_watch = deferred_tx.clone();
-                                    tokio::spawn(watch_share_upload(
-                                        ft_for_watch,
-                                        transfer_id,
-                                        offer,
-                                        summary,
-                                        deferred_tx_for_watch,
-                                    ));
-                                }
-                                Err(e) => {
-                                    warn!("File share failed: {}", e);
-                                    let _ = event_tx.send(BackendEvent::Toast {
-                                        level: NotificationLevel::Error,
-                                        text: format!("File share failed: {e}"),
-                                    });
-                                }
-                            }
-                        } else {
+                        let Some(ft) = file_transfer.as_ref() else {
                             warn!("ShareFile: no file transfer plugin available");
                             let _ = event_tx.send(BackendEvent::Toast {
                                 level: NotificationLevel::Error,
                                 text: "File sharing is not currently available".to_string(),
                             });
+                            continue;
+                        };
+                        match ft.share(path) {
+                            Ok(offer) => {
+                                info!("File share started: {} ({})", offer.name, offer.id.0);
+                                let message_id = uuid::Uuid::new_v4().into_bytes();
+                                let timestamp = std::time::SystemTime::now();
+                                // The plugin owns its on-wire payload encoding;
+                                // rumble-client just routes the attachment.
+                                let attachment = ft.encode_attachment(&offer);
+                                let summary = attachment.fallback_text.clone();
+                                // Sender's local_only card. Renders in-flight
+                                // / failed / complete state by reading the
+                                // plugin's TransferStatus by transfer_id.
+                                // `is_local` stays false — it's a real message
+                                // from the sender's perspective; `local_only`
+                                // alone tags it as sender-side ephemeral.
+                                {
+                                    let mut s = write_state(&state);
+                                    let my_uid = s.my_user_id;
+                                    s.chat_messages.push(crate::events::ChatMessage {
+                                        id: message_id,
+                                        sender: client_name.clone(),
+                                        sender_id: my_uid,
+                                        text: summary,
+                                        timestamp,
+                                        is_local: false,
+                                        kind: Default::default(),
+                                        attachment: Some(attachment.clone()),
+                                        local_only: true,
+                                        remote_only: false,
+                                    });
+                                    if s.chat_messages.len() > 100 {
+                                        s.chat_messages.remove(0);
+                                    }
+                                }
+                                repaint();
+                                // Watcher broadcasts once the upload succeeds.
+                                // On failure it just returns — the card reads
+                                // TransferStatus.error directly from the plugin.
+                                let ft_for_watch = ft.clone();
+                                let deferred_tx_for_watch = deferred_tx.clone();
+                                let sender = client_name.clone();
+                                tokio::spawn(watch_share_upload(
+                                    ft_for_watch,
+                                    offer.id.0.clone(),
+                                    message_id,
+                                    attachment,
+                                    sender,
+                                    timestamp,
+                                    deferred_tx_for_watch,
+                                ));
+                            }
+                            Err(e) => {
+                                // Plugin couldn't even form a transfer entry
+                                // (e.g. file unreadable). Surface as a system
+                                // chat line — no card to attach to.
+                                warn!("File share failed: {}", e);
+                                let _ = event_tx.send(BackendEvent::Toast {
+                                    level: NotificationLevel::Error,
+                                    text: format!("File share failed: {e}"),
+                                });
+                            }
                         }
                     }
 
@@ -1511,7 +1525,8 @@ async fn run_connection_task<P: Platform>(
                                     is_local: true,
                                     kind: Default::default(),
                                     attachment: None,
-                                    phase: Default::default(),
+                                    local_only: false,
+                                    remote_only: false,
                                 });
                                 repaint();
                             }
@@ -1955,37 +1970,36 @@ async fn run_stream_dispatch<H: BiStreamHandle>(bi_handle: H, file_transfer: Opt
     }
 }
 
-/// Poll the file-transfer plugin until the named upload finishes or
-/// disappears, then send a [`DeferredAction`] back to the connection
-/// task. The 250 ms tick keeps the polling cost negligible while still
-/// flipping the card promptly on small uploads.
+/// Poll the file-transfer plugin until the named upload finishes
+/// successfully and ask the connection task to broadcast its chat
+/// message. Failure paths (plugin error, plugin dropped entry, cancel)
+/// just terminate the watcher — the sender's local_only card reads
+/// state directly from the plugin's TransferStatus.
 async fn watch_share_upload(
     ft: Arc<dyn FileTransferPlugin>,
     transfer_id: String,
-    offer: rumble_client_traits::FileOffer,
-    summary: String,
+    message_id: [u8; 16],
+    attachment: rumble_protocol::types::ChatAttachment,
+    sender: String,
+    timestamp: std::time::SystemTime,
     deferred_tx: mpsc::UnboundedSender<DeferredAction>,
 ) {
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         let transfers = ft.transfers();
         let Some(status) = transfers.into_iter().find(|s| s.id.0 == transfer_id) else {
-            // Plugin dropped the entry without finishing (disconnect,
-            // shutdown). Treat as failure so the card doesn't stay stuck
-            // in PendingUpload forever.
-            let _ = deferred_tx.send(DeferredAction::FailShareUpload { transfer_id });
             return;
         };
-        if status.is_finished && status.error.is_none() {
-            let _ = deferred_tx.send(DeferredAction::FinalizeShareUpload {
-                transfer_id,
-                offer,
-                summary,
-            });
+        if status.error.is_some() {
             return;
         }
-        if status.error.is_some() {
-            let _ = deferred_tx.send(DeferredAction::FailShareUpload { transfer_id });
+        if status.is_finished {
+            let _ = deferred_tx.send(DeferredAction::FinalizeShareUpload {
+                message_id,
+                attachment,
+                sender,
+                timestamp,
+            });
             return;
         }
     }
@@ -2018,7 +2032,8 @@ fn add_local_message(state: &Arc<RwLock<State>>, text: String, repaint: &Arc<dyn
         is_local: true,
         kind: Default::default(),
         attachment: None,
-        phase: Default::default(),
+        local_only: false,
+        remote_only: false,
     });
     // Keep only recent messages
     if s.chat_messages.len() > 100 {
@@ -2172,9 +2187,17 @@ fn handle_server_message(
                             crate::events::ChatMessageKind::Room
                         };
 
-                        let attachment = cb.attachment.and_then(rumble_protocol::chat_attachment_from_proto);
+                        let attachment = cb.attachment.map(rumble_protocol::chat_attachment_from_proto);
 
                         let mut s = write_state(state);
+                        // Dedup by message id: covers history-sync re-arrival
+                        // of a message we already have, including the
+                        // sender's own remote_only mirror of an outgoing
+                        // broadcast that comes back via someone else's
+                        // history share.
+                        if s.chat_messages.iter().any(|m| m.id == id) {
+                            return;
+                        }
                         s.chat_messages.push(crate::events::ChatMessage {
                             id,
                             sender: cb.sender,
@@ -2186,7 +2209,8 @@ fn handle_server_message(
                             is_local: false,
                             kind,
                             attachment,
-                            phase: Default::default(),
+                            local_only: false,
+                            remote_only: false,
                         });
                         // Keep only recent messages
                         if s.chat_messages.len() > 100 {
@@ -2217,7 +2241,8 @@ fn handle_server_message(
                                 other_username: dm.sender_name,
                             },
                             attachment: None,
-                            phase: Default::default(),
+                            local_only: false,
+                            remote_only: false,
                         });
                         if s.chat_messages.len() > 100 {
                             s.chat_messages.remove(0);
@@ -2239,7 +2264,8 @@ fn handle_server_message(
                             is_local: true,
                             kind: Default::default(),
                             attachment: None,
-                            phase: Default::default(),
+                            local_only: false,
+                            remote_only: false,
                         });
                         if s.chat_messages.len() > 100 {
                             s.chat_messages.remove(0);
@@ -2709,19 +2735,4 @@ fn build_client_room_chain(
             (room_uuid, acl_data)
         })
         .collect()
-}
-
-fn format_bytes(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = 1024 * KB;
-    const GB: u64 = 1024 * MB;
-    if bytes >= GB {
-        format!("{:.1} GB", bytes as f64 / GB as f64)
-    } else if bytes >= MB {
-        format!("{:.1} MB", bytes as f64 / MB as f64)
-    } else if bytes >= KB {
-        format!("{:.1} KB", bytes as f64 / KB as f64)
-    } else {
-        format!("{} B", bytes)
-    }
 }

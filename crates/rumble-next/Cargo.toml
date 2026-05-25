@@ -27,6 +27,7 @@ rumble-client-traits = { path = "../rumble-client-traits" }
 rumble-desktop = { path = "../rumble-desktop" }
 rumble-desktop-shell = { path = "../rumble-desktop-shell", features = ["egui-keys"] }
 rumble-protocol = { path = "../rumble-protocol" }
+prost = { workspace = true }
 ed25519-dalek = { workspace = true }
 rand = { workspace = true }
 hex = "0.4"

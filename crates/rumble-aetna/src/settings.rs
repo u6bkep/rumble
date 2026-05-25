@@ -994,8 +994,7 @@ fn render_devices(pending: &PendingSettings, audio: &AudioState) -> El {
         section_card(
             "Device list",
             [
-                row([button("Refresh devices").key(KEY_REFRESH_DEVICES).secondary(), spacer()])
-                    .width(Size::Fill(1.0)),
+                row([button("Refresh devices").key(KEY_REFRESH_DEVICES).secondary(), spacer()]).width(Size::Fill(1.0)),
                 paragraph(
                     "Device changes apply when you click Save. Switching devices while connected may briefly drop \
                      audio.",
@@ -1139,13 +1138,10 @@ fn render_processing(
         // per-processor schema fields when the processor is enabled.
         let mut body: Vec<El> = Vec::new();
         body.push(
-            row([
-                spacer(),
-                switch(proc_config.enabled).key(proc_enabled_key(idx)),
-            ])
-            .gap(tokens::SPACE_3)
-            .align(Align::Center)
-            .width(Size::Fill(1.0)),
+            row([spacer(), switch(proc_config.enabled).key(proc_enabled_key(idx))])
+                .gap(tokens::SPACE_3)
+                .align(Align::Center)
+                .width(Size::Fill(1.0)),
         );
         if !description.is_empty() {
             body.push(paragraph(description).muted().font_size(tokens::TEXT_XS.size));
@@ -1407,10 +1403,7 @@ fn render_sounds(pending: &PendingSettings) -> El {
     let master = section_card(
         "Master",
         [
-            field_row(
-                "Enable sound effects",
-                switch(pending.sfx_enabled).key(KEY_SFX_ENABLED),
-            ),
+            field_row("Enable sound effects", switch(pending.sfx_enabled).key(KEY_SFX_ENABLED)),
             field_row(
                 format!("Volume ({}%)", (pending.sfx_volume * 100.0).round() as i32),
                 slider(pending.sfx_volume, tokens::PRIMARY)
@@ -1875,7 +1868,9 @@ fn render_stats(audio: &AudioState) -> El {
         ],
     );
 
-    column([encoder, network, playback]).gap(tokens::SPACE_3).width(Size::Fill(1.0))
+    column([encoder, network, playback])
+        .gap(tokens::SPACE_3)
+        .width(Size::Fill(1.0))
 }
 
 /// Build / version info populated by `build.rs` via `cargo:rustc-env=`.
@@ -1917,7 +1912,9 @@ fn render_about() -> El {
             .width(Size::Fill(1.0)),
     ));
 
-    column([section_card("Rumble", rows)]).gap(tokens::SPACE_3).width(Size::Fill(1.0))
+    column([section_card("Rumble", rows)])
+        .gap(tokens::SPACE_3)
+        .width(Size::Fill(1.0))
 }
 
 /// Convert an aetna `KeyPress` into a `HotkeyBinding` using the same

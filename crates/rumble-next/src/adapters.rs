@@ -4,8 +4,9 @@
 
 use std::collections::HashMap;
 
+use prost::Message as _;
 use rumble_protocol::{
-    ChatAttachment, ChatMessage, ChatMessageKind, ConnectionState, FileOfferInfo, RoomTree, RoomTreeNode, State, proto,
+    ChatMessage, ChatMessageKind, ConnectionState, RoomTree, RoomTreeNode, State, proto, proto::RelayFileSharePayload,
     uuid_from_room_id,
 };
 use rumble_widgets::{TreeNode, TreeNodeId, UserState};
@@ -178,8 +179,9 @@ fn render_entry(
             format!("{} → {}", m.sender, other_username)
         }
     };
-    let media = m.attachment.as_ref().map(|a| match a {
-        ChatAttachment::FileOffer(fo) => file_offer_media(fo, m.sender.as_str(), my_username),
+    let media = m.attachment.as_ref().and_then(|a| {
+        let fo = RelayFileSharePayload::decode(a.payload.as_slice()).ok()?;
+        Some(file_offer_media(&fo, m.sender.as_str(), my_username))
     });
     // When an attachment is present, the `text` field is just a
     // human-readable summary that the file card already conveys —
@@ -188,7 +190,7 @@ fn render_entry(
     ChatEntry::Msg(ChatMsg { who, t, body, media })
 }
 
-fn file_offer_media(fo: &FileOfferInfo, sender: &str, my_username: Option<&str>) -> Media {
+fn file_offer_media(fo: &RelayFileSharePayload, sender: &str, my_username: Option<&str>) -> Media {
     Media::FileOffer {
         ext: file_extension_label(&fo.name, &fo.mime),
         name: fo.name.clone(),

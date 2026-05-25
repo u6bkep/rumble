@@ -44,6 +44,29 @@ pub struct RelayShareData {
     pub mime: String,
 }
 
+/// Encode a `FileOffer` into the relay plugin's ChatAttachment payload.
+/// The payload schema is `proto::RelayFileSharePayload` (defined in
+/// api.proto for build convenience but semantically owned by this plugin).
+pub fn encode_payload(offer: &FileOffer) -> Vec<u8> {
+    let msg = proto::RelayFileSharePayload {
+        transfer_id: offer.id.0.clone(),
+        name: offer.name.clone(),
+        size: offer.size,
+        mime: offer.mime.clone(),
+        share_data: offer.share_data.clone(),
+    };
+    msg.encode_to_vec()
+}
+
+/// Decode a ChatAttachment payload produced by `encode_payload`. Returns
+/// `None` if the payload is malformed.
+pub fn decode_payload(payload: &[u8]) -> Option<proto::RelayFileSharePayload> {
+    proto::RelayFileSharePayload::decode(payload).ok()
+}
+
+/// Current schema version for the relay payload format.
+pub const PAYLOAD_SCHEMA_VERSION: u32 = 1;
+
 /// Internal state for a pending or active transfer.
 struct TransferEntry {
     id: TransferId,
@@ -294,7 +317,12 @@ async fn do_upload(
     match read_plugin_ack(&mut *recv).await? {
         PluginAck::Ok => {}
         PluginAck::Rejected { code, error } => {
-            anyhow::bail!("upload rejected by server (code {code}): {error}");
+            // The reason string is what the user sees on the failure
+            // card; the numeric code is dev/ops detail and stays in the
+            // log. Don't glue them together — the UI surface already
+            // labels this as an upload failure.
+            warn!(transfer_id, code, error = %error, "server rejected upload");
+            anyhow::bail!("{error}");
         }
     }
 
@@ -467,8 +495,27 @@ async fn do_fetch(
     Ok(dest)
 }
 
+/// Reverse-DNS namespace for this plugin's chat attachments. Public so
+/// the aetna renderer can match against it without depending on the
+/// concrete plugin type.
+pub const NAMESPACE: &str = "rumble.file_transfer.relay";
+
 #[async_trait]
 impl FileTransferPlugin for FileTransferRelayPlugin {
+    fn namespace(&self) -> &'static str {
+        NAMESPACE
+    }
+
+    fn encode_attachment(&self, offer: &FileOffer) -> rumble_protocol::types::ChatAttachment {
+        rumble_protocol::types::ChatAttachment {
+            namespace: NAMESPACE.to_string(),
+            schema_version: PAYLOAD_SCHEMA_VERSION,
+            payload: encode_payload(offer),
+            // The only thing non-relay-aware clients see; keep it human.
+            fallback_text: format!("shared file \"{}\" ({})", offer.name, format_bytes_simple(offer.size)),
+        }
+    }
+
     fn set_room_id(&self, room_id: String) {
         let new_room = room_id.clone();
         let old_room = {
@@ -513,20 +560,50 @@ impl FileTransferPlugin for FileTransferRelayPlugin {
     fn share(&self, path: PathBuf) -> Result<FileOffer> {
         let metadata = std::fs::metadata(&path)?;
         let file_size = metadata.len();
+        let file_name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "unnamed".to_owned());
+        let mime = mime_guess::from_path(&file_name).first_or_octet_stream().to_string();
 
         if file_size > rumble_client_traits::MAX_UPLOAD_BYTES {
-            self.emit(
-                PluginNotificationLevel::Error,
-                format!(
-                    "File too large ({}); limit is {}",
-                    format_bytes_simple(file_size),
-                    format_bytes_simple(rumble_client_traits::MAX_UPLOAD_BYTES),
-                ),
+            // Pre-flight failure: create a synthetic error entry in the
+            // transfers table so the UI's chat card can read the failure
+            // from TransferStatus the same way it would for any other
+            // upload error. The plugin is the single source of truth for
+            // transfer state, including pre-flight rejections.
+            let transfer_id = uuid::Uuid::new_v4().to_string();
+            let error = format!(
+                "file too large ({}); limit is {}",
+                format_bytes_simple(file_size),
+                format_bytes_simple(rumble_client_traits::MAX_UPLOAD_BYTES),
             );
-            anyhow::bail!(
-                "file exceeds max upload size of {} bytes",
-                rumble_client_traits::MAX_UPLOAD_BYTES
-            );
+            let cancel = CancellationToken::new();
+            let entry = TransferEntry {
+                id: TransferId(transfer_id.clone()),
+                name: file_name.clone(),
+                size: file_size,
+                mime: mime.clone(),
+                path: Some(path.clone()),
+                share_data: None,
+                room_id: None,
+                progress: 0.0,
+                is_complete: true,
+                is_upload: true,
+                error: Some(error.clone()),
+                cancel,
+                speed_bps: 0,
+                last_sample_bytes: 0,
+                last_sample_at: Instant::now(),
+            };
+            self.transfers.lock().insert(transfer_id.clone(), entry);
+            return Ok(FileOffer {
+                id: TransferId(transfer_id),
+                name: file_name,
+                size: file_size,
+                mime,
+                share_data: String::new(),
+            });
         }
 
         // Duplicate-in-flight detection: if the same path is already
@@ -554,12 +631,7 @@ impl FileTransferPlugin for FileTransferRelayPlugin {
             }
         }
 
-        let file_name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "unnamed".to_owned());
         let transfer_id = uuid::Uuid::new_v4().to_string();
-        let mime = mime_guess::from_path(&file_name).first_or_octet_stream().to_string();
         let room_id = self.room_id.lock().clone();
 
         let share_data = RelayShareData {

@@ -220,32 +220,39 @@ message RequestStateSync {
   bytes actual_hash = 2;
 }
 
-// File-transfer offer attached to a chat message. The carrying message's
-// `text` field MUST hold a human-readable summary so older clients without
-// this schema display something sensible.
-message FileOffer {
-  // Schema version for the offer payload. Currently 1.
-  uint32 schema_version = 1;
-  // Unique transfer identifier (UUID string).
-  string transfer_id = 2;
-  // Original filename.
-  string name = 3;
-  // File size in bytes.
-  uint64 size = 4;
-  // MIME type (e.g. "image/jpeg").
-  string mime = 5;
-  // Opaque payload consumed by the receiving FileTransferPlugin
-  // (e.g. relay metadata, magnet link).
-  string share_data = 6;
+// Plugin-namespaced sidecar carried alongside a chat message. The
+// server forwards this unchanged; the receiving client looks up
+// `namespace` in its renderer/handler registry and decodes `payload`
+// per the plugin's private schema. Clients without a matching plugin
+// display `fallback_text`.
+message ChatAttachment {
+  // Reverse-DNS plugin identifier (e.g. "rumble.file_transfer.relay").
+  string namespace = 1;
+  // Schema version for the payload format, plugin-defined.
+  uint32 schema_version = 2;
+  // Opaque plugin-encoded payload.
+  bytes payload = 3;
+  // Text shown when no plugin matches `namespace`.
+  string fallback_text = 4;
 }
 
-// Typed sidecar carried alongside a chat message. Older clients that
-// don't know this field fall back to the message's plain `text`.
-message ChatAttachment {
-  oneof kind {
-    FileOffer file_offer = 1;
-    // Future: ImageEmbed, VoiceMemo, Location, Poll, ...
-  }
+// Relay-plugin payload schema. Encoded into ChatAttachment.payload by
+// the relay file-transfer plugin. Defined here for build-system
+// convenience; semantically owned by `rumble-desktop`'s relay plugin
+// and only meaningful when the carrying ChatAttachment has
+// `namespace == "rumble.file_transfer.relay"`.
+message RelayFileSharePayload {
+  // Unique transfer identifier (UUID string). Used by the plugin to
+  // key its TransferStatus table; not the chat message id.
+  string transfer_id = 1;
+  // Original filename.
+  string name = 2;
+  // File size in bytes.
+  uint64 size = 3;
+  // MIME type (e.g. "image/jpeg").
+  string mime = 4;
+  // Opaque relay-specific metadata (e.g. how to fetch from the cache).
+  string share_data = 5;
 }
 
 // Chat message sent from client to server.

@@ -21,9 +21,7 @@ use aetna_markdown::md;
 use linkify::{LinkFinder, LinkKind};
 use rumble_client_traits::file_transfer::{PluginTransferState, TransferDirection, TransferStatus};
 use rumble_desktop_shell::ChatSettings;
-use rumble_protocol::{
-    ChatAttachment, ChatMessage, ChatMessageKind, FileOfferInfo, LifecyclePhase, State, permissions::Permissions,
-};
+use rumble_protocol::{ChatMessage, ChatMessageKind, State, permissions::Permissions, proto::RelayFileSharePayload};
 
 use crate::{animated_gpu::AnimatedGpu, theme as palette};
 
@@ -215,6 +213,18 @@ pub const KEY_LIGHTBOX_IMAGE: &str = "chat:lightbox:image";
 pub const LIGHTBOX_ZOOM_MIN: f32 = 0.25;
 pub const LIGHTBOX_ZOOM_MAX: f32 = 10.0;
 pub const LIGHTBOX_ZOOM_STEP: f32 = 0.20;
+
+/// Decode a relay-plugin file-share payload off a chat message's
+/// attachment, if the attachment exists and belongs to the relay plugin.
+/// Returns `None` for messages with no attachment or attachments from
+/// other plugins.
+pub fn relay_payload(msg: &ChatMessage) -> Option<RelayFileSharePayload> {
+    let att = msg.attachment.as_ref()?;
+    if att.namespace != rumble_desktop::FILE_TRANSFER_RELAY_NAMESPACE {
+        return None;
+    }
+    rumble_desktop::decode_relay_payload(&att.payload)
+}
 
 pub fn download_key(transfer_id: &str) -> String {
     format!("chat:download:{transfer_id}")
@@ -413,6 +423,9 @@ fn history(
     let lines: Vec<El> = state
         .chat_messages
         .iter()
+        // remote_only messages are sender-side mirrors of broadcasts the
+        // sender already sees via their local_only card — never render.
+        .filter(|msg| !msg.remote_only)
         .map(|msg| {
             render_message(
                 msg,
@@ -468,8 +481,10 @@ fn render_message(
         String::new()
     };
 
-    // Local system messages: plain selectable text, no markdown.
-    if msg.is_local {
+    // Local system messages with no attachment: plain italic system text.
+    // Local messages WITH an attachment (sender's local_only file card)
+    // fall through to the normal render path so the card displays.
+    if msg.is_local && msg.attachment.is_none() {
         return paragraph(format!("{prefix}{}", msg.text))
             .font_size(tokens::TEXT_XS.size)
             .text_color(palette::CHAT_SYS)
@@ -507,27 +522,36 @@ fn render_message(
         plain_with_links(&msg.text, msg_key).width(Size::Fill(1.0))
     };
 
-    // Attachment card (image preview, video poster, or file card).
-    // Image previews take priority over video previews when both
-    // happen to materialise at the same time.
-    let attachment: Option<El> = match msg.attachment.as_ref() {
-        Some(ChatAttachment::FileOffer(offer)) => Some(if let Some(cached) = image_cache.get(&offer.transfer_id) {
-            let playback = gif_playback.get(&offer.transfer_id);
-            let gpu = animated_textures.get(&offer.transfer_id);
-            image_preview(offer, cached, playback, gpu)
-        } else if let Some(thumb) = video_thumbs.get(&offer.transfer_id) {
-            video_preview(offer, thumb)
+    // Attachment dispatch: look up the namespace, decode the payload via
+    // the matching plugin helper, render accordingly. Unknown namespaces
+    // fall back to attachment.fallback_text.
+    let attachment: Option<El> = msg.attachment.as_ref().map(|att| {
+        if att.namespace == rumble_desktop::FILE_TRANSFER_RELAY_NAMESPACE
+            && let Some(offer) = rumble_desktop::decode_relay_payload(&att.payload)
+        {
+            if let Some(cached) = image_cache.get(&offer.transfer_id) {
+                let playback = gif_playback.get(&offer.transfer_id);
+                let gpu = animated_textures.get(&offer.transfer_id);
+                image_preview(&offer, cached, playback, gpu)
+            } else if let Some(thumb) = video_thumbs.get(&offer.transfer_id) {
+                video_preview(&offer, thumb)
+            } else {
+                file_offer_card(
+                    &offer,
+                    transfers.get(&offer.transfer_id),
+                    is_own,
+                    pending_cancel_confirm,
+                )
+            }
         } else {
-            file_offer_card(
-                offer,
-                transfers.get(&offer.transfer_id),
-                is_own,
-                msg.phase,
-                pending_cancel_confirm,
-            )
-        }),
-        None => None,
-    };
+            paragraph(att.fallback_text.clone())
+                .muted()
+                .italic()
+                .font_size(tokens::TEXT_XS.size)
+                .selectable()
+                .width(Size::Fill(1.0))
+        }
+    });
 
     let mut parts: Vec<El> = vec![header, body];
     if let Some(att) = attachment {
@@ -559,10 +583,9 @@ fn render_message(
 }
 
 fn file_offer_card(
-    offer: &FileOfferInfo,
+    offer: &RelayFileSharePayload,
     status: Option<&TransferStatus>,
     is_local_sender: bool,
-    phase: LifecyclePhase,
     pending_cancel_confirm: &HashMap<String, Instant>,
 ) -> El {
     let header = row([
@@ -586,7 +609,7 @@ fn file_offer_card(
         .muted()
         .font_size(tokens::TEXT_XS.size);
 
-    let body = file_card_body(offer, status, is_local_sender, phase, pending_cancel_confirm);
+    let body = file_card_body(offer, status, is_local_sender, pending_cancel_confirm);
 
     column([header, meta, body])
         .key(file_card_key(&offer.transfer_id))
@@ -600,60 +623,66 @@ fn file_offer_card(
 }
 
 /// Determine the action/progress body for a file card based on the
-/// user's relationship to the file (sender vs receiver), upload phase,
-/// and transfer status.
+/// user's relationship to the file (sender vs receiver) and the plugin's
+/// TransferStatus. The plugin is the single source of truth for upload
+/// state: progress, errors, completion all flow from `status`.
 fn file_card_body(
-    offer: &FileOfferInfo,
+    offer: &RelayFileSharePayload,
     status: Option<&TransferStatus>,
     is_local_sender: bool,
-    phase: LifecyclePhase,
     pending_cancel_confirm: &HashMap<String, Instant>,
 ) -> El {
+    // Upload/download error reported by the plugin — show the reason.
+    if let Some(s) = status
+        && let Some(reason) = s.error.as_deref()
+        && !reason.is_empty()
+    {
+        let label = if is_local_sender {
+            "Upload failed"
+        } else {
+            "Download failed"
+        };
+        let header = text(label)
+            .text_color(palette::MUTED_SERVER)
+            .font_size(tokens::TEXT_XS.size)
+            .semibold();
+        let mut parts: Vec<El> = vec![row([header.width(Size::Fill(1.0))]).width(Size::Fill(1.0))];
+        parts.push(
+            paragraph(reason.to_string())
+                .text_color(palette::MUTED_SERVER)
+                .font_size(tokens::TEXT_XS.size)
+                .key(format!("chat:file-card:{}.err", offer.transfer_id))
+                .selectable()
+                .width(Size::Fill(1.0)),
+        );
+        if is_local_sender {
+            parts.push(
+                text("Retry by sharing the file again")
+                    .muted()
+                    .font_size(tokens::TEXT_XS.size),
+            );
+        }
+        return column(parts).gap(tokens::SPACE_1).width(Size::Fill(1.0));
+    }
+
     // In-flight transfer (upload or download): show progress regardless of sender/receiver.
     if let Some(s) = status {
-        if !s.is_finished && s.error.is_none() && is_in_flight(s.state) {
+        if !s.is_finished && is_in_flight(s.state) {
             let confirm_pending = pending_cancel_confirm.contains_key(&s.id.0);
             return transfer_progress_block(s, confirm_pending);
         }
     }
 
     if is_local_sender {
-        match phase {
-            LifecyclePhase::PendingUpload => {
-                // Show an indeterminate upload progress block while the upload is queued
-                // but no active TransferStatus exists yet.
-                let bar = progress_indeterminate(tokens::PRIMARY);
-                let label = text("Uploading…").muted().font_size(tokens::TEXT_XS.size);
-                return column([bar, label]).gap(tokens::SPACE_1).width(Size::Fill(1.0));
-            }
-            LifecyclePhase::FailedUpload => {
-                let error_text = text("Upload failed")
-                    .text_color(palette::MUTED_SERVER)
-                    .font_size(tokens::TEXT_XS.size);
-                // Retry is a stub: no local_path available on the offer, so we
-                // can't re-share the same file without user re-selection.
-                let retry_label = text("Retry by sharing the file again")
-                    .muted()
-                    .font_size(tokens::TEXT_XS.size);
-                return column([
-                    row([error_text.width(Size::Fill(1.0))]).width(Size::Fill(1.0)),
-                    retry_label,
-                ])
-                .gap(tokens::SPACE_1)
-                .width(Size::Fill(1.0));
-            }
-            LifecyclePhase::Live => {
-                // Sender + live: file was uploaded. Show Open/Reveal if we have a local_path.
-                if let Some(s) = status
-                    && s.is_finished
-                    && s.local_path.is_some()
-                {
-                    return sender_complete_row(&offer.transfer_id);
-                }
-                // Sender + live but no completed status: show nothing actionable.
-                return row([spacer()]).width(Size::Fill(1.0));
-            }
+        // Sender, no error, status finished or absent.
+        if let Some(s) = status
+            && s.is_finished
+            && s.local_path.is_some()
+        {
+            return sender_complete_row(&offer.transfer_id);
         }
+        // No status / no local path — nothing actionable to render.
+        return row([spacer()]).width(Size::Fill(1.0));
     }
 
     // Receiver side.
@@ -694,7 +723,7 @@ fn sender_complete_row(transfer_id: &str) -> El {
 }
 
 /// Open + Reveal buttons for a receiver whose download completed.
-fn receiver_complete_row(offer: &FileOfferInfo, status: &TransferStatus) -> El {
+fn receiver_complete_row(offer: &RelayFileSharePayload, status: &TransferStatus) -> El {
     let is_playable_video = status.local_path.is_some() && crate::video::is_video_name(&offer.name);
     let mut btns: Vec<El> = vec![spacer()];
     if is_playable_video {
@@ -845,7 +874,7 @@ fn format_eta(remaining_bytes: u64, speed_bps: u64) -> String {
 /// one-frame race after decode lands), use the regular `image()`
 /// widget with `ImageFit::Contain`.
 fn image_preview(
-    offer: &FileOfferInfo,
+    offer: &RelayFileSharePayload,
     cached: &CachedImage,
     playback: Option<&GifPlayback>,
     gpu: Option<&AnimatedGpu>,
@@ -1000,7 +1029,7 @@ fn svg_contain_fill(icon: SvgIcon) -> El {
 /// overlay, caption beneath. Whole card is clickable —
 /// activating it routes through [`crate::video::open_video_key`]
 /// the same way the file-card "Play" button does.
-fn video_preview(offer: &FileOfferInfo, thumb: &Image) -> El {
+fn video_preview(offer: &RelayFileSharePayload, thumb: &Image) -> El {
     const PREVIEW_HEIGHT: f32 = 400.0;
 
     // See [`image_preview`] / [`animated_surface_preview`] for the

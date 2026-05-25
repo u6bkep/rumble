@@ -10,11 +10,30 @@
 
 use eframe::egui::{self, Event, Modifiers, PointerButton, Pos2};
 use image::{ImageBuffer, Rgba};
+use prost::Message as _;
 use rumble_client_traits::file_transfer::{PluginTransferState, TransferDirection, TransferId, TransferStatus};
 use rumble_next::TestHarness;
 use rumble_protocol::{
-    ChatAttachment, ChatMessage, ChatMessageKind, ConnectionState, FileOfferInfo, State, proto, room_id_from_uuid,
+    ChatAttachment, ChatMessage, ChatMessageKind, ConnectionState, State, proto, proto::RelayFileSharePayload,
+    room_id_from_uuid,
 };
+
+/// Build a relay-plugin ChatAttachment from inline metadata for tests.
+fn relay_attachment(transfer_id: &str, name: &str, size: u64, mime: &str) -> ChatAttachment {
+    let payload = RelayFileSharePayload {
+        transfer_id: transfer_id.into(),
+        name: name.into(),
+        size,
+        mime: mime.into(),
+        share_data: "{}".into(),
+    };
+    ChatAttachment {
+        namespace: "rumble.file_transfer.relay".into(),
+        schema_version: 1,
+        payload: payload.encode_to_vec(),
+        fallback_text: format!("shared {name}"),
+    }
+}
 use std::path::PathBuf;
 
 fn write_test_png_sized(w: u32, h: u32, name: &str) -> PathBuf {
@@ -101,19 +120,14 @@ fn renders_image_preview_for_completed_file_offer() {
     state.chat_messages.push(ChatMessage {
         id: [0u8; 16],
         sender: "alice".to_string(),
+        sender_id: None,
         text: "shared hello.png".to_string(),
         timestamp: std::time::SystemTime::now(),
         is_local: false,
         kind: ChatMessageKind::Room,
-        attachment: Some(ChatAttachment::FileOffer(FileOfferInfo {
-            schema_version: 1,
-            transfer_id: "tx-1".to_string(),
-            name: "hello.png".to_string(),
-            size: 256,
-            mime: "image/png".to_string(),
-            share_data: "{}".to_string(),
-        })),
-        phase: Default::default(),
+        attachment: Some(relay_attachment("tx-1", "hello.png", 256, "image/png")),
+        local_only: false,
+        remote_only: false,
     });
 
     let mut harness = TestHarness::with_state(state);
@@ -229,19 +243,14 @@ fn setup_harness_with_image_sized(w: u32, h: u32, name: &str) -> (TestHarness, P
     state.chat_messages.push(ChatMessage {
         id: [0u8; 16],
         sender: "alice".to_string(),
+        sender_id: None,
         text: "shared hello.png".to_string(),
         timestamp: std::time::SystemTime::now(),
         is_local: false,
         kind: ChatMessageKind::Room,
-        attachment: Some(ChatAttachment::FileOffer(FileOfferInfo {
-            schema_version: 1,
-            transfer_id: "tx-1".to_string(),
-            name: "hello.png".to_string(),
-            size: 256,
-            mime: "image/png".to_string(),
-            share_data: "{}".to_string(),
-        })),
-        phase: Default::default(),
+        attachment: Some(relay_attachment("tx-1", "hello.png", 256, "image/png")),
+        local_only: false,
+        remote_only: false,
     });
 
     let harness = TestHarness::with_state(state);
@@ -407,12 +416,14 @@ fn click_image_preview_in_overflowing_chat() {
         state.chat_messages.push(ChatMessage {
             id: [(i & 0xff) as u8; 16],
             sender: "alice".to_string(),
+            sender_id: None,
             text: format!("filler message #{i} so the scroll area has to scroll"),
             timestamp: std::time::SystemTime::now(),
             is_local: false,
             kind: ChatMessageKind::Room,
             attachment: None,
-            phase: Default::default(),
+            local_only: false,
+            remote_only: false,
         });
     }
     // Image FileOffer at the end — that's where stick-to-bottom keeps
@@ -420,19 +431,14 @@ fn click_image_preview_in_overflowing_chat() {
     state.chat_messages.push(ChatMessage {
         id: [0xfeu8; 16],
         sender: "alice".to_string(),
+        sender_id: None,
         text: "shared hello.png".to_string(),
         timestamp: std::time::SystemTime::now(),
         is_local: false,
         kind: ChatMessageKind::Room,
-        attachment: Some(ChatAttachment::FileOffer(FileOfferInfo {
-            schema_version: 1,
-            transfer_id: "tx-1".to_string(),
-            name: "hello.png".to_string(),
-            size: 256,
-            mime: "image/png".to_string(),
-            share_data: "{}".to_string(),
-        })),
-        phase: Default::default(),
+        attachment: Some(relay_attachment("tx-1", "hello.png", 256, "image/png")),
+        local_only: false,
+        remote_only: false,
     });
 
     let mut harness = TestHarness::with_state(state);
@@ -521,19 +527,14 @@ fn click_image_preview_with_failed_load() {
     state.chat_messages.push(ChatMessage {
         id: [0u8; 16],
         sender: "alice".to_string(),
+        sender_id: None,
         text: "shared bogus.png".to_string(),
         timestamp: std::time::SystemTime::now(),
         is_local: false,
         kind: ChatMessageKind::Room,
-        attachment: Some(ChatAttachment::FileOffer(FileOfferInfo {
-            schema_version: 1,
-            transfer_id: "tx-1".to_string(),
-            name: "bogus.png".to_string(),
-            size: 256,
-            mime: "image/png".to_string(),
-            share_data: "{}".to_string(),
-        })),
-        phase: Default::default(),
+        attachment: Some(relay_attachment("tx-1", "bogus.png", 256, "image/png")),
+        local_only: false,
+        remote_only: false,
     });
 
     let mut harness = TestHarness::with_state(state);

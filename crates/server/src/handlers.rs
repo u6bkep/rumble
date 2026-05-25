@@ -834,6 +834,12 @@ async fn handle_chat_message(
     // Snapshot clients first, then iterate without holding any state locks
     let clients = state.snapshot_clients();
     for h in clients {
+        // Don't echo the sender back to itself — the sender's client
+        // inserts its own copy of the message before sending. Universal
+        // rule for chat broadcasts: outbound only.
+        if h.user_id == sender.user_id {
+            continue;
+        }
         let user_room = state.get_user_room(h.user_id).await;
         let in_target = user_room.map(|r| target_rooms.contains(&r)).unwrap_or(false);
         if !in_target {

@@ -130,8 +130,19 @@ pub struct TransferStatus {
 /// method is async and called from the stream dispatch task.
 #[async_trait]
 pub trait FileTransferPlugin: Send + Sync + 'static {
+    /// Reverse-DNS plugin identifier (e.g. "rumble.file_transfer.relay").
+    /// Used as the `ChatAttachment.namespace` for messages this plugin
+    /// produces; receiving clients look this up in their renderer
+    /// registry to find a matching handler.
+    fn namespace(&self) -> &'static str;
+
     /// Share a local file and return metadata for recipients.
     fn share(&self, path: PathBuf) -> anyhow::Result<FileOffer>;
+
+    /// Encode a `FileOffer` (from `share`) into the `ChatAttachment`
+    /// payload format this plugin uses on the wire. The plugin owns its
+    /// payload schema; callers just take the bytes and embed them.
+    fn encode_attachment(&self, offer: &FileOffer) -> rumble_protocol::types::ChatAttachment;
 
     /// Begin downloading a file from opaque share data (e.g., relay metadata).
     fn download(&self, share_data: &str) -> anyhow::Result<TransferId>;

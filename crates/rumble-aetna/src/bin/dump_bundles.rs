@@ -25,9 +25,9 @@ use rumble_aetna::{
 use rumble_desktop_shell::{KeyInfo, RecentServer, SettingsStore};
 use rumble_protocol::{
     AudioDeviceInfo, AudioState, AudioStats, ChatAttachment, ChatMessage, ChatMessageKind, Command, ConnectionState,
-    FileOfferInfo, PendingCertificate, State, Uuid, VoiceMode,
+    PendingCertificate, State, Uuid, VoiceMode,
     permissions::{ADMIN_PERMISSIONS, DEFAULT_PERMISSIONS, Permissions},
-    proto::{GroupInfo, RoomAclEntry, RoomInfo, User, UserId},
+    proto::{GroupInfo, RelayFileSharePayload, RoomAclEntry, RoomInfo, User, UserId},
     room_id_from_uuid,
 };
 
@@ -41,6 +41,7 @@ use rumble_protocol::{
 /// backend to apply them.
 struct MockBackend {
     state: State,
+    transfers: Vec<rumble_client_traits::file_transfer::TransferStatus>,
 }
 
 impl UiBackend for MockBackend {
@@ -48,6 +49,9 @@ impl UiBackend for MockBackend {
         self.state.clone()
     }
     fn send(&self, _command: Command) {}
+    fn transfers(&self) -> Vec<rumble_client_traits::file_transfer::TransferStatus> {
+        self.transfers.clone()
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -144,6 +148,13 @@ enum Scene {
     /// agent-reachability badge and the "Re-select SSH agent key…"
     /// affordance.
     SettingsConnectionSshAgent,
+    /// Connected session with a file share mid-upload on the sender's
+    /// side. The card reads progress from the plugin's TransferStatus.
+    FileSharePending,
+    /// Connected session with a file share whose upload failed (e.g.
+    /// "file too large"). The card reads the error reason from the
+    /// plugin's TransferStatus.
+    FileShareFailed,
 }
 
 impl Scene {
@@ -183,6 +194,8 @@ impl Scene {
         Scene::SettingsConnectionElevated,
         Scene::SettingsConnectionLocalKey,
         Scene::SettingsConnectionSshAgent,
+        Scene::FileSharePending,
+        Scene::FileShareFailed,
     ];
 
     fn slug(self) -> &'static str {
@@ -222,6 +235,8 @@ impl Scene {
             Scene::SettingsConnectionElevated => "settings_connection_elevated",
             Scene::SettingsConnectionLocalKey => "settings_connection_local_key",
             Scene::SettingsConnectionSshAgent => "settings_connection_ssh_agent",
+            Scene::FileSharePending => "file_share_pending",
+            Scene::FileShareFailed => "file_share_failed",
         }
     }
 
@@ -298,6 +313,46 @@ impl Scene {
             Scene::RoomAclModal => room_acl_state(),
             Scene::ElevatePrompt | Scene::SettingsConnectionSudo => sudo_capable_state(false),
             Scene::SettingsConnectionElevated => sudo_capable_state(true),
+            Scene::FileSharePending | Scene::FileShareFailed => file_share_state(self),
+        }
+    }
+
+    /// Transfers list that the MockBackend exposes via `transfers()`.
+    /// Only file_share_* scenes use this; everything else is empty.
+    fn build_transfers(self) -> Vec<rumble_client_traits::file_transfer::TransferStatus> {
+        use rumble_client_traits::file_transfer::{PluginTransferState, TransferDirection, TransferId, TransferStatus};
+        match self {
+            Scene::FileSharePending => vec![TransferStatus {
+                id: TransferId("demo-pending".into()),
+                name: "design-mockups.tar.gz".into(),
+                size: 24 * 1024 * 1024,
+                direction: TransferDirection::Upload,
+                progress: 0.37,
+                download_speed: 0,
+                upload_speed: 3 * 1024 * 1024,
+                peers: 1,
+                state: PluginTransferState::Downloading,
+                is_finished: false,
+                error: None,
+                local_path: None,
+                peer_details: Vec::new(),
+            }],
+            Scene::FileShareFailed => vec![TransferStatus {
+                id: TransferId("demo-failed".into()),
+                name: "movie.mkv".into(),
+                size: 4_500_000_000,
+                direction: TransferDirection::Upload,
+                progress: 0.0,
+                download_speed: 0,
+                upload_speed: 0,
+                peers: 0,
+                state: PluginTransferState::Error,
+                is_finished: true,
+                error: Some("file too large (4.19 GiB); limit is 256 MiB".into()),
+                local_path: None,
+                peer_details: Vec::new(),
+            }],
+            _ => Vec::new(),
         }
     }
 
@@ -503,7 +558,19 @@ fn make_chat_full(
         is_local,
         kind,
         attachment,
-        phase: Default::default(),
+        local_only: false,
+        remote_only: false,
+    }
+}
+
+/// Helper: build a relay-plugin ChatAttachment for fixture chat messages.
+fn relay_attachment(payload: RelayFileSharePayload, fallback_text: &str) -> ChatAttachment {
+    use prost::Message;
+    ChatAttachment {
+        namespace: rumble_desktop::FILE_TRANSFER_RELAY_NAMESPACE.to_string(),
+        schema_version: rumble_desktop::FILE_TRANSFER_RELAY_PAYLOAD_SCHEMA_VERSION,
+        payload: payload.encode_to_vec(),
+        fallback_text: fallback_text.into(),
     }
 }
 
@@ -696,6 +763,46 @@ fn make_room_with_parent(uuid: u128, name: &str, parent: Option<u128>) -> RoomIn
     }
 }
 
+/// Fixture for the FileShare* scenes: connected session with a single
+/// sender-side local_only file-share message whose card draws state
+/// from the plugin's TransferStatus (set up via `build_transfers`).
+fn file_share_state(scene: Scene) -> State {
+    let mut state = connected_state();
+    let (transfer_id, name, size, mime, fallback, summary) = match scene {
+        Scene::FileSharePending => (
+            "demo-pending",
+            "design-mockups.tar.gz",
+            24 * 1024 * 1024,
+            "application/gzip",
+            "shared file: design-mockups.tar.gz (24 MB)",
+            "shared file: design-mockups.tar.gz (24 MB)",
+        ),
+        Scene::FileShareFailed => (
+            "demo-failed",
+            "movie.mkv",
+            4_500_000_000,
+            "video/x-matroska",
+            "shared file: movie.mkv (4.19 GB)",
+            "shared file: movie.mkv (4.19 GB)",
+        ),
+        _ => unreachable!(),
+    };
+    let attachment = relay_attachment(
+        RelayFileSharePayload {
+            transfer_id: transfer_id.into(),
+            name: name.into(),
+            size,
+            mime: mime.into(),
+            share_data: String::new(),
+        },
+        fallback,
+    );
+    let mut msg = make_chat_full(20, "alice", summary, ChatMessageKind::Room, false, Some(attachment));
+    msg.local_only = true;
+    state.chat_messages.push(msg);
+    state
+}
+
 fn connected_state() -> State {
     let mut audio = AudioState {
         voice_mode: VoiceMode::Continuous,
@@ -745,14 +852,16 @@ fn connected_state() -> State {
                 "shared file: deploy_notes.md (12.3 KB)",
                 ChatMessageKind::Room,
                 false,
-                Some(ChatAttachment::FileOffer(FileOfferInfo {
-                    schema_version: 1,
-                    transfer_id: "demo-offer".into(),
-                    name: "deploy_notes.md".into(),
-                    size: 12_345,
-                    mime: "text/markdown".into(),
-                    share_data: "demo".into(),
-                })),
+                Some(relay_attachment(
+                    RelayFileSharePayload {
+                        transfer_id: "demo-offer".into(),
+                        name: "deploy_notes.md".into(),
+                        size: 12_345,
+                        mime: "text/markdown".into(),
+                        share_data: "demo".into(),
+                    },
+                    "shared file: deploy_notes.md (12.3 KB)",
+                )),
             ),
         ],
         // The chat composer enables itself only when the local user has
@@ -960,7 +1069,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     //
     // Safety: set before any thread is spawned (tokio runtimes are
     // built inside the per-scene loop below).
-    unsafe { std::env::set_var("RUMBLE_DISABLE_PORTAL", "1"); }
+    unsafe {
+        std::env::set_var("RUMBLE_DISABLE_PORTAL", "1");
+    }
 
     // Match the real app's window viewport so layout matches what users see.
     let viewport = Rect::new(0.0, 0.0, 1280.0, 800.0);
@@ -985,6 +1096,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for scene in scenes {
         let backend = MockBackend {
             state: scene.build_state(),
+            transfers: scene.build_transfers(),
         };
         let identity = Identity::load(scratch.clone())?;
         let settings = SettingsStore::load_from_path(Some(scratch.join("settings.json")));
