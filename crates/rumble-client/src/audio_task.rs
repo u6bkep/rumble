@@ -26,7 +26,7 @@
 
 use crate::{
     audio_dump::AudioDumper,
-    codec::{OPUS_FRAME_SIZE, is_dtx_frame},
+    codec::OPUS_FRAME_SIZE,
     events::{AudioSettings, AudioStats, State, VoiceMode},
     handle::{read_state, write_state},
 };
@@ -355,6 +355,20 @@ impl<D: VoiceDecoderTrait> UserAudioState<D> {
             return None;
         }
 
+        // If we haven't received a packet in a while, treat the stream as ended
+        // even without an explicit EOS marker. Guards against lost EOS datagrams,
+        // sender crashes, NAT rebinds, and any other case where the sender stops
+        // without a clean signal — otherwise we'd PLC forever generating noise.
+        // 60 ms is 3 frame-times, well outside normal jitter.
+        const STREAM_STALE_THRESHOLD: Duration = Duration::from_millis(60);
+        if !self.stream_ended && self.last_received.elapsed() > STREAM_STALE_THRESHOLD {
+            debug!(
+                "No packet received for {:?}, treating stream as ended",
+                self.last_received.elapsed()
+            );
+            self.stream_ended = true;
+        }
+
         // If stream ended and buffer is empty, don't try to play more
         // (this avoids counting "missing" packets as lost when transmission intentionally stopped)
         if self.stream_ended && self.jitter_buffer.is_empty() {
@@ -604,13 +618,18 @@ async fn run_audio_task<P: Platform>(
     // =============================================================================
     // DTX (Discontinuous Transmission) Handling
     // =============================================================================
-    // DTX frames are very small (≤2 bytes) silence indicators from Opus.
-    // Instead of sending every DTX frame, we:
-    // 1. Skip DTX frames if we sent something within the last 400ms
-    // 2. Send DTX frames as keepalives every ~400ms during silence
-    // 3. Only increment sequence when we actually send a packet
-    const DTX_KEEPALIVE_INTERVAL: Duration = Duration::from_millis(400);
-    let last_send_time: Arc<std::sync::Mutex<Option<Instant>>> = Arc::new(std::sync::Mutex::new(None));
+    // Opus emits very small frames (≤2 bytes) during silence. We send those
+    // frames as-is rather than skipping them: sequence numbers stay
+    // consecutive at one-per-20ms, so the receiver's jitter buffer never
+    // sees a wall-clock gap that looks like packet loss. The cost is ~12
+    // kbps of overhead while the VAD/gate is open but the speaker is
+    // quiet — which is negligible compared to ~24 kbps active voice and
+    // avoids the receiver-side PLC bursts that skipping caused.
+    //
+    // Long silences are still handled efficiently: when the VAD gate
+    // closes (`pipeline_result.suppress` flips to true in the capture
+    // callback), we emit a single EOS marker and stop sending entirely
+    // until the gate reopens.
 
     // =========================================================================
     // Transmission State Machine
@@ -736,11 +755,6 @@ async fn run_audio_task<P: Platform>(
                             Err(e) => {
                                 error!("Failed to create connection-scoped encoder: {}", e);
                             }
-                        }
-
-                        // Reset DTX tracking for new connection
-                        if let Ok(mut guard) = last_send_time.lock() {
-                            *guard = None;
                         }
 
                         // Start audio output for receiving (unless deafened)
@@ -1252,63 +1266,26 @@ async fn run_audio_task<P: Platform>(
                         }
                     };
 
-                    // DTX handling: Skip sending DTX frames unless enough time has passed
-                    // DTX frames are very small (≤2 bytes) and indicate silence.
-                    // We skip them to save bandwidth, but send periodic keepalives.
-                    let now = Instant::now();
-                    let is_dtx = !end_of_stream && is_dtx_frame(&opus_data);
-
-                    let should_send = if is_dtx {
-                        // Check if we need to send a keepalive
-                        let send_keepalive = if let Ok(guard) = last_send_time.lock() {
-                            match *guard {
-                                Some(last) => now.duration_since(last) >= DTX_KEEPALIVE_INTERVAL,
-                                None => true, // First packet, always send
-                            }
-                        } else {
-                            true
-                        };
-
-                        if send_keepalive {
-                            trace!("Sending DTX keepalive frame");
-                            true
-                        } else {
-                            trace!("Skipping DTX frame (keepalive not needed yet)");
-                            false
-                        }
-                    } else {
-                        // Non-DTX frame (actual voice) or EOS - always send
-                        true
+                    let datagram = VoiceDatagram {
+                        sender_id: Some(my_user_id),
+                        room_id: None, // Server determines room from connection state
+                        sequence: send_sequence,
+                        timestamp_us: 0, // Optional per proto; receiver uses arrival time
+                        opus_data,
+                        end_of_stream,
                     };
+                    send_sequence = send_sequence.wrapping_add(1);
+                    let datagram_bytes = datagram.encode_to_vec();
 
-                    if should_send {
-                        let datagram = VoiceDatagram {
-                            sender_id: Some(my_user_id),
-                            room_id: None, // Server determines room from connection state
-                            sequence: send_sequence,
-                            timestamp_us: 0, // Optional per proto; receiver uses arrival time
-                            opus_data,
-                            end_of_stream,
-                        };
-                        // Only increment sequence when we actually send
-                        send_sequence = send_sequence.wrapping_add(1);
-                        let datagram_bytes = datagram.encode_to_vec();
+                    // Track statistics (only for actual audio, not EOS)
+                    if !end_of_stream {
+                        packets_sent += 1;
+                        bytes_sent += size_bytes as u64;
+                    }
 
-                        // Update last send time for DTX tracking
-                        if let Ok(mut guard) = last_send_time.lock() {
-                            *guard = Some(now);
-                        }
-
-                        // Track statistics (only for actual audio, not EOS)
-                        if !end_of_stream {
-                            packets_sent += 1;
-                            bytes_sent += size_bytes as u64;
-                        }
-
-                        if let Err(e) = conn.send_datagram(&datagram_bytes) {
-                            warn!("Failed to send voice datagram: {}", e);
-                            // Connection might be closed - will be detected by read_datagram
-                        }
+                    if let Err(e) = conn.send_datagram(&datagram_bytes) {
+                        warn!("Failed to send voice datagram: {}", e);
+                        // Connection might be closed - will be detected by read_datagram
                     }
                 }
             }
