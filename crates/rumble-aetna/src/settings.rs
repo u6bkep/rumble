@@ -762,20 +762,21 @@ pub fn render(
 fn render_connection(pending: &PendingSettings, identity: &Identity, app_state: &State) -> El {
     use rumble_desktop_shell::KeySource;
 
-    let mut children: Vec<El> = Vec::new();
-    children.push(section_heading("Identity"));
+    let mut cards: Vec<El> = Vec::new();
 
     let Some(config) = identity.manager().config().cloned() else {
-        children.push(paragraph("No identity configured.").text_color(tokens::WARNING));
-        children.push(row([spacer(), button("Set up identity…").key(KEY_REGENERATE).primary()]).width(Size::Fill(1.0)));
-        children.push(divider());
-        children.extend(render_autoconnect_rows(pending));
+        cards.push(section_card(
+            "Identity",
+            [
+                paragraph("No identity configured.").text_color(tokens::WARNING),
+                row([spacer(), button("Set up identity…").key(KEY_REGENERATE).primary()]).width(Size::Fill(1.0)),
+            ],
+        ));
+        cards.push(section_card("Auto-connect", render_autoconnect_rows(pending)));
         if let Some(superuser) = render_superuser_section(app_state) {
-            children.push(divider());
-            children.push(section_heading("Superuser"));
-            children.extend(superuser);
+            cards.push(section_card("Superuser", superuser));
         }
-        return column(children).gap(tokens::SPACE_3).width(Size::Fill(1.0));
+        return column(cards).gap(tokens::SPACE_3).width(Size::Fill(1.0));
     };
 
     // ---- Source detail ----
@@ -800,8 +801,10 @@ fn render_connection(pending: &PendingSettings, identity: &Identity, app_state: 
             ("SSH agent", detail)
         }
     };
-    children.push(field_row("Storage", text(storage_label.to_string()).semibold()));
-    children.push(paragraph(storage_detail).muted().font_size(tokens::TEXT_XS.size));
+
+    let mut identity_rows: Vec<El> = Vec::new();
+    identity_rows.push(field_row("Storage", text(storage_label.to_string()).semibold()));
+    identity_rows.push(paragraph(storage_detail).muted().font_size(tokens::TEXT_XS.size));
 
     // For ssh-agent identities: show whether the agent socket is
     // reachable right now. We can't verify the bound key is loaded
@@ -811,7 +814,7 @@ fn render_connection(pending: &PendingSettings, identity: &Identity, app_state: 
     let agent_reachable = ssh_agent_available();
     if matches!(config.source, KeySource::SshAgent { .. }) {
         if agent_reachable {
-            children.push(
+            identity_rows.push(
                 alert([
                     alert_title("SSH agent reachable"),
                     alert_description(
@@ -821,7 +824,7 @@ fn render_connection(pending: &PendingSettings, identity: &Identity, app_state: 
                 .info(),
             );
         } else {
-            children.push(
+            identity_rows.push(
                 alert([
                     alert_title("SSH agent not reachable"),
                     alert_description(
@@ -834,7 +837,7 @@ fn render_connection(pending: &PendingSettings, identity: &Identity, app_state: 
         }
     }
 
-    children.push(field_row(
+    identity_rows.push(field_row(
         "Fingerprint",
         mono(identity.fingerprint())
             .font_size(tokens::TEXT_XS.size)
@@ -843,7 +846,7 @@ fn render_connection(pending: &PendingSettings, identity: &Identity, app_state: 
     ));
     if let Some(pubkey) = identity.public_key() {
         let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, pubkey);
-        children.push(field_row(
+        identity_rows.push(field_row(
             "Public key",
             row([
                 mono(b64)
@@ -858,7 +861,7 @@ fn render_connection(pending: &PendingSettings, identity: &Identity, app_state: 
         ));
     }
     let path = identity.manager().config_dir().join("identity.json");
-    children.push(field_row(
+    identity_rows.push(field_row(
         "On disk",
         mono(path.display().to_string())
             .font_size(tokens::TEXT_XS.size)
@@ -881,39 +884,36 @@ fn render_connection(pending: &PendingSettings, identity: &Identity, app_state: 
     } else {
         agent_btn.disabled()
     };
-    children.push(row([spacer(), agent_btn]).width(Size::Fill(1.0)));
+    identity_rows.push(row([spacer(), agent_btn]).width(Size::Fill(1.0)));
 
-    // ---- Replace identity (destructive) ----
-    children.push(divider());
-    children.push(section_heading("Replace identity"));
-    children.push(
-        alert([
-            alert_title("Regenerating overwrites your identity"),
-            alert_description(
-                "Servers that knew the old key won't recognise the new one — you'll have to re-register or be \
-                 re-approved.",
-            ),
-        ])
-        .warning(),
-    );
-    children.push(
-        row([
-            spacer(),
-            button("Generate new identity…").key(KEY_REGENERATE).destructive(),
-        ])
-        .width(Size::Fill(1.0)),
-    );
+    cards.push(section_card("Identity", identity_rows));
 
-    children.push(divider());
-    children.extend(render_autoconnect_rows(pending));
+    cards.push(section_card(
+        "Replace identity",
+        [
+            alert([
+                alert_title("Regenerating overwrites your identity"),
+                alert_description(
+                    "Servers that knew the old key won't recognise the new one — you'll have to re-register or be \
+                     re-approved.",
+                ),
+            ])
+            .warning(),
+            row([
+                spacer(),
+                button("Generate new identity…").key(KEY_REGENERATE).destructive(),
+            ])
+            .width(Size::Fill(1.0)),
+        ],
+    ));
+
+    cards.push(section_card("Auto-connect", render_autoconnect_rows(pending)));
 
     if let Some(superuser) = render_superuser_section(app_state) {
-        children.push(divider());
-        children.push(section_heading("Superuser"));
-        children.extend(superuser);
+        cards.push(section_card("Superuser", superuser));
     }
 
-    column(children).gap(tokens::SPACE_3).width(Size::Fill(1.0))
+    column(cards).gap(tokens::SPACE_3).width(Size::Fill(1.0))
 }
 
 fn render_autoconnect_rows(pending: &PendingSettings) -> Vec<El> {
@@ -983,21 +983,29 @@ fn render_devices(pending: &PendingSettings, audio: &AudioState) -> El {
     let output_label = device_label_for(pending.output_device.as_deref(), &audio.output_devices);
 
     column([
-        section_heading("Input device"),
-        select_trigger(KEY_INPUT_DEVICE, input_label),
-        spacer().height(Size::Fixed(tokens::SPACE_1)),
-        section_heading("Output device"),
-        select_trigger(KEY_OUTPUT_DEVICE, output_label),
-        spacer().height(Size::Fixed(tokens::SPACE_2)),
-        row([button("Refresh devices").key(KEY_REFRESH_DEVICES).secondary(), spacer()]).width(Size::Fill(1.0)),
-        divider(),
-        paragraph(
-            "Device changes apply when you click Save. Switching devices while connected may briefly drop audio.",
-        )
-        .muted()
-        .font_size(tokens::TEXT_XS.size),
+        section_card(
+            "Input device",
+            [select_trigger(KEY_INPUT_DEVICE, input_label).width(Size::Fill(1.0))],
+        ),
+        section_card(
+            "Output device",
+            [select_trigger(KEY_OUTPUT_DEVICE, output_label).width(Size::Fill(1.0))],
+        ),
+        section_card(
+            "Device list",
+            [
+                row([button("Refresh devices").key(KEY_REFRESH_DEVICES).secondary(), spacer()])
+                    .width(Size::Fill(1.0)),
+                paragraph(
+                    "Device changes apply when you click Save. Switching devices while connected may briefly drop \
+                     audio.",
+                )
+                .muted()
+                .font_size(tokens::TEXT_XS.size),
+            ],
+        ),
     ])
-    .gap(tokens::SPACE_2)
+    .gap(tokens::SPACE_3)
     .width(Size::Fill(1.0))
 }
 
@@ -1009,70 +1017,82 @@ fn render_voice(pending: &PendingSettings) -> El {
     let bitrate_slug = bitrate_slug(pending.audio.bitrate);
 
     column([
-        section_heading("Voice mode"),
-        tabs_list(
-            KEY_VOICE_MODE_TABS,
-            &mode_slug,
-            [("ptt", "Push-to-Talk"), ("cont", "Continuous")],
+        section_card(
+            "Voice mode",
+            [
+                tabs_list(
+                    KEY_VOICE_MODE_TABS,
+                    &mode_slug,
+                    [("ptt", "Push-to-Talk"), ("cont", "Continuous")],
+                ),
+                paragraph(match pending.voice_mode {
+                    PersistentVoiceMode::PushToTalk => "Hold the configured PTT key (default: Space) to transmit.",
+                    PersistentVoiceMode::Continuous => {
+                        "Always transmitting. Add a VAD processor to gate on voice activity."
+                    }
+                })
+                .muted()
+                .font_size(tokens::TEXT_XS.size),
+            ],
         ),
-        paragraph(match pending.voice_mode {
-            PersistentVoiceMode::PushToTalk => "Hold the configured PTT key (default: Space) to transmit.",
-            PersistentVoiceMode::Continuous => "Always transmitting. Add a VAD processor to gate on voice activity.",
-        })
-        .muted()
-        .font_size(tokens::TEXT_XS.size),
-        divider(),
-        section_heading("Encoder"),
-        field_row(
-            "Bitrate",
-            tabs_list(
-                KEY_BITRATE_TABS,
-                &bitrate_slug,
-                [
-                    ("low", "24 kbps"),
-                    ("medium", "32 kbps"),
-                    ("high", "64 kbps"),
-                    ("very-high", "96 kbps"),
-                ],
-            )
-            .width(Size::Fixed(360.0)),
+        section_card(
+            "Encoder",
+            [
+                field_row(
+                    "Bitrate",
+                    tabs_list(
+                        KEY_BITRATE_TABS,
+                        &bitrate_slug,
+                        [
+                            ("low", "24 kbps"),
+                            ("medium", "32 kbps"),
+                            ("high", "64 kbps"),
+                            ("very-high", "96 kbps"),
+                        ],
+                    )
+                    .width(Size::Fixed(360.0)),
+                ),
+                field_row(
+                    format!("Complexity ({})", pending.audio.encoder_complexity),
+                    slider(pending.audio.encoder_complexity as f32 / 10.0, tokens::PRIMARY)
+                        .key(KEY_VOICE_COMPLEXITY)
+                        .width(Size::Fixed(280.0)),
+                ),
+                paragraph("Higher complexity = better quality, more CPU. Range 0–10.")
+                    .muted()
+                    .font_size(tokens::TEXT_XS.size),
+            ],
         ),
-        field_row(
-            format!("Complexity ({})", pending.audio.encoder_complexity),
-            slider(pending.audio.encoder_complexity as f32 / 10.0, tokens::PRIMARY)
-                .key(KEY_VOICE_COMPLEXITY)
-                .width(Size::Fixed(280.0)),
-        ),
-        paragraph("Higher complexity = better quality, more CPU. Range 0–10.")
-            .muted()
-            .font_size(tokens::TEXT_XS.size),
-        divider(),
-        section_heading("Network"),
-        field_row(
-            "Forward Error Correction",
-            switch(pending.audio.fec_enabled).key(KEY_VOICE_FEC),
-        ),
-        field_row(
-            format!(
-                "Jitter buffer ({} packets · ~{}ms)",
-                pending.audio.jitter_buffer_delay_packets,
-                pending.audio.jitter_buffer_delay_packets * 20
-            ),
-            slider(
-                (pending.audio.jitter_buffer_delay_packets as f32 - 1.0) / 9.0,
-                tokens::PRIMARY,
-            )
-            .key(KEY_VOICE_JITTER)
-            .width(Size::Fixed(280.0)),
-        ),
-        field_row(
-            format!("Expected packet loss ({}%)", pending.audio.packet_loss_percent),
-            slider(pending.audio.packet_loss_percent as f32 / 25.0, tokens::PRIMARY)
-                .key(KEY_VOICE_PACKET_LOSS)
-                .width(Size::Fixed(280.0)),
+        section_card(
+            "Network",
+            [
+                field_row(
+                    "Forward Error Correction",
+                    switch(pending.audio.fec_enabled).key(KEY_VOICE_FEC),
+                ),
+                field_row(
+                    format!(
+                        "Jitter buffer ({} packets · ~{}ms)",
+                        pending.audio.jitter_buffer_delay_packets,
+                        pending.audio.jitter_buffer_delay_packets * 20
+                    ),
+                    slider(
+                        (pending.audio.jitter_buffer_delay_packets as f32 - 1.0) / 9.0,
+                        tokens::PRIMARY,
+                    )
+                    .key(KEY_VOICE_JITTER)
+                    .width(Size::Fixed(280.0)),
+                ),
+                field_row(
+                    format!("Expected packet loss ({}%)", pending.audio.packet_loss_percent),
+                    slider(pending.audio.packet_loss_percent as f32 / 25.0, tokens::PRIMARY)
+                        .key(KEY_VOICE_PACKET_LOSS)
+                        .width(Size::Fixed(280.0)),
+                ),
+            ],
         ),
     ])
-    .gap(tokens::SPACE_2)
+    .gap(tokens::SPACE_3)
     .width(Size::Fill(1.0))
 }
 
@@ -1082,18 +1102,23 @@ fn render_processing(
     registry: &ProcessorRegistry,
     selection: &Selection,
 ) -> El {
-    let mut rows: Vec<El> = Vec::new();
-    rows.push(
-        paragraph(
+    let mut cards: Vec<El> = Vec::new();
+
+    cards.push(section_card(
+        "Processor pipeline",
+        [paragraph(
             "Audio processors applied to your microphone before encoding. Order is fixed; toggle individual stages \
              on/off.",
         )
         .muted()
-        .font_size(tokens::TEXT_XS.size),
-    );
+        .font_size(tokens::TEXT_XS.size)],
+    ));
 
     if pending.tx_pipeline.processors.is_empty() {
-        rows.push(paragraph("No processors registered.").muted());
+        cards.push(section_card(
+            "Processors",
+            [paragraph("No processors registered.").muted()],
+        ));
     }
 
     for (idx, proc_config) in pending.tx_pipeline.processors.iter().enumerate() {
@@ -1110,13 +1135,11 @@ fn render_processing(
             .map(|(_, _, desc)| desc.to_string())
             .unwrap_or_default();
 
-        // Header row: processor name + enable switch. The description
-        // sits on its own row underneath rather than next to the
-        // switch, so the row's intrinsic height doesn't get clamped
-        // to the switch and clip the wrapped description.
-        rows.push(
+        // Build the card body: header (toggle + description), then any
+        // per-processor schema fields when the processor is enabled.
+        let mut body: Vec<El> = Vec::new();
+        body.push(
             row([
-                text(display_name).semibold(),
                 spacer(),
                 switch(proc_config.enabled).key(proc_enabled_key(idx)),
             ])
@@ -1125,16 +1148,14 @@ fn render_processing(
             .width(Size::Fill(1.0)),
         );
         if !description.is_empty() {
-            rows.push(paragraph(description).muted().font_size(tokens::TEXT_XS.size));
+            body.push(paragraph(description).muted().font_size(tokens::TEXT_XS.size));
         }
-
-        // Per-processor schema fields (only when the processor is on).
         if proc_config.enabled
             && let Some(schema) = registry.settings_schema(&proc_config.type_id)
             && let Some(properties) = schema.get("properties").and_then(|p| p.as_object())
         {
             for (key, prop_schema) in properties {
-                rows.push(render_schema_field(
+                body.push(render_schema_field(
                     idx,
                     key,
                     prop_schema,
@@ -1143,14 +1164,16 @@ fn render_processing(
                 ));
             }
         }
-        rows.push(spacer().height(Size::Fixed(tokens::SPACE_1)));
+
+        cards.push(section_card(display_name, body));
     }
 
-    rows.push(divider());
-    rows.push(section_heading("Input level"));
-    rows.push(input_level_meter(&pending.tx_pipeline, audio));
+    cards.push(section_card(
+        "Input level",
+        [input_level_meter(&pending.tx_pipeline, audio)],
+    ));
 
-    column(rows).gap(tokens::SPACE_2).width(Size::Fill(1.0))
+    column(cards).gap(tokens::SPACE_3).width(Size::Fill(1.0))
 }
 
 /// Render one schema-defined property as a labelled control. `number` /
@@ -1381,22 +1404,26 @@ fn threshold_bar(value_n: f32, threshold_n: f32, release_n: Option<f32>, bar_w: 
 }
 
 fn render_sounds(pending: &PendingSettings) -> El {
-    let mut rows: Vec<El> = Vec::new();
-    rows.push(field_row(
-        "Enable sound effects",
-        switch(pending.sfx_enabled).key(KEY_SFX_ENABLED),
-    ));
-    rows.push(field_row(
-        format!("Volume ({}%)", (pending.sfx_volume * 100.0).round() as i32),
-        slider(pending.sfx_volume, tokens::PRIMARY)
-            .key(KEY_SFX_VOLUME)
-            .width(Size::Fixed(280.0)),
-    ));
-    rows.push(divider());
-    rows.push(section_heading("Individual sounds"));
+    let master = section_card(
+        "Master",
+        [
+            field_row(
+                "Enable sound effects",
+                switch(pending.sfx_enabled).key(KEY_SFX_ENABLED),
+            ),
+            field_row(
+                format!("Volume ({}%)", (pending.sfx_volume * 100.0).round() as i32),
+                slider(pending.sfx_volume, tokens::PRIMARY)
+                    .key(KEY_SFX_VOLUME)
+                    .width(Size::Fixed(280.0)),
+            ),
+        ],
+    );
+
+    let mut individual_rows: Vec<El> = Vec::new();
     for (idx, kind) in SfxKind::all().iter().enumerate() {
         let enabled = pending.sfx_kind_enabled.get(idx).copied().unwrap_or(true);
-        rows.push(
+        individual_rows.push(
             row([
                 text(kind.label().to_string()).label(),
                 spacer(),
@@ -1408,37 +1435,55 @@ fn render_sounds(pending: &PendingSettings) -> El {
             .width(Size::Fill(1.0)),
         );
     }
-    column(rows).gap(tokens::SPACE_2).width(Size::Fill(1.0))
+
+    column([master, section_card("Individual sounds", individual_rows)])
+        .gap(tokens::SPACE_3)
+        .width(Size::Fill(1.0))
 }
 
 fn render_chat(pending: &PendingSettings) -> El {
     column([
-        field_row(
-            "Show timestamps",
-            switch(pending.show_timestamps).key(KEY_CHAT_SHOW_TIMESTAMPS),
+        section_card(
+            "Timestamps",
+            [
+                field_row(
+                    "Show timestamps",
+                    switch(pending.show_timestamps).key(KEY_CHAT_SHOW_TIMESTAMPS),
+                ),
+                field_row(
+                    "Timestamp format",
+                    select_trigger(KEY_CHAT_FORMAT, pending.timestamp_format.label()).width(Size::Fixed(280.0)),
+                ),
+            ],
         ),
-        field_row(
-            "Timestamp format",
-            select_trigger(KEY_CHAT_FORMAT, pending.timestamp_format.label()).width(Size::Fixed(280.0)),
+        section_card(
+            "History",
+            [
+                field_row(
+                    "Auto-sync history on join",
+                    switch(pending.auto_sync_history).key(KEY_CHAT_AUTO_SYNC),
+                ),
+                paragraph(
+                    "Asks peers for backlog when joining a room so you can read what was said before you arrived.",
+                )
+                .muted()
+                .font_size(tokens::TEXT_XS.size),
+            ],
         ),
-        divider(),
-        field_row(
-            "Auto-sync history on join",
-            switch(pending.auto_sync_history).key(KEY_CHAT_AUTO_SYNC),
+        section_card(
+            "Media",
+            [
+                field_row(
+                    "Auto-play animated images",
+                    switch(pending.gif_autoplay).key(KEY_CHAT_GIF_AUTOPLAY),
+                ),
+                paragraph("Off shows the first frame with a play button overlay until you start it.")
+                    .muted()
+                    .font_size(tokens::TEXT_XS.size),
+            ],
         ),
-        paragraph("Asks peers for backlog when joining a room so you can read what was said before you arrived.")
-            .muted()
-            .font_size(tokens::TEXT_XS.size),
-        divider(),
-        field_row(
-            "Auto-play animated images",
-            switch(pending.gif_autoplay).key(KEY_CHAT_GIF_AUTOPLAY),
-        ),
-        paragraph("Off shows the first frame with a play button overlay until you start it.")
-            .muted()
-            .font_size(tokens::TEXT_XS.size),
     ])
-    .gap(tokens::SPACE_2)
+    .gap(tokens::SPACE_3)
     .width(Size::Fill(1.0))
 }
 
@@ -1448,9 +1493,9 @@ fn render_chat(pending: &PendingSettings) -> El {
 /// capture mode (X11 / Windows / macOS) or opens the compositor's
 /// system shortcut dialog (Wayland portal).
 fn render_shortcuts(pending: &PendingSettings, state: &SettingsState, hotkeys: &HotkeyManager) -> El {
-    let mut children: Vec<El> = Vec::new();
+    let mut shortcut_rows: Vec<El> = Vec::new();
 
-    children.push(field_row(
+    shortcut_rows.push(field_row(
         "Enable global shortcuts",
         switch(pending.keyboard.global_hotkeys_enabled).key(KEY_SHORTCUTS_GLOBAL_ENABLE),
     ));
@@ -1461,11 +1506,11 @@ fn render_shortcuts(pending: &PendingSettings, state: &SettingsState, hotkeys: &
     } else {
         "Click a Shortcut cell to bind a key combination; press Escape to cancel capture."
     };
-    children.push(paragraph(helper).muted().font_size(tokens::TEXT_XS.size));
+    shortcut_rows.push(paragraph(helper).muted().font_size(tokens::TEXT_XS.size));
 
     // Column header. Width budgets match the row body below so the
     // labels line up against the dropdown triggers / shortcut buttons.
-    children.push(
+    shortcut_rows.push(
         row([
             text("Function")
                 .muted()
@@ -1487,18 +1532,18 @@ fn render_shortcuts(pending: &PendingSettings, state: &SettingsState, hotkeys: &
     );
 
     if pending.keyboard.shortcuts.is_empty() {
-        children.push(
+        shortcut_rows.push(
             paragraph("No shortcuts configured — click Add to create one.")
                 .muted()
                 .font_size(tokens::TEXT_XS.size),
         );
     } else {
         for entry in &pending.keyboard.shortcuts {
-            children.push(shortcut_row(entry, state, hotkeys, is_wayland));
+            shortcut_rows.push(shortcut_row(entry, state, hotkeys, is_wayland));
         }
     }
 
-    children.push(
+    shortcut_rows.push(
         row([
             button_with_icon(IconName::Plus, "Add")
                 .key(KEY_SHORTCUTS_ADD)
@@ -1509,31 +1554,35 @@ fn render_shortcuts(pending: &PendingSettings, state: &SettingsState, hotkeys: &
         .width(Size::Fill(1.0)),
     );
 
+    let mut cards: Vec<El> = vec![section_card("Shortcuts", shortcut_rows)];
+
     if is_wayland {
-        children.push(divider());
-        children.push(section_heading("Use your desktop's shortcut settings (advanced)"));
-        children.push(
-            paragraph(
-                "If the portal flow above doesn't suit your compositor (tiling WMs like Sway / Hyprland, or GNOME's \
-                 Custom Shortcuts), bind any key in your desktop's keyboard settings to a shell command that talks to \
-                 rumble over a Unix socket. Note: most desktop shortcut systems only fire on key press, so this path \
-                 supports toggle / mute / deafen well but isn't ideal for hold-style push-to-talk.",
-            )
-            .muted()
-            .font_size(tokens::TEXT_XS.size),
-        );
-        children.push(
-            paragraph("Start aetna with `--rpc-server` to enable the socket at $XDG_RUNTIME_DIR/rumble/aetna.sock.")
+        cards.push(section_card(
+            "Use your desktop's shortcut settings (advanced)",
+            [
+                paragraph(
+                    "If the portal flow above doesn't suit your compositor (tiling WMs like Sway / Hyprland, or \
+                     GNOME's Custom Shortcuts), bind any key in your desktop's keyboard settings to a shell command \
+                     that talks to rumble over a Unix socket. Note: most desktop shortcut systems only fire on key \
+                     press, so this path supports toggle / mute / deafen well but isn't ideal for hold-style \
+                     push-to-talk.",
+                )
                 .muted()
                 .font_size(tokens::TEXT_XS.size),
-        );
-        children.push(rpc_example_row("Toggle mute", RPC_EXAMPLE_TOGGLE_MUTE));
-        children.push(rpc_example_row("Toggle deafen", RPC_EXAMPLE_TOGGLE_DEAFEN));
-        children.push(rpc_example_row("Start transmit (PTT)", RPC_EXAMPLE_START_TRANSMIT));
-        children.push(rpc_example_row("Stop transmit (PTT)", RPC_EXAMPLE_STOP_TRANSMIT));
+                paragraph(
+                    "Start aetna with `--rpc-server` to enable the socket at $XDG_RUNTIME_DIR/rumble/aetna.sock.",
+                )
+                .muted()
+                .font_size(tokens::TEXT_XS.size),
+                rpc_example_row("Toggle mute", RPC_EXAMPLE_TOGGLE_MUTE),
+                rpc_example_row("Toggle deafen", RPC_EXAMPLE_TOGGLE_DEAFEN),
+                rpc_example_row("Start transmit (PTT)", RPC_EXAMPLE_START_TRANSMIT),
+                rpc_example_row("Stop transmit (PTT)", RPC_EXAMPLE_STOP_TRANSMIT),
+            ],
+        ));
     }
 
-    column(children).gap(tokens::SPACE_2).width(Size::Fill(1.0))
+    column(cards).gap(tokens::SPACE_3).width(Size::Fill(1.0))
 }
 
 /// Example shell commands the user can paste into their DE's custom-
@@ -1616,8 +1665,7 @@ fn shortcut_row(entry: &ShortcutEntry, state: &SettingsState, hotkeys: &HotkeyMa
 }
 
 fn render_files(pending: &PendingSettings, selection: &Selection) -> El {
-    let mut children: Vec<El> = vec![
-        section_heading("Auto-download"),
+    let mut auto_dl: Vec<El> = vec![
         field_row(
             "Enable auto-download",
             switch(pending.auto_download_enabled).key(KEY_FILES_AUTO_DOWNLOAD),
@@ -1646,14 +1694,14 @@ fn render_files(pending: &PendingSettings, selection: &Selection) -> El {
     ];
 
     if pending.auto_download_rules.is_empty() {
-        children.push(
+        auto_dl.push(
             paragraph("No rules — add one below to start auto-downloading matching files.")
                 .muted()
                 .font_size(tokens::TEXT_XS.size),
         );
     } else {
         for (idx, rule) in pending.auto_download_rules.iter().enumerate() {
-            children.push(rule_row(idx, rule, selection, pending.auto_download_enabled));
+            auto_dl.push(rule_row(idx, rule, selection, pending.auto_download_enabled));
         }
     }
 
@@ -1665,41 +1713,48 @@ fn render_files(pending: &PendingSettings, selection: &Selection) -> El {
         action_row.push(button(format!("+ {label}")).key(preset_key(idx)).ghost());
     }
     action_row.push(spacer());
-    children.push(row(action_row).gap(tokens::SPACE_2).width(Size::Fill(1.0)));
+    auto_dl.push(row(action_row).gap(tokens::SPACE_2).width(Size::Fill(1.0)));
 
-    children.push(divider());
-    children.push(section_heading("Bandwidth limits"));
-    children.push(field_row(
-        format!("Download limit ({})", speed_label(pending.download_speed_kbps)),
-        slider(
-            pending.download_speed_kbps as f32 / MAX_SPEED_KBPS as f32,
-            tokens::PRIMARY,
-        )
-        .key(KEY_FILES_DL_LIMIT)
-        .width(Size::Fixed(280.0)),
-    ));
-    children.push(field_row(
-        format!("Upload limit ({})", speed_label(pending.upload_speed_kbps)),
-        slider(
-            pending.upload_speed_kbps as f32 / MAX_SPEED_KBPS as f32,
-            tokens::PRIMARY,
-        )
-        .key(KEY_FILES_UL_LIMIT)
-        .width(Size::Fixed(280.0)),
-    ));
-    children.push(divider());
-    children.push(section_heading("Download location"));
-    children.push(download_dir_row(pending));
-    children.push(
-        paragraph(
-            "Where downloaded files are saved. Changes apply on the next connect — active transfers keep using the \
-             directory that was set when they started.",
-        )
-        .muted()
-        .font_size(tokens::TEXT_XS.size),
+    let bandwidth = section_card(
+        "Bandwidth limits",
+        [
+            field_row(
+                format!("Download limit ({})", speed_label(pending.download_speed_kbps)),
+                slider(
+                    pending.download_speed_kbps as f32 / MAX_SPEED_KBPS as f32,
+                    tokens::PRIMARY,
+                )
+                .key(KEY_FILES_DL_LIMIT)
+                .width(Size::Fixed(280.0)),
+            ),
+            field_row(
+                format!("Upload limit ({})", speed_label(pending.upload_speed_kbps)),
+                slider(
+                    pending.upload_speed_kbps as f32 / MAX_SPEED_KBPS as f32,
+                    tokens::PRIMARY,
+                )
+                .key(KEY_FILES_UL_LIMIT)
+                .width(Size::Fixed(280.0)),
+            ),
+        ],
     );
 
-    column(children).gap(tokens::SPACE_2).width(Size::Fill(1.0))
+    let location = section_card(
+        "Download location",
+        [
+            download_dir_row(pending),
+            paragraph(
+                "Where downloaded files are saved. Changes apply on the next connect — active transfers keep using \
+                 the directory that was set when they started.",
+            )
+            .muted()
+            .font_size(tokens::TEXT_XS.size),
+        ],
+    );
+
+    column([section_card("Auto-download", auto_dl), bandwidth, location])
+        .gap(tokens::SPACE_3)
+        .width(Size::Fill(1.0))
 }
 
 /// Render the download-location row: path display (or a placeholder
@@ -1777,36 +1832,50 @@ fn render_stats(audio: &AudioState) -> El {
         tokens::SUCCESS
     };
 
-    column([
-        stat_row(
-            "Actual bitrate",
-            format!("{:.1} kbps", stats.actual_bitrate_bps / 1000.0),
-            None,
-        ),
-        stat_row(
-            "Avg frame size",
-            format!("{:.1} bytes", stats.avg_frame_size_bytes),
-            None,
-        ),
-        stat_row("Packets sent", stats.packets_sent.to_string(), None),
-        stat_row("Packets received", stats.packets_received.to_string(), None),
-        stat_row(
-            "Packet loss",
-            format!("{:.1}% ({} lost)", loss_pct, stats.packets_lost),
-            Some(loss_color),
-        ),
-        stat_row("FEC recovered", stats.packets_recovered_fec.to_string(), None),
-        stat_row("Frames concealed", stats.frames_concealed.to_string(), None),
-        stat_row(
-            "Buffer level",
-            format!("{} packets", stats.playback_buffer_packets),
-            None,
-        ),
-        spacer().height(Size::Fixed(tokens::SPACE_2)),
-        row([spacer(), button("Reset statistics").key(KEY_STATS_RESET).secondary()]).width(Size::Fill(1.0)),
-    ])
-    .gap(tokens::SPACE_1)
-    .width(Size::Fill(1.0))
+    let encoder = section_card(
+        "Encoder",
+        [
+            stat_row(
+                "Actual bitrate",
+                format!("{:.1} kbps", stats.actual_bitrate_bps / 1000.0),
+                None,
+            ),
+            stat_row(
+                "Avg frame size",
+                format!("{:.1} bytes", stats.avg_frame_size_bytes),
+                None,
+            ),
+        ],
+    );
+
+    let network = section_card(
+        "Network",
+        [
+            stat_row("Packets sent", stats.packets_sent.to_string(), None),
+            stat_row("Packets received", stats.packets_received.to_string(), None),
+            stat_row(
+                "Packet loss",
+                format!("{:.1}% ({} lost)", loss_pct, stats.packets_lost),
+                Some(loss_color),
+            ),
+            stat_row("FEC recovered", stats.packets_recovered_fec.to_string(), None),
+        ],
+    );
+
+    let playback = section_card(
+        "Playback",
+        [
+            stat_row("Frames concealed", stats.frames_concealed.to_string(), None),
+            stat_row(
+                "Buffer level",
+                format!("{} packets", stats.playback_buffer_packets),
+                None,
+            ),
+            row([spacer(), button("Reset statistics").key(KEY_STATS_RESET).secondary()]).width(Size::Fill(1.0)),
+        ],
+    );
+
+    column([encoder, network, playback]).gap(tokens::SPACE_3).width(Size::Fill(1.0))
 }
 
 /// Build / version info populated by `build.rs` via `cargo:rustc-env=`.
@@ -1820,7 +1889,6 @@ fn render_about() -> El {
     let dirty = env!("RUMBLE_AETNA_GIT_DIRTY") == "true";
 
     let mut rows: Vec<El> = Vec::new();
-    rows.push(section_heading("Rumble"));
     rows.push(field_row("Package version", text(pkg_version).semibold()));
 
     if !tag.is_empty() {
@@ -1849,7 +1917,7 @@ fn render_about() -> El {
             .width(Size::Fill(1.0)),
     ));
 
-    column(rows).gap(tokens::SPACE_2).width(Size::Fill(1.0))
+    column([section_card("Rumble", rows)]).gap(tokens::SPACE_3).width(Size::Fill(1.0))
 }
 
 /// Convert an aetna `KeyPress` into a `HotkeyBinding` using the same
@@ -1905,8 +1973,30 @@ fn keypress_to_binding(press: &KeyPress) -> Option<HotkeyBinding> {
 
 // ---- view helpers ---------------------------------------------------
 
-fn section_heading(label: impl Into<String>) -> El {
-    text(label).semibold().font_size(tokens::TEXT_SM.size)
+/// Wrap a related group of settings rows in a titled card. The card
+/// is the "panel" we group settings into so each tab reads as a stack
+/// of bordered groups instead of a flat run of dividers + headings.
+fn section_card<I, E>(title: impl Into<String>, children: I) -> El
+where
+    I: IntoIterator<Item = E>,
+    E: Into<El>,
+{
+    card([
+        card_header([card_title(title)]).padding(Sides {
+            left: tokens::SPACE_4,
+            right: tokens::SPACE_4,
+            top: tokens::SPACE_3,
+            bottom: tokens::SPACE_2,
+        }),
+        card_content(children.into_iter().map(Into::into).collect::<Vec<_>>())
+            .padding(Sides {
+                left: tokens::SPACE_4,
+                right: tokens::SPACE_4,
+                top: 0.0,
+                bottom: tokens::SPACE_4,
+            })
+            .gap(tokens::SPACE_2),
+    ])
 }
 
 fn stat_row(label: impl Into<String>, value: impl Into<String>, color: Option<Color>) -> El {

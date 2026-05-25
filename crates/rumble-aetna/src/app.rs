@@ -623,6 +623,10 @@ impl<B: UiBackend> App for RumbleApp<B> {
         std::mem::take(&mut self.pending_link_opens)
     }
 
+    fn theme(&self) -> Theme {
+        Theme::radix_slate_blue_dark()
+    }
+
     fn build(&self, cx: &BuildCx) -> El {
         self.chat_row_w.set(cx.viewport().map(|(w, _)| w).unwrap_or(0.0));
         let state = self.backend.state();
