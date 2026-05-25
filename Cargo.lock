@@ -196,7 +196,7 @@ version = "0.1.0"
 [[package]]
 name = "aetna-markdown"
 version = "0.4.0"
-source = "git+https://github.com/computer-whisperer/aetna?rev=3ee7f502cf3036367ddc9ae380df8958d28ff68a#3ee7f502cf3036367ddc9ae380df8958d28ff68a"
+source = "git+https://github.com/computer-whisperer/aetna?rev=ebc825ca731e859f67adf57a27a41855df70a6cd#ebc825ca731e859f67adf57a27a41855df70a6cd"
 dependencies = [
  "aetna-core",
  "pulldown-cmark",
