@@ -425,6 +425,15 @@ impl HotkeyManager {
         if !self.is_wayland {
             return;
         }
+        // Test/headless escape hatch — `crates/rumble-aetna/src/bin/dump_bundles.rs`
+        // builds many RumbleApp instances back-to-back, and each portal
+        // session leaves a D-Bus listener task behind that backs up
+        // xdg-desktop-portal until the dump hangs mid-run. Setting this
+        // env var lets headless tools opt out without faking a desktop
+        // session type.
+        if std::env::var_os("RUMBLE_DISABLE_PORTAL").is_some() {
+            return;
+        }
         tracing::info!("Initializing XDG Portal GlobalShortcuts backend");
         match PortalHotkeyBackend::new(runtime_handle).await {
             Some(backend) => {

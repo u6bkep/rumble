@@ -952,6 +952,16 @@ fn demo_pending_cert() -> PendingCertificate {
 // ---------------------------------------------------------------------
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Each scene iteration constructs a fresh RumbleApp, which opens a
+    // new XDG GlobalShortcuts portal session on Wayland. After several
+    // iterations xdg-desktop-portal stops responding and the dump hangs
+    // mid-run. Disable portal init here — `dump_bundles` doesn't need
+    // global hotkeys to render the UI tree.
+    //
+    // Safety: set before any thread is spawned (tokio runtimes are
+    // built inside the per-scene loop below).
+    unsafe { std::env::set_var("RUMBLE_DISABLE_PORTAL", "1"); }
+
     // Match the real app's window viewport so layout matches what users see.
     let viewport = Rect::new(0.0, 0.0, 1280.0, 800.0);
     let out_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("out");
