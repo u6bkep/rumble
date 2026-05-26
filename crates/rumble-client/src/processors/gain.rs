@@ -10,10 +10,14 @@ use serde::{Deserialize, Serialize};
 use super::type_ids;
 
 /// Settings for the gain processor.
+///
+/// `Default::default()` must match the schema defaults in
+/// [`GainProcessorFactory::settings_schema`]; persisted configs are
+/// backfilled against the schema before reaching this struct.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct GainSettings {
     /// Gain in decibels. 0 = unity, negative = quieter, positive = louder.
-    #[serde(default)]
     pub gain_db: f32,
 }
 

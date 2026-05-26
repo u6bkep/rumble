@@ -30,84 +30,51 @@ const DENOISE_FRAME_SIZE: usize = DenoiseState::FRAME_SIZE;
 
 /// Settings for the denoise/voice-gate processor.
 ///
-/// All fields use serde defaults so old persisted configs (which only
-/// stored an empty object) deserialize cleanly. The serde defaults
-/// represent **legacy behavior**: denoising on, voice gate off — so
-/// existing users don't suddenly get auto-muted on upgrade. New
-/// installs built via the factory's `default_settings` go through
-/// `DenoiseSettings::default()` which enables the voice gate.
+/// Field defaults live in `Default::default()` and **must match** the
+/// `default` values in [`DenoiseProcessorFactory::settings_schema`] —
+/// the schema is the single source of truth, and persisted configs are
+/// backfilled against it (see `ProcessorRegistry::backfill_settings`)
+/// before they reach this struct. The struct-level `#[serde(default)]`
+/// is a defensive belt-and-braces fallback for the create-from-raw-JSON
+/// paths.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct DenoiseSettings {
     /// When true, replace the input audio with the denoised output.
     /// When false, samples pass through untouched but inference still
     /// runs if `vad_enabled` is true.
-    #[serde(default = "default_denoise_enabled")]
     pub denoise_enabled: bool,
 
     /// When true, drive a `suppress` decision off the RNNoise VAD
-    /// probability. Default off for legacy configs (preserves existing
-    /// behavior on upgrade); default on for fresh configs.
-    #[serde(default = "legacy_false")]
+    /// probability.
     pub vad_enabled: bool,
 
     /// Voice probability above which transmission starts (0..1).
-    #[serde(default = "default_vad_trigger")]
     pub vad_trigger: f32,
 
     /// Voice probability the score must drop below — together with
     /// holdoff expiring — for transmission to stop. Set lower than
     /// `vad_trigger` for hysteresis.
-    #[serde(default = "default_vad_release")]
     pub vad_release: f32,
 
     /// Minimum sustained-over-trigger duration before activating.
     /// 0 = activate on first chunk above trigger.
-    #[serde(default = "default_vad_attack_ms")]
     pub vad_attack_ms: u32,
 
     /// After dropping below release, continue transmitting for this
     /// long. Prevents cutting off word endings.
-    #[serde(default = "default_vad_holdoff_ms")]
     pub vad_holdoff_ms: u32,
 }
 
-fn default_denoise_enabled() -> bool {
-    true
-}
-
-fn legacy_false() -> bool {
-    false
-}
-
-fn default_vad_trigger() -> f32 {
-    0.5
-}
-
-fn default_vad_release() -> f32 {
-    0.35
-}
-
-fn default_vad_attack_ms() -> u32 {
-    0
-}
-
-fn default_vad_holdoff_ms() -> u32 {
-    300
-}
-
 impl Default for DenoiseSettings {
-    /// Defaults used for fresh installs and for the factory's
-    /// `default_settings()` — voice gate on. Distinct from the serde
-    /// default applied when deserializing a legacy persisted config
-    /// (gate off there to preserve existing user behavior).
     fn default() -> Self {
         Self {
             denoise_enabled: true,
             vad_enabled: true,
-            vad_trigger: default_vad_trigger(),
-            vad_release: default_vad_release(),
-            vad_attack_ms: default_vad_attack_ms(),
-            vad_holdoff_ms: default_vad_holdoff_ms(),
+            vad_trigger: 0.5,
+            vad_release: 0.35,
+            vad_attack_ms: 0,
+            vad_holdoff_ms: 300,
         }
     }
 }
@@ -265,6 +232,12 @@ impl AudioProcessor for DenoiseProcessor {
 
     fn set_config(&mut self, config: &serde_json::Value) {
         if let Ok(settings) = serde_json::from_value::<DenoiseSettings>(config.clone()) {
+            // Flipping the gate must clear the shaper's attack/holdoff
+            // counters — otherwise stale state from the previous mode
+            // can mis-gate the first frame after the toggle.
+            if settings.vad_enabled != self.settings.vad_enabled {
+                self.shaper.reset();
+            }
             self.settings = settings;
         }
     }
@@ -434,15 +407,18 @@ mod tests {
     }
 
     /// Legacy persisted configs (which carried only an empty `{}`) must
-    /// deserialize with the voice gate OFF — we don't want existing
-    /// users to suddenly start getting muted on upgrade. New installs
-    /// built via the factory go through `DenoiseSettings::default()`,
-    /// which has the gate on.
+    /// pick up the schema defaults rather than some separate "legacy"
+    /// values — otherwise the runtime's gate state and what the UI paints
+    /// drift apart, because the UI reads schema defaults. Backfill at
+    /// load time (see `ProcessorRegistry::backfill_settings` and
+    /// `merge_with_default_tx_pipeline`) makes this true at the JSON
+    /// layer; here we assert that the serde fallback agrees, since it's
+    /// the last line of defense for code paths that bypass backfill.
     #[test]
-    fn test_legacy_empty_config_keeps_vad_off() {
+    fn test_legacy_empty_config_uses_schema_defaults() {
         let settings: DenoiseSettings = serde_json::from_value(serde_json::json!({})).unwrap();
         assert!(settings.denoise_enabled);
-        assert!(!settings.vad_enabled, "legacy configs must default vad_enabled=false");
+        assert!(settings.vad_enabled, "missing fields must fall back to schema defaults");
     }
 
     #[test]

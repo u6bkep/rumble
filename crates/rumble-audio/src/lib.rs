@@ -434,6 +434,47 @@ impl ProcessorRegistry {
             settings: f.default_settings(),
         })
     }
+
+    /// Fill any missing top-level properties in `settings` from this
+    /// processor's schema defaults. Existing values are preserved.
+    ///
+    /// Call this on persisted configs before handing them to the runtime
+    /// or to the UI so that every reader sees a fully populated object.
+    /// Missing fields would otherwise pick up whatever per-reader fallback
+    /// happens to be in scope (serde defaults in the audio task, the
+    /// schema default in the UI display, hardcoded `false`/`0` in UI
+    /// event handlers), and those fallbacks can — and historically did —
+    /// drift apart.
+    ///
+    /// No-op if the type_id is unregistered or its schema has no
+    /// `properties` block.
+    pub fn backfill_settings(&self, type_id: &str, settings: &mut serde_json::Value) {
+        if let Some(schema) = self.settings_schema(type_id) {
+            backfill_settings_from_schema(settings, &schema);
+        }
+    }
+}
+
+/// Fill missing top-level properties in `value` from `schema.properties[*].default`.
+///
+/// If `value` is not a JSON object it is replaced with one. Keys outside
+/// `schema.properties` are preserved.
+pub fn backfill_settings_from_schema(value: &mut serde_json::Value, schema: &serde_json::Value) {
+    let Some(properties) = schema.get("properties").and_then(|p| p.as_object()) else {
+        return;
+    };
+    if !value.is_object() {
+        *value = serde_json::Value::Object(serde_json::Map::new());
+    }
+    let object = value.as_object_mut().expect("just ensured object");
+    for (key, prop_schema) in properties {
+        if object.contains_key(key) {
+            continue;
+        }
+        if let Some(default) = prop_schema.get("default") {
+            object.insert(key.clone(), default.clone());
+        }
+    }
 }
 
 // =============================================================================
@@ -598,6 +639,38 @@ mod tests {
         let result = ProcessorResult::default();
         assert!(!result.suppress);
         assert!(result.level_db.is_none());
+    }
+
+    #[test]
+    fn test_backfill_fills_missing_fields_and_preserves_present_ones() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "a": { "type": "boolean", "default": true },
+                "b": { "type": "integer", "default": 7 },
+                "c": { "type": "number" }, // no default — must stay missing
+            },
+        });
+        let mut value = serde_json::json!({ "b": 1, "extra": "keep me" });
+        backfill_settings_from_schema(&mut value, &schema);
+        assert_eq!(value["a"], serde_json::json!(true));
+        assert_eq!(
+            value["b"],
+            serde_json::json!(1),
+            "present value must not be overwritten"
+        );
+        assert!(value.get("c").is_none(), "properties without a default stay missing");
+        assert_eq!(value["extra"], serde_json::json!("keep me"));
+    }
+
+    #[test]
+    fn test_backfill_replaces_non_object_value() {
+        let schema = serde_json::json!({
+            "properties": { "x": { "default": 42 } },
+        });
+        let mut value = serde_json::Value::Null;
+        backfill_settings_from_schema(&mut value, &schema);
+        assert_eq!(value["x"], serde_json::json!(42));
     }
 
     #[test]

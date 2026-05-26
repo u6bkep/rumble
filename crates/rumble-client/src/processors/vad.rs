@@ -17,13 +17,21 @@ use super::{
 };
 
 /// Settings for the VAD processor.
+///
+/// Field defaults live in `Default::default()` and **must match** the
+/// `default` values in [`VadProcessorFactory::settings_schema`] — the
+/// schema is the single source of truth, and persisted configs are
+/// backfilled against it (see `ProcessorRegistry::backfill_settings`)
+/// before they reach this struct. The struct-level `#[serde(default)]`
+/// is a defensive belt-and-braces fallback for the create-from-raw-JSON
+/// paths.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct VadSettings {
     /// Trigger threshold in dB RMS. Signal must exceed this (for at least
     /// `attack_ms`) to activate transmission.
     /// Typical values: -40 to -30 dB for quiet environments,
     /// -50 to -40 dB for noisy environments.
-    #[serde(default = "default_threshold_db")]
     pub threshold_db: f32,
 
     /// Release (hold) threshold in dB RMS. Once active, the signal must
@@ -32,46 +40,27 @@ pub struct VadSettings {
     /// provide hysteresis (typical: 5–10 dB below the trigger). If
     /// configured above `threshold_db` it is clamped at runtime, which
     /// disables hysteresis.
-    #[serde(default = "default_release_threshold_db")]
     pub release_threshold_db: f32,
 
     /// Minimum attack duration in milliseconds. The signal must remain
     /// above `threshold_db` for this long before activating. Rejects
     /// short transients (keyboard clicks, pops). 0 = activate on first
     /// frame above threshold (original behavior).
-    #[serde(default = "default_attack_ms")]
     pub attack_ms: u32,
 
     /// Holdoff time in milliseconds.
     /// After the signal drops below `release_threshold_db`, continue
     /// transmitting for this duration. Prevents cutting off word endings.
-    #[serde(default = "default_holdoff_ms")]
     pub holdoff_ms: u32,
-}
-
-fn default_threshold_db() -> f32 {
-    -40.0
-}
-
-fn default_release_threshold_db() -> f32 {
-    -45.0
-}
-
-fn default_attack_ms() -> u32 {
-    0
-}
-
-fn default_holdoff_ms() -> u32 {
-    300
 }
 
 impl Default for VadSettings {
     fn default() -> Self {
         Self {
-            threshold_db: default_threshold_db(),
-            release_threshold_db: default_release_threshold_db(),
-            attack_ms: default_attack_ms(),
-            holdoff_ms: default_holdoff_ms(),
+            threshold_db: -40.0,
+            release_threshold_db: -45.0,
+            attack_ms: 0,
+            holdoff_ms: 300,
         }
     }
 }

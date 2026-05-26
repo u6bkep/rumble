@@ -2611,11 +2611,23 @@ pub fn handle_event(
 
                 match prop_type {
                     Some("boolean") => {
+                        // After `merge_with_default_tx_pipeline` runs,
+                        // every schema-defined field is present on the
+                        // persisted config. The schema-default fallback
+                        // is the same one the display path uses
+                        // (`render_schema_field`), so a missing field
+                        // can't make the toggle's "current value" disagree
+                        // with what's painted on screen.
+                        let schema_default = prop_schema
+                            .as_ref()
+                            .and_then(|s| s.get("default"))
+                            .and_then(|d| d.as_bool())
+                            .unwrap_or(false);
                         let mut value = proc_config
                             .settings
                             .get(field)
                             .and_then(|v| v.as_bool())
-                            .unwrap_or(false);
+                            .unwrap_or(schema_default);
                         if switch::apply_event(&mut value, event, route) {
                             ensure_object(&mut proc_config.settings)[field] = JsonValue::Bool(value);
                             return SettingsOutcome::Handled;
