@@ -18,6 +18,7 @@ pub mod backend;
 pub mod chat;
 pub mod elevate;
 pub mod identity;
+pub mod media_cache;
 pub mod password_input;
 pub mod room_acl;
 pub mod room_tree;

@@ -24,11 +24,49 @@ pub enum PluginNotificationLevel {
     Error,
 }
 
-/// Sink for plugin-emitted toast notifications. Construction-time
-/// callback passed in via the Platform factory — the plugin invokes it
-/// when something noteworthy happens (rejected upload, duplicate share,
-/// room-change cancellation, etc.) so the UI can surface it.
-pub type PluginEventSink = std::sync::Arc<dyn Fn(PluginNotificationLevel, String) + Send + Sync>;
+/// One-way event from a [`FileTransferPlugin`] back to the host
+/// (the `rumble-client` connection task, which forwards onto the
+/// UI-facing `BackendEvent` channel).
+///
+/// Two flavours: user-visible notifications (toasts) and structural
+/// lifecycle transitions. The latter is what makes the UI's media
+/// cache event-driven — instead of polling `plugin.transfers()` every
+/// frame to spot newly-completed transfers, listeners react to a
+/// single `TransferStageChanged` per actual transition.
+///
+/// Progress updates within `Active` deliberately don't fire events.
+/// The smoothed bytes-per-second sample re-bases every 250ms and the
+/// fraction changes continuously — flooding the channel would cost
+/// more than the UI saves by getting incremental updates. Progress
+/// bars keep reading `plugin.transfers()` directly.
+#[derive(Debug, Clone)]
+pub enum PluginEvent {
+    /// User-visible notification (upload rejected, duplicate share,
+    /// etc.). The host wraps this in a toast.
+    Notification {
+        level: PluginNotificationLevel,
+        text: String,
+    },
+    /// The named transfer just transitioned to a new `TransferStage`.
+    /// Emitted on every variant change — including the initial
+    /// transition into `Active` (or pre-flight `Failed`) at creation
+    /// time — but NOT on intra-`Active` progress mutations.
+    TransferStageChanged {
+        id: TransferId,
+        direction: TransferDirection,
+        /// File name, threaded through so listeners that surface a
+        /// human label (toast, log line) don't have to re-look it up
+        /// from a separate transfer snapshot.
+        name: String,
+        stage: TransferStage,
+    },
+}
+
+/// Construction-time callback the host passes to a plugin so the
+/// plugin can emit [`PluginEvent`]s back. `Arc<dyn Fn>` keeps the
+/// plugin trait object-safe and lets the sink be cloned into spawned
+/// tasks (`run_upload`, `run_fetch`).
+pub type PluginEventSink = std::sync::Arc<dyn Fn(PluginEvent) + Send + Sync>;
 
 /// Unique identifier for a file transfer (typically a UUID string).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -52,14 +90,51 @@ pub enum TransferDirection {
     Download,
 }
 
-/// State of a transfer from the plugin's perspective.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PluginTransferState {
-    Initializing,
-    Downloading,
-    Seeding,
-    Paused,
-    Error,
+/// Lifecycle stage of a transfer. Replaces the prior trio of
+/// `state` / `is_finished` / `error` fields — those were partially
+/// redundant and let consumers gate on different signals, which is
+/// how an oversized upload could lose its error card the moment a
+/// thumbnail finished decoding. An enum makes the inconsistent
+/// combinations unrepresentable.
+///
+/// State-dependent payloads live inside the variant: progress only
+/// makes sense while a transfer is moving, `local_path` only after
+/// it finishes successfully, `reason` only on failure.
+#[derive(Debug, Clone)]
+pub enum TransferStage {
+    /// Transfer is moving bytes (or about to). `speed_bps` is the
+    /// smoothed throughput in the active direction; `0` before the
+    /// first sample window elapses.
+    Active { progress: f32, speed_bps: u64 },
+    /// Transfer is suspended at `progress`. No bytes flowing.
+    Paused { progress: f32 },
+    /// Transfer completed and the file is at `local_path`. Used for
+    /// both successful uploads (sender's source file) and successful
+    /// downloads (newly written file).
+    Done { local_path: PathBuf },
+    /// Transfer failed. `reason` is the human-readable error already
+    /// fit for display on the chat failure card.
+    Failed { reason: String },
+}
+
+impl TransferStage {
+    /// Progress in `[0.0, 1.0]`. `Done` reports `1.0`, `Failed` reports
+    /// `0.0`, `Paused`/`Active` report their stored fraction.
+    pub fn progress(&self) -> f32 {
+        match self {
+            Self::Active { progress, .. } | Self::Paused { progress } => progress.clamp(0.0, 1.0),
+            Self::Done { .. } => 1.0,
+            Self::Failed { .. } => 0.0,
+        }
+    }
+
+    /// True for transfers that won't change stage further — `Done` or
+    /// `Failed`. Replaces the old `is_finished` field; consumers
+    /// gating "should I act on this completed transfer?" should also
+    /// check it's `Done` specifically, since `Failed` is terminal too.
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Done { .. } | Self::Failed { .. })
+    }
 }
 
 /// Connection type for a transfer peer.
@@ -90,32 +165,38 @@ pub struct PluginPeerInfo {
     pub uploaded_bytes: u64,
 }
 
-/// Status of a file transfer in progress.
+/// Status of a file transfer in progress. The lifecycle stage and its
+/// per-stage payload (progress, error, completed path) live inside
+/// [`TransferStage`]; consumers `match` on it rather than checking
+/// `is_finished` against `error` against `state` and hoping they agree.
 #[derive(Debug, Clone)]
 pub struct TransferStatus {
     pub id: TransferId,
     pub name: String,
     pub size: u64,
-    /// Whether this is an upload or download from the local client's perspective.
+    /// Upload vs download from the local client's perspective. Orthogonal
+    /// to stage (an upload can be Active, Done, or Failed; same for a
+    /// download).
     pub direction: TransferDirection,
-    /// Progress as a fraction in [0.0, 1.0].
-    pub progress: f32,
-    /// Download speed in bytes per second.
-    pub download_speed: u64,
-    /// Upload speed in bytes per second.
-    pub upload_speed: u64,
-    /// Number of connected peers.
+    /// Lifecycle stage with stage-specific payload.
+    pub stage: TransferStage,
+    /// Number of connected peers (relay plugin always reports `0`).
     pub peers: u32,
-    /// Current transfer state.
-    pub state: PluginTransferState,
-    /// Whether the transfer is finished (fully downloaded).
-    pub is_finished: bool,
-    /// Error message if in error state.
-    pub error: Option<String>,
-    /// Local file path if available.
-    pub local_path: Option<PathBuf>,
     /// Per-peer details.
     pub peer_details: Vec<PluginPeerInfo>,
+}
+
+impl TransferStatus {
+    /// Convenience: the `local_path` from a [`TransferStage::Done`]
+    /// stage, or `None` for any other stage. Used by code that only
+    /// cares about completed transfers' files (file-open buttons,
+    /// preview decoders).
+    pub fn done_path(&self) -> Option<&PathBuf> {
+        match &self.stage {
+            TransferStage::Done { local_path } => Some(local_path),
+            _ => None,
+        }
+    }
 }
 
 /// Optional file transfer capability, injected into BackendHandle.

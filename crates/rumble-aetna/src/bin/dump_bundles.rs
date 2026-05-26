@@ -320,21 +320,18 @@ impl Scene {
     /// Transfers list that the MockBackend exposes via `transfers()`.
     /// Only file_share_* scenes use this; everything else is empty.
     fn build_transfers(self) -> Vec<rumble_client_traits::file_transfer::TransferStatus> {
-        use rumble_client_traits::file_transfer::{PluginTransferState, TransferDirection, TransferId, TransferStatus};
+        use rumble_client_traits::file_transfer::{TransferDirection, TransferId, TransferStage, TransferStatus};
         match self {
             Scene::FileSharePending => vec![TransferStatus {
                 id: TransferId("demo-pending".into()),
                 name: "design-mockups.tar.gz".into(),
                 size: 24 * 1024 * 1024,
                 direction: TransferDirection::Upload,
-                progress: 0.37,
-                download_speed: 0,
-                upload_speed: 3 * 1024 * 1024,
+                stage: TransferStage::Active {
+                    progress: 0.37,
+                    speed_bps: 3 * 1024 * 1024,
+                },
                 peers: 1,
-                state: PluginTransferState::Downloading,
-                is_finished: false,
-                error: None,
-                local_path: None,
                 peer_details: Vec::new(),
             }],
             Scene::FileShareFailed => vec![TransferStatus {
@@ -342,14 +339,10 @@ impl Scene {
                 name: "movie.mkv".into(),
                 size: 4_500_000_000,
                 direction: TransferDirection::Upload,
-                progress: 0.0,
-                download_speed: 0,
-                upload_speed: 0,
+                stage: TransferStage::Failed {
+                    reason: "file too large (4.19 GiB); limit is 256 MiB".into(),
+                },
                 peers: 0,
-                state: PluginTransferState::Error,
-                is_finished: true,
-                error: Some("file too large (4.19 GiB); limit is 256 MiB".into()),
-                local_path: None,
                 peer_details: Vec::new(),
             }],
             _ => Vec::new(),

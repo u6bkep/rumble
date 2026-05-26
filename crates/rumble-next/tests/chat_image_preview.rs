@@ -11,7 +11,7 @@
 use eframe::egui::{self, Event, Modifiers, PointerButton, Pos2};
 use image::{ImageBuffer, Rgba};
 use prost::Message as _;
-use rumble_client_traits::file_transfer::{PluginTransferState, TransferDirection, TransferId, TransferStatus};
+use rumble_client_traits::file_transfer::{TransferDirection, TransferId, TransferStage, TransferStatus};
 use rumble_next::TestHarness;
 use rumble_protocol::{
     ChatAttachment, ChatMessage, ChatMessageKind, ConnectionState, State, proto, proto::RelayFileSharePayload,
@@ -136,14 +136,10 @@ fn renders_image_preview_for_completed_file_offer() {
         name: "hello.png".to_string(),
         size: 256,
         direction: TransferDirection::Download,
-        progress: 1.0,
-        download_speed: 0,
-        upload_speed: 0,
+        stage: TransferStage::Done {
+            local_path: png.clone(),
+        },
         peers: 0,
-        state: PluginTransferState::Seeding,
-        is_finished: true,
-        error: None,
-        local_path: Some(png.clone()),
         peer_details: vec![],
     }]);
 
@@ -259,14 +255,10 @@ fn setup_harness_with_image_sized(w: u32, h: u32, name: &str) -> (TestHarness, P
         name: "hello.png".to_string(),
         size: 256,
         direction: TransferDirection::Download,
-        progress: 1.0,
-        download_speed: 0,
-        upload_speed: 0,
+        stage: TransferStage::Done {
+            local_path: png.clone(),
+        },
         peers: 0,
-        state: PluginTransferState::Seeding,
-        is_finished: true,
-        error: None,
-        local_path: Some(png.clone()),
         peer_details: vec![],
     }]);
 
@@ -447,14 +439,10 @@ fn click_image_preview_in_overflowing_chat() {
         name: "hello.png".to_string(),
         size: 256,
         direction: TransferDirection::Download,
-        progress: 1.0,
-        download_speed: 0,
-        upload_speed: 0,
+        stage: TransferStage::Done {
+            local_path: png.clone(),
+        },
         peers: 0,
-        state: PluginTransferState::Seeding,
-        is_finished: true,
-        error: None,
-        local_path: Some(png.clone()),
         peer_details: vec![],
     }]);
 
@@ -543,14 +531,8 @@ fn click_image_preview_with_failed_load() {
         name: "bogus.png".to_string(),
         size: 256,
         direction: TransferDirection::Download,
-        progress: 1.0,
-        download_speed: 0,
-        upload_speed: 0,
+        stage: TransferStage::Done { local_path: bogus_path },
         peers: 0,
-        state: PluginTransferState::Seeding,
-        is_finished: true,
-        error: None,
-        local_path: Some(bogus_path),
         peer_details: vec![],
     }]);
 

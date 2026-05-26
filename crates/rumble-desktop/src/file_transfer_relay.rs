@@ -22,8 +22,8 @@ use async_trait::async_trait;
 use prost::Message;
 use rumble_client_traits::{
     file_transfer::{
-        FileOffer, FileTransferPlugin, PluginEventSink, PluginNotificationLevel, TransferDirection, TransferId,
-        TransferStatus,
+        FileOffer, FileTransferPlugin, PluginEvent, PluginEventSink, PluginNotificationLevel, TransferDirection,
+        TransferId, TransferStage, TransferStatus,
     },
     transport::{
         BiRecvStream, BiSendStream, PluginAck, StreamOpener, read_length_prefixed, read_plugin_ack,
@@ -67,14 +67,15 @@ pub fn decode_payload(payload: &[u8]) -> Option<proto::RelayFileSharePayload> {
 /// Current schema version for the relay payload format.
 pub const PAYLOAD_SCHEMA_VERSION: u32 = 1;
 
-/// Internal state for a pending or active transfer.
+/// Internal state for a pending or active transfer. The stage enum
+/// is the single source of truth for what's going on — separate
+/// `is_complete`/`error`/`progress` fields were what let the original
+/// bug create contradictory states ("complete AND errored").
 struct TransferEntry {
     id: TransferId,
     name: String,
     size: u64,
     mime: String,
-    /// Local path (for completed downloads or outgoing uploads).
-    path: Option<PathBuf>,
     /// Opaque share_data string (uploads only). Cached so a duplicate
     /// in-flight share can return the existing offer instead of
     /// re-uploading.
@@ -83,16 +84,16 @@ struct TransferEntry {
     /// in-flight uploads that need to be cancelled when the user
     /// switches rooms.
     room_id: Option<String>,
-    progress: f32,
-    is_complete: bool,
-    is_upload: bool,
-    error: Option<String>,
+    direction: TransferDirection,
+    stage: TransferStage,
+    /// Original on-disk path being uploaded (uploads only; `None` for
+    /// downloads). Kept separate from `stage` so the duplicate-in-flight
+    /// check can find an Active upload by path without waiting for the
+    /// transfer to land in `Done`. On successful completion this same
+    /// path also lands in `stage = Done { local_path }`.
+    source_path: Option<PathBuf>,
     /// Cancellation token for this transfer's task.
     cancel: CancellationToken,
-    /// Smoothed bytes-per-second over the last sampling window. Updated
-    /// by the upload/fetch tasks via [`update_speed`]; reads from
-    /// `transfers()` see the most recent value.
-    speed_bps: u64,
     /// Bytes transferred at the last speed sample. Combined with
     /// `last_sample_at` to compute a fresh `speed_bps`.
     last_sample_bytes: u64,
@@ -102,37 +103,13 @@ struct TransferEntry {
 
 impl TransferEntry {
     fn to_status(&self) -> TransferStatus {
-        let state = if self.error.is_some() {
-            rumble_client_traits::file_transfer::PluginTransferState::Error
-        } else if self.is_complete {
-            rumble_client_traits::file_transfer::PluginTransferState::Seeding
-        } else if self.is_upload {
-            rumble_client_traits::file_transfer::PluginTransferState::Initializing
-        } else {
-            rumble_client_traits::file_transfer::PluginTransferState::Downloading
-        };
-        let (download_speed, upload_speed) = if self.is_upload {
-            (0, self.speed_bps)
-        } else {
-            (self.speed_bps, 0)
-        };
         TransferStatus {
             id: self.id.clone(),
             name: self.name.clone(),
             size: self.size,
-            direction: if self.is_upload {
-                TransferDirection::Upload
-            } else {
-                TransferDirection::Download
-            },
-            progress: self.progress,
-            download_speed,
-            upload_speed,
+            direction: self.direction,
+            stage: self.stage.clone(),
             peers: 0,
-            state,
-            is_finished: self.is_complete,
-            error: self.error.clone(),
-            local_path: self.path.clone(),
             peer_details: Vec::new(),
         }
     }
@@ -168,12 +145,22 @@ fn unique_dest_path(dir: &std::path::Path, file_name: &str) -> PathBuf {
     initial
 }
 
-/// Update an entry's smoothed bytes-per-second sample. Re-baselines
-/// when at least 250 ms has elapsed since the last sample, which keeps
-/// the displayed speed steady at high data rates without making low-
-/// rate transfers look stalled. Caller already holds the transfers map
-/// lock.
-fn update_speed(entry: &mut TransferEntry, bytes_so_far: u64) {
+/// Update an `Active` entry's progress + smoothed bytes-per-second
+/// sample. Re-baselines when at least 250 ms has elapsed, which keeps
+/// the displayed speed steady at high data rates without making
+/// low-rate transfers look stalled. No-op if the entry isn't `Active`
+/// — a transfer that's already terminal shouldn't be having its
+/// progress overwritten by a stale in-flight write. Caller already
+/// holds the transfers map lock.
+fn update_active_progress(entry: &mut TransferEntry, bytes_so_far: u64, total_size: u64) {
+    let TransferStage::Active { progress, speed_bps } = &mut entry.stage else {
+        return;
+    };
+    *progress = if total_size > 0 {
+        (bytes_so_far as f32) / (total_size as f32)
+    } else {
+        1.0
+    };
     let now = Instant::now();
     let elapsed = now.duration_since(entry.last_sample_at);
     if elapsed.as_millis() < 250 {
@@ -181,7 +168,7 @@ fn update_speed(entry: &mut TransferEntry, bytes_so_far: u64) {
     }
     let delta = bytes_so_far.saturating_sub(entry.last_sample_bytes);
     let secs = elapsed.as_secs_f64().max(0.001);
-    entry.speed_bps = (delta as f64 / secs) as u64;
+    *speed_bps = (delta as f64 / secs) as u64;
     entry.last_sample_bytes = bytes_so_far;
     entry.last_sample_at = now;
 }
@@ -220,10 +207,34 @@ impl FileTransferRelayPlugin {
         }
     }
 
-    fn emit(&self, level: PluginNotificationLevel, msg: impl Into<String>) {
-        if let Some(sink) = &self.event_sink {
-            (sink)(level, msg.into());
-        }
+    fn emit_notification(&self, level: PluginNotificationLevel, msg: impl Into<String>) {
+        emit_notification(self.event_sink.as_ref(), level, msg);
+    }
+}
+
+/// Module-level emitters so spawned tasks (`run_upload`, `run_fetch`)
+/// that don't hold `&Self` can still push events through a cloned sink.
+fn emit_notification(sink: Option<&PluginEventSink>, level: PluginNotificationLevel, msg: impl Into<String>) {
+    if let Some(s) = sink {
+        s(PluginEvent::Notification {
+            level,
+            text: msg.into(),
+        });
+    }
+}
+
+/// Push a `TransferStageChanged` for `entry`'s current stage. Call
+/// this after every assignment to `entry.stage` — the helper centralises
+/// the field-by-field copy so the relay code's mutation sites stay
+/// readable and don't drift from the event payload schema.
+fn emit_stage(sink: Option<&PluginEventSink>, entry: &TransferEntry) {
+    if let Some(s) = sink {
+        s(PluginEvent::TransferStageChanged {
+            id: entry.id.clone(),
+            direction: entry.direction,
+            name: entry.name.clone(),
+            stage: entry.stage.clone(),
+        });
     }
 }
 
@@ -256,13 +267,16 @@ async fn run_upload(
         ) => r,
     };
 
+    let mut t = transfers.lock();
+    let Some(entry) = t.get_mut(&transfer_id) else {
+        return;
+    };
     match result {
         Ok(()) => {
-            let mut t = transfers.lock();
-            if let Some(entry) = t.get_mut(&transfer_id) {
-                entry.progress = 1.0;
-                entry.is_complete = true;
-            }
+            entry.stage = TransferStage::Done {
+                local_path: path.clone(),
+            };
+            emit_stage(event_sink.as_ref(), entry);
             info!(transfer_id, "relay upload complete");
         }
         Err(e) => {
@@ -271,14 +285,16 @@ async fn run_upload(
             // change, explicit cancel); don't toast for those — the
             // failure card carries enough signal already.
             let cancelled = cancel.is_cancelled() || msg == "cancelled";
-            let mut t = transfers.lock();
-            if let Some(entry) = t.get_mut(&transfer_id) {
-                entry.error = Some(msg.clone());
-            }
+            entry.stage = TransferStage::Failed { reason: msg.clone() };
+            emit_stage(event_sink.as_ref(), entry);
             drop(t);
             warn!(transfer_id, error = %msg, "relay upload failed");
-            if !cancelled && let Some(sink) = &event_sink {
-                (sink)(PluginNotificationLevel::Error, format!("Upload failed: {msg}"));
+            if !cancelled {
+                emit_notification(
+                    event_sink.as_ref(),
+                    PluginNotificationLevel::Error,
+                    format!("Upload failed: {msg}"),
+                );
             }
         }
     }
@@ -344,12 +360,7 @@ async fn do_upload(
         {
             let mut t = transfers.lock();
             if let Some(entry) = t.get_mut(transfer_id) {
-                entry.progress = if file_size > 0 {
-                    (sent as f32) / (file_size as f32)
-                } else {
-                    1.0
-                };
-                update_speed(entry, sent);
+                update_active_progress(entry, sent, file_size);
             }
         }
     }
@@ -383,27 +394,31 @@ async fn run_fetch(
         r = do_fetch(&opener, &transfer_id, &downloads_dir, &transfers) => r,
     };
 
+    let mut t = transfers.lock();
+    let Some(entry) = t.get_mut(&transfer_id) else {
+        return;
+    };
     match result {
         Ok(dest) => {
-            let mut t = transfers.lock();
-            if let Some(entry) = t.get_mut(&transfer_id) {
-                entry.progress = 1.0;
-                entry.is_complete = true;
-                entry.path = Some(dest.clone());
-            }
+            entry.stage = TransferStage::Done {
+                local_path: dest.clone(),
+            };
+            emit_stage(event_sink.as_ref(), entry);
             info!(transfer_id, dest = %dest.display(), "relay fetch complete");
         }
         Err(e) => {
             let msg = e.to_string();
             let cancelled = cancel.is_cancelled() || msg == "cancelled";
-            let mut t = transfers.lock();
-            if let Some(entry) = t.get_mut(&transfer_id) {
-                entry.error = Some(msg.clone());
-            }
+            entry.stage = TransferStage::Failed { reason: msg.clone() };
+            emit_stage(event_sink.as_ref(), entry);
             drop(t);
             warn!(transfer_id, error = %msg, "relay fetch failed");
-            if !cancelled && let Some(sink) = &event_sink {
-                (sink)(PluginNotificationLevel::Error, format!("Download failed: {msg}"));
+            if !cancelled {
+                emit_notification(
+                    event_sink.as_ref(),
+                    PluginNotificationLevel::Error,
+                    format!("Download failed: {msg}"),
+                );
             }
         }
     }
@@ -472,12 +487,7 @@ async fn do_fetch(
 
                 let mut t = transfers.lock();
                 if let Some(entry) = t.get_mut(transfer_id) {
-                    entry.progress = if file_size > 0 {
-                        (received as f32) / (file_size as f32)
-                    } else {
-                        1.0
-                    };
-                    update_speed(entry, received);
+                    update_active_progress(entry, received, file_size);
                 }
             }
             Ok(Some(_)) => continue, // zero-length read
@@ -535,13 +545,15 @@ impl FileTransferPlugin for FileTransferRelayPlugin {
             let mut t = self.transfers.lock();
             let mut n = 0;
             for entry in t.values_mut() {
-                if entry.is_upload
-                    && !entry.is_complete
-                    && entry.error.is_none()
+                if entry.direction == TransferDirection::Upload
+                    && matches!(entry.stage, TransferStage::Active { .. } | TransferStage::Paused { .. })
                     && entry.room_id.as_deref() == Some(old_room.as_str())
                 {
                     entry.cancel.cancel();
-                    entry.error = Some("room changed".to_owned());
+                    entry.stage = TransferStage::Failed {
+                        reason: "room changed".to_owned(),
+                    };
+                    emit_stage(self.event_sink.as_ref(), entry);
                     n += 1;
                 }
             }
@@ -550,7 +562,7 @@ impl FileTransferPlugin for FileTransferRelayPlugin {
 
         if cancelled > 0 {
             let noun = if cancelled == 1 { "upload" } else { "uploads" };
-            self.emit(
+            self.emit_notification(
                 PluginNotificationLevel::Warn,
                 format!("{cancelled} {noun} cancelled due to room change"),
             );
@@ -567,36 +579,36 @@ impl FileTransferPlugin for FileTransferRelayPlugin {
         let mime = mime_guess::from_path(&file_name).first_or_octet_stream().to_string();
 
         if file_size > rumble_client_traits::MAX_UPLOAD_BYTES {
-            // Pre-flight failure: create a synthetic error entry in the
+            // Pre-flight failure: create a synthetic Failed entry in the
             // transfers table so the UI's chat card can read the failure
             // from TransferStatus the same way it would for any other
             // upload error. The plugin is the single source of truth for
             // transfer state, including pre-flight rejections.
             let transfer_id = uuid::Uuid::new_v4().to_string();
-            let error = format!(
+            let reason = format!(
                 "file too large ({}); limit is {}",
                 format_bytes_simple(file_size),
                 format_bytes_simple(rumble_client_traits::MAX_UPLOAD_BYTES),
             );
-            let cancel = CancellationToken::new();
             let entry = TransferEntry {
                 id: TransferId(transfer_id.clone()),
                 name: file_name.clone(),
                 size: file_size,
                 mime: mime.clone(),
-                path: Some(path.clone()),
                 share_data: None,
                 room_id: None,
-                progress: 0.0,
-                is_complete: true,
-                is_upload: true,
-                error: Some(error.clone()),
-                cancel,
-                speed_bps: 0,
+                direction: TransferDirection::Upload,
+                stage: TransferStage::Failed { reason },
+                source_path: None,
+                cancel: CancellationToken::new(),
                 last_sample_bytes: 0,
                 last_sample_at: Instant::now(),
             };
-            self.transfers.lock().insert(transfer_id.clone(), entry);
+            {
+                let mut t = self.transfers.lock();
+                t.insert(transfer_id.clone(), entry);
+                emit_stage(self.event_sink.as_ref(), t.get(&transfer_id).expect("just inserted"));
+            }
             return Ok(FileOffer {
                 id: TransferId(transfer_id),
                 name: file_name,
@@ -607,17 +619,19 @@ impl FileTransferPlugin for FileTransferRelayPlugin {
         }
 
         // Duplicate-in-flight detection: if the same path is already
-        // uploading and not yet complete, return the existing FileOffer
+        // uploading (Active or Paused), return the existing FileOffer
         // instead of re-uploading. This dedups e.g. double-click on the
         // share button or a paste while the previous paste is still in
         // flight.
         {
             let t = self.transfers.lock();
             if let Some(existing) = t.values().find(|e| {
-                e.is_upload && !e.is_complete && e.error.is_none() && e.path.as_deref() == Some(path.as_path())
+                e.direction == TransferDirection::Upload
+                    && matches!(e.stage, TransferStage::Active { .. } | TransferStage::Paused { .. })
+                    && e.source_path.as_deref() == Some(path.as_path())
             }) && let Some(share_data) = existing.share_data.clone()
             {
-                self.emit(
+                self.emit_notification(
                     PluginNotificationLevel::Warn,
                     format!("Already uploading \"{}\"", existing.name),
                 );
@@ -648,24 +662,28 @@ impl FileTransferPlugin for FileTransferRelayPlugin {
             name: file_name.clone(),
             size: file_size,
             mime: mime.clone(),
-            path: Some(path.clone()),
             share_data: Some(share_data_json.clone()),
             room_id: if room_id.is_empty() {
                 None
             } else {
                 Some(room_id.clone())
             },
-            progress: 0.0,
-            is_complete: false,
-            is_upload: true,
-            error: None,
+            direction: TransferDirection::Upload,
+            stage: TransferStage::Active {
+                progress: 0.0,
+                speed_bps: 0,
+            },
+            source_path: Some(path.clone()),
             cancel: cancel.clone(),
-            speed_bps: 0,
             last_sample_bytes: 0,
             last_sample_at: Instant::now(),
         };
 
-        self.transfers.lock().insert(transfer_id.clone(), entry);
+        {
+            let mut t = self.transfers.lock();
+            t.insert(transfer_id.clone(), entry);
+            emit_stage(self.event_sink.as_ref(), t.get(&transfer_id).expect("just inserted"));
+        }
 
         // Spawn upload task.
         let opener = self.opener.clone();
@@ -706,20 +724,24 @@ impl FileTransferPlugin for FileTransferRelayPlugin {
             name: relay_data.file_name,
             size: relay_data.file_size,
             mime: relay_data.mime,
-            path: None,
             share_data: None,
             room_id: None,
-            progress: 0.0,
-            is_complete: false,
-            is_upload: false,
-            error: None,
+            direction: TransferDirection::Download,
+            stage: TransferStage::Active {
+                progress: 0.0,
+                speed_bps: 0,
+            },
+            source_path: None,
             cancel: cancel.clone(),
-            speed_bps: 0,
             last_sample_bytes: 0,
             last_sample_at: Instant::now(),
         };
 
-        self.transfers.lock().insert(transfer_id.clone(), entry);
+        {
+            let mut t = self.transfers.lock();
+            t.insert(transfer_id.clone(), entry);
+            emit_stage(self.event_sink.as_ref(), t.get(&transfer_id).expect("just inserted"));
+        }
 
         // Spawn fetch task.
         let opener = self.opener.clone();
@@ -754,8 +776,14 @@ impl FileTransferPlugin for FileTransferRelayPlugin {
 
     fn get_file_path(&self, id: &TransferId) -> Result<PathBuf> {
         let t = self.transfers.lock();
+        // Successful uploads keep `source_path`; successful downloads
+        // land in `Done { local_path }`. Try Done first since it's the
+        // standard "completed transfer" signal.
         t.get(&id.0)
-            .and_then(|e| e.path.clone())
+            .and_then(|e| match &e.stage {
+                TransferStage::Done { local_path } => Some(local_path.clone()),
+                _ => e.source_path.clone(),
+            })
             .ok_or_else(|| anyhow::anyhow!("no file path for transfer {}", id.0))
     }
 

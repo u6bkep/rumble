@@ -6,10 +6,9 @@
 use std::{
     cell::Cell,
     collections::{HashMap, HashSet},
-    io::BufReader,
     path::{Path, PathBuf},
     sync::LazyLock,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use aetna_core::{prelude::*, toast::ToastSpec};
@@ -27,7 +26,6 @@ use rumble_protocol::{AudioSettings, Command, ConnectionState, PendingCertificat
 use tokio::{runtime::Runtime, task::JoinHandle};
 
 use crate::{
-    animated_gpu::AnimatedGpu,
     backend::UiBackend,
     chat,
     elevate::{self, ElevateOutcome, ElevateState},
@@ -160,46 +158,17 @@ pub struct RumbleApp<B: UiBackend = crate::backend::NativeUiBackend> {
     /// another download. Cleared on disconnect.
     auto_handled_offers: HashSet<String>,
 
-    /// Decoded image cache keyed by `transfer_id`. Populated in
-    /// `before_build` once a file transfer reports `is_finished` with
-    /// a `local_path`; the chat module reads from this map to swap an
-    /// inline preview in for the file card. Static images are a single
-    /// frame; GIFs decode their full frame sequence so playback
-    /// doesn't re-decode.
-    image_cache: chat::ImageCache,
-
-    /// `transfer_id`s we have tried to decode and failed (corrupt,
-    /// truncated, unsupported codec). Recorded so the next frame
-    /// doesn't keep re-attempting the same decode.
-    image_failed: HashSet<String>,
-
-    /// Per-message GIF playback state keyed by `transfer_id`. One
-    /// entry per animated cache entry; the inline preview and the
-    /// lightbox both read from this so they stay in lockstep. Seeded
-    /// when [`Self::pump_image_cache`] inserts an animated entry.
-    gif_playback: HashMap<String, chat::GifPlayback>,
+    /// Event-driven owner of every transfer-keyed media map (image
+    /// cache, GIF playback, GPU mirrors, video thumbs, lightbox
+    /// decode). Replaces what used to be eight parallel maps on App.
+    /// Reacts to [`rumble_client::BackendEvent::TransferStageChanged`]
+    /// drained each frame in `drain_backend_events`.
+    media_cache: crate::media_cache::MediaCache,
 
     /// Click-to-enlarge image viewer state. `Some` when a chat image
     /// preview was clicked; cleared by Close / Escape / scrim click.
-    /// The image itself comes from [`Self::lightbox_full`] (a
-    /// dedicated full-resolution decode) or, until that decode lands,
-    /// the thumbnail in [`Self::image_cache`].
+    /// The image bytes come from [`media_cache`].
     image_lightbox: Option<chat::Lightbox>,
-
-    /// Full-resolution image (or animated frame sequence) for the
-    /// active lightbox. Decoded off-thread on lightbox open and
-    /// dropped on close, so the 1024-capped thumbnail in
-    /// `image_cache` no longer caps lightbox quality. `None` until
-    /// the decode completes (the lightbox falls back to the
-    /// thumbnail in the meantime), or when the source failed to
-    /// decode.
-    lightbox_full: Option<chat::CachedImage>,
-
-    /// In-flight full-resolution decode spawned on `runtime`. Polled
-    /// each frame in `poll_lightbox_decode`; the result lands in
-    /// `lightbox_full`. Aborted (and never observed) when the
-    /// lightbox closes before the decode finishes.
-    pending_lightbox_decode: Option<JoinHandle<Result<chat::CachedImage, image::ImageError>>>,
 
     /// Right-click context menu for a file card. `Some` while open;
     /// cleared by any menu action, the dismiss scrim, or Escape.
@@ -225,19 +194,11 @@ pub struct RumbleApp<B: UiBackend = crate::backend::NativeUiBackend> {
     room_acl_modal: Option<room_acl::RoomAclModalState>,
 
     /// `wgpu::Device` handle stashed by [`WinitWgpuApp::gpu_setup`]
-    /// once at startup, used in [`Self::sync_animated_gpu`] to lazily
-    /// allocate per-message textures for animated previews. `None`
-    /// before the host has finished bringing up wgpu (e.g. while
-    /// running tests against a `MockUiBackend`).
+    /// once at startup, used in `media_cache.sync_animated_gpu` to
+    /// lazily allocate per-message textures for animated previews.
+    /// `None` before the host has finished bringing up wgpu (e.g.
+    /// while running tests against a `MockUiBackend`).
     gpu_device: Option<wgpu::Device>,
-
-    /// Per-message GPU mirrors for animated previews keyed by
-    /// `transfer_id`. Populated lazily by [`Self::sync_animated_gpu`]
-    /// the first time `before_paint` runs with an active
-    /// [`chat::GifPlayback`] for an animated cache entry. Dropped
-    /// alongside its `gif_playback` slot so the GPU memory tracks the
-    /// CPU-side cache.
-    animated_gpu: HashMap<String, AnimatedGpu>,
 
     /// Currently-open video lightbox, if any. Owns the libmpv
     /// stream + decode worker + GPU mirror; dropped on close to
@@ -249,26 +210,6 @@ pub struct RumbleApp<B: UiBackend = crate::backend::NativeUiBackend> {
     /// is offloaded to the runtime to avoid stalling the UI; the
     /// completed stream lands in `active_video` next frame.
     pending_video_open: Option<JoinHandle<PendingVideoOpenResult>>,
-
-    /// Decoded poster thumbnails for downloaded video files,
-    /// keyed by `transfer_id`. Populated by [`Self::pump_video_thumbs`]
-    /// after a one-shot libmpv decode of the first frame; chat
-    /// consults this to swap a `file_offer_card` for a
-    /// `video_preview` card when the entry is ready.
-    video_thumbs: HashMap<String, Image>,
-    /// Failed extraction bookkeeping: how many times we've tried
-    /// and when we last tried. Transient failures (libmpv
-    /// cold-start timeout, brief file contention while the upload
-    /// reader is still active) self-recover via backoff. Only
-    /// after [`THUMB_MAX_ATTEMPTS`] failures do we give up — past
-    /// that the file probably really isn't decodable and re-trying
-    /// every few seconds would just churn libmpv.
-    failed_video_thumbs: HashMap<String, ThumbFailure>,
-    /// In-flight thumbnail-decode tasks keyed by `transfer_id`.
-    /// Polled in [`Self::pump_video_thumbs`]; on completion the
-    /// result lands in either `video_thumbs` (Ok) or
-    /// `failed_video_thumbs` (Err).
-    pending_video_thumbs: HashMap<String, JoinHandle<Result<Image, rumble_video::Error>>>,
 
     /// Queued toasts collected from backend events each frame.
     /// Drained by [`App::drain_toasts`] so aetna's runtime synthesizes
@@ -344,6 +285,8 @@ impl<B: UiBackend> RumbleApp<B> {
             tracing::warn!("hotkey registration failed: {e}");
         }
 
+        let runtime_handle_for_media_cache = runtime.handle().clone();
+        let initial_gif_autoplay = settings.settings().chat.gif_autoplay;
         Self {
             backend,
             identity,
@@ -374,24 +317,16 @@ impl<B: UiBackend> RumbleApp<B> {
             prev_server_muted: false,
             pending_file_dialog: None,
             auto_handled_offers: HashSet::new(),
-            image_cache: HashMap::new(),
-            image_failed: HashSet::new(),
-            gif_playback: HashMap::new(),
+            media_cache: crate::media_cache::MediaCache::new(runtime_handle_for_media_cache, initial_gif_autoplay),
             image_lightbox: None,
-            lightbox_full: None,
-            pending_lightbox_decode: None,
             file_context_menu: None,
             pending_save_as: None,
             pending_pick_download_dir: None,
             file_drop_hover: false,
             room_acl_modal: None,
             gpu_device: None,
-            animated_gpu: HashMap::new(),
             active_video: None,
             pending_video_open: None,
-            video_thumbs: HashMap::new(),
-            failed_video_thumbs: HashMap::new(),
-            pending_video_thumbs: HashMap::new(),
             pending_toasts: Vec::new(),
             pending_link_opens: Vec::new(),
             pending_cancel_confirm: HashMap::new(),
@@ -412,186 +347,6 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
-/// Cap on the longest edge of a cached chat thumbnail, in pixels.
-/// ~1024 keeps the 220px-tall preview rect sharp on a 2× display
-/// without burning RAM on phone-camera-sized sources.
-const MAX_PREVIEW_PX: u32 = 1024;
-
-/// Cap on the longest edge of a lightbox full-resolution decode, in
-/// pixels. Generous enough that real-world photos go through
-/// untouched but defensive against pathological inputs (and well
-/// under the typical 8192 GPU texture limit).
-const MAX_LIGHTBOX_PX: u32 = 4096;
-
-/// Max attempts before giving up on a video thumbnail. Three tries
-/// covers the common transient cases (libmpv cold-start timeout on
-/// the first try, brief file-contention with an in-flight upload
-/// reader) without churning libmpv forever on files that genuinely
-/// won't decode.
-const THUMB_MAX_ATTEMPTS: u8 = 3;
-
-/// Per-attempt delay schedule between video-thumbnail retries.
-/// Indexed by completed-attempt count: after the 1st failure wait
-/// 2s, after the 2nd wait 8s. Hits long enough to outlast a busy
-/// upload reader while staying interactive on the cold-start path.
-const THUMB_RETRY_DELAYS: &[Duration] = &[Duration::from_secs(2), Duration::from_secs(8)];
-
-/// Per-id retry bookkeeping written by [`RumbleApp::pump_video_thumbs`]
-/// and consulted on subsequent frames. `attempts` counts completed
-/// failures (incremented on drain), `last_attempt` is the most
-/// recent spawn instant (so the backoff timer measures since that,
-/// not since the failure landed).
-#[derive(Clone, Copy, Debug)]
-struct ThumbFailure {
-    attempts: u8,
-    last_attempt: Instant,
-}
-
-/// Decode `path` into a [`chat::CachedImage`]. `max_px` caps the
-/// longest edge of every emitted frame — `Some(n)` downsamples, `None`
-/// loads the source at its natural resolution.
-///
-/// Animated GIF, animated WebP, and APNG decode every frame and produce
-/// [`chat::CachedImage::Animated`]; single-frame animations and all
-/// other formats collapse to `Static`.
-fn decode_image(path: &Path, max_px: Option<u32>) -> Result<chat::CachedImage, image::ImageError> {
-    use image::{
-        AnimationDecoder, ImageFormat,
-        codecs::{gif::GifDecoder, png::PngDecoder, webp::WebPDecoder},
-    };
-
-    // SVG isn't a raster format — `image::ImageReader` doesn't know it.
-    // Detect by extension first, then read the file as text and hand it
-    // to aetna's vector parser. The resulting `SvgIcon` clones cheaply
-    // and renders crisp at any size via aetna's vector tessellator.
-    if path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.eq_ignore_ascii_case("svg"))
-        .unwrap_or(false)
-    {
-        let svg_text = std::fs::read_to_string(path).map_err(image::ImageError::IoError)?;
-        let icon = aetna_core::SvgIcon::parse(&svg_text).map_err(|e| {
-            image::ImageError::Decoding(image::error::DecodingError::new(
-                image::error::ImageFormatHint::Name("svg".into()),
-                e.to_string(),
-            ))
-        })?;
-        return Ok(chat::CachedImage::Svg(icon));
-    }
-
-    let reader = image::ImageReader::open(path)?.with_guessed_format()?;
-    match reader.format() {
-        Some(ImageFormat::Gif) => {
-            let decoder = GifDecoder::new(BufReader::new(std::fs::File::open(path)?))?;
-            return collect_animated_frames(decoder.into_frames(), max_px);
-        }
-        Some(ImageFormat::WebP) => {
-            let decoder = WebPDecoder::new(BufReader::new(std::fs::File::open(path)?))?;
-            if decoder.has_animation() {
-                return collect_animated_frames(decoder.into_frames(), max_px);
-            }
-        }
-        Some(ImageFormat::Png) => {
-            let decoder = PngDecoder::new(BufReader::new(std::fs::File::open(path)?))?;
-            if decoder.is_apng()? {
-                return collect_animated_frames(decoder.apng()?.into_frames(), max_px);
-            }
-        }
-        _ => {}
-    }
-
-    let img = reader.decode()?;
-    let img = match max_px {
-        Some(cap) if img.width().max(img.height()) > cap => img.thumbnail(cap, cap),
-        _ => img,
-    };
-    let rgba = img.to_rgba8();
-    Ok(chat::CachedImage::Static(Image::from_rgba8(
-        rgba.width(),
-        rgba.height(),
-        rgba.into_raw(),
-    )))
-}
-
-/// Drain an animation decoder's [`image::Frames`] iterator, downsample
-/// each by `max_px`, and pack the result into a
-/// [`chat::CachedImage::Animated`]. A delay floor of 20ms per frame
-/// keeps a 0/1-ms pathological file from pegging the playback pump
-/// (browsers do the same — Chrome and Firefox both clamp tiny delays).
-/// Single-frame inputs collapse to `Static`.
-fn collect_animated_frames(
-    frames: image::Frames<'_>,
-    max_px: Option<u32>,
-) -> Result<chat::CachedImage, image::ImageError> {
-    use image::DynamicImage;
-
-    let mut out: Vec<(Image, Duration)> = Vec::new();
-    for frame in frames {
-        let frame = frame?;
-        let (numer, denom) = frame.delay().numer_denom_ms();
-        let micros = (numer as u64).saturating_mul(1000) / (denom.max(1) as u64);
-        let delay = Duration::from_micros(micros).max(Duration::from_millis(20));
-
-        let mut dynimg = DynamicImage::ImageRgba8(frame.into_buffer());
-        if let Some(cap) = max_px
-            && dynimg.width().max(dynimg.height()) > cap
-        {
-            dynimg = dynimg.thumbnail(cap, cap);
-        }
-        let rgba = dynimg.to_rgba8();
-        let img = Image::from_rgba8(rgba.width(), rgba.height(), rgba.into_raw());
-        out.push((img, delay));
-    }
-
-    if out.len() <= 1 {
-        // Single-frame source (rare but legal for any of these formats).
-        // The animated UI overhead — playback state, controls overlay —
-        // adds nothing here, so collapse to Static. An empty file would
-        // have been refused by the decoder; the unwrap_or is a paranoid
-        // fallback.
-        return Ok(chat::CachedImage::Static(
-            out.into_iter()
-                .next()
-                .map(|(img, _)| img)
-                .unwrap_or_else(|| Image::from_rgba8(1, 1, vec![0, 0, 0, 0])),
-        ));
-    }
-
-    Ok(chat::CachedImage::Animated { frames: out })
-}
-
-/// Backwards-compat wrapper for the chat thumbnail cache decode.
-fn decode_thumbnail(path: &Path) -> Result<chat::CachedImage, image::ImageError> {
-    decode_image(path, Some(MAX_PREVIEW_PX))
-}
-
-/// Advance an animated cache entry's playhead given elapsed wall-clock
-/// time. Skips through any number of frames whose accumulated delay is
-/// already in the past, so a long idle window resumes at the visually-
-/// correct frame in one update rather than fast-forwarding through
-/// every frame for one tick each.
-fn advance_gif_frame(pb: &mut chat::GifPlayback, frames: &[(Image, Duration)], now: Instant) {
-    let mut elapsed = now.saturating_duration_since(pb.last_advance);
-    let mut idx = pb.frame_idx.min(frames.len() - 1);
-    let mut advanced = false;
-    loop {
-        let cur_delay = frames[idx].1;
-        if elapsed < cur_delay {
-            break;
-        }
-        elapsed -= cur_delay;
-        idx = (idx + 1) % frames.len();
-        advanced = true;
-    }
-    if advanced {
-        pb.frame_idx = idx;
-        // Anchor `last_advance` at the frame boundary we landed on, so
-        // residual sub-frame elapsed time doesn't accumulate drift.
-        pb.last_advance = now - elapsed;
-    }
-}
-
 impl<B: UiBackend> App for RumbleApp<B> {
     fn before_build(&mut self) {
         self.poll_agent_op();
@@ -600,14 +355,20 @@ impl<B: UiBackend> App for RumbleApp<B> {
         self.poll_pick_download_dir();
         self.pump_auto_download();
         self.pump_sfx();
-        self.pump_image_cache();
-        self.poll_lightbox_decode();
-        self.pump_gif_animations();
-        self.pump_video_thumbs();
+        // Drain backend events FIRST so any TransferStageChanged
+        // lands on the media cache before its drain_pending +
+        // playback advance run for this frame. The order is what
+        // makes the new card show up the same frame the transfer
+        // finishes (event arrives → media cache decodes synchronously
+        // for images → render reads cache).
+        self.media_cache
+            .set_gif_autoplay_default(self.settings.settings().chat.gif_autoplay);
+        self.drain_backend_events();
+        self.media_cache.drain_pending();
+        let now = Instant::now();
+        self.media_cache.advance_gif_playheads(now);
         self.poll_video_open();
         self.pump_hotkeys();
-        self.drain_backend_events();
-        let now = Instant::now();
         self.pending_cancel_confirm
             .retain(|_, t| now.duration_since(*t).as_secs() < 3);
         if let Some(active) = self.active_video.as_mut() {
@@ -637,10 +398,10 @@ impl<B: UiBackend> App for RumbleApp<B> {
         let transfers: chat::TransferMap = all_transfers.iter().map(|t| (t.id.0.clone(), t.clone())).collect();
 
         let (in_flight_uploads, in_flight_downloads) = {
-            use rumble_client_traits::file_transfer::TransferDirection;
+            use rumble_client_traits::file_transfer::{TransferDirection, TransferStage};
             all_transfers
                 .iter()
-                .filter(|t| !t.is_finished && t.error.is_none())
+                .filter(|t| matches!(t.stage, TransferStage::Active { .. } | TransferStage::Paused { .. }))
                 .fold((0usize, 0usize), |(up, dn), t| match t.direction {
                     TransferDirection::Upload => (up + 1, dn),
                     TransferDirection::Download => (up, dn + 1),
@@ -659,10 +420,7 @@ impl<B: UiBackend> App for RumbleApp<B> {
                 chat::render(
                     &state,
                     &shell.chat,
-                    &self.image_cache,
-                    &self.gif_playback,
-                    &self.animated_gpu,
-                    &self.video_thumbs,
+                    &self.media_cache,
                     &transfers,
                     &self.pending_cancel_confirm,
                     &self.chat_input,
@@ -765,13 +523,10 @@ impl<B: UiBackend> App for RumbleApp<B> {
             && cert_layer.is_none()
             && !self.settings_state.open
             && let Some(lightbox_state) = self.image_lightbox.as_ref()
-            && let Some(cached) = self
-                .lightbox_full
-                .as_ref()
-                .or_else(|| self.image_cache.get(&lightbox_state.transfer_id))
+            && let Some(cached) = self.media_cache.lightbox_image_for(&lightbox_state.transfer_id)
         {
-            let playback = self.gif_playback.get(&lightbox_state.transfer_id);
-            let gpu = self.animated_gpu.get(&lightbox_state.transfer_id);
+            let playback = self.media_cache.gif_playback_for(&lightbox_state.transfer_id);
+            let gpu = self.media_cache.animated_gpu_for(&lightbox_state.transfer_id);
             Some(chat::render_lightbox(lightbox_state, cached, playback, gpu))
         } else {
             None
@@ -1223,11 +978,8 @@ impl<B: UiBackend> App for RumbleApp<B> {
             return;
         }
         let lightbox_image_size = self.image_lightbox.as_ref().and_then(|lightbox| {
-            let cached = self
-                .lightbox_full
-                .as_ref()
-                .or_else(|| self.image_cache.get(&lightbox.transfer_id))?;
-            let playback = self.gif_playback.get(&lightbox.transfer_id);
+            let cached = self.media_cache.lightbox_image_for(&lightbox.transfer_id)?;
+            let playback = self.media_cache.gif_playback_for(&lightbox.transfer_id);
             Some(cached.current_frame_size(playback))
         });
         if let Some(lightbox) = self.image_lightbox.as_mut() {
@@ -1436,11 +1188,8 @@ impl<B: UiBackend> App for RumbleApp<B> {
     fn on_wheel_event(&mut self, event: UiEvent) -> bool {
         if self.image_lightbox.is_some() {
             let image_size = self.image_lightbox.as_ref().and_then(|lightbox| {
-                let cached = self
-                    .lightbox_full
-                    .as_ref()
-                    .or_else(|| self.image_cache.get(&lightbox.transfer_id))?;
-                let playback = self.gif_playback.get(&lightbox.transfer_id);
+                let cached = self.media_cache.lightbox_image_for(&lightbox.transfer_id)?;
+                let playback = self.media_cache.gif_playback_for(&lightbox.transfer_id);
                 Some(cached.current_frame_size(playback))
             });
             if let Some(lightbox) = self.image_lightbox.as_mut()
@@ -1932,7 +1681,7 @@ impl<B: UiBackend> RumbleApp<B> {
             .transfers()
             .into_iter()
             .find(|t| t.id.0 == transfer_id)
-            .and_then(|t| t.local_path);
+            .and_then(|t| t.done_path().cloned());
         self.file_context_menu = Some(chat::FileContextMenu {
             transfer_id: transfer_id.to_string(),
             name,
@@ -1967,7 +1716,7 @@ impl<B: UiBackend> RumbleApp<B> {
             .transfers()
             .into_iter()
             .find(|t| t.id.0 == transfer_id)
-            .and_then(|t| t.local_path)
+            .and_then(|t| t.done_path().cloned())
         {
             open_path(&path);
         }
@@ -1980,7 +1729,7 @@ impl<B: UiBackend> RumbleApp<B> {
             .transfers()
             .into_iter()
             .find(|t| t.id.0 == transfer_id)
-            .and_then(|t| t.local_path)
+            .and_then(|t| t.done_path().cloned())
         {
             let folder = path.parent().unwrap_or(&path);
             open_path(folder);
@@ -2071,7 +1820,7 @@ impl<B: UiBackend> RumbleApp<B> {
     /// 1024-capped thumbnail as the inline preview, so the open is
     /// always immediate.
     fn open_lightbox(&mut self, transfer_id: &str) {
-        if !self.image_cache.contains_key(transfer_id) {
+        if self.media_cache.image_for(transfer_id).is_none() {
             return;
         }
         let snapshot = self.backend.state();
@@ -2085,25 +1834,7 @@ impl<B: UiBackend> RumbleApp<B> {
             })
             .unwrap_or_else(|| transfer_id.to_string());
         self.image_lightbox = Some(chat::Lightbox::new(transfer_id, name));
-
-        // Force-resume an animated entry on lightbox open: the user
-        // explicitly chose to view it, so the chat-settings autoplay
-        // gate doesn't apply here. Static entries simply have no
-        // playback record.
-        if let Some(pb) = self.gif_playback.get_mut(transfer_id)
-            && !pb.playing
-        {
-            pb.playing = true;
-            pb.last_advance = Instant::now();
-        }
-
-        // Cancel any previous in-flight full-res decode and reset
-        // the slot — opening a new lightbox shouldn't leak the prior
-        // image or fold in a stale decode that lands later.
-        if let Some(prev) = self.pending_lightbox_decode.take() {
-            prev.abort();
-        }
-        self.lightbox_full = None;
+        self.media_cache.force_resume_playback(transfer_id);
 
         // Look up the local file path from the live transfer set; if
         // it's missing (e.g., the transfer plugin GC'd a finished
@@ -2113,14 +1844,11 @@ impl<B: UiBackend> RumbleApp<B> {
             .transfers()
             .into_iter()
             .find(|t| t.id.0 == transfer_id)
-            .and_then(|t| t.local_path);
+            .and_then(|t| t.done_path().cloned());
         let Some(path) = path else {
             return;
         };
-        self.pending_lightbox_decode = Some(
-            self.runtime
-                .spawn_blocking(move || decode_image(&path, Some(MAX_LIGHTBOX_PX))),
-        );
+        self.media_cache.open_lightbox_decode(transfer_id, path);
     }
 
     /// Close the lightbox: clear the active state, drop the
@@ -2129,10 +1857,7 @@ impl<B: UiBackend> RumbleApp<B> {
     /// away.
     fn close_lightbox(&mut self) {
         self.image_lightbox = None;
-        self.lightbox_full = None;
-        if let Some(handle) = self.pending_lightbox_decode.take() {
-            handle.abort();
-        }
+        self.media_cache.close_lightbox();
     }
 
     /// Open the video lightbox for `transfer_id`. Looks up the
@@ -2163,7 +1888,7 @@ impl<B: UiBackend> RumbleApp<B> {
         let Some(status) = entry else {
             return;
         };
-        let Some(path) = status.local_path.clone() else {
+        let Some(path) = status.done_path().cloned() else {
             return;
         };
         let name = status.name.clone();
@@ -2230,44 +1955,10 @@ impl<B: UiBackend> RumbleApp<B> {
     /// overlay is only rendered for animated cache entries, so this is
     /// reachable defensively at most.
     fn toggle_gif_playback(&mut self, transfer_id: &str) {
-        if let Some(pb) = self.gif_playback.get_mut(transfer_id) {
-            pb.playing = !pb.playing;
-            // Reset the wall-clock anchor whenever play resumes so the
-            // current frame still shows for its full delay rather than
-            // immediately advancing if the entry sat paused for a while.
-            if pb.playing {
-                pb.last_advance = Instant::now();
-            }
-        }
-    }
-
-    /// Drain a finished full-resolution lightbox decode. Discard the
-    /// result if the lightbox has been closed in the meantime — the
-    /// user moved on, no point uploading the texture.
-    fn poll_lightbox_decode(&mut self) {
-        let Some(handle) = self.pending_lightbox_decode.as_ref() else {
-            return;
-        };
-        if !handle.is_finished() {
-            return;
-        }
-        let handle = self.pending_lightbox_decode.take().unwrap();
-        if self.image_lightbox.is_none() {
-            // User closed the lightbox before decode landed — drop.
-            return;
-        }
-        match self.runtime.block_on(handle) {
-            Ok(Ok(img)) => {
-                self.lightbox_full = Some(img);
-            }
-            Ok(Err(e)) => {
-                tracing::debug!("lightbox full-res decode failed: {e}");
-            }
-            Err(e) if e.is_cancelled() => {}
-            Err(e) => {
-                tracing::error!("lightbox decode task panicked: {e}");
-            }
-        }
+        // MediaCache resets the wall-clock anchor on every toggle so
+        // the current frame still shows for its full delay rather than
+        // immediately advancing if the entry sat paused for a while.
+        let _ = self.media_cache.toggle_playback(transfer_id);
     }
 
     /// Scan newly-arrived chat messages and auto-download any `FileOffer`
@@ -2522,6 +2213,12 @@ impl<B: UiBackend> RumbleApp<B> {
         use aetna_core::toast::ToastLevel;
         use rumble_client::NotificationLevel;
         for event in self.backend.drain_events() {
+            // Always offer the event to media_cache first — it
+            // ignores variants it doesn't care about. The match
+            // below only handles UI-side reactions (toast queue);
+            // the actual transfer-state handling lives in
+            // media_cache::on_event.
+            self.media_cache.on_event(&event);
             match event {
                 rumble_client::BackendEvent::Toast { level, text } => {
                     let tl = match level {
@@ -2531,296 +2228,23 @@ impl<B: UiBackend> RumbleApp<B> {
                     };
                     self.pending_toasts.push(ToastSpec::new(tl, text));
                 }
-            }
-        }
-    }
-
-    /// Walk the live transfer list each frame and decode any newly-
-    /// completed image transfers into the chat-module image cache.
-    /// Decoding runs synchronously on the UI thread because:
-    ///
-    /// * thumbnails are small (we cap at MAX_PREVIEW_PIXELS) and PNG /
-    ///   JPEG decode at that size finishes in a millisecond or two on
-    ///   modern hardware,
-    /// * we only do it once per `transfer_id` per session (cached in
-    ///   `image_cache`; failures are recorded in `image_failed`),
-    /// * doing it asynchronously would require a separate `Arc<Mutex>`
-    ///   pump and would not noticeably improve perceived latency.
-    ///
-    /// On disconnect the cache is cleared so a reconnect re-decodes
-    /// against whatever the new session's local paths are.
-    fn pump_image_cache(&mut self) {
-        let snapshot = self.backend.state();
-        if !snapshot.connection.is_connected() {
-            return;
-        }
-        let transfers = self.backend.transfers();
-        if transfers.is_empty() {
-            return;
-        }
-        for status in transfers {
-            if !status.is_finished {
-                continue;
-            }
-            let Some(path) = status.local_path.as_ref() else {
-                continue;
-            };
-            let id = &status.id.0;
-            if self.image_cache.contains_key(id) || self.image_failed.contains(id) {
-                continue;
-            }
-            if !chat::is_image_name(&status.name) {
-                // Mark as "not an image" so we don't re-check the
-                // extension every frame.
-                self.image_failed.insert(id.clone());
-                continue;
-            }
-            match decode_thumbnail(path) {
-                Ok(cached) => {
-                    if cached.is_animated() {
-                        // Seed playback state once so the inline preview
-                        // and lightbox observe a stable playhead. Honour
-                        // the chat-settings autoplay default for the
-                        // initial state; play/pause clicks toggle from
-                        // there.
-                        let autoplay = self.settings.settings().chat.gif_autoplay;
-                        self.gif_playback
-                            .entry(id.clone())
-                            .or_insert_with(|| chat::GifPlayback::new(autoplay));
-                    }
-                    self.image_cache.insert(id.clone(), cached);
-                }
-                Err(e) => {
-                    tracing::debug!(
-                        "image preview decode failed for {} ({}): {e}",
-                        status.name,
-                        path.display()
-                    );
-                    self.image_failed.insert(id.clone());
+                rumble_client::BackendEvent::TransferStageChanged { .. } => {
+                    // Media cache already handled it above; no
+                    // additional UI-side reaction needed here.
                 }
             }
         }
     }
 
-    /// Mirrors [`Self::pump_image_cache`] but for video files:
-    /// kicks off a one-shot libmpv decode of the first frame for
-    /// each downloaded video that doesn't already have a thumbnail
-    /// (or a record of failure), and drains finished decode tasks
-    /// into [`Self::video_thumbs`].
-    ///
-    /// Decode happens off-thread via `runtime.spawn_blocking` so
-    /// the 50–200ms libmpv startup cost doesn't stall the UI on
-    /// the frame the file finishes downloading.
-    fn pump_video_thumbs(&mut self) {
-        let snapshot = self.backend.state();
-        if !snapshot.connection.is_connected() {
-            // Drain any in-flight decodes whether or not we're
-            // still connected — they're cheap to land and the
-            // user might reconnect mid-decode.
-            self.drain_finished_video_thumbs();
-            return;
-        }
-
-        // Drain finished tasks first so the spawn loop below
-        // doesn't see stale `pending_video_thumbs` entries for
-        // ids that just landed.
-        self.drain_finished_video_thumbs();
-
-        let now = Instant::now();
-        for status in self.backend.transfers() {
-            if !status.is_finished {
-                continue;
-            }
-            let Some(path) = status.local_path.clone() else {
-                tracing::debug!(
-                    "pump_video_thumbs: skip {} ({}): finished but no local_path",
-                    status.id.0,
-                    status.name,
-                );
-                continue;
-            };
-            let id = status.id.0.clone();
-            if self.video_thumbs.contains_key(&id) || self.pending_video_thumbs.contains_key(&id) {
-                continue;
-            }
-            // Previous failures: skip permanently once we've burned
-            // [`THUMB_MAX_ATTEMPTS`], otherwise wait out the
-            // per-attempt backoff before respawning.
-            if let Some(fail) = self.failed_video_thumbs.get(&id) {
-                if fail.attempts >= THUMB_MAX_ATTEMPTS {
-                    continue;
-                }
-                let idx = (fail.attempts as usize)
-                    .saturating_sub(1)
-                    .min(THUMB_RETRY_DELAYS.len() - 1);
-                let delay = THUMB_RETRY_DELAYS[idx];
-                if now.saturating_duration_since(fail.last_attempt) < delay {
-                    continue;
-                }
-            }
-            if !video::is_video_name(&status.name) {
-                // Not a video — leave the file card alone. We
-                // don't mark it failed because there's nothing
-                // to retry.
-                continue;
-            }
-            let attempt_no = self.failed_video_thumbs.get(&id).map(|f| f.attempts + 1).unwrap_or(1);
-            tracing::debug!(
-                "pump_video_thumbs: spawn extract for {} ({}) direction={:?} attempt={}/{} path={}",
-                id,
-                status.name,
-                status.direction,
-                attempt_no,
-                THUMB_MAX_ATTEMPTS,
-                path.display(),
-            );
-            let handle = self.runtime.spawn_blocking(move || video::extract_thumbnail(&path));
-            self.pending_video_thumbs.insert(id.clone(), handle);
-            // Update last_attempt so backoff measures from the spawn,
-            // not from when the failure eventually lands on drain.
-            if let Some(fail) = self.failed_video_thumbs.get_mut(&id) {
-                fail.last_attempt = now;
-            }
-        }
-    }
-
-    /// Drain every finished entry in [`Self::pending_video_thumbs`]
-    /// into either `video_thumbs` (success) or `failed_video_thumbs`
-    /// (error). Pulled out of `pump_video_thumbs` so the early-
-    /// return when disconnected still flushes results.
-    fn drain_finished_video_thumbs(&mut self) {
-        let finished: Vec<String> = self
-            .pending_video_thumbs
-            .iter()
-            .filter(|(_, h)| h.is_finished())
-            .map(|(id, _)| id.clone())
-            .collect();
-        let now = Instant::now();
-        for id in finished {
-            let handle = self.pending_video_thumbs.remove(&id).unwrap();
-            match self.runtime.block_on(handle) {
-                Ok(Ok(image)) => {
-                    tracing::debug!("video thumbnail decoded for {id}: {}x{}", image.width(), image.height(),);
-                    // Clear any prior failure record so a recovered
-                    // file moves cleanly into the video_thumbs map.
-                    self.failed_video_thumbs.remove(&id);
-                    self.video_thumbs.insert(id, image);
-                }
-                Ok(Err(e)) => {
-                    let entry = self.failed_video_thumbs.entry(id.clone()).or_insert(ThumbFailure {
-                        attempts: 0,
-                        last_attempt: now,
-                    });
-                    entry.attempts = entry.attempts.saturating_add(1);
-                    entry.last_attempt = now;
-                    if entry.attempts >= THUMB_MAX_ATTEMPTS {
-                        tracing::warn!(
-                            "video thumbnail decode failed for {id} (attempt {}/{}, giving up): {e}",
-                            entry.attempts,
-                            THUMB_MAX_ATTEMPTS,
-                        );
-                    } else {
-                        tracing::debug!(
-                            "video thumbnail decode failed for {id} (attempt {}/{}, will retry): {e}",
-                            entry.attempts,
-                            THUMB_MAX_ATTEMPTS,
-                        );
-                    }
-                }
-                Err(join_err) => {
-                    // Panic in the spawn_blocking closure — treat as a
-                    // hard failure (don't retry), since panicking
-                    // again on the same input is the likely outcome.
-                    tracing::warn!("video thumbnail decode task panicked for {id}: {join_err}");
-                    self.failed_video_thumbs.insert(
-                        id,
-                        ThumbFailure {
-                            attempts: THUMB_MAX_ATTEMPTS,
-                            last_attempt: now,
-                        },
-                    );
-                }
-            }
-        }
-    }
-
-    /// Advance every active GIF playhead by the elapsed wall-clock
-    /// time. Each frame's display delay is treated as the dwell time
-    /// before the next frame appears — multi-frame skips are folded
-    /// into a single update so a tab the user backgrounded for a few
-    /// seconds resumes at the right frame instead of catching up frame
-    /// by frame.
-    ///
-    /// Drops `gif_playback` entries whose underlying cache entry has
-    /// gone away (e.g. because the transfer was evicted), so the map
-    /// can't outgrow the cache it shadows.
-    fn pump_gif_animations(&mut self) {
-        let now = Instant::now();
-        // Walk by key first so the borrow on `image_cache` is dropped
-        // before we mutate playback. Avoids a double-borrow on `self`.
-        let keys: Vec<String> = self.gif_playback.keys().cloned().collect();
-        for id in keys {
-            let drop_entry = match self.image_cache.get(&id) {
-                Some(chat::CachedImage::Animated { frames, .. }) => {
-                    if let Some(pb) = self.gif_playback.get_mut(&id) {
-                        if !pb.playing || frames.is_empty() {
-                            // Paused: keep the entry, don't burn cycles.
-                            // Empty frames is impossible by construction
-                            // (decode collapses to Static) but guard
-                            // anyway so the loop can't divide by zero.
-                            false
-                        } else {
-                            advance_gif_frame(pb, frames, now);
-                            false
-                        }
-                    } else {
-                        false
-                    }
-                }
-                // Cache entry vanished or is Static — drop the playback
-                // record so the map stays bounded.
-                _ => true,
-            };
-            if drop_entry {
-                self.gif_playback.remove(&id);
-            }
-        }
-    }
-
-    /// Lazily allocate per-message wgpu textures for animated entries
-    /// with active playback, upload the current frame to each, and
-    /// drop GPU mirrors whose playback has gone away. Called from
-    /// [`WinitWgpuApp::before_paint`] so the upload lands before
-    /// aetna's paint pass samples the texture this frame.
-    ///
-    /// Frame-advance bookkeeping lives in [`Self::pump_gif_animations`]
-    /// (run from `before_build`); this method is purely the GPU-side
-    /// mirror.
+    /// Sync GPU mirrors for animated entries: delegates to
+    /// `media_cache.sync_animated_gpu`. Called from
+    /// `WinitWgpuApp::before_paint` once the wgpu device is available
+    /// — `gpu_setup` stashes it on App.
     fn sync_animated_gpu(&mut self, queue: &wgpu::Queue) {
         let Some(device) = self.gpu_device.as_ref() else {
-            // gpu_setup hasn't run yet (or we're under a test backend
-            // that never calls it). Nothing to do.
             return;
         };
-
-        // Drop mirrors whose playback record is gone — keeps the
-        // GPU resident set bounded by the CPU-side cache.
-        self.animated_gpu.retain(|id, _| self.gif_playback.contains_key(id));
-
-        for (id, pb) in &self.gif_playback {
-            let Some(chat::CachedImage::Animated { frames }) = self.image_cache.get(id) else {
-                continue;
-            };
-            if frames.is_empty() {
-                continue;
-            }
-            let idx = pb.frame_idx.min(frames.len() - 1);
-            let entry = self
-                .animated_gpu
-                .entry(id.clone())
-                .or_insert_with(|| AnimatedGpu::allocate(device, &frames[0].0));
-            entry.upload_frame(queue, frames, idx);
-        }
+        self.media_cache.sync_animated_gpu(device, queue);
     }
 
     /// Lazily allocate the active video's GPU mirror (needs the
@@ -3268,11 +2692,12 @@ impl<B: UiBackend> RumbleApp<B> {
     }
 
     /// Test/scene-dump hook to seed the chat image-preview cache. The
-    /// runtime path goes through `pump_image_cache`, but bundle dumps
-    /// don't have a real file-transfer plugin behind them — so let the
-    /// scene-builder push a synthetic decoded image directly.
+    /// runtime path runs through `media_cache.on_event`, but bundle
+    /// dumps don't have a real file-transfer plugin behind them — so
+    /// let the scene-builder push a synthetic decoded image directly.
     pub fn insert_image_preview_for_test(&mut self, transfer_id: impl Into<String>, img: Image) {
-        self.image_cache
+        self.media_cache
+            .image_cache_mut()
             .insert(transfer_id.into(), chat::CachedImage::Static(img));
     }
 

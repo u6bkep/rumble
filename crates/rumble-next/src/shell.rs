@@ -637,16 +637,18 @@ fn draw_media<B: UiBackend>(
             //   2. The user has clicked Download already → "Downloading…"
             //      placeholder while the plugin spins up.
             //   3. Default → "Download" button.
+            use rumble_client_traits::file_transfer::TransferStage;
             let status = transfer_index.get(transfer_id);
-            let action = match (is_own, status) {
-                (_, Some(s)) if s.is_finished && s.local_path.is_some() => {
-                    let path = s.local_path.clone().expect("checked above");
-                    Some(FileOfferAction::Completed { path })
-                }
-                (_, Some(s)) if s.error.is_some() => Some(FileOfferAction::Failed(s.error.clone().unwrap_or_default())),
-                (_, Some(s)) => Some(FileOfferAction::InProgress {
-                    progress: s.progress.clamp(0.0, 1.0),
+            let action = match (is_own, status.map(|s| &s.stage)) {
+                (_, Some(TransferStage::Done { local_path })) => Some(FileOfferAction::Completed {
+                    path: local_path.clone(),
                 }),
+                (_, Some(TransferStage::Failed { reason })) => Some(FileOfferAction::Failed(reason.clone())),
+                (_, Some(TransferStage::Active { progress, .. } | TransferStage::Paused { progress })) => {
+                    Some(FileOfferAction::InProgress {
+                        progress: progress.clamp(0.0, 1.0),
+                    })
+                }
                 (true, None) => None,
                 (false, None) if accepted_offers.contains(transfer_id) => Some(FileOfferAction::Accepted),
                 (false, None) => Some(FileOfferAction::Available),
@@ -1257,7 +1259,7 @@ fn transfer_row<B: UiBackend>(
     pending_open: &mut Vec<PendingOpen>,
     backend: &B,
 ) {
-    use rumble_client_traits::file_transfer::PluginTransferState;
+    use rumble_client_traits::file_transfer::TransferStage;
     SurfaceFrame::new(SurfaceKind::Group)
         .inner_margin(Margin::symmetric(10, 8))
         .show(ui, |ui| {
@@ -1278,21 +1280,26 @@ fn transfer_row<B: UiBackend>(
                         );
                     });
                 });
-                let progress = status.progress.clamp(0.0, 1.0);
-                ui.add(egui::ProgressBar::new(progress).desired_width(f32::INFINITY));
+                ui.add(egui::ProgressBar::new(status.stage.progress()).desired_width(f32::INFINITY));
                 ui.label(
                     RichText::new(transfer_byte_summary(status))
                         .color(tokens.text_muted)
                         .font(tokens.font_mono.clone()),
                 );
-                if let Some(err) = &status.error {
-                    ui.label(RichText::new(err).color(tokens.danger).font(tokens.font_mono.clone()));
+                if let TransferStage::Failed { reason } = &status.stage {
+                    ui.label(
+                        RichText::new(reason)
+                            .color(tokens.danger)
+                            .font(tokens.font_mono.clone()),
+                    );
                 }
                 ui.add_space(2.0);
                 ui.horizontal(|ui| {
                     let id = &status.id;
-                    let is_active = !status.is_finished
-                        && !matches!(status.state, PluginTransferState::Error | PluginTransferState::Seeding);
+                    let is_active = matches!(
+                        status.stage,
+                        TransferStage::Active { .. } | TransferStage::Paused { .. }
+                    );
                     if ButtonArgs::new("Cancel")
                         .role(PressableRole::Danger)
                         .disabled(!is_active)
@@ -1302,8 +1309,8 @@ fn transfer_row<B: UiBackend>(
                     {
                         tracing::warn!("cancel transfer {} failed: {e}", id.0);
                     }
-                    let path = status.local_path.clone();
-                    let can_open = status.is_finished && path.is_some();
+                    let path = status.done_path().cloned();
+                    let can_open = path.is_some();
                     if ButtonArgs::new("Open")
                         .role(PressableRole::Default)
                         .disabled(!can_open)
@@ -1329,20 +1336,19 @@ fn transfer_row<B: UiBackend>(
 }
 
 fn transfer_state_label(status: &rumble_client_traits::file_transfer::TransferStatus) -> String {
-    use rumble_client_traits::file_transfer::PluginTransferState;
-    let pct = (status.progress.clamp(0.0, 1.0) * 100.0).round() as u32;
-    match status.state {
-        _ if status.is_finished => "Done".into(),
-        PluginTransferState::Initializing => format!("Uploading · {pct}%"),
-        PluginTransferState::Downloading => format!("Downloading · {pct}%"),
-        PluginTransferState::Seeding => "Seeding".into(),
-        PluginTransferState::Paused => "Paused".into(),
-        PluginTransferState::Error => "Error".into(),
+    use rumble_client_traits::file_transfer::{TransferDirection, TransferStage};
+    let pct = (status.stage.progress() * 100.0).round() as u32;
+    match (&status.stage, status.direction) {
+        (TransferStage::Done { .. }, _) => "Done".into(),
+        (TransferStage::Failed { .. }, _) => "Error".into(),
+        (TransferStage::Paused { .. }, _) => "Paused".into(),
+        (TransferStage::Active { .. }, TransferDirection::Upload) => format!("Uploading · {pct}%"),
+        (TransferStage::Active { .. }, TransferDirection::Download) => format!("Downloading · {pct}%"),
     }
 }
 
 fn transfer_byte_summary(status: &rumble_client_traits::file_transfer::TransferStatus) -> String {
-    let done = (status.progress.clamp(0.0, 1.0) as f64 * status.size as f64) as u64;
+    let done = (status.stage.progress() as f64 * status.size as f64) as u64;
     format!("{} / {}", format_bytes(done), format_bytes(status.size))
 }
 

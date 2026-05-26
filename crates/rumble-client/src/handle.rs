@@ -87,7 +87,20 @@ pub enum NotificationLevel {
 /// it each frame.
 #[derive(Debug, Clone)]
 pub enum BackendEvent {
+    /// User-visible notification — wrap in a toast.
     Toast { level: NotificationLevel, text: String },
+    /// A file transfer just changed lifecycle stage. Forwarded from
+    /// the file-transfer plugin's [`PluginEvent::TransferStageChanged`]
+    /// so the UI's media cache reacts on transition rather than
+    /// polling `plugin.transfers()` every frame. Only emitted on
+    /// stage *transitions* — intra-`Active` progress updates do not
+    /// fire events (progress bars keep reading the snapshot).
+    TransferStageChanged {
+        id: rumble_client_traits::TransferId,
+        direction: rumble_client_traits::TransferDirection,
+        name: String,
+        stage: rumble_client_traits::TransferStage,
+    },
 }
 
 /// A handle to the backend that can be used from UI code.
@@ -1990,33 +2003,52 @@ async fn watch_share_upload(
         let Some(status) = transfers.into_iter().find(|s| s.id.0 == transfer_id) else {
             return;
         };
-        if status.error.is_some() {
-            return;
-        }
-        if status.is_finished {
-            let _ = deferred_tx.send(DeferredAction::FinalizeShareUpload {
-                message_id,
-                attachment,
-                sender,
-                timestamp,
-            });
-            return;
+        use rumble_client_traits::file_transfer::TransferStage;
+        match status.stage {
+            TransferStage::Done { .. } => {
+                let _ = deferred_tx.send(DeferredAction::FinalizeShareUpload {
+                    message_id,
+                    attachment,
+                    sender,
+                    timestamp,
+                });
+                return;
+            }
+            TransferStage::Failed { .. } => return,
+            TransferStage::Active { .. } | TransferStage::Paused { .. } => {}
         }
     }
 }
 
-/// Build a [`PluginEventSink`] that forwards plugin-emitted toast
-/// events onto the [`BackendEvent`] channel. Defined here so the
-/// connection task can build it inline without `rumble-client-traits`
-/// taking a dependency on `BackendEvent`.
+/// Build a [`PluginEventSink`] that translates plugin events onto the
+/// [`BackendEvent`] channel. Defined here so the connection task can
+/// build it inline without `rumble-client-traits` taking a dependency
+/// on `BackendEvent`.
 fn plugin_event_sink(event_tx: mpsc::UnboundedSender<BackendEvent>) -> rumble_client_traits::PluginEventSink {
-    Arc::new(move |level, text| {
-        let mapped = match level {
-            rumble_client_traits::PluginNotificationLevel::Info => NotificationLevel::Info,
-            rumble_client_traits::PluginNotificationLevel::Warn => NotificationLevel::Warn,
-            rumble_client_traits::PluginNotificationLevel::Error => NotificationLevel::Error,
+    use rumble_client_traits::PluginEvent;
+    Arc::new(move |event| {
+        let mapped = match event {
+            PluginEvent::Notification { level, text } => {
+                let level = match level {
+                    rumble_client_traits::PluginNotificationLevel::Info => NotificationLevel::Info,
+                    rumble_client_traits::PluginNotificationLevel::Warn => NotificationLevel::Warn,
+                    rumble_client_traits::PluginNotificationLevel::Error => NotificationLevel::Error,
+                };
+                BackendEvent::Toast { level, text }
+            }
+            PluginEvent::TransferStageChanged {
+                id,
+                direction,
+                name,
+                stage,
+            } => BackendEvent::TransferStageChanged {
+                id,
+                direction,
+                name,
+                stage,
+            },
         };
-        let _ = event_tx.send(BackendEvent::Toast { level: mapped, text });
+        let _ = event_tx.send(mapped);
     })
 }
 

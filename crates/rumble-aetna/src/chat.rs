@@ -19,11 +19,11 @@ use std::{
 use aetna_core::{prelude::*, surface::SurfaceAlpha};
 use aetna_markdown::md;
 use linkify::{LinkFinder, LinkKind};
-use rumble_client_traits::file_transfer::{PluginTransferState, TransferDirection, TransferStatus};
+use rumble_client_traits::file_transfer::{TransferDirection, TransferStage, TransferStatus};
 use rumble_desktop_shell::ChatSettings;
 use rumble_protocol::{ChatMessage, ChatMessageKind, State, permissions::Permissions, proto::RelayFileSharePayload};
 
-use crate::{animated_gpu::AnimatedGpu, theme as palette};
+use crate::{animated_gpu::AnimatedGpu, media_cache::MediaCache, theme as palette};
 
 /// Decoded image cache, keyed by `transfer_id`. The App maintains this
 /// map and passes it through on render so the chat can swap a file
@@ -357,10 +357,7 @@ pub fn render_file_context_menu(menu: &FileContextMenu) -> El {
 pub fn render(
     state: &State,
     chat_settings: &ChatSettings,
-    image_cache: &ImageCache,
-    gif_playback: &HashMap<String, GifPlayback>,
-    animated_textures: &AnimatedTextureMap,
-    video_thumbs: &VideoThumbMap,
+    media_cache: &MediaCache,
     transfers: &TransferMap,
     pending_cancel_confirm: &HashMap<String, Instant>,
     chat_input: &str,
@@ -376,10 +373,7 @@ pub fn render(
         history(
             state,
             chat_settings,
-            image_cache,
-            gif_playback,
-            animated_textures,
-            video_thumbs,
+            media_cache,
             transfers,
             pending_cancel_confirm,
             my_user_id,
@@ -395,10 +389,7 @@ pub fn render(
 fn history(
     state: &State,
     chat_settings: &ChatSettings,
-    image_cache: &ImageCache,
-    gif_playback: &HashMap<String, GifPlayback>,
-    animated_textures: &AnimatedTextureMap,
-    video_thumbs: &VideoThumbMap,
+    media_cache: &MediaCache,
     transfers: &TransferMap,
     pending_cancel_confirm: &HashMap<String, Instant>,
     my_user_id: Option<u64>,
@@ -430,10 +421,7 @@ fn history(
             render_message(
                 msg,
                 chat_settings,
-                image_cache,
-                gif_playback,
-                animated_textures,
-                video_thumbs,
+                media_cache,
                 transfers,
                 pending_cancel_confirm,
                 my_user_id,
@@ -453,10 +441,7 @@ fn history(
 fn render_message(
     msg: &ChatMessage,
     chat_settings: &ChatSettings,
-    image_cache: &ImageCache,
-    gif_playback: &HashMap<String, GifPlayback>,
-    animated_textures: &AnimatedTextureMap,
-    video_thumbs: &VideoThumbMap,
+    media_cache: &MediaCache,
     transfers: &TransferMap,
     pending_cancel_confirm: &HashMap<String, Instant>,
     my_user_id: Option<u64>,
@@ -522,35 +507,14 @@ fn render_message(
         plain_with_links(&msg.text, msg_key).width(Size::Fill(1.0))
     };
 
-    // Attachment dispatch: look up the namespace, decode the payload via
-    // the matching plugin helper, render accordingly. Unknown namespaces
-    // fall back to attachment.fallback_text.
+    // Attachment dispatch: classify into an explicit AttachmentView,
+    // then render the chosen variant. The view enum makes precedence
+    // a data fact (Failed beats Image beats Video beats File) so the
+    // renderer can't accidentally hide a failed share behind a cached
+    // thumbnail.
     let attachment: Option<El> = msg.attachment.as_ref().map(|att| {
-        if att.namespace == rumble_desktop::FILE_TRANSFER_RELAY_NAMESPACE
-            && let Some(offer) = rumble_desktop::decode_relay_payload(&att.payload)
-        {
-            if let Some(cached) = image_cache.get(&offer.transfer_id) {
-                let playback = gif_playback.get(&offer.transfer_id);
-                let gpu = animated_textures.get(&offer.transfer_id);
-                image_preview(&offer, cached, playback, gpu)
-            } else if let Some(thumb) = video_thumbs.get(&offer.transfer_id) {
-                video_preview(&offer, thumb)
-            } else {
-                file_offer_card(
-                    &offer,
-                    transfers.get(&offer.transfer_id),
-                    is_own,
-                    pending_cancel_confirm,
-                )
-            }
-        } else {
-            paragraph(att.fallback_text.clone())
-                .muted()
-                .italic()
-                .font_size(tokens::TEXT_XS.size)
-                .selectable()
-                .width(Size::Fill(1.0))
-        }
+        let view = attachment_view(att, media_cache, transfers);
+        render_attachment_view(view, is_own, pending_cancel_confirm)
     });
 
     let mut parts: Vec<El> = vec![header, body];
@@ -582,33 +546,138 @@ fn render_message(
     }
 }
 
+/// Classified view of a chat attachment, computed once per message
+/// render before any El is built. The variants encode the dispatch
+/// precedence as data — `Failed` always beats every preview variant,
+/// `Image` beats `Video` (the same file could in principle decode as
+/// both), `Video` beats the plain `File` card.
+///
+/// Lifting this out of an `if let` chain serves two purposes:
+///   1. It makes the precedence audit-able. The bug that motivated
+///      this refactor was a renderer that picked Video over File-card
+///      whenever a thumbnail had decoded — including for an upload
+///      that had failed. Now `Failed` lives in its own arm and can't
+///      be shadowed.
+///   2. It localises the borrow lifetimes. The renderer arms take
+///      already-resolved references rather than re-doing the lookups.
+enum AttachmentView<'a> {
+    /// Inline image preview. The transfer is `Done` and the bytes
+    /// have decoded into the chat image cache.
+    Image {
+        offer: RelayFileSharePayload,
+        cached: &'a CachedImage,
+        playback: Option<&'a GifPlayback>,
+        gpu: Option<&'a AnimatedGpu>,
+    },
+    /// Inline video poster card. The transfer is `Done` and the first
+    /// frame has been extracted into the video-thumb cache.
+    Video {
+        offer: RelayFileSharePayload,
+        thumb: &'a Image,
+    },
+    /// Plain file card. Status is `None` (history-sync message from
+    /// before this session started a transfer for this offer) or one
+    /// of `Active`/`Paused`/`Done` (the latter for sender-side or
+    /// non-previewable receiver-side completions).
+    File {
+        offer: RelayFileSharePayload,
+        status: Option<&'a TransferStatus>,
+    },
+    /// Terminal failure. Renders a dedicated error card; takes
+    /// precedence over every preview variant so the error always
+    /// surfaces.
+    Failed {
+        offer: RelayFileSharePayload,
+        reason: String,
+    },
+    /// Attachment whose plugin namespace we don't recognise. Falls
+    /// back to the human-readable summary the producing plugin
+    /// embedded for exactly this case.
+    UnknownPlugin { text: String },
+}
+
+/// Classify a `ChatAttachment` into the [`AttachmentView`] variant
+/// that should be rendered. Pure function — no rendering, just data.
+fn attachment_view<'a>(
+    att: &rumble_protocol::types::ChatAttachment,
+    media_cache: &'a MediaCache,
+    transfers: &'a TransferMap,
+) -> AttachmentView<'a> {
+    if att.namespace != rumble_desktop::FILE_TRANSFER_RELAY_NAMESPACE {
+        return AttachmentView::UnknownPlugin {
+            text: att.fallback_text.clone(),
+        };
+    }
+    let Some(offer) = rumble_desktop::decode_relay_payload(&att.payload) else {
+        return AttachmentView::UnknownPlugin {
+            text: att.fallback_text.clone(),
+        };
+    };
+
+    let status = transfers.get(&offer.transfer_id);
+
+    // Failure wins over every preview. A failed upload still has its
+    // source file on the sender's disk, so the image/video thumb
+    // caches might well have populated against it — we deliberately
+    // ignore those and surface the error.
+    if let Some(s) = status
+        && let TransferStage::Failed { reason } = &s.stage
+    {
+        return AttachmentView::Failed {
+            offer,
+            reason: reason.clone(),
+        };
+    }
+
+    if let Some(cached) = media_cache.image_for(&offer.transfer_id) {
+        return AttachmentView::Image {
+            cached,
+            playback: media_cache.gif_playback_for(&offer.transfer_id),
+            gpu: media_cache.animated_gpu_for(&offer.transfer_id),
+            offer,
+        };
+    }
+    if let Some(thumb) = media_cache.video_thumb_for(&offer.transfer_id) {
+        return AttachmentView::Video { offer, thumb };
+    }
+    AttachmentView::File { offer, status }
+}
+
+/// Render the chosen [`AttachmentView`] variant.
+fn render_attachment_view(
+    view: AttachmentView<'_>,
+    is_local_sender: bool,
+    pending_cancel_confirm: &HashMap<String, Instant>,
+) -> El {
+    match view {
+        AttachmentView::Image {
+            offer,
+            cached,
+            playback,
+            gpu,
+        } => image_preview(&offer, cached, playback, gpu),
+        AttachmentView::Video { offer, thumb } => video_preview(&offer, thumb),
+        AttachmentView::File { offer, status } => {
+            file_offer_card(&offer, status, is_local_sender, pending_cancel_confirm)
+        }
+        AttachmentView::Failed { offer, reason } => failed_card(&offer, &reason, is_local_sender),
+        AttachmentView::UnknownPlugin { text } => paragraph(text)
+            .muted()
+            .italic()
+            .font_size(tokens::TEXT_XS.size)
+            .selectable()
+            .width(Size::Fill(1.0)),
+    }
+}
+
 fn file_offer_card(
     offer: &RelayFileSharePayload,
     status: Option<&TransferStatus>,
     is_local_sender: bool,
     pending_cancel_confirm: &HashMap<String, Instant>,
 ) -> El {
-    let header = row([
-        icon(IconName::FileText).text_color(tokens::MUTED_FOREGROUND),
-        text(offer.name.clone())
-            .semibold()
-            .ellipsis()
-            .key(format!("chat:file-card:{}.name", offer.transfer_id))
-            .tooltip(offer.name.clone()),
-    ])
-    .gap(tokens::SPACE_1)
-    .align(Align::Center)
-    .width(Size::Fill(1.0));
-
-    let mime = if offer.mime.is_empty() {
-        "unknown".to_string()
-    } else {
-        offer.mime.clone()
-    };
-    let meta = text(format!("{} · {mime}", format_size(offer.size)))
-        .muted()
-        .font_size(tokens::TEXT_XS.size);
-
+    let header = file_card_header(offer);
+    let meta = file_card_meta(offer);
     let body = file_card_body(offer, status, is_local_sender, pending_cancel_confirm);
 
     column([header, meta, body])
@@ -622,88 +691,119 @@ fn file_offer_card(
         .width(Size::Fill(1.0))
 }
 
+/// Header row: file-type icon + the filename, ellipsis-truncated with
+/// the full name in a tooltip. Shared by the regular `file_offer_card`
+/// and the `failed_card` so a failed share still shows what was
+/// attempted.
+fn file_card_header(offer: &RelayFileSharePayload) -> El {
+    row([
+        icon(IconName::FileText).text_color(tokens::MUTED_FOREGROUND),
+        text(offer.name.clone())
+            .semibold()
+            .ellipsis()
+            .key(format!("chat:file-card:{}.name", offer.transfer_id))
+            .tooltip(offer.name.clone()),
+    ])
+    .gap(tokens::SPACE_1)
+    .align(Align::Center)
+    .width(Size::Fill(1.0))
+}
+
+/// Secondary line: human size + MIME type. Used by the same two card
+/// builders as [`file_card_header`].
+fn file_card_meta(offer: &RelayFileSharePayload) -> El {
+    let mime = if offer.mime.is_empty() {
+        "unknown".to_string()
+    } else {
+        offer.mime.clone()
+    };
+    text(format!("{} · {mime}", format_size(offer.size)))
+        .muted()
+        .font_size(tokens::TEXT_XS.size)
+}
+
 /// Determine the action/progress body for a file card based on the
-/// user's relationship to the file (sender vs receiver) and the plugin's
-/// TransferStatus. The plugin is the single source of truth for upload
-/// state: progress, errors, completion all flow from `status`.
+/// user's relationship to the file (sender vs receiver) and the
+/// transfer's lifecycle stage. The Failed stage is handled upstream
+/// in [`AttachmentView`] — by the time we get here, `status.stage` is
+/// `Active`, `Paused`, `Done`, or `status` is `None`.
 fn file_card_body(
     offer: &RelayFileSharePayload,
     status: Option<&TransferStatus>,
     is_local_sender: bool,
     pending_cancel_confirm: &HashMap<String, Instant>,
 ) -> El {
-    // Upload/download error reported by the plugin — show the reason.
-    if let Some(s) = status
-        && let Some(reason) = s.error.as_deref()
-        && !reason.is_empty()
-    {
-        let label = if is_local_sender {
-            "Upload failed"
-        } else {
-            "Download failed"
-        };
-        let header = text(label)
-            .text_color(palette::MUTED_SERVER)
-            .font_size(tokens::TEXT_XS.size)
-            .semibold();
-        let mut parts: Vec<El> = vec![row([header.width(Size::Fill(1.0))]).width(Size::Fill(1.0))];
-        parts.push(
-            paragraph(reason.to_string())
-                .text_color(palette::MUTED_SERVER)
-                .font_size(tokens::TEXT_XS.size)
-                .key(format!("chat:file-card:{}.err", offer.transfer_id))
-                .selectable()
-                .width(Size::Fill(1.0)),
-        );
-        if is_local_sender {
-            parts.push(
-                text("Retry by sharing the file again")
-                    .muted()
-                    .font_size(tokens::TEXT_XS.size),
-            );
-        }
-        return column(parts).gap(tokens::SPACE_1).width(Size::Fill(1.0));
-    }
-
-    // In-flight transfer (upload or download): show progress regardless of sender/receiver.
-    if let Some(s) = status {
-        if !s.is_finished && is_in_flight(s.state) {
+    match status.map(|s| &s.stage) {
+        Some(TransferStage::Active { .. } | TransferStage::Paused { .. }) => {
+            let s = status.expect("matched on status above");
             let confirm_pending = pending_cancel_confirm.contains_key(&s.id.0);
-            return transfer_progress_block(s, confirm_pending);
+            transfer_progress_block(s, confirm_pending)
         }
+        Some(TransferStage::Done { .. }) if is_local_sender => sender_complete_row(&offer.transfer_id),
+        Some(TransferStage::Done { .. }) => receiver_complete_row(offer, status.expect("matched on status above")),
+        // No status: sender side renders nothing actionable (their
+        // local-only card is just the header). Receiver side gets a
+        // Download button to start the fetch.
+        None if is_local_sender => row([spacer()]).width(Size::Fill(1.0)),
+        None => row([
+            spacer(),
+            button_with_icon(IconName::Download, "Download")
+                .key(download_key(&offer.transfer_id))
+                .primary(),
+        ])
+        .gap(tokens::SPACE_2)
+        .width(Size::Fill(1.0))
+        .align(Align::Center),
+        // Failed is lifted to the AttachmentView::Failed dispatch arm
+        // and never reaches the file_card_body; emit a no-op as a
+        // defensive default rather than asserting unreachable.
+        Some(TransferStage::Failed { .. }) => row([spacer()]).width(Size::Fill(1.0)),
     }
+}
 
+/// Failure card body. Replaces the file card entirely when an upload
+/// or download fails — the renderer reaches this path via
+/// [`AttachmentView::Failed`] regardless of any preview cache hit, so
+/// a failed share never has its error hidden behind a stale thumbnail.
+fn failed_card(offer: &RelayFileSharePayload, reason: &str, is_local_sender: bool) -> El {
+    let label = if is_local_sender {
+        "Upload failed"
+    } else {
+        "Download failed"
+    };
+    let header = row([text(label)
+        .text_color(palette::MUTED_SERVER)
+        .font_size(tokens::TEXT_XS.size)
+        .semibold()
+        .width(Size::Fill(1.0))])
+    .width(Size::Fill(1.0));
+    let reason_el = paragraph(reason.to_string())
+        .text_color(palette::MUTED_SERVER)
+        .font_size(tokens::TEXT_XS.size)
+        .key(format!("chat:file-card:{}.err", offer.transfer_id))
+        .selectable()
+        .width(Size::Fill(1.0));
+
+    let card_header = file_card_header(offer);
+    let meta = file_card_meta(offer);
+    let mut body: Vec<El> = vec![card_header, meta, header, reason_el];
     if is_local_sender {
-        // Sender, no error, status finished or absent.
-        if let Some(s) = status
-            && s.is_finished
-            && s.local_path.is_some()
-        {
-            return sender_complete_row(&offer.transfer_id);
-        }
-        // No status / no local path — nothing actionable to render.
-        return row([spacer()]).width(Size::Fill(1.0));
+        body.push(
+            text("Retry by sharing the file again")
+                .muted()
+                .font_size(tokens::TEXT_XS.size),
+        );
     }
 
-    // Receiver side.
-    if let Some(s) = status {
-        if s.is_finished && s.local_path.is_some() {
-            // Receiver completed download.
-            return receiver_complete_row(offer, s);
-        }
-        // Status exists but not finished/error — fall through to Download.
-    }
-
-    // Default: receiver hasn't downloaded yet.
-    row([
-        spacer(),
-        button_with_icon(IconName::Download, "Download")
-            .key(download_key(&offer.transfer_id))
-            .primary(),
-    ])
-    .gap(tokens::SPACE_2)
-    .width(Size::Fill(1.0))
-    .align(Align::Center)
+    column(body)
+        .key(file_card_key(&offer.transfer_id))
+        .gap(tokens::SPACE_1)
+        .padding(Sides::all(tokens::SPACE_2))
+        .fill(tokens::SECONDARY)
+        .stroke(tokens::BORDER)
+        .stroke_width(1.0)
+        .radius(tokens::RADIUS_MD)
+        .width(Size::Fill(1.0))
 }
 
 /// Open + Reveal buttons for a sender whose upload completed.
@@ -724,7 +824,7 @@ fn sender_complete_row(transfer_id: &str) -> El {
 
 /// Open + Reveal buttons for a receiver whose download completed.
 fn receiver_complete_row(offer: &RelayFileSharePayload, status: &TransferStatus) -> El {
-    let is_playable_video = status.local_path.is_some() && crate::video::is_video_name(&offer.name);
+    let is_playable_video = status.done_path().is_some() && crate::video::is_video_name(&offer.name);
     let mut btns: Vec<El> = vec![spacer()];
     if is_playable_video {
         btns.push(
@@ -749,26 +849,27 @@ fn receiver_complete_row(offer: &RelayFileSharePayload, status: &TransferStatus)
         .align(Align::Center)
 }
 
-/// True when a transfer is active enough that we should render a
-/// progress bar rather than a Download button.
-fn is_in_flight(state: PluginTransferState) -> bool {
-    matches!(
-        state,
-        PluginTransferState::Initializing | PluginTransferState::Downloading | PluginTransferState::Paused
-    )
-}
-
 /// Progress bar + bytes-transferred + speed/ETA line for an in-flight
 /// transfer. Shows "Uploading" or "Downloading" prefix based on direction.
 /// Zero-byte files show a full progress bar rather than indeterminate.
 /// `confirm_pending` is true when the first cancel click has been received
 /// and the button should show "Cancel?" to prompt confirmation.
 fn transfer_progress_block(status: &TransferStatus, confirm_pending: bool) -> El {
+    // Stage-extracted progress + speed. `Done`/`Failed` shouldn't reach
+    // this function — callers gate on Active/Paused — but the
+    // `TransferStage::progress` helper degrades gracefully if they do.
+    let progress_frac = status.stage.progress();
+    let (speed_bps, paused) = match status.stage {
+        TransferStage::Active { speed_bps, .. } => (speed_bps, false),
+        TransferStage::Paused { .. } => (0, true),
+        _ => (0, false),
+    };
+
     // Zero-byte files: show a complete bar rather than indeterminate progress.
     let bar: El = if status.size == 0 {
         progress(1.0, tokens::PRIMARY)
     } else {
-        progress(status.progress.clamp(0.0, 1.0), tokens::PRIMARY)
+        progress(progress_frac, tokens::PRIMARY)
     };
 
     let direction_label = match status.direction {
@@ -781,29 +882,21 @@ fn transfer_progress_block(status: &TransferStatus, confirm_pending: bool) -> El
             .muted()
             .font_size(tokens::TEXT_XS.size)
     } else {
-        let speed = if status.state == PluginTransferState::Paused {
-            0
-        } else if status.download_speed > 0 {
-            status.download_speed
-        } else {
-            status.upload_speed
-        };
-
-        let pct = (status.progress.clamp(0.0, 1.0) * 100.0).round() as i32;
-        let transferred = (status.size as f32 * status.progress.clamp(0.0, 1.0)) as u64;
+        let pct = (progress_frac * 100.0).round() as i32;
+        let transferred = (status.size as f32 * progress_frac) as u64;
         let bytes_label = format!("{} / {}", format_size(transferred), format_size(status.size));
-        let speed_label = match status.state {
-            PluginTransferState::Paused => "Paused".to_string(),
-            _ if speed > 0 => format!("{}/s", format_size(speed)),
-            _ => "…".to_string(),
+        let speed_label = if paused {
+            "Paused".to_string()
+        } else if speed_bps > 0 {
+            format!("{}/s", format_size(speed_bps))
+        } else {
+            "…".to_string()
         };
-        let eta_label = match status.state {
-            PluginTransferState::Paused => String::new(),
-            _ if speed > 0 && status.size > transferred => {
-                let remaining = status.size - transferred;
-                format!(" · {} left", format_eta(remaining, speed))
-            }
-            _ => String::new(),
+        let eta_label = if !paused && speed_bps > 0 && status.size > transferred {
+            let remaining = status.size - transferred;
+            format!(" · {} left", format_eta(remaining, speed_bps))
+        } else {
+            String::new()
         };
 
         text(format!(
@@ -850,6 +943,37 @@ fn format_eta(remaining_bytes: u64, speed_bps: u64) -> String {
     }
 }
 
+/// Wrap an inner El (`image()`, `surface()`, or `stack([poster, badge])`)
+/// in the nested-`Size::Aspect` Contain layout the three preview cards
+/// (image, video poster, animated GIF) all share. Centers a
+/// natural-aspect rect inside a fill-width column, capped to
+/// `max_height` (and optionally `max_width`). The inner El's own
+/// `Size::Fill(1.0)` width+height pick up the inscribed rect.
+///
+/// `vector()` (SVG) and `surface()` (GPU texture) have no built-in
+/// Contain analog like `image_fit(ImageFit::Contain)`, so this pattern
+/// is how we get aspect-correct letterboxing for them. Static images
+/// don't strictly need it (their fit could be done via `image_fit`),
+/// but using the same pattern keeps inline overlay positioning
+/// consistent — corner badges park on the *visible* rect, not the
+/// bounding rect's letterbox bands.
+fn preview_card(inner: El, natural_w: u32, natural_h: u32, max_height: f32, max_width: Option<f32>) -> El {
+    let aspect_h_over_w = natural_h as f32 / natural_w.max(1) as f32;
+    let aspect_w_over_h = natural_w.max(1) as f32 / natural_h.max(1) as f32;
+    let inner_wrapper = column([inner])
+        .height(Size::Fill(1.0))
+        .width(Size::Aspect(aspect_w_over_h));
+    let mut outer = column([inner_wrapper])
+        .width(Size::Fill(1.0))
+        .height(Size::Aspect(aspect_h_over_w))
+        .max_height(max_height)
+        .align(Align::Center);
+    if let Some(mw) = max_width {
+        outer = outer.max_width(mw);
+    }
+    outer
+}
+
 /// Inline thumbnail card for an image attachment whose underlying
 /// transfer is complete. The preview rect is fixed-height, fill-width;
 /// `Contain` fit then letterboxes the source so portrait and landscape
@@ -893,35 +1017,27 @@ fn image_preview(
                 .current_frame(playback)
                 .expect("non-svg variant always has a raster frame")
                 .clone();
-            // Card hugs the frame's aspect ratio (Size::Aspect derives
-            // height from the filled width) so landscape frames don't
-            // letterbox top/bottom inside a fixed-tall rect; max_height
-            // caps the worst-case portrait, and ImageFit::Contain handles
-            // the residual aspect mismatch when that cap engages.
             let (nw, nh) = cached.current_frame_size(playback);
-            let aspect_h_over_w = nh as f32 / nw.max(1) as f32;
-            let aspect_w_over_h = nw.max(1) as f32 / nh.max(1) as f32;
             if cached.is_animated() {
                 // Animated cache entry whose GPU mirror hasn't
                 // materialized yet (one-frame race after decode).
-                // Fall through to image()-based playback for this
-                // frame; the next frame swaps to surface(). Uses the
-                // same nested-Aspect Contain as
-                // [`animated_surface_preview`] so the controls pill
-                // parks on the visible image, not on letterbox bands.
+                // Falls through to image()-based playback for this
+                // frame; the next frame swaps to surface().
                 let preview = image(frame)
                     .radius(tokens::RADIUS_SM)
                     .width(Size::Fill(1.0))
                     .height(Size::Fill(1.0));
                 let is_playing = playback.map(|p| p.playing).unwrap_or(false);
-                column([stack([preview, gif_controls_overlay(&offer.transfer_id, is_playing)])
-                    .height(Size::Fill(1.0))
-                    .width(Size::Aspect(aspect_w_over_h))])
-                .width(Size::Fill(1.0))
-                .height(Size::Aspect(aspect_h_over_w))
-                .max_height(PREVIEW_HEIGHT)
-                .align(Align::Center)
+                let inner = stack([preview, gif_controls_overlay(&offer.transfer_id, is_playing)])
+                    .width(Size::Fill(1.0))
+                    .height(Size::Fill(1.0));
+                preview_card(inner, nw, nh, PREVIEW_HEIGHT, None)
             } else {
+                // Static raster: image_fit(Contain) handles aspect
+                // letterboxing on its own — no need for the nested
+                // helper here. Aspect on the height locks the card to
+                // the frame's ratio, max_height caps portraits.
+                let aspect_h_over_w = nh as f32 / nw.max(1) as f32;
                 image(frame)
                     .image_fit(ImageFit::Contain)
                     .radius(tokens::RADIUS_SM)
@@ -952,38 +1068,18 @@ fn image_preview(
         .width(Size::Fill(1.0))
 }
 
-/// SVG preview layer for inline cards. The `vector()` widget paints into
-/// whatever rect it's given without any built-in aspect handling
-/// (no `vector_fit` analog to `image_fit`/`surface_fit`), so we
-/// re-express Contain via nested `Size::Aspect`:
-///
-///   - The outer column carries the height cap as a `Fill × Aspect`
-///     rect. If the natural ratio asks for more height than `height`
-///     allows, `max_height` clamps and the outer rect ends up with a
-///     non-natural aspect.
-///   - The inner vector locks back to the natural aspect with
-///     `height: Fill, width: Aspect(w/h)`. `align(Center)` then
-///     centres it horizontally, producing letterbox bands when the
-///     outer's aspect was clamped.
-///
-/// Equivalent to the old layout override for every aspect ratio
-/// that fits inside the chat panel's effective width.
+/// SVG preview layer for inline cards. `vector()` has no built-in
+/// Contain (no `vector_fit` analog to `image_fit`/`surface_fit`), so
+/// the [`preview_card`] helper is what gives it aspect-correct
+/// letterboxing inside a height-capped rect.
 fn svg_contain_preview(icon: SvgIcon, height: f32) -> El {
     let [_, _, vw, vh] = icon.vector_asset().view_box;
-    let nat_w = vw.max(1.0);
-    let nat_h = vh.max(1.0);
-    let aspect_h_over_w = nat_h / nat_w;
-    let aspect_w_over_h = nat_w / nat_h;
+    let nat_w = vw.round().max(1.0) as u32;
+    let nat_h = vh.round().max(1.0) as u32;
     let asset = icon.vector_asset().clone();
 
-    column([vector(asset)
-        .height(Size::Fill(1.0))
-        .width(Size::Aspect(aspect_w_over_h))])
-    .width(Size::Fill(1.0))
-    .height(Size::Aspect(aspect_h_over_w))
-    .max_height(height)
-    .align(Align::Center)
-    .radius(tokens::RADIUS_SM)
+    let inner = vector(asset).height(Size::Fill(1.0)).width(Size::Fill(1.0));
+    preview_card(inner, nat_w, nat_h, height, None).radius(tokens::RADIUS_SM)
 }
 
 /// Fit-to-window SVG variant for the lightbox: fills the available
@@ -1032,13 +1128,10 @@ fn svg_contain_fill(icon: SvgIcon) -> El {
 fn video_preview(offer: &RelayFileSharePayload, thumb: &Image) -> El {
     const PREVIEW_HEIGHT: f32 = 400.0;
 
-    // See [`image_preview`] / [`animated_surface_preview`] for the
-    // Size::Aspect rationale — the poster card hugs the thumbnail's
-    // aspect ratio, capped by max_height. The badge is centred on the
-    // *visible* image rect (not on letterbox bands when max_height
-    // engages), so the inner stack carries the natural aspect lock.
-    let aspect_h_over_w = thumb.height() as f32 / thumb.width().max(1) as f32;
-    let aspect_w_over_h = thumb.width() as f32 / thumb.height().max(1) as f32;
+    // The poster card hugs the thumbnail's aspect ratio (via
+    // [`preview_card`]), capped at PREVIEW_HEIGHT. The play badge sits
+    // inside the same aspect-locked rect so it parks on the *visible*
+    // image, not on letterbox bands when the height cap engages.
     let poster = image(thumb.clone())
         .radius(tokens::RADIUS_SM)
         .width(Size::Fill(1.0))
@@ -1074,13 +1167,10 @@ fn video_preview(offer: &RelayFileSharePayload, thumb: &Image) -> El {
     .width(Size::Fill(1.0))
     .height(Size::Fill(1.0));
 
-    let preview_layer = column([stack([poster, centred_badge])
-        .height(Size::Fill(1.0))
-        .width(Size::Aspect(aspect_w_over_h))])
-    .width(Size::Fill(1.0))
-    .height(Size::Aspect(aspect_h_over_w))
-    .max_height(PREVIEW_HEIGHT)
-    .align(Align::Center);
+    let inner = stack([poster, centred_badge])
+        .width(Size::Fill(1.0))
+        .height(Size::Fill(1.0));
+    let preview_layer = preview_card(inner, thumb.width(), thumb.height(), PREVIEW_HEIGHT, None);
 
     let caption = text(format!("{} · {}", offer.name, format_size(offer.size)))
         .muted()
@@ -1104,12 +1194,10 @@ fn video_preview(offer: &RelayFileSharePayload, thumb: &Image) -> El {
 
 /// Build the surface-based preview for an animated entry. Sizes the
 /// surface to the texture's natural aspect ratio (height-pinned at
-/// `PREVIEW_HEIGHT`, width capped at `PREVIEW_MAX_WIDTH` for very wide
-/// images), and centers it horizontally in the card width with
-/// leading/trailing spacers — equivalent to a height-only
-/// `ImageFit::Contain` with no letterbox bands. The controls overlay
-/// stacks above the surface so its bottom-right corner sits on the
-/// image, not on empty card padding.
+/// `preview_height`, width capped at `PREVIEW_MAX_WIDTH` for very wide
+/// images). The controls overlay stacks above the surface inside the
+/// same aspect-locked rect so its bottom-right corner sits on the
+/// image, not on letterbox padding.
 fn animated_surface_preview(
     transfer_id: &str,
     gpu: &AnimatedGpu,
@@ -1123,8 +1211,6 @@ fn animated_surface_preview(
     const PREVIEW_MAX_WIDTH: f32 = 480.0;
 
     let (tw, th) = gpu.size();
-    let aspect_h_over_w = th as f32 / tw.max(1) as f32;
-    let aspect_w_over_h = tw as f32 / th.max(1) as f32;
 
     let mut surface_el = surface(gpu.app_texture().clone())
         .surface_alpha(SurfaceAlpha::Straight)
@@ -1139,20 +1225,10 @@ fn animated_surface_preview(
         surface_el = surface_el.redraw_within(deadline);
     }
 
-    // Nested `Size::Aspect` Contain (see [`svg_contain_preview`]). The
-    // inner stack re-locks the natural aspect so that the surface and
-    // the controls overlay share the *visible* aspect-correct rect —
-    // crucial here, since the play/lightbox pill must park in the
-    // bottom-right of the painted image, not the bounding rect's
-    // letterbox bands.
-    column([stack([surface_el, gif_controls_overlay(transfer_id, is_playing)])
-        .height(Size::Fill(1.0))
-        .width(Size::Aspect(aspect_w_over_h))])
-    .width(Size::Fill(1.0))
-    .height(Size::Aspect(aspect_h_over_w))
-    .max_height(preview_height)
-    .max_width(PREVIEW_MAX_WIDTH)
-    .align(Align::Center)
+    let inner = stack([surface_el, gif_controls_overlay(transfer_id, is_playing)])
+        .width(Size::Fill(1.0))
+        .height(Size::Fill(1.0));
+    preview_card(inner, tw, th, preview_height, Some(PREVIEW_MAX_WIDTH))
 }
 
 /// Bottom-right pill of icon buttons overlaid on an animated image
