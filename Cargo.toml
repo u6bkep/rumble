@@ -87,3 +87,21 @@ egui_extras = { git = "https://github.com/u6bkep/egui.git", branch = "rumble-fix
 egui_glow = { git = "https://github.com/u6bkep/egui.git", branch = "rumble-fix-hit-test-nan-rect" }
 egui-wgpu = { git = "https://github.com/u6bkep/egui.git", branch = "rumble-fix-hit-test-nan-rect" }
 egui_kittest = { git = "https://github.com/u6bkep/egui.git", branch = "rumble-fix-hit-test-nan-rect" }
+
+# Optimize MSDF-generation crates in dev builds. aetna's
+# `Runner::warm_default_glyphs` pre-rasterizes printable ASCII for
+# Inter + JetBrains Mono at startup using `fdsm` (pure-Rust MSDF
+# generator) over `nalgebra` / `image` numerics. Unoptimized, those
+# ~190 glyphs take ~20s and dominate aetna-app launch time; with -O3
+# on just these leaves it drops to ~0.9s. Application crates stay
+# unoptimized, so debug/edit-compile cycles are unaffected.
+[profile.dev.package.fdsm]
+opt-level = 3
+[profile.dev.package.fdsm-ttf-parser]
+opt-level = 3
+[profile.dev.package.nalgebra]
+opt-level = 3
+[profile.dev.package.image]
+opt-level = 3
+[profile.dev.package.ttf-parser]
+opt-level = 3
