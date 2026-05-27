@@ -288,8 +288,69 @@ fn apply_voice(_state: &Arc<RwLock<State>>, ev: VoiceEvent, _repaint: &Arc<dyn F
     }
 }
 
-fn apply_connection(_state: &Arc<RwLock<State>>, ev: ConnectionEvent, _repaint: &Arc<dyn Fn() + Send + Sync>) {
-    debug!(target: "rumble_client::projection", "connection event (stub, not yet applied): {:?}", ev);
+fn apply_connection(state: &Arc<RwLock<State>>, ev: ConnectionEvent, repaint: &Arc<dyn Fn() + Send + Sync>) {
+    let mut s = match state.write() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    match ev {
+        ConnectionEvent::ConnectStarted { server_addr } => {
+            s.connection = crate::events::ConnectionState::Connecting { server_addr };
+        }
+        ConnectionEvent::CertificatePending { cert_info } => {
+            s.connection = crate::events::ConnectionState::CertificatePending { cert_info };
+        }
+        ConnectionEvent::Connected {
+            server_name,
+            user_id,
+            session_public_key,
+            session_id,
+        } => {
+            s.connection = crate::events::ConnectionState::Connected { server_name, user_id };
+            // A fresh authenticated connection clears any prior kick
+            // reason — it was for the previous session.
+            s.kicked = None;
+            s.my_user_id = Some(user_id);
+            s.my_session_public_key = Some(session_public_key);
+            s.my_session_id = Some(session_id);
+        }
+        ConnectionEvent::Disconnected => {
+            s.connection = crate::events::ConnectionState::Disconnected;
+            s.my_user_id = None;
+            s.my_room_id = None;
+            s.my_session_public_key = None;
+            s.my_session_id = None;
+        }
+        ConnectionEvent::ConnectionLost { error } => {
+            s.connection = crate::events::ConnectionState::ConnectionLost { error };
+            // Same clear-on-loss policy as Disconnected — the session
+            // identity is gone, the next connect attempt will populate
+            // fresh values.
+            s.my_user_id = None;
+            s.my_session_public_key = None;
+            s.my_session_id = None;
+        }
+        ConnectionEvent::Kicked { reason } => {
+            s.kicked = Some(reason);
+        }
+        ConnectionEvent::PermissionDenied { message } => {
+            s.permission_denied = Some(message);
+        }
+        ConnectionEvent::ElevatedChanged { .. } => {
+            // The is_elevated bit lives on the matching `User` entry,
+            // which is updated by the RoomEvent stream (UserUpdated /
+            // FullStateReplaced). Nothing to do here.
+        }
+        ConnectionEvent::WelcomeMessageReceived { text } => {
+            // Welcome text is rendered as a chat system notice; the
+            // ChatEvent::SystemNotice path is the actual writer. This
+            // variant exists so future consumers (e.g. a server-info
+            // panel) can react to the welcome without parsing chat.
+            let _ = text;
+        }
+    }
+    drop(s);
+    repaint();
 }
 
 fn apply_room(_state: &Arc<RwLock<State>>, ev: RoomEvent, _repaint: &Arc<dyn Fn() + Send + Sync>) {

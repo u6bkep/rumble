@@ -823,12 +823,10 @@ async fn run_connection_task<P: Platform>(
                     Command::Connect { addr, name, public_key, password } => {
                         client_name = name.clone();
 
-                        // Update state to Connecting
-                        {
-                            let mut s = write_state(&state);
-                            s.connection = ConnectionState::Connecting { server_addr: addr.clone() };
-                        }
-                        repaint();
+                        // Update state to Connecting via projection.
+                        let _ = bus.connection.send(crate::ConnectionEvent::ConnectStarted {
+                            server_addr: addr.clone(),
+                        });
 
                         // Create a captured cert holder for the verifier to store self-signed certs
                         let captured_cert = new_captured_cert();
@@ -836,23 +834,23 @@ async fn run_connection_task<P: Platform>(
                         // Attempt connection with Ed25519 auth
                         match connect_to_server::<P::Transport>(&addr, &name, &public_key, key_signer.as_ref(), password.as_deref(), &config, captured_cert.clone()).await {
                             Ok((mut new_transport, user_id, rooms, users, groups, session_info)) => {
-                                // Update state to Connected
+                                // Connection-identity transition via the projection.
+                                let _ = bus.connection.send(crate::ConnectionEvent::Connected {
+                                    server_name: "Rumble Server".to_string(),
+                                    user_id,
+                                    session_public_key: session_info.session_public_key,
+                                    session_id: session_info.session_id,
+                                });
+                                // Room/user state and `my_room_id` still
+                                // applied directly — RoomEvent conversion
+                                // happens in the next phase-2 commit.
                                 {
                                     let mut s = write_state(&state);
-                                    s.connection = ConnectionState::Connected {
-                                        server_name: "Rumble Server".to_string(),
-                                        user_id,
-                                    };
-                                    s.kicked = None;
-                                    s.my_user_id = Some(user_id);
-                                    // Find our user in the users list and get their current room
                                     s.my_room_id = users.iter()
                                         .find(|u| u.user_id.as_ref().map(|id| id.value) == Some(user_id))
                                         .and_then(|u| u.current_room.as_ref())
                                         .and_then(rumble_protocol::uuid_from_room_id)
                                         .or(Some(ROOT_ROOM_UUID));
-                                    s.my_session_public_key = Some(session_info.session_public_key);
-                                    s.my_session_id = Some(session_info.session_id);
                                     s.rooms = rooms;
                                     s.users = users;
                                     s.group_definitions = groups;
@@ -933,29 +931,21 @@ async fn run_connection_task<P: Platform>(
                                         password: password.clone(),
                                         public_key,
                                     };
-                                    {
-                                        let mut s = write_state(&state);
-                                        s.connection = ConnectionState::CertificatePending { cert_info: pending };
-                                    }
-                                    repaint();
+                                    let _ = bus.connection.send(crate::ConnectionEvent::CertificatePending {
+                                        cert_info: pending,
+                                    });
                                 } else if is_cert_error_message(&e) {
                                     // Cert verification error but we didn't capture the cert - shouldn't happen
                                     // but log and treat as connection failure
                                     error!("Certificate verification error but no cert captured: {}", e);
-                                    {
-                                        let mut s = write_state(&state);
-                                        s.connection = ConnectionState::ConnectionLost {
-                                            error: format!("Certificate error: {}", e)
-                                        };
-                                    }
-                                    repaint();
+                                    let _ = bus.connection.send(crate::ConnectionEvent::ConnectionLost {
+                                        error: format!("Certificate error: {}", e),
+                                    });
                                 } else {
                                     error!("Connection failed: {}", e);
-                                    {
-                                        let mut s = write_state(&state);
-                                        s.connection = ConnectionState::ConnectionLost { error: e.to_string() };
-                                    }
-                                    repaint();
+                                    let _ = bus.connection.send(crate::ConnectionEvent::ConnectionLost {
+                                        error: e.to_string(),
+                                    });
                                 }
                             }
                         }
@@ -977,10 +967,10 @@ async fn run_connection_task<P: Platform>(
 
                             // Update state to Connecting
                             {
-                                let mut s = write_state(&state);
-                                s.connection = ConnectionState::Connecting { server_addr: pending.server_addr.clone() };
+                                let _ = bus.connection.send(crate::ConnectionEvent::ConnectStarted {
+                                    server_addr: pending.server_addr.clone(),
+                                });
                             }
-                            repaint();
 
                             // Create a new config with the certificate added
                             let mut new_config = config.clone();
@@ -1000,22 +990,19 @@ async fn run_connection_task<P: Platform>(
                                 captured_cert,
                             ).await {
                                 Ok((mut new_transport, user_id, rooms, users, groups, session_info)) => {
-                                    // Success! Update state
+                                    let _ = bus.connection.send(crate::ConnectionEvent::Connected {
+                                        server_name: "Rumble Server".to_string(),
+                                        user_id,
+                                        session_public_key: session_info.session_public_key,
+                                        session_id: session_info.session_id,
+                                    });
                                     {
                                         let mut s = write_state(&state);
-                                        s.connection = ConnectionState::Connected {
-                                            server_name: "Rumble Server".to_string(),
-                                            user_id,
-                                        };
-                                        s.kicked = None;
-                                        s.my_user_id = Some(user_id);
                                         s.my_room_id = users.iter()
                                             .find(|u| u.user_id.as_ref().map(|id| id.value) == Some(user_id))
                                             .and_then(|u| u.current_room.as_ref())
                                             .and_then(rumble_protocol::uuid_from_room_id)
                                             .or(Some(ROOT_ROOM_UUID));
-                                        s.my_session_public_key = Some(session_info.session_public_key);
-                                        s.my_session_id = Some(session_info.session_id);
                                         s.rooms = rooms;
                                         s.users = users;
                                         s.group_definitions = groups;
@@ -1086,11 +1073,9 @@ async fn run_connection_task<P: Platform>(
                                 }
                                 Err(e) => {
                                     error!("Connection failed after accepting certificate: {}", e);
-                                    {
-                                        let mut s = write_state(&state);
-                                        s.connection = ConnectionState::ConnectionLost { error: e.to_string() };
-                                    }
-                                    repaint();
+                                    let _ = bus.connection.send(crate::ConnectionEvent::ConnectionLost {
+                                        error: e.to_string(),
+                                    });
                                 }
                             }
                         } else {
@@ -1100,17 +1085,10 @@ async fn run_connection_task<P: Platform>(
 
                     Command::RejectCertificate => {
                         // Simply go back to disconnected state
-                        {
-                            let s = read_state(&state);
-                            if let ConnectionState::CertificatePending { cert_info } = &s.connection {
-                                info!("User rejected certificate for {}", cert_info.server_name);
-                            }
+                        if let ConnectionState::CertificatePending { cert_info } = &read_state(&state).connection {
+                            info!("User rejected certificate for {}", cert_info.server_name);
                         }
-                        {
-                            let mut s = write_state(&state);
-                            s.connection = ConnectionState::Disconnected;
-                        }
-                        repaint();
+                        let _ = bus.connection.send(crate::ConnectionEvent::Disconnected);
                     }
 
                     Command::Disconnect => {
@@ -1123,13 +1101,12 @@ async fn run_connection_task<P: Platform>(
                         }
                         file_transfer = None;
                         publish_ft(&file_transfer);
+                        // Connection-identity transition via projection;
+                        // room/user wipe stays as a direct write until the
+                        // RoomEvent conversion lands.
+                        let _ = bus.connection.send(crate::ConnectionEvent::Disconnected);
                         {
                             let mut s = write_state(&state);
-                            s.connection = ConnectionState::Disconnected;
-                            s.my_user_id = None;
-                            s.my_room_id = None;
-                            s.my_session_public_key = None;
-                            s.my_session_id = None;
                             s.rooms.clear();
                             s.users.clear();
                             s.rebuild_room_tree();
@@ -1959,22 +1936,20 @@ async fn run_receiver_task(
     }
 
     // Update state only if not already disconnected (explicit disconnect sets Disconnected)
-    {
+    let already_disconnected = matches!(read_state(&state).connection, ConnectionState::Disconnected);
+    if !already_disconnected {
+        let _ = bus.connection.send(crate::ConnectionEvent::ConnectionLost {
+            error: "Connection closed".to_string(),
+        });
+        // Room/user wipe stays direct until RoomEvent conversion lands.
         let mut s = write_state(&state);
-        if !matches!(s.connection, ConnectionState::Disconnected) {
-            s.connection = ConnectionState::ConnectionLost {
-                error: "Connection closed".to_string(),
-            };
-            s.my_user_id = None;
-            s.my_room_id = None;
-            s.my_session_public_key = None;
-            s.my_session_id = None;
-            s.rooms.clear();
-            s.users.clear();
-            s.rebuild_room_tree();
-        }
+        s.my_room_id = None;
+        s.rooms.clear();
+        s.users.clear();
+        s.rebuild_room_tree();
+        drop(s);
+        repaint();
     }
-    repaint();
 }
 
 /// Background task that accepts server-initiated bi-directional streams
@@ -2289,10 +2264,9 @@ fn handle_server_message(
         }
         Some(Payload::PermissionDenied(pd)) => {
             warn!("Permission denied: {}", pd.message);
-            let mut s = write_state(state);
-            s.permission_denied = Some(pd.message);
-            drop(s);
-            repaint();
+            let _ = bus
+                .connection
+                .send(crate::ConnectionEvent::PermissionDenied { message: pd.message });
         }
         Some(Payload::UserKicked(uk)) => {
             let my_user_id = read_state(state).my_user_id;
@@ -2304,15 +2278,12 @@ fn handle_server_message(
                     format!("Kicked by {}: {}", uk.kicked_by, uk.reason)
                 };
                 warn!("{}", reason);
-                let mut s = write_state(state);
-                s.kicked = Some(reason);
-                drop(s);
+                let _ = bus.connection.send(crate::ConnectionEvent::Kicked { reason });
                 // The server will close the connection, so we don't need to disconnect explicitly
             } else {
                 // Another user was kicked - they'll get a UserLeft event too
                 info!("User {} was kicked by {}", uk.user_id, uk.kicked_by);
             }
-            repaint();
         }
         _ => {}
     }
