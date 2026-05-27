@@ -305,7 +305,6 @@ impl<P: Platform> BackendHandle<P> {
 
         // Clone handles for the connection task
         let state_for_task = state.clone();
-        let repaint_for_task = repaint_callback.clone();
         let config_for_task = connect_config.clone();
         let audio_task_for_connection = audio_task.clone();
         let command_tx_for_task = command_tx.clone();
@@ -315,6 +314,8 @@ impl<P: Platform> BackendHandle<P> {
         let bus_for_projection = bus.clone();
         let state_for_projection = state.clone();
         let repaint_for_projection = repaint_callback.clone();
+        let audio_task_for_projection = audio_task.clone();
+        let file_transfer_for_projection = file_transfer.clone();
 
         // Spawn background thread with tokio runtime for connection task.
         // The projection task is spawned on this same runtime so it
@@ -331,12 +332,13 @@ impl<P: Platform> BackendHandle<P> {
                     state_for_projection,
                     repaint_for_projection,
                     &bus_for_projection,
+                    audio_task_for_projection,
+                    file_transfer_for_projection,
                 );
                 run_connection_task::<P>(
                     command_rx,
                     command_tx_for_task,
                     state_for_task,
-                    repaint_for_task,
                     config_for_task,
                     key_signer_for_task,
                     audio_task_for_connection,
@@ -711,16 +713,11 @@ async fn run_connection_task<P: Platform>(
     mut command_rx: mpsc::UnboundedReceiver<Command>,
     command_tx: mpsc::UnboundedSender<Command>,
     state: Arc<RwLock<State>>,
-    repaint: Arc<dyn Fn() + Send + Sync>,
     config: ConnectConfig,
     key_signer: Arc<dyn KeySigning>,
     audio_task: AudioTaskHandle,
     file_transfer_slot: Arc<RwLock<Option<Arc<dyn FileTransferPlugin>>>>,
     event_tx: mpsc::UnboundedSender<BackendEvent>,
-    // Phase 2 in progress: chat sites have been converted to emit
-    // `bus.chat.send(...)`; other domains (connection, room, voice)
-    // still mutate `state` directly and will be converted in
-    // follow-up commits.
     bus: crate::projection::EventBus,
 ) {
     // Connection state
@@ -842,23 +839,30 @@ async fn run_connection_task<P: Platform>(
                                     session_public_key: session_info.session_public_key,
                                     session_id: session_info.session_id,
                                 });
-                                // Room/user state and `my_room_id` still
-                                // applied directly — RoomEvent conversion
-                                // happens in the next phase-2 commit.
-                                {
-                                    let mut s = write_state(&state);
-                                    s.my_room_id = users.iter()
-                                        .find(|u| u.user_id.as_ref().map(|id| id.value) == Some(user_id))
-                                        .and_then(|u| u.current_room.as_ref())
-                                        .and_then(rumble_protocol::uuid_from_room_id)
-                                        .or(Some(ROOT_ROOM_UUID));
-                                    s.rooms = rooms;
-                                    s.users = users;
-                                    s.group_definitions = groups;
-                                    s.rebuild_room_tree();
+                                // Pre-compute our room from the connect-time
+                                // user list (falling back to root if missing).
+                                let my_room_uuid = users.iter()
+                                    .find(|u| u.user_id.as_ref().map(|id| id.value) == Some(user_id))
+                                    .and_then(|u| u.current_room.as_ref())
+                                    .and_then(rumble_protocol::uuid_from_room_id)
+                                    .unwrap_or(ROOT_ROOM_UUID);
+
+                                // Per-room effective permissions for the
+                                // FullStateReplaced payload (server-computed).
+                                let mut per_room_permissions: HashMap<Uuid, u32> = HashMap::new();
+                                for room in &rooms {
+                                    if let Some(room_uuid) = room.id.as_ref().and_then(rumble_protocol::uuid_from_room_id) {
+                                        per_room_permissions.insert(room_uuid, room.effective_permissions);
+                                    }
                                 }
-                                recalculate_effective_permissions(&state);
-                                repaint();
+
+                                let _ = bus.room.send(crate::RoomEvent::FullStateReplaced {
+                                    rooms,
+                                    users,
+                                    groups,
+                                    per_room_permissions,
+                                });
+                                let _ = bus.room.send(crate::RoomEvent::SelfMovedToRoom { room_id: my_room_uuid });
 
                                 // Notify audio task of new connection
                                 audio_task.send(AudioCommand::ConnectionEstablished {
@@ -904,14 +908,12 @@ async fn run_connection_task<P: Platform>(
 
                                 // Spawn receiver task for reliable messages
                                 let state_clone = state.clone();
-                                let repaint_clone = repaint.clone();
                                 let audio_task_clone = audio_task.clone();
                                 let command_tx_clone = command_tx.clone();
-                                let ft_for_recv = ft_arc;
                                 let ft_slot_for_recv = file_transfer_slot.clone();
                                 let bus_for_recv = bus.clone();
                                 tokio::spawn(async move {
-                                    run_receiver_task(recv_stream, state_clone, repaint_clone, audio_task_clone, command_tx_clone, ft_for_recv, ft_slot_for_recv, bus_for_recv).await;
+                                    run_receiver_task(recv_stream, state_clone, audio_task_clone, command_tx_clone, ft_slot_for_recv, bus_for_recv).await;
                                 });
 
                                 // Spawn stream dispatch task for server-initiated bi-directional streams
@@ -997,20 +999,24 @@ async fn run_connection_task<P: Platform>(
                                         session_public_key: session_info.session_public_key,
                                         session_id: session_info.session_id,
                                     });
-                                    {
-                                        let mut s = write_state(&state);
-                                        s.my_room_id = users.iter()
-                                            .find(|u| u.user_id.as_ref().map(|id| id.value) == Some(user_id))
-                                            .and_then(|u| u.current_room.as_ref())
-                                            .and_then(rumble_protocol::uuid_from_room_id)
-                                            .or(Some(ROOT_ROOM_UUID));
-                                        s.rooms = rooms;
-                                        s.users = users;
-                                        s.group_definitions = groups;
-                                        s.rebuild_room_tree();
+                                    let my_room_uuid = users.iter()
+                                        .find(|u| u.user_id.as_ref().map(|id| id.value) == Some(user_id))
+                                        .and_then(|u| u.current_room.as_ref())
+                                        .and_then(rumble_protocol::uuid_from_room_id)
+                                        .unwrap_or(ROOT_ROOM_UUID);
+                                    let mut per_room_permissions: HashMap<Uuid, u32> = HashMap::new();
+                                    for room in &rooms {
+                                        if let Some(room_uuid) = room.id.as_ref().and_then(rumble_protocol::uuid_from_room_id) {
+                                            per_room_permissions.insert(room_uuid, room.effective_permissions);
+                                        }
                                     }
-                                    recalculate_effective_permissions(&state);
-                                    repaint();
+                                    let _ = bus.room.send(crate::RoomEvent::FullStateReplaced {
+                                        rooms,
+                                        users,
+                                        groups,
+                                        per_room_permissions,
+                                    });
+                                    let _ = bus.room.send(crate::RoomEvent::SelfMovedToRoom { room_id: my_room_uuid });
 
                                     // Notify audio task
                                     audio_task.send(AudioCommand::ConnectionEstablished {
@@ -1057,14 +1063,12 @@ async fn run_connection_task<P: Platform>(
 
                                     // Spawn receiver task
                                     let state_clone = state.clone();
-                                    let repaint_clone = repaint.clone();
                                     let audio_task_clone = audio_task.clone();
                                     let command_tx_clone = command_tx.clone();
-                                    let ft_for_recv = ft_arc;
                                     let ft_slot_for_recv = file_transfer_slot.clone();
                                     let bus_for_recv = bus.clone();
                                     tokio::spawn(async move {
-                                        run_receiver_task(recv_stream, state_clone, repaint_clone, audio_task_clone, command_tx_clone, ft_for_recv, ft_slot_for_recv, bus_for_recv).await;
+                                        run_receiver_task(recv_stream, state_clone, audio_task_clone, command_tx_clone, ft_slot_for_recv, bus_for_recv).await;
                                     });
 
                                     // Spawn stream dispatch task for server-initiated bi-directional streams
@@ -1102,17 +1106,16 @@ async fn run_connection_task<P: Platform>(
                         }
                         file_transfer = None;
                         publish_ft(&file_transfer);
-                        // Connection-identity transition via projection;
-                        // room/user wipe stays as a direct write until the
-                        // RoomEvent conversion lands.
+                        // Wipe room/user state via the projection: emit a
+                        // FullStateReplaced with empty payloads alongside
+                        // the connection-identity Disconnected event.
+                        let _ = bus.room.send(crate::RoomEvent::FullStateReplaced {
+                            rooms: Vec::new(),
+                            users: Vec::new(),
+                            groups: Vec::new(),
+                            per_room_permissions: HashMap::new(),
+                        });
                         let _ = bus.connection.send(crate::ConnectionEvent::Disconnected);
-                        {
-                            let mut s = write_state(&state);
-                            s.rooms.clear();
-                            s.users.clear();
-                            s.rebuild_room_tree();
-                        }
-                        repaint();
                     }
 
                     Command::Shutdown => {
@@ -1894,14 +1897,11 @@ async fn connect_to_server<T: Transport>(
 ///
 /// Uses `TransportRecvStream` for framed message reception. Connection loss
 /// is detected when `recv()` returns `None` or an error.
-#[allow(clippy::too_many_arguments)] // private helper
 async fn run_receiver_task(
     mut recv: impl TransportRecvStream,
     state: Arc<RwLock<State>>,
-    repaint: Arc<dyn Fn() + Send + Sync>,
     audio_task: AudioTaskHandle,
     command_tx: mpsc::UnboundedSender<Command>,
-    file_transfer: Option<Arc<dyn FileTransferPlugin>>,
     file_transfer_slot: Arc<RwLock<Option<Arc<dyn FileTransferPlugin>>>>,
     bus: crate::projection::EventBus,
 ) {
@@ -1909,7 +1909,7 @@ async fn run_receiver_task(
         match recv.recv().await {
             Ok(Some(frame)) => {
                 if let Ok(env) = proto::Envelope::decode(&*frame) {
-                    handle_server_message(env, &state, &repaint, &audio_task, &command_tx, &file_transfer, &bus);
+                    handle_server_message(env, &state, &command_tx, &bus);
                 }
             }
             Ok(None) => {
@@ -1942,14 +1942,14 @@ async fn run_receiver_task(
         let _ = bus.connection.send(crate::ConnectionEvent::ConnectionLost {
             error: "Connection closed".to_string(),
         });
-        // Room/user wipe stays direct until RoomEvent conversion lands.
-        let mut s = write_state(&state);
-        s.my_room_id = None;
-        s.rooms.clear();
-        s.users.clear();
-        s.rebuild_room_tree();
-        drop(s);
-        repaint();
+        // Wipe room/user state via the projection so my_room_id / rooms /
+        // users / room_tree all get cleared atomically.
+        let _ = bus.room.send(crate::RoomEvent::FullStateReplaced {
+            rooms: Vec::new(),
+            users: Vec::new(),
+            groups: Vec::new(),
+            per_room_permissions: HashMap::new(),
+        });
     }
 }
 
@@ -2089,15 +2089,12 @@ fn add_local_message(bus: &crate::projection::EventBus, text: String) {
     let _ = bus.chat.send(crate::ChatEvent::SystemNotice { text });
 }
 
-/// Handle an incoming server message and update state accordingly.
-#[allow(clippy::too_many_arguments)] // private helper
+/// Handle an incoming server message and translate it into the matching
+/// domain-event emissions on the bus.
 fn handle_server_message(
     env: proto::Envelope,
     state: &Arc<RwLock<State>>,
-    repaint: &Arc<dyn Fn() + Send + Sync>,
-    audio_task: &AudioTaskHandle,
     command_tx: &mpsc::UnboundedSender<Command>,
-    file_transfer: &Option<Arc<dyn FileTransferPlugin>>,
     bus: &crate::projection::EventBus,
 ) {
     match env.payload {
@@ -2110,71 +2107,26 @@ fn handle_server_message(
             if let Some(kind) = se.kind {
                 match kind {
                     proto::server_event::Kind::ServerState(ss) => {
-                        // Full state replacement
-                        let mut s = write_state(state);
-
-                        // Extract per-room effective permissions from server-computed values
-                        s.per_room_permissions.clear();
+                        // Build per-room permissions map from server-computed
+                        // values, then emit a single FullStateReplaced event.
+                        // The projection handles state mutation, audio task
+                        // notifications (RoomChanged + SetServerMuted), and
+                        // permission recalc.
+                        let mut per_room_permissions: HashMap<Uuid, u32> = HashMap::new();
                         for room in &ss.rooms {
                             if let Some(room_uuid) = room.id.as_ref().and_then(rumble_protocol::uuid_from_room_id) {
-                                s.per_room_permissions.insert(room_uuid, room.effective_permissions);
+                                per_room_permissions.insert(room_uuid, room.effective_permissions);
                             }
                         }
-
-                        s.rooms = ss.rooms;
-                        s.users = ss.users.clone();
-                        s.group_definitions = ss.groups;
-                        s.rebuild_room_tree();
-
-                        // Update effective_permissions from per-room data for current room
-                        if let Some(my_room) = s.my_room_id
-                            && let Some(&perms) = s.per_room_permissions.get(&my_room)
-                        {
-                            s.effective_permissions = perms;
-                        }
-
-                        // Sync our own server-muted state to the audio task on
-                        // initial connect — without this, joining a SPEAK-denied
-                        // room before the first frame would leave the mic
-                        // capturing even though the server is dropping packets.
-                        let my_server_muted = s.my_user_id.and_then(|id| {
-                            ss.users
-                                .iter()
-                                .find(|u| u.user_id.as_ref().map(|x| x.value) == Some(id))
-                                .map(|u| u.server_muted)
+                        let _ = bus.room.send(crate::RoomEvent::FullStateReplaced {
+                            rooms: ss.rooms,
+                            users: ss.users,
+                            groups: ss.groups,
+                            per_room_permissions,
                         });
-
-                        // Notify audio task about users in our room (for proactive decoder creation)
-                        if let Some(my_room_id) = &s.my_room_id {
-                            let my_user_id = s.my_user_id;
-                            let user_ids_in_room: Vec<u64> = ss
-                                .users
-                                .iter()
-                                .filter_map(|u| {
-                                    let user_id = u.user_id.as_ref().map(|id| id.value)?;
-                                    let user_room =
-                                        u.current_room.as_ref().and_then(rumble_protocol::uuid_from_room_id)?;
-                                    if user_room == *my_room_id && Some(user_id) != my_user_id {
-                                        Some(user_id)
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .collect();
-                            drop(s);
-                            audio_task.send(AudioCommand::RoomChanged { user_ids_in_room });
-                        } else {
-                            drop(s);
-                        }
-                        if let Some(muted) = my_server_muted {
-                            audio_task.send(AudioCommand::SetServerMuted { muted });
-                        }
-                        // Still do client-side recalculation as fallback
-                        recalculate_effective_permissions(state);
-                        repaint();
                     }
                     proto::server_event::Kind::StateUpdate(su) => {
-                        apply_state_update(su, state, repaint, audio_task, file_transfer);
+                        apply_state_update(su, state, bus);
                     }
                     proto::server_event::Kind::ChatBroadcast(cb) => {
                         // Extract message ID or generate a fallback
@@ -2305,432 +2257,152 @@ fn handle_server_message(
     }
 }
 
-/// Apply a state update to the current state.
-fn apply_state_update(
-    update: proto::StateUpdate,
-    state: &Arc<RwLock<State>>,
-    repaint: &Arc<dyn Fn() + Send + Sync>,
-    audio_task: &AudioTaskHandle,
-    file_transfer: &Option<Arc<dyn FileTransferPlugin>>,
-) {
-    if let Some(u) = update.update {
-        let mut s = write_state(state);
-        match u {
-            proto::state_update::Update::RoomCreated(rc) => {
-                if let Some(room) = rc.room {
-                    s.rooms.push(room);
-                    s.rebuild_room_tree();
-                    drop(s);
-                    recalculate_effective_permissions(state);
-                    repaint();
-                    return;
-                }
-            }
-            proto::state_update::Update::RoomDeleted(rd) => {
-                if let Some(rid) = rd.room_id.and_then(|r| rumble_protocol::uuid_from_room_id(&r)) {
-                    s.rooms
-                        .retain(|r| r.id.as_ref().and_then(rumble_protocol::uuid_from_room_id) != Some(rid));
-                    s.rebuild_room_tree();
-                    drop(s);
-                    recalculate_effective_permissions(state);
-                    repaint();
-                    return;
-                }
-            }
-            proto::state_update::Update::RoomRenamed(rr) => {
-                if let Some(rid) = rr.room_id.and_then(|r| rumble_protocol::uuid_from_room_id(&r)) {
-                    if let Some(room) = s
-                        .rooms
-                        .iter_mut()
-                        .find(|r| r.id.as_ref().and_then(rumble_protocol::uuid_from_room_id) == Some(rid))
-                    {
-                        room.name = rr.new_name;
-                    }
-                    s.rebuild_room_tree();
-                }
-            }
-            proto::state_update::Update::RoomMoved(rm) => {
-                if let Some(rid) = rm.room_id.and_then(|r| rumble_protocol::uuid_from_room_id(&r)) {
-                    if let Some(room) = s
-                        .rooms
-                        .iter_mut()
-                        .find(|r| r.id.as_ref().and_then(rumble_protocol::uuid_from_room_id) == Some(rid))
-                    {
-                        room.parent_id = rm.new_parent_id;
-                    }
-                    s.rebuild_room_tree();
-                }
-            }
-            proto::state_update::Update::RoomDescriptionChanged(rdc) => {
-                if let Some(rid) = rdc.room_id.and_then(|r| rumble_protocol::uuid_from_room_id(&r)) {
-                    let desc = if rdc.description.is_empty() {
-                        None
-                    } else {
-                        Some(rdc.description)
-                    };
-                    if let Some(room) = s
-                        .rooms
-                        .iter_mut()
-                        .find(|r| r.id.as_ref().and_then(rumble_protocol::uuid_from_room_id) == Some(rid))
-                    {
-                        room.description = desc;
-                    }
-                    s.rebuild_room_tree();
-                }
-            }
-            proto::state_update::Update::UserJoined(uj) => {
-                if let Some(user) = uj.user {
-                    // Only add if user doesn't already exist (avoid duplicates from
-                    // receiving our own UserJoined broadcast after initial ServerState)
-                    let user_id_value = user.user_id.as_ref().map(|id| id.value);
-                    let already_exists = s
-                        .users
-                        .iter()
-                        .any(|u| u.user_id.as_ref().map(|id| id.value) == user_id_value);
-                    if !already_exists {
-                        // Check if this user is joining our room - if so, notify audio task
-                        let my_room_id = s.my_room_id;
-                        let user_room = user.current_room.as_ref().and_then(rumble_protocol::uuid_from_room_id);
-                        let notify_audio = user_id_value.is_some() && my_room_id.is_some() && user_room == my_room_id;
+/// Translate a `StateUpdate` envelope into the matching `RoomEvent`
+/// emission. The projection task in `projection.rs` is the sole
+/// writer of room/user/group state and the sole dispatcher of audio-task
+/// notifications and file-transfer-plugin room-id updates.
+fn apply_state_update(update: proto::StateUpdate, state: &Arc<RwLock<State>>, bus: &crate::projection::EventBus) {
+    use crate::RoomEvent;
 
-                        s.users.push(user);
-
-                        if notify_audio && let Some(uid) = user_id_value {
-                            drop(s);
-                            audio_task.send(AudioCommand::UserJoinedRoom { user_id: uid });
-                            repaint();
-                            return;
-                        }
-                    }
-                }
-            }
-            proto::state_update::Update::UserLeft(ul) => {
-                if let Some(uid) = ul.user_id {
-                    // Check if the leaving user was in our room
-                    let my_room_id = s.my_room_id;
-                    let was_in_our_room = s
-                        .users
-                        .iter()
-                        .find(|u| u.user_id.as_ref().map(|id| id.value) == Some(uid.value))
-                        .map(|u| u.current_room.as_ref().and_then(rumble_protocol::uuid_from_room_id) == my_room_id)
-                        .unwrap_or(false);
-
-                    s.users
-                        .retain(|u| u.user_id.as_ref().map(|id| id.value) != Some(uid.value));
-
-                    // Notify audio task if user was in our room
-                    if was_in_our_room && my_room_id.is_some() {
-                        drop(s);
-                        audio_task.send(AudioCommand::UserLeftRoom { user_id: uid.value });
-                        repaint();
-                        return;
-                    }
-                }
-            }
-            proto::state_update::Update::UserMoved(um) => {
-                if let (Some(uid), Some(to_room)) = (um.user_id, um.to_room_id.clone()) {
-                    let to_room_clone = to_room.clone();
-                    let to_room_id = rumble_protocol::uuid_from_room_id(&to_room_clone);
-                    let my_room_id = s.my_room_id;
-                    let my_user_id = s.my_user_id;
-
-                    // Look up where the user was before (from_room is implicit in User.current_room)
-                    let from_room_id = s
-                        .users
-                        .iter()
-                        .find(|u| u.user_id.as_ref().map(|id| id.value) == Some(uid.value))
-                        .and_then(|u| u.current_room.as_ref().and_then(rumble_protocol::uuid_from_room_id));
-
-                    // Now update the user's current room
-                    if let Some(user) = s
-                        .users
-                        .iter_mut()
-                        .find(|u| u.user_id.as_ref().map(|id| id.value) == Some(uid.value))
-                    {
-                        user.current_room = Some(to_room);
-                    }
-
-                    // Check if this is us moving
-                    if my_user_id == Some(uid.value) {
-                        s.my_room_id = to_room_id;
-
-                        // Update the relay plugin's room ID
-                        if let Some(ft) = file_transfer {
-                            ft.set_room_id(to_room_id.map(|r| r.to_string()).unwrap_or_default());
-                        }
-
-                        // We changed rooms - rebuild decoder list
-                        if let Some(new_room_id) = to_room_id {
-                            let user_ids_in_room: Vec<u64> = s
-                                .users
-                                .iter()
-                                .filter_map(|u| {
-                                    let user_id = u.user_id.as_ref().map(|id| id.value)?;
-                                    let user_room =
-                                        u.current_room.as_ref().and_then(rumble_protocol::uuid_from_room_id)?;
-                                    if user_room == new_room_id && Some(user_id) != my_user_id {
-                                        Some(user_id)
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .collect();
-                            drop(s);
-                            audio_task.send(AudioCommand::RoomChanged { user_ids_in_room });
-                            recalculate_effective_permissions(state);
-                            repaint();
-                            return;
-                        }
-                    } else {
-                        // Another user moved - check if they joined/left our room
-                        let joined_our_room = my_room_id.is_some() && to_room_id == my_room_id;
-                        let left_our_room = my_room_id.is_some() && from_room_id == my_room_id;
-
-                        if joined_our_room {
-                            drop(s);
-                            audio_task.send(AudioCommand::UserJoinedRoom { user_id: uid.value });
-                            repaint();
-                            return;
-                        } else if left_our_room {
-                            drop(s);
-                            audio_task.send(AudioCommand::UserLeftRoom { user_id: uid.value });
-                            repaint();
-                            return;
-                        }
-                    }
-                }
-            }
-            proto::state_update::Update::UserStatusChanged(usc) => {
-                if let Some(uid) = usc.user_id {
-                    let my_user_id = s.my_user_id;
-                    if let Some(user) = s
-                        .users
-                        .iter_mut()
-                        .find(|u| u.user_id.as_ref().map(|id| id.value) == Some(uid.value))
-                    {
-                        let prev_server_muted = user.server_muted;
-                        user.is_muted = usc.is_muted;
-                        user.is_deafened = usc.is_deafened;
-                        user.server_muted = usc.server_muted;
-                        user.is_elevated = usc.is_elevated;
-                        // Propagate our own server_muted flips to the audio
-                        // task so it stops capturing instead of just sending
-                        // packets the server will drop.
-                        if my_user_id == Some(uid.value) && prev_server_muted != usc.server_muted {
-                            drop(s);
-                            audio_task.send(AudioCommand::SetServerMuted {
-                                muted: usc.server_muted,
-                            });
-                            repaint();
-                            return;
-                        }
-                    }
-                }
-            }
-            proto::state_update::Update::GroupChanged(gc) => {
-                if gc.deleted {
-                    if let Some(group) = &gc.group {
-                        s.group_definitions.retain(|g| g.name != group.name);
-                    }
-                } else if let Some(group) = gc.group {
-                    if let Some(existing) = s.group_definitions.iter_mut().find(|g| g.name == group.name) {
-                        *existing = group;
-                    } else {
-                        s.group_definitions.push(group);
-                    }
-                }
-                drop(s);
-                recalculate_effective_permissions(state);
-                repaint();
-                return;
-            }
-            proto::state_update::Update::UserGroupChanged(ugc) => {
-                // Update user's groups list in our local state
-                let my_user_id = s.my_user_id;
-                if let Some(user) = s
-                    .users
-                    .iter_mut()
-                    .find(|u| u.user_id.as_ref().map(|id| id.value) == Some(ugc.user_id))
-                {
-                    if ugc.added {
-                        if !user.groups.contains(&ugc.group) {
-                            user.groups.push(ugc.group);
-                        }
-                    } else {
-                        user.groups.retain(|g| g != &ugc.group);
-                    }
-                }
-                if my_user_id == Some(ugc.user_id) {
-                    drop(s);
-                    recalculate_effective_permissions(state);
-                    repaint();
-                    return;
-                }
-            }
-            proto::state_update::Update::RoomAclChanged(rac) => {
-                if let Some(rid) = rac.room_id.and_then(|r| rumble_protocol::uuid_from_room_id(&r)) {
-                    // Update the room's ACL data in our local state
-                    if let Some(room) = s
-                        .rooms
-                        .iter_mut()
-                        .find(|r| r.id.as_ref().and_then(rumble_protocol::uuid_from_room_id) == Some(rid))
-                    {
-                        room.inherit_acl = rac.inherit_acl;
-                        room.acls = rac.entries;
-                    }
-                    drop(s);
-                    // Recalculate permissions since ACLs changed
-                    recalculate_effective_permissions(state);
-                    repaint();
-                    return;
-                }
-            }
-        }
-        drop(s);
-        repaint();
-    }
-}
-
-/// Recalculate the effective permissions for the current user in all rooms.
-///
-/// Updates both `effective_permissions` (for current room) and `per_room_permissions`
-/// (for all rooms). This acquires the state lock internally, so the caller must NOT hold it.
-fn recalculate_effective_permissions(state: &Arc<RwLock<State>>) {
-    let s = state.read().unwrap();
-    let my_user_id = match s.my_user_id {
-        Some(id) => id,
-        None => return,
+    let Some(u) = update.update else {
+        return;
     };
-
-    // Build user's group list
-    let mut user_groups = vec!["default".to_string()];
-    if let Some(me) = s
-        .users
-        .iter()
-        .find(|u| u.user_id.as_ref().map(|id| id.value) == Some(my_user_id))
-    {
-        for g in &me.groups {
-            if !user_groups.contains(g) {
-                user_groups.push(g.clone());
+    match u {
+        proto::state_update::Update::RoomCreated(rc) => {
+            if let Some(room) = rc.room {
+                let _ = bus.room.send(RoomEvent::RoomAdded { room });
             }
         }
-        // Add username as implicit group
-        if !user_groups.contains(&me.username) {
-            user_groups.push(me.username.clone());
-        }
-    }
-
-    // Build group permissions map
-    let mut group_perms = std::collections::HashMap::new();
-    for gd in &s.group_definitions {
-        group_perms.insert(
-            gd.name.clone(),
-            rumble_protocol::permissions::Permissions::from_bits_truncate(gd.permissions),
-        );
-    }
-
-    // Check superuser status
-    let is_elevated = s
-        .users
-        .iter()
-        .find(|u| u.user_id.as_ref().map(|id| id.value) == Some(my_user_id))
-        .map(|u| u.is_elevated)
-        .unwrap_or(false);
-
-    let my_room_id = s.my_room_id;
-
-    // Collect all room UUIDs
-    let room_uuids: Vec<Uuid> = s
-        .rooms
-        .iter()
-        .filter_map(|r| r.id.as_ref().and_then(rumble_protocol::uuid_from_room_id))
-        .collect();
-
-    // Clone rooms for chain building (we'll release the read lock)
-    let rooms_snapshot = s.rooms.clone();
-    drop(s);
-
-    // Compute per-room effective permissions
-    let mut per_room = HashMap::new();
-    for room_uuid in &room_uuids {
-        let room_chain = build_client_room_chain(&rooms_snapshot, *room_uuid);
-        let ref_chain: Vec<(Uuid, Option<&rumble_protocol::permissions::RoomAclData>)> =
-            room_chain.iter().map(|(uuid, acl)| (*uuid, acl.as_ref())).collect();
-        let effective =
-            rumble_protocol::permissions::effective_permissions(&user_groups, &group_perms, &ref_chain, is_elevated);
-        per_room.insert(*room_uuid, effective.bits());
-    }
-
-    let mut s = state.write().unwrap();
-    s.per_room_permissions = per_room;
-
-    // Update the current room's effective_permissions for backward compatibility
-    if let Some(my_room) = my_room_id
-        && let Some(&perms) = s.per_room_permissions.get(&my_room)
-    {
-        s.effective_permissions = perms;
-    }
-}
-
-/// Build the room chain from root to target room, with ACL data for each room.
-fn build_client_room_chain(
-    rooms: &[rumble_protocol::proto::RoomInfo],
-    target: Uuid,
-) -> Vec<(Uuid, Option<rumble_protocol::permissions::RoomAclData>)> {
-    use rumble_protocol::permissions::{AclEntry, Permissions, RoomAclData};
-
-    let mut path = Vec::new();
-    let mut current = target;
-
-    loop {
-        path.push(current);
-        if current == rumble_protocol::ROOT_ROOM_UUID {
-            break;
-        }
-        let parent = rooms.iter().find_map(|r| {
-            let rid = r.id.as_ref().and_then(rumble_protocol::uuid_from_room_id)?;
-            if rid == current {
-                r.parent_id.as_ref().and_then(rumble_protocol::uuid_from_room_id)
-            } else {
-                None
+        proto::state_update::Update::RoomDeleted(rd) => {
+            if let Some(rid) = rd.room_id.and_then(|r| rumble_protocol::uuid_from_room_id(&r)) {
+                let _ = bus.room.send(RoomEvent::RoomRemoved { room_id: rid });
             }
-        });
-        match parent {
-            Some(p) => current = p,
-            None => break,
         }
-    }
-
-    path.reverse();
-    if path.first() != Some(&rumble_protocol::ROOT_ROOM_UUID) {
-        path.insert(0, rumble_protocol::ROOT_ROOM_UUID);
-    }
-    path.dedup();
-
-    path.into_iter()
-        .map(|room_uuid| {
-            let acl_data = rooms.iter().find_map(|r| {
-                let rid = r.id.as_ref().and_then(rumble_protocol::uuid_from_room_id)?;
-                if rid == room_uuid && !r.acls.is_empty() {
-                    Some(RoomAclData {
-                        inherit_acl: r.inherit_acl,
-                        entries: r
-                            .acls
-                            .iter()
-                            .map(|e| AclEntry {
-                                group: e.group.clone(),
-                                grant: Permissions::from_bits_truncate(e.grant),
-                                deny: Permissions::from_bits_truncate(e.deny),
-                                apply_here: e.apply_here,
-                                apply_subs: e.apply_subs,
-                            })
-                            .collect(),
-                    })
-                } else {
+        proto::state_update::Update::RoomRenamed(rr) => {
+            if let Some(rid) = rr.room_id.and_then(|r| rumble_protocol::uuid_from_room_id(&r)) {
+                let _ = bus.room.send(RoomEvent::RoomRenamed {
+                    room_id: rid,
+                    name: rr.new_name,
+                });
+            }
+        }
+        proto::state_update::Update::RoomMoved(rm) => {
+            if let Some(rid) = rm.room_id.and_then(|r| rumble_protocol::uuid_from_room_id(&r)) {
+                let new_parent = rm.new_parent_id.and_then(|r| rumble_protocol::uuid_from_room_id(&r));
+                let _ = bus.room.send(RoomEvent::RoomMoved {
+                    room_id: rid,
+                    new_parent,
+                });
+            }
+        }
+        proto::state_update::Update::RoomDescriptionChanged(rdc) => {
+            if let Some(rid) = rdc.room_id.and_then(|r| rumble_protocol::uuid_from_room_id(&r)) {
+                let description = if rdc.description.is_empty() {
                     None
+                } else {
+                    Some(rdc.description)
+                };
+                let _ = bus.room.send(RoomEvent::RoomDescriptionSet {
+                    room_id: rid,
+                    description,
+                });
+            }
+        }
+        proto::state_update::Update::UserJoined(uj) => {
+            if let Some(user) = uj.user {
+                let _ = bus.room.send(RoomEvent::UserJoined { user });
+            }
+        }
+        proto::state_update::Update::UserLeft(ul) => {
+            if let Some(uid) = ul.user_id {
+                let _ = bus.room.send(RoomEvent::UserLeft { user_id: uid.value });
+            }
+        }
+        proto::state_update::Update::UserMoved(um) => {
+            if let (Some(uid), Some(to_room)) = (um.user_id, um.to_room_id) {
+                let to_room_uuid = rumble_protocol::uuid_from_room_id(&to_room);
+                let my_user_id = read_state(state).my_user_id;
+                let _ = bus.room.send(RoomEvent::UserMoved {
+                    user_id: uid.value,
+                    room_id: to_room_uuid,
+                });
+                // If it's us moving and the target is set, follow up with
+                // SelfMovedToRoom so the projection updates my_room_id +
+                // notifies the audio task + nudges the file-transfer plugin.
+                if my_user_id == Some(uid.value)
+                    && let Some(room_uuid) = to_room_uuid
+                {
+                    let _ = bus.room.send(RoomEvent::SelfMovedToRoom { room_id: room_uuid });
                 }
-            });
-            (room_uuid, acl_data)
-        })
-        .collect()
+            }
+        }
+        proto::state_update::Update::UserStatusChanged(usc) => {
+            // Build the full updated User by reading the current snapshot
+            // and overlaying the changed fields. The projection takes the
+            // full User and applies the side effect (SetServerMuted if it
+            // affects us) inside its locked section.
+            if let Some(uid) = usc.user_id {
+                let snapshot = read_state(state);
+                if let Some(existing) = snapshot
+                    .users
+                    .iter()
+                    .find(|u| u.user_id.as_ref().map(|id| id.value) == Some(uid.value))
+                {
+                    let mut user = existing.clone();
+                    user.is_muted = usc.is_muted;
+                    user.is_deafened = usc.is_deafened;
+                    user.server_muted = usc.server_muted;
+                    user.is_elevated = usc.is_elevated;
+                    drop(snapshot);
+                    let _ = bus.room.send(RoomEvent::UserUpdated { user });
+                }
+            }
+        }
+        proto::state_update::Update::GroupChanged(gc) => {
+            if gc.deleted {
+                if let Some(group) = gc.group {
+                    let _ = bus.room.send(RoomEvent::GroupRemoved { name: group.name });
+                }
+            } else if let Some(group) = gc.group {
+                // Existing-vs-new is decided in the projection (which
+                // holds the source of truth); we emit Modified and the
+                // projection upserts.
+                let _ = bus.room.send(RoomEvent::GroupModified { group });
+            }
+        }
+        proto::state_update::Update::UserGroupChanged(ugc) => {
+            // Same "merge into existing user" pattern as UserStatusChanged.
+            let snapshot = read_state(state);
+            if let Some(existing) = snapshot
+                .users
+                .iter()
+                .find(|u| u.user_id.as_ref().map(|id| id.value) == Some(ugc.user_id))
+            {
+                let mut user = existing.clone();
+                if ugc.added {
+                    if !user.groups.contains(&ugc.group) {
+                        user.groups.push(ugc.group);
+                    }
+                } else {
+                    user.groups.retain(|g| g != &ugc.group);
+                }
+                drop(snapshot);
+                let _ = bus.room.send(RoomEvent::UserUpdated { user });
+            }
+        }
+        proto::state_update::Update::RoomAclChanged(rac) => {
+            if let Some(rid) = rac.room_id.and_then(|r| rumble_protocol::uuid_from_room_id(&r)) {
+                let _ = bus.room.send(RoomEvent::RoomAclChanged {
+                    room_id: rid,
+                    inherit_acl: rac.inherit_acl,
+                    acls: rac.entries,
+                    // The server-computed effective bitmask for this
+                    // editor isn't included in the proto envelope today;
+                    // projection will recompute locally.
+                    effective: 0,
+                    per_room_recompute: HashMap::new(),
+                });
+            }
+        }
+    }
 }
