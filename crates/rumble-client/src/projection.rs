@@ -521,7 +521,7 @@ fn apply_room(
                 .iter_mut()
                 .find(|r| r.id.as_ref().and_then(rumble_protocol::uuid_from_room_id) == Some(room_id))
             {
-                room.parent_id = new_parent.map(|p| rumble_protocol::room_id_from_uuid(p));
+                room.parent_id = new_parent.map(rumble_protocol::room_id_from_uuid);
             }
             s.rebuild_room_tree();
         }
@@ -597,7 +597,7 @@ fn apply_room(
                 .iter_mut()
                 .find(|u| u.user_id.as_ref().map(|id| id.value) == Some(user_id))
             {
-                user.current_room = room_id.map(|r| rumble_protocol::room_id_from_uuid(r));
+                user.current_room = room_id.map(rumble_protocol::room_id_from_uuid);
             }
 
             if my_user_id == Some(user_id) {
@@ -676,12 +676,11 @@ fn apply_room(
     for cmd in audio_cmds {
         audio_task.send(cmd);
     }
-    if let Some(new_room) = new_room_id_for_ft {
-        if let Ok(guard) = file_transfer.read()
-            && let Some(ft) = guard.as_ref()
-        {
-            ft.set_room_id(new_room.map(|r| r.to_string()).unwrap_or_default());
-        }
+    if let Some(new_room) = new_room_id_for_ft
+        && let Ok(guard) = file_transfer.read()
+        && let Some(ft) = guard.as_ref()
+    {
+        ft.set_room_id(new_room.map(|r| r.to_string()).unwrap_or_default());
     }
     if recompute_perms {
         recompute_effective_permissions(state);
