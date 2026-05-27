@@ -4,6 +4,25 @@ members = [
     "crates/*",
     "xtask",
 ]
+# Active set built by `cargo build` / `cargo test` without -p. The
+# deprecated crates (rumble-egui, rumble-next, rumble-widgets,
+# harness-cli — see "Deprecated Crates" in CLAUDE.md) stay workspace
+# members so dependency resolution and `cargo build -p rumble-egui`
+# still work, but they're skipped by default so cross-cutting
+# refactors don't pay their compile-time tax.
+default-members = [
+    "crates/mumble-bridge",
+    "crates/rumble-aetna",
+    "crates/rumble-audio",
+    "crates/rumble-client",
+    "crates/rumble-client-traits",
+    "crates/rumble-desktop",
+    "crates/rumble-desktop-shell",
+    "crates/rumble-protocol",
+    "crates/rumble-video",
+    "crates/server",
+    "xtask",
+]
 exclude = [
     "docker/p2p-test",
     "docker/backend-p2p-test",
