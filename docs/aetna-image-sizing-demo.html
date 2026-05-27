@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Image sizing: fixed-height contain vs intrinsic</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: system-ui, sans-serif;
+    background: #1a1a2e;
+    color: #e0e0e0;
+    padding: 24px;
+    display: flex;
+    gap: 32px;
+    align-items: flex-start;
+  }
+
+  h2 { font-size: 14px; font-weight: 600; margin-bottom: 8px; color: #aaa; text-transform: uppercase; letter-spacing: 0.05em; }
+  p  { font-size: 12px; color: #888; margin-bottom: 12px; line-height: 1.5; }
+  code { background: #2a2a3e; padding: 2px 5px; border-radius: 3px; font-size: 11px; color: #a0c4ff; }
+
+  /* Resizable chat panel simulation */
+  .panel {
+    background: #16213e;
+    border: 1px solid #2a2a4e;
+    border-radius: 8px;
+    padding: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    resize: horizontal;
+    overflow: auto;
+    min-width: 180px;
+    max-width: 600px;
+  }
+
+  .panel-label {
+    font-size: 11px;
+    color: #666;
+    text-align: center;
+    margin-bottom: 4px;
+  }
+
+  .message-text {
+    font-size: 12px;
+    color: #ccc;
+  }
+
+  /* Card shared styles */
+  .card {
+    background: #0f3460;
+    border: 1px solid #2a2a5e;
+    border-radius: 6px;
+    padding: 8px;
+    width: 100%;
+  }
+
+  .caption {
+    font-size: 11px;
+    color: #888;
+    margin-top: 6px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  /* ── CURRENT: fixed 220px height + object-fit: contain ── */
+  .preview-fixed {
+    width: 100%;
+    height: 220px;
+    background: #0a0a1a; /* letterbox band colour */
+    border-radius: 4px;
+    object-fit: contain;
+    display: block;
+  }
+
+  /* ── DESIRED: width 100%, height auto → intrinsic aspect ratio ── */
+  .preview-intrinsic {
+    width: 100%;
+    height: auto;
+    border-radius: 4px;
+    display: block;
+  }
+
+  /* layout columns */
+  .col { flex: 1; min-width: 260px; }
+
+  .badge {
+    display: inline-block;
+    font-size: 10px;
+    padding: 2px 7px;
+    border-radius: 10px;
+    margin-bottom: 6px;
+    font-weight: 600;
+  }
+  .badge-current  { background: #5c3317; color: #f4a460; }
+  .badge-desired  { background: #1a3d1a; color: #7ec87e; }
+
+  .hint { font-size: 11px; color: #555; margin-top: 8px; text-align: center; }
+</style>
+</head>
+<body>
+
+<!-- LEFT: current behaviour -->
+<div class="col">
+  <h2>Current</h2>
+  <span class="badge badge-current">Fixed height + Contain</span>
+  <p>
+    The image element has a fixed <code>height: 220px</code> and <code>object-fit: contain</code>.
+    The image is scaled to fit inside the box — correct aspect ratio, but the remaining space
+    becomes empty letterbox bands. Drag the panel wider: the bands grow, the image stays the same size.
+  </p>
+  <p>Equivalent aetna code:</p>
+  <p><code>image(img).width(Fill(1.0)).height(Fixed(220.0)).image_fit(Contain)</code></p>
+
+  <div class="panel" style="width: 300px;">
+    <div class="panel-label">← drag corner to resize →</div>
+    <div class="message-text">alice: check this out</div>
+    <div class="card">
+      <img class="preview-fixed"
+           src="https://upload.wikimedia.org/wikipedia/commons/thumb/3/3f/Bikesgray.jpg/1280px-Bikesgray.jpg"
+           alt="16:9 sample">
+      <div class="caption">photo.jpg · 1.2 MB</div>
+    </div>
+    <div class="message-text">bob: nice</div>
+    <div class="card">
+      <img class="preview-fixed"
+           src="https://upload.wikimedia.org/wikipedia/commons/thumb/e/ec/Mona_Lisa%2C_by_Leonardo_da_Vinci%2C_from_C2RMF_retouched.jpg/402px-Mona_Lisa%2C_by_Leonardo_da_Vinci%2C_from_C2RMF_retouched.jpg"
+           alt="portrait sample">
+      <div class="caption">portrait.jpg · 0.8 MB</div>
+    </div>
+  </div>
+  <p class="hint">Notice the dark bands — wasted space that grows as the panel widens.</p>
+</div>
+
+<!-- RIGHT: desired behaviour -->
+<div class="col">
+  <h2>Desired</h2>
+  <span class="badge badge-desired">Intrinsic height (width: 100%, height: auto)</span>
+  <p>
+    The image element fills the available width and derives its height from the image's natural
+    aspect ratio — no letterbox bands. Drag the panel wider: the image grows proportionally.
+    This is CSS <code>width: 100%; height: auto</code> on an <code>&lt;img&gt;</code>.
+  </p>
+  <p>Desired aetna code:</p>
+  <p><code>image(img).width(Fill(1.0)).height(Hug)</code> <em>(with aspect-ratio-aware Hug)</em></p>
+
+  <div class="panel" style="width: 300px;">
+    <div class="panel-label">← drag corner to resize →</div>
+    <div class="message-text">alice: check this out</div>
+    <div class="card">
+      <img class="preview-intrinsic"
+           src="https://upload.wikimedia.org/wikipedia/commons/thumb/3/3f/Bikesgray.jpg/1280px-Bikesgray.jpg"
+           alt="16:9 sample">
+      <div class="caption">photo.jpg · 1.2 MB</div>
+    </div>
+    <div class="message-text">bob: nice</div>
+    <div class="card">
+      <img class="preview-intrinsic"
+           src="https://upload.wikimedia.org/wikipedia/commons/thumb/e/ec/Mona_Lisa%2C_by_Leonardo_da_Vinci%2C_from_C2RMF_retouched.jpg/402px-Mona_Lisa%2C_by_Leonardo_da_Vinci%2C_from_C2RMF_retouched.jpg"
+           alt="portrait sample">
+      <div class="caption">portrait.jpg · 0.8 MB</div>
+    </div>
+  </div>
+  <p class="hint">Image fills the width cleanly. Portrait images get tall — a max-height cap may be desirable.</p>
+</div>
+
+</body>
+</html>

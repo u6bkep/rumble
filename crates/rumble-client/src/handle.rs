@@ -111,10 +111,12 @@ pub enum BackendEvent {
 pub struct BackendHandle<P: Platform> {
     /// Shared state that the UI reads.
     ///
-    /// Phase 2 (in progress): the [`projection`][crate::projection]
-    /// task will become the sole writer. Today the connection and
-    /// audio tasks still mutate this directly; the projection task is
-    /// wired up as a logging stub. See `projection.rs` module docs.
+    /// The [`projection`][crate::projection] task is the sole
+    /// writer of this `RwLock` in the active code path. The connection
+    /// and audio tasks emit typed events on the `bus` instead of
+    /// touching `state` directly; the projection folds those events
+    /// into the snapshot. `state_mut()` exists as an escape hatch for
+    /// the deprecated egui clients to clear one-shot fields.
     state: Arc<RwLock<State>>,
     /// Channel to send commands to the connection task.
     command_tx: mpsc::UnboundedSender<Command>,
@@ -288,9 +290,8 @@ impl<P: Platform> BackendHandle<P> {
 
         // Typed per-domain event channels. The connection and audio
         // tasks emit into the senders held here; the projection task
-        // (spawned below) subscribes to all of them and — once the
-        // phase-2 conversion lands — becomes the sole writer of
-        // `State`. External subscribers attach via the
+        // (spawned below) subscribes to all of them and is the sole
+        // writer of `State`. External subscribers attach via the
         // `subscribe_*` methods on `BackendHandle`.
         let bus = crate::projection::EventBus::new();
 
@@ -325,9 +326,8 @@ impl<P: Platform> BackendHandle<P> {
             let rt = tokio::runtime::Runtime::new().expect("create tokio runtime");
             rt.block_on(async move {
                 // Projection task: subscribes to every domain channel
-                // and (phase 2) maintains `State`. Today it's a logging
-                // stub; the wiring is what we need in place to flip the
-                // writers in a follow-up commit.
+                // and maintains `State`. Sole writer of the snapshot the
+                // UI reads each frame.
                 let _projection_handle = crate::projection::spawn_projection_task(
                     state_for_projection,
                     repaint_for_projection,

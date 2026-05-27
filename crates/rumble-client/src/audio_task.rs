@@ -494,9 +494,10 @@ impl AudioTaskHandle {
 
 /// Configuration for the audio task.
 pub struct AudioTaskConfig<P: Platform> {
-    /// Shared state. Read-only for the audio task post-projection cut-over;
-    /// it's still threaded through to a few helpers (capture callback reads
-    /// settings) until the final cleanup pass moves those to event-driven.
+    /// Shared state, read-only for the audio task. Used to read the
+    /// initial `AudioSettings` / pipeline configs at startup and to
+    /// snapshot `talking_users` when computing stop-transitions on
+    /// bulk-clear paths (disconnect, deafen, room change).
     pub state: Arc<RwLock<State>>,
     /// Repaint callback for UI updates.
     pub repaint: Arc<dyn Fn() + Send + Sync>,

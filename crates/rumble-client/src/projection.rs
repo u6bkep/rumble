@@ -7,36 +7,30 @@
 //! each frame. Conceptually a [CQRS] read-model maintainer: the
 //! events are the source of truth; `State` is a cached projection.
 //!
-//! ## Phase 1 (current): wiring stub
+//! ## Sole-writer invariant
 //!
-//! Today this task is a logging passthrough — it receives events
-//! and traces them, but does not yet write to `State`. The
-//! connection and audio tasks still mutate `State` directly. The
-//! infrastructure is in place so a follow-up commit can flip the
-//! writer in one motion: remove `write_state` from the tasks,
-//! switch the projection from `trace!` to actual field updates,
-//! same observable behaviour.
-//!
-//! ## Phase 2 (planned): sole writer
-//!
-//! - Tasks stop writing `State`.
-//! - Each `apply_*` helper here mutates `State` from its event.
-//! - Effective-permission recompute (currently
-//!   `recalculate_effective_permissions` in handle.rs) moves into
-//!   the projection's `RoomEvent` handlers, since the projection
-//!   owns the inputs.
-//! - On broadcast lag (consumer fell too far behind the 1024-deep
-//!   ring), trigger a server resync via `ServerState` and reset.
+//! Nothing else in the active code path acquires a write lock on
+//! `state`. The connection and audio tasks emit typed events; this
+//! task applies them. `BackendHandle::state_mut()` exists as a
+//! public escape hatch for the deprecated egui clients to clear
+//! one-shot fields, but the active aetna path does not call it.
 //!
 //! ## Why a separate task instead of folding into the connection task
 //!
-//! The connection task currently does too many jobs (network I/O,
-//! command dispatch, state mutation). Splitting the state writer
-//! out lets the connection task be purely an
-//! "inputs → typed events" translator. It also makes the
-//! single-writer invariant for `State` *structural* rather than
-//! aspirational: nothing in the codebase (other than this file)
-//! has a `&mut` path into `State`.
+//! The connection task already does too many jobs (network I/O,
+//! command dispatch). Splitting the state writer out lets the
+//! connection task be purely an "inputs → typed events" translator
+//! and makes the single-writer invariant for `State` *structural*
+//! rather than aspirational.
+//!
+//! ## Resync-on-lag (TODO)
+//!
+//! `tokio::broadcast` returns `RecvError::Lagged(n)` when a consumer
+//! falls behind the ring. Today the projection logs and continues —
+//! at which point `state` is divergent from the event log and may
+//! never recover. The eventual fix is to request a fresh `ServerState`
+//! from the server and reset the snapshot. Capacity is 1024 which
+//! should be ample; if it ever lags in practice, that's a real bug.
 //!
 //! [CQRS]: https://martinfowler.com/bliki/CQRS.html
 
@@ -46,11 +40,8 @@ use std::{
 };
 
 use rumble_client_traits::FileTransferPlugin;
-use tokio::sync::broadcast::{
-    self,
-    error::{RecvError, TryRecvError},
-};
-use tracing::{debug, error, warn};
+use tokio::sync::broadcast::{self, error::RecvError};
+use tracing::{debug, error};
 use uuid::Uuid;
 
 use crate::{
@@ -99,11 +90,6 @@ impl Default for EventBus {
 /// `Sender` on the bus is alive (i.e. as long as the connection or
 /// audio task is running). When all senders drop, every `recv()`
 /// returns `Closed` and the task exits cleanly.
-///
-/// Phase 1: applies no state mutations — the connection/audio tasks
-/// are still the writers. The events are received and traced; this
-/// proves the wiring without changing observable behaviour. See
-/// module docs.
 pub fn spawn_projection_task(
     state: Arc<RwLock<State>>,
     repaint: Arc<dyn Fn() + Send + Sync>,
@@ -182,9 +168,10 @@ pub fn spawn_projection_task(
 }
 
 fn on_lag(domain: &'static str, skipped: u64) {
-    // Phase 1: log and continue. Phase 2 will trigger a server
-    // resync (`ServerState` re-request) so the projection re-syncs
-    // from a known-good baseline.
+    // TODO: trigger a server resync (`ServerState` re-request) so the
+    // projection rebuilds from a known-good baseline. Until then, the
+    // `state` snapshot is divergent from the event log and won't catch
+    // up on its own. See module docs.
     error!("projection: {domain} channel lagged, skipped {skipped} events");
 }
 
@@ -209,11 +196,6 @@ fn is_closed<T: Clone>(rx: &broadcast::Receiver<T>) -> bool {
     // sender count: when it hits zero, the channel is closed.
     rx.sender_strong_count() == 0
 }
-
-// =============================================================================
-// Phase 1: apply_* are tracing stubs. Phase 2 will fold each event
-// into the appropriate `State` field mutation here.
-// =============================================================================
 
 /// Trim the chat log to the recent-message cap. The cap is the same
 /// 100-entry sliding window the connection task used to enforce
@@ -854,11 +836,4 @@ fn apply_transfer(_state: &Arc<RwLock<State>>, ev: TransferEvent, _repaint: &Arc
     // subscribers (chat card, media cache, auto-download) that want
     // the typed stream alongside the existing mpsc UX path.
     tracing::trace!(target: "rumble_client::projection", "transfer event: {:?}", ev);
-}
-
-// Silence unused warnings on the broadcast `TryRecvError` import — it'll
-// be used by phase 2's resync logic.
-#[allow(dead_code)]
-fn _phase2_resync_marker(_: TryRecvError) {
-    warn!("phase 2: implement server resync on lag");
 }
