@@ -298,6 +298,7 @@ impl<P: Platform> BackendHandle<P> {
         let audio_task = spawn_audio_task::<P>(AudioTaskConfig {
             state: state.clone(),
             repaint: repaint_callback.clone(),
+            bus: bus.clone(),
             audio_dumper,
             audio_backend,
         });

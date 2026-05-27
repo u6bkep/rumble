@@ -27,8 +27,10 @@
 use crate::{
     audio_dump::AudioDumper,
     codec::OPUS_FRAME_SIZE,
+    domain_events::{DeviceKind, VoiceEvent},
     events::{AudioSettings, AudioStats, State, VoiceMode},
-    handle::{read_state, write_state},
+    handle::read_state,
+    projection::EventBus,
 };
 use bytes::Bytes;
 use prost::Message;
@@ -492,10 +494,15 @@ impl AudioTaskHandle {
 
 /// Configuration for the audio task.
 pub struct AudioTaskConfig<P: Platform> {
-    /// Shared state for updating talking_users.
+    /// Shared state. Read-only for the audio task post-projection cut-over;
+    /// it's still threaded through to a few helpers (capture callback reads
+    /// settings) until the final cleanup pass moves those to event-driven.
     pub state: Arc<RwLock<State>>,
     /// Repaint callback for UI updates.
     pub repaint: Arc<dyn Fn() + Send + Sync>,
+    /// Event bus — the audio task emits `VoiceEvent`s here, the projection
+    /// task folds them into `State`.
+    pub bus: EventBus,
     /// Audio dumper for debugging (optional).
     pub audio_dumper: Option<AudioDumper>,
     /// Audio backend instance, owned by the audio task. Tests can pass a
@@ -530,6 +537,7 @@ async fn run_audio_task<P: Platform>(
 ) {
     let state = config.state;
     let repaint = config.repaint;
+    let bus = config.bus;
     let audio_dumper = config.audio_dumper.unwrap_or_else(AudioDumper::disabled);
 
     // Audio backend for device access (lives on this thread)
@@ -702,11 +710,7 @@ async fn run_audio_task<P: Platform>(
                 if let Some(stream) = audio_input.as_ref() {
                     stream.set_active(true);
                 }
-                {
-                    let mut s = write_state(&state);
-                    s.audio.is_transmitting = true;
-                }
-                repaint();
+                let _ = bus.voice.send(VoiceEvent::TransmittingChanged { active: true });
                 info!("Capture activated (samples will be processed)");
             } else if !want && capture_is_active {
                 // Send end-of-stream before deactivating
@@ -716,11 +720,7 @@ async fn run_audio_task<P: Platform>(
                 if let Some(stream) = audio_input.as_ref() {
                     stream.set_active(false);
                 }
-                {
-                    let mut s = write_state(&state);
-                    s.audio.is_transmitting = false;
-                }
-                repaint();
+                let _ = bus.voice.send(VoiceEvent::TransmittingChanged { active: false });
                 info!("Capture deactivated (samples will be discarded)");
             }
         }};
@@ -777,8 +777,7 @@ async fn run_audio_task<P: Platform>(
                                 &processor_registry,
                                 &encoder,
                                 &mut audio_input,
-                                &state,
-                                &repaint,
+                                &bus.voice,
                                 &audio_dumper,
                             );
                         }
@@ -796,7 +795,7 @@ async fn run_audio_task<P: Platform>(
                         sync_transmission!();
 
                         // Destroy connection-scoped audio input stream
-                        stop_transmission::<P>(&mut audio_input, &state, &repaint);
+                        stop_transmission::<P>(&mut audio_input);
 
                         // Destroy connection-scoped encoder
                         if let Ok(mut guard) = encoder.lock() {
@@ -808,12 +807,15 @@ async fn run_audio_task<P: Platform>(
                         ptt_active = false;
                         server_muted = false;
 
-                        // Clear talking users
+                        // Clear talking users — emit a stop event for each
+                        // currently-talking user so subscribers see clean
+                        // transitions rather than a silent state reset.
                         {
-                            let mut s = write_state(&state);
-                            s.audio.talking_users.clear();
+                            let snapshot = read_state(&state).audio.talking_users.clone();
+                            for uid in snapshot {
+                                let _ = bus.voice.send(VoiceEvent::UserStoppedTalking { user_id: uid });
+                            }
                         }
-                        repaint();
 
                         // Clear per-user state
                         user_audio.clear();
@@ -821,15 +823,14 @@ async fn run_audio_task<P: Platform>(
 
                     AudioCommand::SetInputDevice { device_id } => {
                         selected_input = device_id.clone();
-                        {
-                            let mut s = write_state(&state);
-                            s.audio.selected_input = device_id;
-                        }
-                        repaint();
+                        let _ = bus.voice.send(VoiceEvent::SelectedDeviceChanged {
+                            kind: DeviceKind::Input,
+                            id: device_id,
+                        });
 
                         // Restart input stream if connected (need to use new device)
                         if audio_input.is_some() {
-                            stop_transmission::<P>(&mut audio_input, &state, &repaint);
+                            stop_transmission::<P>(&mut audio_input);
                             capture_is_active = false;
                         }
                         if connection.is_some() {
@@ -842,8 +843,7 @@ async fn run_audio_task<P: Platform>(
                                 &processor_registry,
                                 &encoder,
                                 &mut audio_input,
-                                &state,
-                                &repaint,
+                                &bus.voice,
                                 &audio_dumper,
                             );
                         }
@@ -852,11 +852,10 @@ async fn run_audio_task<P: Platform>(
 
                     AudioCommand::SetOutputDevice { device_id } => {
                         selected_output = device_id.clone();
-                        {
-                            let mut s = write_state(&state);
-                            s.audio.selected_output = device_id;
-                        }
-                        repaint();
+                        let _ = bus.voice.send(VoiceEvent::SelectedDeviceChanged {
+                            kind: DeviceKind::Output,
+                            id: device_id,
+                        });
 
                         // Restart output (always, even when disconnected — SFX need it)
                         playback_stream = None;
@@ -877,21 +876,13 @@ async fn run_audio_task<P: Platform>(
 
                     AudioCommand::SetVoiceMode { mode } => {
                         voice_mode = mode;
-                        {
-                            let mut s = write_state(&state);
-                            s.audio.voice_mode = mode;
-                        }
-                        repaint();
+                        let _ = bus.voice.send(VoiceEvent::VoiceModeChanged { mode });
                         sync_transmission!();
                     }
 
                     AudioCommand::SetMuted { muted } => {
                         self_muted = muted;
-                        {
-                            let mut s = write_state(&state);
-                            s.audio.self_muted = muted;
-                        }
-                        repaint();
+                        let _ = bus.voice.send(VoiceEvent::SelfMutedChanged { muted });
 
                         // Stream stays connection-scoped; sync_transmission!
                         // gates the capture callback via set_active(false) and
@@ -906,20 +897,18 @@ async fn run_audio_task<P: Platform>(
                         if deafened && !self_muted {
                             self_muted = true;
                         }
-                        {
-                            let mut s = write_state(&state);
-                            s.audio.self_deafened = deafened;
-                            s.audio.self_muted = self_muted;
-                        }
-                        repaint();
+                        let _ = bus.voice.send(VoiceEvent::SelfDeafenedChanged { deafened });
+                        let _ = bus.voice.send(VoiceEvent::SelfMutedChanged { muted: self_muted });
 
                         // Handle audio output based on deafen state
                         if deafened {
                             playback_stream = None;
+                            // Snapshot talkers and emit stop transitions before
+                            // we wipe local decoder state.
+                            let snapshot = read_state(&state).audio.talking_users.clone();
                             user_audio.clear();
-                            {
-                                let mut s = write_state(&state);
-                                s.audio.talking_users.clear();
+                            for uid in snapshot {
+                                let _ = bus.voice.send(VoiceEvent::UserStoppedTalking { user_id: uid });
                             }
                         } else if connection.is_some() && playback_stream.is_none() {
                             playback_stream = start_audio_output::<P>(&audio_backend, &selected_output, playback_buffer.clone());
@@ -936,6 +925,7 @@ async fn run_audio_task<P: Platform>(
                             // every frame in some flows; don't churn state.
                         } else {
                             server_muted = muted;
+                            let _ = bus.voice.send(VoiceEvent::ServerMutedChanged { muted });
                             // Like SetMuted: gate via set_active, keep the
                             // stream alive across the toggle.
                             sync_transmission!();
@@ -944,47 +934,33 @@ async fn run_audio_task<P: Platform>(
 
                     AudioCommand::MuteUser { user_id } => {
                         muted_users.insert(user_id);
-                        {
-                            let mut s = write_state(&state);
-                            s.audio.muted_users.insert(user_id);
-                        }
-                        repaint();
+                        let _ = bus.voice.send(VoiceEvent::LocalMuteToggled { user_id, muted: true });
                     }
 
                     AudioCommand::UnmuteUser { user_id } => {
                         muted_users.remove(&user_id);
-                        {
-                            let mut s = write_state(&state);
-                            s.audio.muted_users.remove(&user_id);
-                        }
-                        repaint();
+                        let _ = bus.voice.send(VoiceEvent::LocalMuteToggled { user_id, muted: false });
                     }
 
                     AudioCommand::RefreshDevices => {
                         let input_devices = audio_backend.list_input_devices();
                         let output_devices = audio_backend.list_output_devices();
-                        {
-                            let mut s = write_state(&state);
-                            s.audio.input_devices = input_devices;
-                            s.audio.output_devices = output_devices;
-                        }
-                        repaint();
+                        let _ = bus.voice.send(VoiceEvent::DevicesEnumerated {
+                            input: input_devices,
+                            output: output_devices,
+                        });
                     }
 
                     AudioCommand::UpdateSettings { settings } => {
                         info!("Audio task: updating settings");
                         audio_settings = settings.clone();
-
-                        // Update settings in shared state
-                        {
-                            let mut s = write_state(&state);
-                            s.audio.settings = settings;
-                        }
-                        repaint();
+                        let _ = bus.voice.send(VoiceEvent::AudioSettingsChanged {
+                            settings: settings.clone(),
+                        });
 
                         // Recreate stream with new settings if connected
                         if audio_input.is_some() {
-                            stop_transmission::<P>(&mut audio_input, &state, &repaint);
+                            stop_transmission::<P>(&mut audio_input);
                             capture_is_active = false;
                         }
                         if connection.is_some() {
@@ -997,8 +973,7 @@ async fn run_audio_task<P: Platform>(
                                 &processor_registry,
                                 &encoder,
                                 &mut audio_input,
-                                &state,
-                                &repaint,
+                                &bus.voice,
                                 &audio_dumper,
                             );
                         }
@@ -1018,26 +993,21 @@ async fn run_audio_task<P: Platform>(
                             user_state.bytes_received = 0;
                         }
 
-                        // Update state
-                        {
-                            let mut s = write_state(&state);
-                            s.audio.stats = AudioStats::default();
-                        }
-                        repaint();
+                        let _ = bus.voice.send(VoiceEvent::StatsUpdated {
+                            stats: AudioStats::default(),
+                        });
                     }
 
                     AudioCommand::UpdateTxPipeline { config } => {
                         info!("Audio task: updating TX pipeline config");
                         tx_pipeline_config = config.clone();
-                        {
-                            let mut s = write_state(&state);
-                            s.audio.tx_pipeline = config;
-                        }
-                        repaint();
+                        let _ = bus.voice.send(VoiceEvent::TxPipelineChanged {
+                            config: config.clone(),
+                        });
 
                         // Recreate stream to rebuild pipeline with new config
                         if audio_input.is_some() {
-                            stop_transmission::<P>(&mut audio_input, &state, &repaint);
+                            stop_transmission::<P>(&mut audio_input);
                             capture_is_active = false;
                         }
                         if connection.is_some() {
@@ -1050,8 +1020,7 @@ async fn run_audio_task<P: Platform>(
                                 &processor_registry,
                                 &encoder,
                                 &mut audio_input,
-                                &state,
-                                &repaint,
+                                &bus.voice,
                                 &audio_dumper,
                             );
                         }
@@ -1061,10 +1030,9 @@ async fn run_audio_task<P: Platform>(
                     AudioCommand::UpdateRxPipelineDefaults { config } => {
                         info!("Audio task: updating RX pipeline defaults");
                         rx_pipeline_defaults = config.clone();
-                        {
-                            let mut s = write_state(&state);
-                            s.audio.rx_pipeline_defaults = config;
-                        }
+                        let _ = bus.voice.send(VoiceEvent::RxPipelineDefaultsChanged {
+                            config: config.clone(),
+                        });
                         // Rebuild pipelines for users without overrides
                         for (user_id, user_state) in user_audio.iter_mut() {
                             if !per_user_rx.contains_key(user_id) {
@@ -1083,10 +1051,10 @@ async fn run_audio_task<P: Platform>(
                         // Clone the pipeline config before moving config
                         let pipeline_config_owned = config.pipeline_override.clone();
                         per_user_rx.insert(user_id, config.clone());
-                        {
-                            let mut s = write_state(&state);
-                            s.audio.per_user_rx.insert(user_id, config);
-                        }
+                        let _ = bus.voice.send(VoiceEvent::UserRxConfigChanged {
+                            user_id,
+                            config,
+                        });
                         // Rebuild this user's pipeline if they exist
                         if let Some(user_state) = user_audio.get_mut(&user_id) {
                             let pipeline_config = pipeline_config_owned.as_ref().unwrap_or(&rx_pipeline_defaults);
@@ -1102,10 +1070,7 @@ async fn run_audio_task<P: Platform>(
                     AudioCommand::ClearUserRxOverride { user_id } => {
                         info!("Audio task: clearing RX override for user {}", user_id);
                         per_user_rx.remove(&user_id);
-                        {
-                            let mut s = write_state(&state);
-                            s.audio.per_user_rx.remove(&user_id);
-                        }
+                        let _ = bus.voice.send(VoiceEvent::UserRxOverrideCleared { user_id });
                         // Rebuild user's pipeline with defaults
                         if let Some(user_state) = user_audio.get_mut(&user_id) {
                             match rumble_audio::AudioPipeline::from_config(&rx_pipeline_defaults, &processor_registry) {
@@ -1119,23 +1084,21 @@ async fn run_audio_task<P: Platform>(
 
                     AudioCommand::SetUserVolume { user_id, volume_db } => {
                         info!("Audio task: setting volume for user {} to {} dB", user_id, volume_db);
-                        // Update per-user config
+                        // Update per-user config (audio task's own copy)
                         let user_rx = per_user_rx
                             .entry(user_id)
                             .or_default();
                         user_rx.volume_db = volume_db;
-                        {
-                            let mut s = write_state(&state);
-                            let user_rx = s.audio.per_user_rx
-                                .entry(user_id)
-                                .or_default();
-                            user_rx.volume_db = volume_db;
-                        }
+                        // Emit the full UserRxConfig snapshot so the projection
+                        // can mirror it byte-for-byte into state.
+                        let _ = bus.voice.send(VoiceEvent::UserRxConfigChanged {
+                            user_id,
+                            config: user_rx.clone(),
+                        });
                         // Update live user state if they exist
                         if let Some(user_state) = user_audio.get_mut(&user_id) {
                             user_state.volume_db = volume_db;
                         }
-                        repaint();
                     }
 
                     AudioCommand::UserJoinedRoom { user_id } => {
@@ -1178,16 +1141,10 @@ async fn run_audio_task<P: Platform>(
                         // Destroy decoder/pipeline for this user
                         if user_audio.remove(&user_id).is_some() {
                             debug!("Audio task: user {} left room, destroyed decoder", user_id);
-                            // Also remove from talking users
-                            let mut needs_repaint = false;
-                            {
-                                let mut s = write_state(&state);
-                                if s.audio.talking_users.remove(&user_id) {
-                                    needs_repaint = true;
-                                }
-                            }
-                            if needs_repaint {
-                                repaint();
+                            // If they were in our talking set, emit a stop so
+                            // subscribers see the transition.
+                            if read_state(&state).audio.talking_users.contains(&user_id) {
+                                let _ = bus.voice.send(VoiceEvent::UserStoppedTalking { user_id });
                             }
                         }
                     }
@@ -1196,11 +1153,12 @@ async fn run_audio_task<P: Platform>(
                         // We changed rooms - destroy all existing decoders, create new ones
                         debug!("Audio task: room changed, rebuilding decoders for {} users", user_ids_in_room.len());
 
-                        // Clear all existing user audio state
+                        // Snapshot current talkers so we can emit stop events
+                        // for them as we wipe local decoder state.
+                        let prior_talkers = read_state(&state).audio.talking_users.clone();
                         user_audio.clear();
-                        {
-                            let mut s = write_state(&state);
-                            s.audio.talking_users.clear();
+                        for uid in prior_talkers {
+                            let _ = bus.voice.send(VoiceEvent::UserStoppedTalking { user_id: uid });
                         }
 
                         // Create decoders for all users in the new room (except ourselves)
@@ -1317,7 +1275,7 @@ async fn run_audio_task<P: Platform>(
                                         &per_user_rx,
                                         &processor_registry,
                                         &state,
-                                        &repaint,
+                                        &bus.voice,
                                         &audio_dumper,
                                     );
                                 }
@@ -1341,12 +1299,12 @@ async fn run_audio_task<P: Platform>(
 
             // Periodic cleanup of stale talking_users (does not destroy decoders)
             _ = cleanup_interval.tick() => {
-                cleanup_stale_users(&user_audio, &state, &repaint);
+                cleanup_stale_users(&user_audio, &state, &bus.voice);
             }
 
             // Periodic stats update
             _ = stats_interval.tick() => {
-                update_stats(&user_audio, packets_sent, bytes_sent, &state, &repaint);
+                update_stats(&user_audio, packets_sent, bytes_sent, &bus.voice);
             }
         }
     }
@@ -1368,8 +1326,7 @@ fn start_transmission<P: Platform>(
     processor_registry: &rumble_audio::ProcessorRegistry,
     encoder: &Arc<std::sync::Mutex<Option<Enc<P>>>>,
     audio_input: &mut Option<CapStream<P>>,
-    state: &Arc<RwLock<State>>,
-    repaint: &Arc<dyn Fn() + Send + Sync>,
+    voice_tx: &tokio::sync::broadcast::Sender<VoiceEvent>,
     audio_dumper: &AudioDumper,
 ) {
     if audio_input.is_some() {
@@ -1419,8 +1376,9 @@ fn start_transmission<P: Platform>(
     };
     let pipeline_mutex = std::sync::Arc::new(std::sync::Mutex::new(tx_pipeline));
 
-    // State reference for updating input_level_db
-    let state_for_callback = state.clone();
+    // Voice event sender for InputLevel + TransmittingChanged emissions
+    // from the capture callback.
+    let voice_tx_for_callback = voice_tx.clone();
 
     // Track whether we were transmitting (for detecting suppress transitions)
     let was_transmitting = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1431,9 +1389,6 @@ fn start_transmission<P: Platform>(
     // from its internal ring buffer. Discarding 2-3 frames (~40-60ms) fixes this.
     let frames_to_discard = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(3));
     let frames_to_discard_for_callback = frames_to_discard.clone();
-
-    // Repaint callback for notifying UI of VAD state changes
-    let repaint_for_callback = repaint.clone();
 
     // Audio dumper for debugging
     let dumper_for_callback = audio_dumper.clone();
@@ -1467,20 +1422,14 @@ fn start_transmission<P: Platform>(
             let was_tx = was_transmitting_for_callback.load(std::sync::atomic::Ordering::Relaxed);
             let is_tx_now = !pipeline_result.suppress;
 
-            // Update input level and transmitting state in state (for UI metering)
-            // is_transmitting reflects whether audio is actually being transmitted
-            // (not suppressed by VAD or other pipeline processors)
-            if let Ok(mut s) = state_for_callback.write() {
-                if let Some(level_db) = pipeline_result.level_db {
-                    s.audio.input_level_db = Some(level_db);
-                }
-                // Update is_transmitting to reflect actual transmission state
-                s.audio.is_transmitting = is_tx_now;
+            // Emit input level every frame (high-frequency; projection
+            // suppresses to trace! so the log isn't flooded).
+            if let Some(level_db) = pipeline_result.level_db {
+                let _ = voice_tx_for_callback.send(VoiceEvent::InputLevel { db: level_db });
             }
-
-            // Notify UI if transmission state changed (VAD triggered on/off)
+            // Emit a transmitting transition only on edge (VAD on/off).
             if was_tx != is_tx_now {
-                repaint_for_callback();
+                let _ = voice_tx_for_callback.send(VoiceEvent::TransmittingChanged { active: is_tx_now });
             }
 
             // Pipeline suppress flag gates actual transmission
@@ -1544,11 +1493,7 @@ fn start_transmission<P: Platform>(
 /// This destroys the underlying platform stream. It should only be called on
 /// disconnection, device change, settings change, or mute - NOT on PTT release.
 /// The `set_active()` method on the capture stream handles PTT gating.
-fn stop_transmission<P: Platform>(
-    audio_input: &mut Option<CapStream<P>>,
-    _state: &Arc<RwLock<State>>,
-    _repaint: &Arc<dyn Fn() + Send + Sync>,
-) {
+fn stop_transmission<P: Platform>(audio_input: &mut Option<CapStream<P>>) {
     if audio_input.is_none() {
         return; // No stream to destroy
     }
@@ -1599,7 +1544,7 @@ fn handle_voice_datagram<C: VoiceCodec>(
     per_user_rx: &HashMap<u64, rumble_audio::UserRxConfig>,
     processor_registry: &rumble_audio::ProcessorRegistry,
     state: &Arc<RwLock<State>>,
-    repaint: &Arc<dyn Fn() + Send + Sync>,
+    voice_tx: &tokio::sync::broadcast::Sender<VoiceEvent>,
     audio_dumper: &AudioDumper,
 ) {
     // Dump RX opus packet (before jitter buffer)
@@ -1660,17 +1605,12 @@ fn handle_voice_datagram<C: VoiceCodec>(
     user_state.insert_packet(sequence, opus_data);
     user_state.last_received = Instant::now();
 
-    // Update talking_users
-    let mut needs_repaint = false;
-    {
-        let mut s = write_state(state);
-        if !s.audio.talking_users.contains(&sender_id) {
-            s.audio.talking_users.insert(sender_id);
-            needs_repaint = true;
-        }
-    }
-    if needs_repaint {
-        repaint();
+    // Detect first-frame-after-silence by checking the live snapshot of
+    // talking_users — projection updates it from our own events but with
+    // (microsecond-scale) lag, so this is a best-effort dedup. The
+    // projection also dedups on its end.
+    if !read_state(state).audio.talking_users.contains(&sender_id) {
+        let _ = voice_tx.send(VoiceEvent::UserStartedTalking { user_id: sender_id });
     }
 }
 
@@ -1755,7 +1695,7 @@ fn mix_and_play_audio<D: VoiceDecoderTrait>(
 fn cleanup_stale_users<D: VoiceDecoderTrait>(
     user_audio: &HashMap<u64, UserAudioState<D>>,
     state: &Arc<RwLock<State>>,
-    repaint: &Arc<dyn Fn() + Send + Sync>,
+    voice_tx: &tokio::sync::broadcast::Sender<VoiceEvent>,
 ) {
     let stale_threshold = Duration::from_millis(300);
     let now = Instant::now();
@@ -1771,30 +1711,23 @@ fn cleanup_stale_users<D: VoiceDecoderTrait>(
         return;
     }
 
-    // Only remove from talking_users (UI state), NOT from user_audio (decoder state)
-    // The decoder must persist to avoid crackle when the user starts talking again
-    let mut needs_repaint = false;
-    {
-        let mut s = write_state(state);
-        for user_id in &stale_users {
-            if s.audio.talking_users.remove(user_id) {
-                needs_repaint = true;
-            }
+    // Emit a Stopped event for any stale user that was still in the
+    // talking set. Filter against the live snapshot so we don't fire
+    // events for users the projection has already cleared.
+    let talkers = read_state(state).audio.talking_users.clone();
+    for user_id in &stale_users {
+        if talkers.contains(user_id) {
+            let _ = voice_tx.send(VoiceEvent::UserStoppedTalking { user_id: *user_id });
         }
-    }
-
-    if needs_repaint {
-        repaint();
     }
 }
 
-/// Update audio statistics in shared state.
+/// Emit an updated stats roll-up.
 fn update_stats<D: VoiceDecoderTrait>(
     user_audio: &HashMap<u64, UserAudioState<D>>,
     packets_sent: u64,
     bytes_sent: u64,
-    state: &Arc<RwLock<State>>,
-    _repaint: &Arc<dyn Fn() + Send + Sync>,
+    voice_tx: &tokio::sync::broadcast::Sender<VoiceEvent>,
 ) {
     // Aggregate stats from all users
     let mut total_packets_received: u64 = 0;
@@ -1824,24 +1757,21 @@ fn update_stats<D: VoiceDecoderTrait>(
     // At 20ms per frame, we have 50 frames per second
     let actual_bitrate_bps = avg_frame_size * 50.0 * 8.0;
 
-    // Update state
-    {
-        let mut s = write_state(state);
-        s.audio.stats.packets_sent = packets_sent;
-        s.audio.stats.packets_received = total_packets_received;
-        s.audio.stats.packets_lost = total_packets_lost;
-        s.audio.stats.packets_recovered_fec = total_packets_recovered_fec;
-        s.audio.stats.frames_concealed = total_frames_concealed;
-        s.audio.stats.bytes_sent = bytes_sent;
-        s.audio.stats.bytes_received = total_bytes_received;
-        s.audio.stats.avg_frame_size_bytes = avg_frame_size;
-        s.audio.stats.actual_bitrate_bps = actual_bitrate_bps;
-        s.audio.stats.playback_buffer_packets = total_buffer_packets;
-        s.audio.stats.last_update = Some(Instant::now());
-    }
-
-    // Note: We don't call repaint here to avoid excessive repaints
-    // The stats will be visible on next UI-triggered repaint
+    let stats = AudioStats {
+        packets_sent,
+        packets_received: total_packets_received,
+        packets_lost: total_packets_lost,
+        packets_recovered_fec: total_packets_recovered_fec,
+        frames_concealed: total_frames_concealed,
+        bytes_sent,
+        bytes_received: total_bytes_received,
+        avg_frame_size_bytes: avg_frame_size,
+        actual_bitrate_bps,
+        playback_buffer_packets: total_buffer_packets,
+        buffer_underruns: 0,
+        last_update: Some(Instant::now()),
+    };
+    let _ = voice_tx.send(VoiceEvent::StatsUpdated { stats });
 }
 
 #[cfg(test)]

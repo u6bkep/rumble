@@ -275,16 +275,88 @@ fn apply_chat(state: &Arc<RwLock<State>>, ev: ChatEvent, repaint: &Arc<dyn Fn() 
     repaint();
 }
 
-fn apply_voice(_state: &Arc<RwLock<State>>, ev: VoiceEvent, _repaint: &Arc<dyn Fn() + Send + Sync>) {
-    // VoiceEvent::InputLevel and ::StatsUpdated fire frequently
-    // (every audio frame / every stats tick). Suppress to trace.
-    match &ev {
-        VoiceEvent::InputLevel { .. } | VoiceEvent::StatsUpdated { .. } => {
-            tracing::trace!(target: "rumble_client::projection", "voice event (stub): {:?}", ev);
+fn apply_voice(state: &Arc<RwLock<State>>, ev: VoiceEvent, repaint: &Arc<dyn Fn() + Send + Sync>) {
+    // High-frequency events (InputLevel fires per audio frame ~50Hz,
+    // StatsUpdated every 500ms): write state but skip repaint. The UI
+    // reads `audio.input_level_db` and `audio.stats` on its next
+    // already-scheduled redraw — no need to wake it just for a meter
+    // tick.
+    let suppress_repaint = matches!(ev, VoiceEvent::InputLevel { .. } | VoiceEvent::StatsUpdated { .. });
+
+    let mut s = match state.write() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    match ev {
+        VoiceEvent::UserStartedTalking { user_id } => {
+            s.audio.talking_users.insert(user_id);
         }
-        _ => {
-            debug!(target: "rumble_client::projection", "voice event (stub, not yet applied): {:?}", ev);
+        VoiceEvent::UserStoppedTalking { user_id } => {
+            s.audio.talking_users.remove(&user_id);
         }
+        VoiceEvent::SelfMutedChanged { muted } => {
+            s.audio.self_muted = muted;
+        }
+        VoiceEvent::SelfDeafenedChanged { deafened } => {
+            s.audio.self_deafened = deafened;
+        }
+        VoiceEvent::LocalMuteToggled { user_id, muted } => {
+            if muted {
+                s.audio.muted_users.insert(user_id);
+            } else {
+                s.audio.muted_users.remove(&user_id);
+            }
+        }
+        VoiceEvent::ServerMutedChanged { .. } => {
+            // The `server_muted` bit lives on the matching `User` entry
+            // in `state.users`, which is written by the RoomEvent stream
+            // (UserUpdated). This event exists purely as a notification
+            // for SFX / toasts.
+        }
+        VoiceEvent::TransmittingChanged { active } => {
+            s.audio.is_transmitting = active;
+        }
+        VoiceEvent::InputLevel { db } => {
+            s.audio.input_level_db = Some(db);
+        }
+        VoiceEvent::StatsUpdated { stats } => {
+            // Preserve buffer_underruns — nothing increments it today,
+            // but if/when it gets wired up, the audio task's roll-up
+            // doesn't know about it.
+            let preserved_underruns = s.audio.stats.buffer_underruns;
+            s.audio.stats = stats;
+            s.audio.stats.buffer_underruns = preserved_underruns;
+        }
+        VoiceEvent::DevicesEnumerated { input, output } => {
+            s.audio.input_devices = input;
+            s.audio.output_devices = output;
+        }
+        VoiceEvent::SelectedDeviceChanged { kind, id } => match kind {
+            crate::domain_events::DeviceKind::Input => s.audio.selected_input = id,
+            crate::domain_events::DeviceKind::Output => s.audio.selected_output = id,
+        },
+        VoiceEvent::VoiceModeChanged { mode } => {
+            s.audio.voice_mode = mode;
+        }
+        VoiceEvent::AudioSettingsChanged { settings } => {
+            s.audio.settings = settings;
+        }
+        VoiceEvent::TxPipelineChanged { config } => {
+            s.audio.tx_pipeline = config;
+        }
+        VoiceEvent::RxPipelineDefaultsChanged { config } => {
+            s.audio.rx_pipeline_defaults = config;
+        }
+        VoiceEvent::UserRxConfigChanged { user_id, config } => {
+            s.audio.per_user_rx.insert(user_id, config);
+        }
+        VoiceEvent::UserRxOverrideCleared { user_id } => {
+            s.audio.per_user_rx.remove(&user_id);
+        }
+    }
+    drop(s);
+    if !suppress_repaint {
+        repaint();
     }
 }
 

@@ -35,7 +35,7 @@ use rumble_protocol::{
     proto::{GroupInfo, RoomAclEntry, RoomInfo, User},
 };
 
-use crate::events::{AudioDeviceInfo, AudioStats, ChatMessage, PendingCertificate, VoiceMode};
+use crate::events::{AudioDeviceInfo, AudioSettings, AudioStats, ChatMessage, PendingCertificate, VoiceMode};
 
 /// Capacity used for every `broadcast::channel` in the backend.
 /// 1024 is generous enough that the projection task — which is the
@@ -147,6 +147,12 @@ pub enum VoiceEvent {
 
     /// Voice activation mode toggled between PushToTalk and Continuous.
     VoiceModeChanged { mode: VoiceMode },
+
+    /// Opus encoder / jitter-buffer settings changed (bitrate, complexity,
+    /// FEC, jitter delay, etc.). The projection mirrors this into
+    /// `state.audio.settings`; the audio task already applied it to its
+    /// live encoder before emitting.
+    AudioSettingsChanged { settings: AudioSettings },
 
     /// TX (microphone) pipeline configuration changed.
     TxPipelineChanged { config: PipelineConfig },
