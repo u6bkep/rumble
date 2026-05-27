@@ -110,6 +110,11 @@ pub enum BackendEvent {
 /// via `state()` and sends commands via `send()`.
 pub struct BackendHandle<P: Platform> {
     /// Shared state that the UI reads.
+    ///
+    /// Phase 2 (in progress): the [`projection`][crate::projection]
+    /// task will become the sole writer. Today the connection and
+    /// audio tasks still mutate this directly; the projection task is
+    /// wired up as a logging stub. See `projection.rs` module docs.
     state: Arc<RwLock<State>>,
     /// Channel to send commands to the connection task.
     command_tx: mpsc::UnboundedSender<Command>,
@@ -121,6 +126,11 @@ pub struct BackendHandle<P: Platform> {
     /// to enumerate / cancel / locate transfers without going
     /// through the command channel.
     file_transfer: Arc<RwLock<Option<Arc<dyn FileTransferPlugin>>>>,
+    /// Typed per-domain event channels. The connection and audio
+    /// tasks emit into the senders held here; subscribers (the
+    /// projection task plus any UI consumer via
+    /// `subscribe_*`) hold receivers. See [`crate::domain_events`].
+    bus: crate::projection::EventBus,
     /// Background thread running the tokio runtime for connection task.
     /// Held in an `Option` so `Drop` can `take()` and `join()` it after
     /// signalling the connection task to send a graceful disconnect.
@@ -276,6 +286,14 @@ impl<P: Platform> BackendHandle<P> {
         let state = Arc::new(RwLock::new(state));
         let file_transfer: Arc<RwLock<Option<Arc<dyn FileTransferPlugin>>>> = Arc::new(RwLock::new(None));
 
+        // Typed per-domain event channels. The connection and audio
+        // tasks emit into the senders held here; the projection task
+        // (spawned below) subscribes to all of them and — once the
+        // phase-2 conversion lands — becomes the sole writer of
+        // `State`. External subscribers attach via the
+        // `subscribe_*` methods on `BackendHandle`.
+        let bus = crate::projection::EventBus::new();
+
         // Spawn the audio task (runs on its own thread)
         let audio_task = spawn_audio_task::<P>(AudioTaskConfig {
             state: state.clone(),
@@ -292,12 +310,27 @@ impl<P: Platform> BackendHandle<P> {
         let command_tx_for_task = command_tx.clone();
         let file_transfer_for_task = file_transfer.clone();
         let event_tx_for_task = event_tx.clone();
+        let bus_for_task = bus.clone();
+        let bus_for_projection = bus.clone();
+        let state_for_projection = state.clone();
+        let repaint_for_projection = repaint_callback.clone();
 
-        // Spawn background thread with tokio runtime for connection task
+        // Spawn background thread with tokio runtime for connection task.
+        // The projection task is spawned on this same runtime so it
+        // can subscribe to the broadcast channels in scope.
         let key_signer_for_task = key_signer.clone();
         let runtime_thread = std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("create tokio runtime");
             rt.block_on(async move {
+                // Projection task: subscribes to every domain channel
+                // and (phase 2) maintains `State`. Today it's a logging
+                // stub; the wiring is what we need in place to flip the
+                // writers in a follow-up commit.
+                let _projection_handle = crate::projection::spawn_projection_task(
+                    state_for_projection,
+                    repaint_for_projection,
+                    &bus_for_projection,
+                );
                 run_connection_task::<P>(
                     command_rx,
                     command_tx_for_task,
@@ -308,6 +341,7 @@ impl<P: Platform> BackendHandle<P> {
                     audio_task_for_connection,
                     file_transfer_for_task,
                     event_tx_for_task,
+                    bus_for_task,
                 )
                 .await;
             });
@@ -318,6 +352,7 @@ impl<P: Platform> BackendHandle<P> {
             command_tx,
             audio_task,
             file_transfer,
+            bus,
             runtime_thread: Some(runtime_thread),
             _connect_config: connect_config,
             sfx_library: crate::sfx::SfxLibrary::new(),
@@ -325,6 +360,63 @@ impl<P: Platform> BackendHandle<P> {
             event_rx: std::sync::Mutex::new(Some(event_rx)),
             _phantom: std::marker::PhantomData,
         }
+    }
+
+    // -------------------------------------------------------------
+    // Typed event subscriptions
+    // -------------------------------------------------------------
+    //
+    // Each `subscribe_*` returns a fresh `broadcast::Receiver` that
+    // starts seeing events emitted *after* the call (broadcast
+    // channels don't replay history to late subscribers). For
+    // initial state, read [`Self::state`] once; for incremental
+    // updates, subscribe and consume the receiver.
+    //
+    // Per-domain channels mean a consumer that cares only about
+    // chat (or only about voice transitions, etc.) doesn't get
+    // woken up for unrelated events.
+
+    /// Subscribe to chat events ([`ChatEvent`][crate::ChatEvent]).
+    ///
+    /// Consumers: chat renderer's "what's new since last frame" diff,
+    /// auto-download evaluator, DM notification toasts.
+    pub fn subscribe_chat(&self) -> tokio::sync::broadcast::Receiver<crate::ChatEvent> {
+        self.bus.chat.subscribe()
+    }
+
+    /// Subscribe to voice events ([`VoiceEvent`][crate::VoiceEvent]).
+    ///
+    /// Consumers: SFX pump (mute/unmute/talking transitions), VU meter
+    /// (input level), stats display.
+    pub fn subscribe_voice(&self) -> tokio::sync::broadcast::Receiver<crate::VoiceEvent> {
+        self.bus.voice.subscribe()
+    }
+
+    /// Subscribe to connection lifecycle events
+    /// ([`ConnectionEvent`][crate::ConnectionEvent]).
+    ///
+    /// Consumers: connect/disconnect SFX, reconnect-backoff logic,
+    /// permission-denied toast, kick dialog.
+    pub fn subscribe_connection(&self) -> tokio::sync::broadcast::Receiver<crate::ConnectionEvent> {
+        self.bus.connection.subscribe()
+    }
+
+    /// Subscribe to room/server-state events
+    /// ([`RoomEvent`][crate::RoomEvent]).
+    ///
+    /// Consumers: user-joined-your-room SFX cue, room-list refresh
+    /// triggers, ACL-changed permission recompute.
+    pub fn subscribe_room(&self) -> tokio::sync::broadcast::Receiver<crate::RoomEvent> {
+        self.bus.room.subscribe()
+    }
+
+    /// Subscribe to file-transfer lifecycle events
+    /// ([`TransferEvent`][crate::TransferEvent]).
+    ///
+    /// Consumers: media cache (decode-on-completion), chat card
+    /// re-render trigger, auto-download accept.
+    pub fn subscribe_transfer(&self) -> tokio::sync::broadcast::Receiver<crate::TransferEvent> {
+        self.bus.transfer.subscribe()
     }
 
     /// Get the current state for rendering.
@@ -624,6 +716,10 @@ async fn run_connection_task<P: Platform>(
     audio_task: AudioTaskHandle,
     file_transfer_slot: Arc<RwLock<Option<Arc<dyn FileTransferPlugin>>>>,
     event_tx: mpsc::UnboundedSender<BackendEvent>,
+    // Phase 1: bus is wired through but the task doesn't emit yet.
+    // Phase 2 will replace every `write_state(&state)` site here
+    // with a `bus.<domain>.send(...)` call.
+    _bus: crate::projection::EventBus,
 ) {
     // Connection state
     let mut transport: Option<P::Transport> = None;

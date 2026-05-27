@@ -83,6 +83,20 @@ pub mod events;
 // build breaks when items in `events` are renamed/moved.
 pub use events::*;
 
+// Typed per-domain event channels emitted by the connection/audio
+// tasks. Consumed by `projection::spawn_projection_task` (the sole
+// `State` writer, phase 2) and by external subscribers via
+// `BackendHandle::subscribe_*` methods.
+pub mod domain_events;
+pub use domain_events::{
+    ChatEvent, ConnectionEvent, DeviceKind, EVENT_BROADCAST_CAPACITY, RoomEvent, TransferEvent, VoiceEvent,
+};
+
+// Projection task: consumes every domain channel and (phase 2) is
+// the sole writer of `Arc<RwLock<State>>`.
+pub mod projection;
+pub use projection::{EventBus, spawn_projection_task};
+
 // Backend handle (generic over Platform)
 pub mod handle;
 pub use handle::{BackendEvent, NotificationLevel};
