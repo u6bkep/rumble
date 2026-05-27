@@ -56,8 +56,8 @@ pub struct PortalHotkeyBackend {
     /// Kept around so the listener task's sender stays alive even when
     /// the UI hasn't drained recently.
     _event_tx: mpsc::UnboundedSender<HotkeyEvent>,
-    shortcuts: Arc<GlobalShortcuts<'static>>,
-    session: Arc<Session<'static, GlobalShortcuts<'static>>>,
+    shortcuts: Arc<GlobalShortcuts>,
+    session: Arc<Session<GlobalShortcuts>>,
     state: Arc<RwLock<PortalState>>,
     runtime_handle: tokio::runtime::Handle,
     /// True once we've successfully bound at least one shortcut. Drives
@@ -81,7 +81,7 @@ impl PortalHotkeyBackend {
             }
         };
 
-        let session = match shortcuts.create_session().await {
+        let session = match shortcuts.create_session(Default::default()).await {
             Ok(s) => Arc::new(s),
             Err(e) => {
                 tracing::warn!("Failed to create GlobalShortcuts session: {e}");
@@ -150,7 +150,7 @@ impl PortalHotkeyBackend {
                 return;
             }
 
-            match shortcuts.bind_shortcuts(&session, &definitions, None).await {
+            match shortcuts.bind_shortcuts(&session, &definitions, None, Default::default()).await {
                 Ok(request) => match request.response() {
                     Ok(response) => {
                         let bound = response.shortcuts();
@@ -179,7 +179,7 @@ impl PortalHotkeyBackend {
     /// Listen for Activated / Deactivated / ShortcutsChanged signals
     /// and translate them into `HotkeyEvent`s for the UI thread.
     async fn listen_for_signals(
-        shortcuts: Arc<GlobalShortcuts<'static>>,
+        shortcuts: Arc<GlobalShortcuts>,
         state: Arc<RwLock<PortalState>>,
         event_tx: mpsc::UnboundedSender<HotkeyEvent>,
     ) {
@@ -344,7 +344,7 @@ impl PortalHotkeyBackend {
         let shortcuts = Arc::clone(&self.shortcuts);
         let session = Arc::clone(&self.session);
         self.runtime_handle.spawn(async move {
-            match shortcuts.configure_shortcuts(&session, None, None).await {
+            match shortcuts.configure_shortcuts(&session, None, Default::default()).await {
                 Ok(()) => return,
                 Err(e) => {
                     tracing::info!("ConfigureShortcuts unavailable ({e}); launching DE shortcut settings");

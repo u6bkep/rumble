@@ -35,7 +35,6 @@ serde_json = "1.0"
 directories = "6.0"
 ed25519-dalek = { workspace = true }
 rand = { workspace = true }
-rand_core = { workspace = true }
 hex = "0.4"
 # Crypto + SSH agent crates moved to rumble-desktop-shell::identity
 # (the encrypted-keys + ssh-agent features). egui consumes them via

@@ -24,7 +24,7 @@ wgpu = { workspace = true }
 [build-dependencies]
 pkg-config = "0.3"
 ureq = { version = "3", default-features = false, features = ["rustls"] }
-sevenz-rust2 = "0.18"
+sevenz-rust2 = "0.21"
 sha2 = { workspace = true }
 
 [dev-dependencies]

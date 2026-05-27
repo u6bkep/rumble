@@ -28,7 +28,6 @@ ed25519-dalek = { workspace = true }
 rand = { workspace = true }
 dashmap = { workspace = true }
 bytes = { workspace = true }
-hex = { workspace = true }
 
 [build-dependencies]
 prost-build = { workspace = true }

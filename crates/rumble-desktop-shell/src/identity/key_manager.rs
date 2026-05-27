@@ -533,7 +533,7 @@ impl SshAgentClient {
 
         let mut ed25519_keys = Vec::new();
         for id in identities {
-            if let KeyData::Ed25519(ed_key) = &id.pubkey {
+            if let KeyData::Ed25519(ed_key) = id.credential.key_data() {
                 let public_key: [u8; 32] = ed_key.0;
                 ed25519_keys.push(KeyInfo::from_public_key(public_key, id.comment.clone()));
             }
@@ -556,7 +556,7 @@ impl SshAgentClient {
         let identity = identities
             .into_iter()
             .find(|id| {
-                if let KeyData::Ed25519(ed_key) = &id.pubkey {
+                if let KeyData::Ed25519(ed_key) = id.credential.key_data() {
                     let public_key: [u8; 32] = ed_key.0;
                     compute_fingerprint(&public_key) == fingerprint
                 } else {
@@ -566,7 +566,7 @@ impl SshAgentClient {
             .ok_or_else(|| anyhow::anyhow!("Key with fingerprint {} not found in agent", fingerprint))?;
 
         let request = SignRequest {
-            pubkey: identity.pubkey.clone(),
+            credential: identity.credential.clone(),
             data: data.to_vec(),
             flags: 0,
         };
@@ -591,7 +591,7 @@ impl SshAgentClient {
     }
 
     pub async fn add_key(&mut self, signing_key: &SigningKey, comment: &str) -> anyhow::Result<()> {
-        use ssh_agent_lib::proto::{AddIdentity, Credential};
+        use ssh_agent_lib::proto::{AddIdentity, PrivateCredential};
         use ssh_key::{
             private::{Ed25519Keypair, KeypairData},
             public::Ed25519PublicKey,
@@ -605,7 +605,7 @@ impl SshAgentClient {
             private: ssh_key::private::Ed25519PrivateKey::from_bytes(&private_key_bytes),
         };
 
-        let credential = Credential::Key {
+        let credential = PrivateCredential::Key {
             privkey: KeypairData::Ed25519(ed25519_keypair),
             comment: comment.to_string(),
         };

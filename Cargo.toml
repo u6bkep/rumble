@@ -35,22 +35,21 @@ exclude = [
 # the workspace; bumping these is its own coordinated change.
 ed25519-dalek = { version = "3.0.0-pre.4", features = ["rand_core"] }
 rand = "0.10.0-rc.3"
-rand_core = "0.10.0-rc.3"
 
 # Aetna UI library — pinned by git rev to upstream computer-whisperer/aetna.
 # Override locally with `[patch."https://github.com/computer-whisperer/aetna"]`
 # (or `scripts/aetna-local.sh`) if iterating on aetna alongside rumble.
-aetna-core = { git = "https://github.com/computer-whisperer/aetna", rev = "ebc825ca731e859f67adf57a27a41855df70a6cd" }
-aetna-markdown = { git = "https://github.com/computer-whisperer/aetna", rev = "ebc825ca731e859f67adf57a27a41855df70a6cd" }
-aetna-wgpu = { git = "https://github.com/computer-whisperer/aetna", rev = "ebc825ca731e859f67adf57a27a41855df70a6cd" }
-aetna-winit-wgpu = { git = "https://github.com/computer-whisperer/aetna", rev = "ebc825ca731e859f67adf57a27a41855df70a6cd" }
+aetna-core = { git = "https://github.com/computer-whisperer/aetna", rev = "cc23e0ec91e11d52aed36704b8ea7dbd8d5a39f4" }
+aetna-markdown = { git = "https://github.com/computer-whisperer/aetna", rev = "cc23e0ec91e11d52aed36704b8ea7dbd8d5a39f4" }
+aetna-wgpu = { git = "https://github.com/computer-whisperer/aetna", rev = "cc23e0ec91e11d52aed36704b8ea7dbd8d5a39f4" }
+aetna-winit-wgpu = { git = "https://github.com/computer-whisperer/aetna", rev = "cc23e0ec91e11d52aed36704b8ea7dbd8d5a39f4" }
 
 # Shared third-party deps. Per-crate feature picks live at each consumer
 # so the workspace stays neutral about what each crate actually uses;
 # cargo unions feature sets across consumers regardless. Major-version
-# bumps that would ripple through the codebase (sha2 0.11, bincode 3,
-# toml 1, bytesize 2, bcrypt 0.19, global-hotkey 0.8) are intentionally
-# left at the older line — bump them in dedicated commits.
+# bumps that would ripple through the codebase are intentionally left
+# at the older line — bump them in dedicated commits. Currently held
+# back: bincode 3 (sled on-disk format compatibility).
 anyhow = "1"
 async-trait = "0.1"
 base64 = "0.22"
@@ -75,14 +74,13 @@ rustls = { version = "0.23", default-features = false }
 rustls-pemfile = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
-sha2 = "0.10"
+sha2 = "0.11"
 thiserror = "2"
 tokio = "1"
 tokio-util = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
-urlencoding = "2"
 uuid = { version = "1.19", features = ["v4"] }
 webpki-roots = "1"
 wgpu = "29"

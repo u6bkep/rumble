@@ -217,7 +217,11 @@ mod windows_fetch {
             }
             hasher.update(&buf[..n]);
         }
-        let actual = format!("{:x}", hasher.finalize());
+        let actual = hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
         if actual != expected {
             // Drop the bad archive so a subsequent build re-downloads
             // instead of looping forever on a poisoned cache.
