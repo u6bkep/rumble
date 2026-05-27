@@ -7,7 +7,7 @@ use std::{
     cell::Cell,
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::LazyLock,
+    sync::{Arc, LazyLock, Mutex},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -170,6 +170,14 @@ pub struct RumbleApp<B: UiBackend = crate::backend::NativeUiBackend> {
     /// The image bytes come from [`media_cache`].
     image_lightbox: Option<chat::Lightbox>,
 
+    /// Last laid-out size of the lightbox body, refreshed each frame by
+    /// the body's custom layout closure. Read at `+`/`-` click time so a
+    /// Fit→explicit-zoom transition can start from the actual fitted
+    /// scale. `Mutex` is unconditional because the layout closure is
+    /// `Fn(LayoutCtx) -> Vec<Rect>` — no `FnMut` allowed. Mirrors the
+    /// `room_rects` channel on [`RoomTreeState`].
+    lightbox_body_size: Arc<Mutex<Option<(f32, f32)>>>,
+
     /// Right-click context menu for a file card. `Some` while open;
     /// cleared by any menu action, the dismiss scrim, or Escape.
     file_context_menu: Option<chat::FileContextMenu>,
@@ -319,6 +327,7 @@ impl<B: UiBackend> RumbleApp<B> {
             auto_handled_offers: HashSet::new(),
             media_cache: crate::media_cache::MediaCache::new(runtime_handle_for_media_cache, initial_gif_autoplay),
             image_lightbox: None,
+            lightbox_body_size: Arc::new(Mutex::new(None)),
             file_context_menu: None,
             pending_save_as: None,
             pending_pick_download_dir: None,
@@ -527,7 +536,13 @@ impl<B: UiBackend> App for RumbleApp<B> {
         {
             let playback = self.media_cache.gif_playback_for(&lightbox_state.transfer_id);
             let gpu = self.media_cache.animated_gpu_for(&lightbox_state.transfer_id);
-            Some(chat::render_lightbox(lightbox_state, cached, playback, gpu))
+            Some(chat::render_lightbox(
+                lightbox_state,
+                self.lightbox_body_size.clone(),
+                cached,
+                playback,
+                gpu,
+            ))
         } else {
             None
         };
@@ -982,13 +997,14 @@ impl<B: UiBackend> App for RumbleApp<B> {
             let playback = self.media_cache.gif_playback_for(&lightbox.transfer_id);
             Some(cached.current_frame_size(playback))
         });
+        let lightbox_body_size = self.lightbox_body_size.lock().ok().and_then(|s| *s);
         if let Some(lightbox) = self.image_lightbox.as_mut() {
             if event.is_click_or_activate(chat::KEY_LIGHTBOX_ZOOM_IN) {
-                lightbox.zoom_in(lightbox_image_size);
+                lightbox.zoom_in(lightbox_body_size, lightbox_image_size);
                 return;
             }
             if event.is_click_or_activate(chat::KEY_LIGHTBOX_ZOOM_OUT) {
-                lightbox.zoom_out(lightbox_image_size);
+                lightbox.zoom_out(lightbox_body_size, lightbox_image_size);
                 return;
             }
             if event.is_click_or_activate(chat::KEY_LIGHTBOX_ZOOM_FIT) {
@@ -999,10 +1015,14 @@ impl<B: UiBackend> App for RumbleApp<B> {
                 lightbox.natural_size();
                 return;
             }
-            // Drag-to-pan on the image surface. Disabled at zoom <= 1.0
-            // since there's nothing to pan to — the image is centred
-            // and the body already shows everything.
-            if event.route() == Some(chat::KEY_LIGHTBOX_IMAGE) && !lightbox.fit_to_window && lightbox.zoom > 1.0 {
+            // Drag-to-pan on the image surface. Gated on "scaled image
+            // overflows the body" rather than `zoom > 1.0`: a large
+            // image at <100% can still extend past the viewport, and
+            // the user expects to be able to pan it in that case.
+            let overflows = lightbox_image_size.is_some_and(|(w, h)| {
+                lightbox.image_overflows_body((w as f32, h as f32), lightbox_body_size)
+            });
+            if event.route() == Some(chat::KEY_LIGHTBOX_IMAGE) && overflows {
                 match event.kind {
                     UiEventKind::PointerDown => {
                         if let Some(pos) = event.pointer {
@@ -1192,13 +1212,14 @@ impl<B: UiBackend> App for RumbleApp<B> {
                 let playback = self.media_cache.gif_playback_for(&lightbox.transfer_id);
                 Some(cached.current_frame_size(playback))
             });
+            let body_size = self.lightbox_body_size.lock().ok().and_then(|s| *s);
             if let Some(lightbox) = self.image_lightbox.as_mut()
                 && let Some((_, dy)) = event.wheel_delta
             {
                 if dy < 0.0 {
-                    lightbox.zoom_in(image_size);
+                    lightbox.zoom_in(body_size, image_size);
                 } else if dy > 0.0 {
-                    lightbox.zoom_out(image_size);
+                    lightbox.zoom_out(body_size, image_size);
                 }
             }
             return true;
@@ -1857,6 +1878,9 @@ impl<B: UiBackend> RumbleApp<B> {
     /// away.
     fn close_lightbox(&mut self) {
         self.image_lightbox = None;
+        if let Ok(mut size) = self.lightbox_body_size.lock() {
+            *size = None;
+        }
         self.media_cache.close_lightbox();
     }
 

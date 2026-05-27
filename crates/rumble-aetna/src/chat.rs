@@ -1375,10 +1375,6 @@ pub struct Lightbox {
     /// Pan offset in logical pixels. `(0, 0)` keeps the (scaled) image
     /// centred in the body.
     pub pan: (f32, f32),
-    /// Last laid-out body size in logical pixels. Written during the
-    /// lightbox body's layout pass and read by Fit -> explicit zoom
-    /// transitions so `+`/`-` can start from the actual fitted scale.
-    pub body_size: Arc<Mutex<Option<(f32, f32)>>>,
     /// Ephemeral pan-drag state, cleared on `PointerUp`. Captured at
     /// `PointerDown`: the pointer position + the pan value at that
     /// moment, so subsequent `Drag` events can compute a delta without
@@ -1394,7 +1390,6 @@ impl Lightbox {
             zoom: 1.0,
             fit_to_window: true,
             pan: (0.0, 0.0),
-            body_size: Arc::new(Mutex::new(None)),
             drag: PanDrag::default(),
         }
     }
@@ -1410,17 +1405,17 @@ impl Lightbox {
         self.pan = (0.0, 0.0);
     }
 
-    pub fn zoom_in(&mut self, image_size: Option<(u32, u32)>) {
+    pub fn zoom_in(&mut self, body_size: Option<(f32, f32)>, image_size: Option<(u32, u32)>) {
         if self.fit_to_window {
-            self.set_zoom(self.fit_step_zoom(image_size, ZoomDirection::In));
+            self.set_zoom(fit_step_zoom(body_size, image_size, ZoomDirection::In));
             return;
         }
         self.set_zoom(next_zoom_step(self.zoom, ZoomDirection::In));
     }
 
-    pub fn zoom_out(&mut self, image_size: Option<(u32, u32)>) {
+    pub fn zoom_out(&mut self, body_size: Option<(f32, f32)>, image_size: Option<(u32, u32)>) {
         if self.fit_to_window {
-            self.set_zoom(self.fit_step_zoom(image_size, ZoomDirection::Out));
+            self.set_zoom(fit_step_zoom(body_size, image_size, ZoomDirection::Out));
             return;
         }
         self.set_zoom(next_zoom_step(self.zoom, ZoomDirection::Out));
@@ -1436,15 +1431,36 @@ impl Lightbox {
         }
     }
 
-    fn fit_step_zoom(&self, image_size: Option<(u32, u32)>, direction: ZoomDirection) -> f32 {
-        fit_scale(self.body_size(), image_size)
-            .map(|scale| next_zoom_step(scale, direction))
-            .unwrap_or_else(|| next_zoom_step(1.0, direction))
+    /// True when the scaled image (`natural * zoom`) exceeds the body
+    /// in either axis — i.e. there's content outside the viewport that
+    /// the user might want to bring into view. Drives both pan-drag
+    /// enablement and the grab cursor: when the whole image fits, there
+    /// is nothing to pan to.
+    ///
+    /// Always false in Fit mode (Contain guarantees the image fits) and
+    /// when the body hasn't been laid out yet (`body == None`, only on
+    /// the very first frame after open).
+    pub fn image_overflows_body(&self, natural: (f32, f32), body: Option<(f32, f32)>) -> bool {
+        if self.fit_to_window {
+            return false;
+        }
+        let Some((body_w, body_h)) = body else {
+            return false;
+        };
+        let scaled_w = natural.0 * self.zoom;
+        let scaled_h = natural.1 * self.zoom;
+        scaled_w > body_w || scaled_h > body_h
     }
+}
 
-    fn body_size(&self) -> Option<(f32, f32)> {
-        self.body_size.lock().ok().and_then(|size| *size)
-    }
+fn fit_step_zoom(
+    body_size: Option<(f32, f32)>,
+    image_size: Option<(u32, u32)>,
+    direction: ZoomDirection,
+) -> f32 {
+    fit_scale(body_size, image_size)
+        .map(|scale| next_zoom_step(scale, direction))
+        .unwrap_or_else(|| next_zoom_step(1.0, direction))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1500,12 +1516,13 @@ pub struct PanDrag {
 /// preview's playhead.
 pub fn render_lightbox(
     lightbox: &Lightbox,
+    body_size_sink: Arc<Mutex<Option<(f32, f32)>>>,
     cached: &CachedImage,
     playback: Option<&GifPlayback>,
     gpu: Option<&AnimatedGpu>,
 ) -> El {
     let header = lightbox_header(lightbox);
-    let body = lightbox_body(lightbox, cached, playback, gpu);
+    let body = lightbox_body(lightbox, body_size_sink, cached, playback, gpu);
 
     let panel = column([header, body])
         .style_profile(StyleProfile::Surface)
@@ -1580,6 +1597,7 @@ fn lightbox_header(lightbox: &Lightbox) -> El {
 
 fn lightbox_body(
     lightbox: &Lightbox,
+    body_size_sink: Arc<Mutex<Option<(f32, f32)>>>,
     cached: &CachedImage,
     playback: Option<&GifPlayback>,
     gpu: Option<&AnimatedGpu>,
@@ -1589,7 +1607,10 @@ fn lightbox_body(
         (w as f32, h as f32)
     };
     let fit_to_window = lightbox.fit_to_window;
-    let body_size = lightbox.body_size.clone();
+    // Last frame's laid-out body size, used to decide the grab cursor.
+    // One frame stale (the closure below writes this frame's size); a
+    // cursor flicker on the very first frame after resize is harmless.
+    let prev_body_size = body_size_sink.lock().ok().and_then(|s| *s);
 
     // In Fit mode the image/surface fills the body and `Contain`
     // computes the runtime scale from the available window. In explicit
@@ -1668,7 +1689,12 @@ fn lightbox_body(
     stack([inner])
         .key(KEY_LIGHTBOX_IMAGE)
         .layout(move |ctx: LayoutCtx| {
-            if let Ok(mut size) = body_size.lock() {
+            // Stash the body's laid-out size for the App so a Fit→explicit-zoom
+            // transition (`+`/`-` while in Fit mode) can step from the actual
+            // fitted scale instead of from `1.0`. Out-of-band by necessity:
+            // `Lightbox` lives in App state, not in the El tree, so its event
+            // handlers have no other path to a post-layout rect today.
+            if let Ok(mut size) = body_size_sink.lock() {
                 *size = Some((ctx.container.w, ctx.container.h));
             }
 
@@ -1685,7 +1711,7 @@ fn lightbox_body(
         .radius(tokens::RADIUS_MD)
         .cursor(if lightbox.drag.anchor.is_some() {
             Cursor::Grabbing
-        } else if !lightbox.fit_to_window && lightbox.zoom > 1.0 {
+        } else if lightbox.image_overflows_body((natural_w, natural_h), prev_body_size) {
             Cursor::Grab
         } else {
             Cursor::Default
@@ -1848,5 +1874,34 @@ mod tests {
         assert!((uneven_fit - 0.37).abs() < 0.001);
         assert!((next_zoom_step(uneven_fit, ZoomDirection::In) - 0.4).abs() < 0.001);
         assert_eq!(next_zoom_step(uneven_fit, ZoomDirection::Out), LIGHTBOX_ZOOM_MIN);
+    }
+
+    #[test]
+    fn pan_enabled_when_scaled_image_overflows_body() {
+        let body = Some((800.0, 600.0));
+        let huge = (4000.0, 3000.0);
+        let small = (200.0, 150.0);
+
+        // Fit mode is always non-overflowing (Contain clamps to body).
+        let lb = Lightbox {
+            transfer_id: "t".into(),
+            name: "n".into(),
+            zoom: 1.0,
+            fit_to_window: true,
+            pan: (0.0, 0.0),
+            drag: PanDrag::default(),
+        };
+        assert!(!lb.image_overflows_body(huge, body));
+
+        // Large image at <100%: scaled is 4000*0.3 = 1200 > 800 → pannable.
+        let lb = Lightbox { fit_to_window: false, zoom: 0.3, ..lb };
+        assert!(lb.image_overflows_body(huge, body));
+
+        // Small image at 200% still fits: 200*2 = 400 < 800 → not pannable.
+        let lb = Lightbox { zoom: 2.0, ..lb };
+        assert!(!lb.image_overflows_body(small, body));
+
+        // Body unknown → no pan (matches first-frame behavior).
+        assert!(!lb.image_overflows_body(huge, None));
     }
 }
