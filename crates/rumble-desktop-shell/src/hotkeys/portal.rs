@@ -150,7 +150,10 @@ impl PortalHotkeyBackend {
                 return;
             }
 
-            match shortcuts.bind_shortcuts(&session, &definitions, None, Default::default()).await {
+            match shortcuts
+                .bind_shortcuts(&session, &definitions, None, Default::default())
+                .await
+            {
                 Ok(request) => match request.response() {
                     Ok(response) => {
                         let bound = response.shortcuts();
