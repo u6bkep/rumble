@@ -207,8 +207,72 @@ fn is_closed<T: Clone>(rx: &broadcast::Receiver<T>) -> bool {
 // into the appropriate `State` field mutation here.
 // =============================================================================
 
-fn apply_chat(_state: &Arc<RwLock<State>>, ev: ChatEvent, _repaint: &Arc<dyn Fn() + Send + Sync>) {
-    debug!(target: "rumble_client::projection", "chat event (stub, not yet applied): {:?}", ev);
+/// Trim the chat log to the recent-message cap. The cap is the same
+/// 100-entry sliding window the connection task used to enforce
+/// inline at every push site. Centralised here so we only have to
+/// reason about it in one place.
+const CHAT_MESSAGE_CAP: usize = 100;
+
+fn apply_chat(state: &Arc<RwLock<State>>, ev: ChatEvent, repaint: &Arc<dyn Fn() + Send + Sync>) {
+    let mut s = match state.write() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    match ev {
+        ChatEvent::MessageAdded { msg } => {
+            // Dedup by id covers history-sync re-arrival of a message we
+            // already have (including the sender's SenderMirror coming
+            // back via someone else's history share).
+            if s.chat_messages.iter().any(|m| m.id == msg.id) {
+                return;
+            }
+            s.chat_messages.push(msg);
+        }
+        ChatEvent::SystemNotice { text } => {
+            s.chat_messages.push(crate::events::ChatMessage {
+                id: uuid::Uuid::new_v4().into_bytes(),
+                sender: String::new(),
+                sender_id: None,
+                text,
+                timestamp: std::time::SystemTime::now(),
+                kind: Default::default(),
+                attachment: None,
+                visibility: crate::events::ChatMessageVisibility::System,
+            });
+        }
+        ChatEvent::SenderDraftInserted { msg } | ChatEvent::SenderMirrorInserted { msg } => {
+            // Draft and Mirror twins share an id intentionally
+            // (sender's own outgoing share has a local card AND a
+            // history-sync twin). The render/history filters tell
+            // them apart by visibility; no dedup here.
+            s.chat_messages.push(msg);
+        }
+        ChatEvent::HistoryMerged { msgs } => {
+            // Caller (connection task) pre-filtered against existing
+            // ids; we still re-check defensively because between the
+            // filter snapshot and our apply, another event may have
+            // added an entry that collides.
+            let existing: std::collections::HashSet<[u8; 16]> = s.chat_messages.iter().map(|m| m.id).collect();
+            let mut added = false;
+            for msg in msgs {
+                if !existing.contains(&msg.id) {
+                    s.chat_messages.push(msg);
+                    added = true;
+                }
+            }
+            if added {
+                s.chat_messages.sort_by_key(|m| m.timestamp);
+            }
+        }
+    }
+    // Cap retention. Same 100-entry sliding window the connection
+    // task used to enforce at every push site, now centralised.
+    let len = s.chat_messages.len();
+    if len > CHAT_MESSAGE_CAP {
+        s.chat_messages.drain(0..len - CHAT_MESSAGE_CAP);
+    }
+    drop(s);
+    repaint();
 }
 
 fn apply_voice(_state: &Arc<RwLock<State>>, ev: VoiceEvent, _repaint: &Arc<dyn Fn() + Send + Sync>) {

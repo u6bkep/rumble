@@ -716,10 +716,11 @@ async fn run_connection_task<P: Platform>(
     audio_task: AudioTaskHandle,
     file_transfer_slot: Arc<RwLock<Option<Arc<dyn FileTransferPlugin>>>>,
     event_tx: mpsc::UnboundedSender<BackendEvent>,
-    // Phase 1: bus is wired through but the task doesn't emit yet.
-    // Phase 2 will replace every `write_state(&state)` site here
-    // with a `bus.<domain>.send(...)` call.
-    _bus: crate::projection::EventBus,
+    // Phase 2 in progress: chat sites have been converted to emit
+    // `bus.chat.send(...)`; other domains (connection, room, voice)
+    // still mutate `state` directly and will be converted in
+    // follow-up commits.
+    bus: crate::projection::EventBus,
 ) {
     // Connection state
     let mut transport: Option<P::Transport> = None;
@@ -789,8 +790,8 @@ async fn run_connection_task<P: Platform>(
                         // late peers receive it. The SenderDraft twin (same
                         // id) keeps showing the live transfer state on the
                         // sender's screen.
-                        if let Ok(mut s) = state.write() {
-                            s.chat_messages.push(crate::events::ChatMessage {
+                        let _ = bus.chat.send(crate::ChatEvent::SenderMirrorInserted {
+                            msg: crate::events::ChatMessage {
                                 id: message_id,
                                 sender,
                                 sender_id: None,
@@ -799,13 +800,8 @@ async fn run_connection_task<P: Platform>(
                                 kind: Default::default(),
                                 attachment: Some(attachment),
                                 visibility: crate::events::ChatMessageVisibility::SenderMirror,
-                            });
-                            if s.chat_messages.len() > 100 {
-                                s.chat_messages.remove(0);
-                            }
-                            drop(s);
-                            repaint();
-                        }
+                            },
+                        });
                     }
                 }
             }
@@ -914,8 +910,9 @@ async fn run_connection_task<P: Platform>(
                                 let command_tx_clone = command_tx.clone();
                                 let ft_for_recv = ft_arc;
                                 let ft_slot_for_recv = file_transfer_slot.clone();
+                                let bus_for_recv = bus.clone();
                                 tokio::spawn(async move {
-                                    run_receiver_task(recv_stream, state_clone, repaint_clone, audio_task_clone, command_tx_clone, ft_for_recv, ft_slot_for_recv).await;
+                                    run_receiver_task(recv_stream, state_clone, repaint_clone, audio_task_clone, command_tx_clone, ft_for_recv, ft_slot_for_recv, bus_for_recv).await;
                                 });
 
                                 // Spawn stream dispatch task for server-initiated bi-directional streams
@@ -1077,8 +1074,9 @@ async fn run_connection_task<P: Platform>(
                                     let command_tx_clone = command_tx.clone();
                                     let ft_for_recv = ft_arc;
                                     let ft_slot_for_recv = file_transfer_slot.clone();
+                                    let bus_for_recv = bus.clone();
                                     tokio::spawn(async move {
-                                        run_receiver_task(recv_stream, state_clone, repaint_clone, audio_task_clone, command_tx_clone, ft_for_recv, ft_slot_for_recv).await;
+                                        run_receiver_task(recv_stream, state_clone, repaint_clone, audio_task_clone, command_tx_clone, ft_for_recv, ft_slot_for_recv, bus_for_recv).await;
                                     });
 
                                     // Spawn stream dispatch task for server-initiated bi-directional streams
@@ -1265,24 +1263,20 @@ async fn run_connection_task<P: Platform>(
                                 error!("Failed to send ChatMessage: {}", e);
                             }
                             // Insert locally — server no longer echoes chat
-                            // back to the sender.
-                            let mut s = write_state(&state);
-                            let my_uid = s.my_user_id;
-                            s.chat_messages.push(crate::events::ChatMessage {
-                                id: message_id,
-                                sender: client_name.clone(),
-                                sender_id: my_uid,
-                                text,
-                                timestamp,
-                                kind: crate::events::ChatMessageKind::Room,
-                                attachment: None,
-                                visibility: crate::events::ChatMessageVisibility::Normal,
+                            // back to the sender. Projection applies the push.
+                            let my_uid = read_state(&state).my_user_id;
+                            let _ = bus.chat.send(crate::ChatEvent::MessageAdded {
+                                msg: crate::events::ChatMessage {
+                                    id: message_id,
+                                    sender: client_name.clone(),
+                                    sender_id: my_uid,
+                                    text,
+                                    timestamp,
+                                    kind: crate::events::ChatMessageKind::Room,
+                                    attachment: None,
+                                    visibility: crate::events::ChatMessageVisibility::Normal,
+                                },
                             });
-                            if s.chat_messages.len() > 100 {
-                                s.chat_messages.remove(0);
-                            }
-                            drop(s);
-                            repaint();
                         }
                     }
 
@@ -1308,25 +1302,19 @@ async fn run_connection_task<P: Platform>(
                             if let Err(e) = send_envelope(t, &env).await {
                                 error!("Failed to send tree ChatMessage: {}", e);
                             }
-                            // Insert locally — server no longer echoes chat
-                            // back to the sender.
-                            let mut s = write_state(&state);
-                            let my_uid = s.my_user_id;
-                            s.chat_messages.push(crate::events::ChatMessage {
-                                id: message_id,
-                                sender: client_name.clone(),
-                                sender_id: my_uid,
-                                text,
-                                timestamp,
-                                kind: crate::events::ChatMessageKind::Tree,
-                                attachment: None,
-                                visibility: crate::events::ChatMessageVisibility::Normal,
+                            let my_uid = read_state(&state).my_user_id;
+                            let _ = bus.chat.send(crate::ChatEvent::MessageAdded {
+                                msg: crate::events::ChatMessage {
+                                    id: message_id,
+                                    sender: client_name.clone(),
+                                    sender_id: my_uid,
+                                    text,
+                                    timestamp,
+                                    kind: crate::events::ChatMessageKind::Tree,
+                                    attachment: None,
+                                    visibility: crate::events::ChatMessageVisibility::Normal,
+                                },
                             });
-                            if s.chat_messages.len() > 100 {
-                                s.chat_messages.remove(0);
-                            }
-                            drop(s);
-                            repaint();
                         }
                     }
 
@@ -1350,48 +1338,27 @@ async fn run_connection_task<P: Platform>(
                             if let Err(e) = send_envelope(t, &env).await {
                                 error!("Failed to send DirectMessage: {}", e);
                             }
-                            // Add local message so the sender sees their own DM
-                            let mut s = write_state(&state);
-                            let my_uid = s.my_user_id;
-                            s.chat_messages.push(crate::events::ChatMessage {
-                                id: message_id,
-                                sender: client_name.clone(),
-                                sender_id: my_uid,
-                                text,
-                                timestamp,
-                                kind: crate::events::ChatMessageKind::DirectMessage {
-                                    other_user_id: target_user_id,
-                                    other_username: target_username,
+                            let my_uid = read_state(&state).my_user_id;
+                            let _ = bus.chat.send(crate::ChatEvent::MessageAdded {
+                                msg: crate::events::ChatMessage {
+                                    id: message_id,
+                                    sender: client_name.clone(),
+                                    sender_id: my_uid,
+                                    text,
+                                    timestamp,
+                                    kind: crate::events::ChatMessageKind::DirectMessage {
+                                        other_user_id: target_user_id,
+                                        other_username: target_username,
+                                    },
+                                    attachment: None,
+                                    visibility: crate::events::ChatMessageVisibility::Normal,
                                 },
-                                attachment: None,
-                                visibility: crate::events::ChatMessageVisibility::Normal,
                             });
-                            if s.chat_messages.len() > 100 {
-                                s.chat_messages.remove(0);
-                            }
-                            drop(s);
-                            repaint();
                         }
                     }
 
                     Command::LocalMessage { text } => {
-                        let mut s = write_state(&state);
-                        s.chat_messages.push(crate::events::ChatMessage {
-                            id: uuid::Uuid::new_v4().into_bytes(),
-                            sender: String::new(),
-                            sender_id: None,
-                            text,
-                            timestamp: std::time::SystemTime::now(),
-                            kind: Default::default(),
-                            attachment: None,
-                            visibility: crate::events::ChatMessageVisibility::System,
-                        });
-                        // Keep only recent messages
-                        if s.chat_messages.len() > 100 {
-                            s.chat_messages.remove(0);
-                        }
-                        drop(s);
-                        repaint();
+                        let _ = bus.chat.send(crate::ChatEvent::SystemNotice { text });
                     }
 
                     // Audio commands are routed to audio task in BackendHandle::send()
@@ -1502,10 +1469,9 @@ async fn run_connection_task<P: Platform>(
                                 // `SenderMirror` entry (inserted by
                                 // FinalizeShareUpload once the broadcast goes
                                 // out) carries that responsibility.
-                                {
-                                    let mut s = write_state(&state);
-                                    let my_uid = s.my_user_id;
-                                    s.chat_messages.push(crate::events::ChatMessage {
+                                let my_uid = read_state(&state).my_user_id;
+                                let _ = bus.chat.send(crate::ChatEvent::SenderDraftInserted {
+                                    msg: crate::events::ChatMessage {
                                         id: message_id,
                                         sender: client_name.clone(),
                                         sender_id: my_uid,
@@ -1514,12 +1480,8 @@ async fn run_connection_task<P: Platform>(
                                         kind: Default::default(),
                                         attachment: Some(attachment.clone()),
                                         visibility: crate::events::ChatMessageVisibility::SenderDraft,
-                                    });
-                                    if s.chat_messages.len() > 100 {
-                                        s.chat_messages.remove(0);
-                                    }
-                                }
-                                repaint();
+                                    },
+                                });
                                 // Watcher broadcasts once the upload succeeds.
                                 // On failure it just returns — the card reads
                                 // TransferStatus.error directly from the plugin.
@@ -1615,18 +1577,9 @@ async fn run_connection_task<P: Platform>(
                                 error!("Failed to send chat history request: {}", e);
                             } else {
                                 info!("Sent chat history request to room");
-                                let mut s = write_state(&state);
-                                s.chat_messages.push(crate::events::ChatMessage {
-                                    id: uuid::Uuid::new_v4().into_bytes(),
-                                    sender: "System".to_string(),
-                                    sender_id: None,
+                                let _ = bus.chat.send(crate::ChatEvent::SystemNotice {
                                     text: "Requesting chat history from peers...".to_string(),
-                                    timestamp: SystemTime::now(),
-                                    kind: Default::default(),
-                                    attachment: None,
-                                    visibility: crate::events::ChatMessageVisibility::System,
                                 });
-                                repaint();
                             }
                         }
                     }
@@ -1963,6 +1916,7 @@ async fn connect_to_server<T: Transport>(
 ///
 /// Uses `TransportRecvStream` for framed message reception. Connection loss
 /// is detected when `recv()` returns `None` or an error.
+#[allow(clippy::too_many_arguments)] // private helper
 async fn run_receiver_task(
     mut recv: impl TransportRecvStream,
     state: Arc<RwLock<State>>,
@@ -1971,12 +1925,13 @@ async fn run_receiver_task(
     command_tx: mpsc::UnboundedSender<Command>,
     file_transfer: Option<Arc<dyn FileTransferPlugin>>,
     file_transfer_slot: Arc<RwLock<Option<Arc<dyn FileTransferPlugin>>>>,
+    bus: crate::projection::EventBus,
 ) {
     loop {
         match recv.recv().await {
             Ok(Some(frame)) => {
                 if let Ok(env) = proto::Envelope::decode(&*frame) {
-                    handle_server_message(env, &state, &repaint, &audio_task, &command_tx, &file_transfer);
+                    handle_server_message(env, &state, &repaint, &audio_task, &command_tx, &file_transfer, &bus);
                 }
             }
             Ok(None) => {
@@ -2137,28 +2092,14 @@ fn plugin_event_sink(event_tx: mpsc::UnboundedSender<BackendEvent>) -> rumble_cl
     })
 }
 
-/// Add a local status message to the chat.
-fn add_local_message(state: &Arc<RwLock<State>>, text: String, repaint: &Arc<dyn Fn() + Send + Sync>) {
-    let mut s = write_state(state);
-    s.chat_messages.push(crate::events::ChatMessage {
-        id: uuid::Uuid::new_v4().into_bytes(),
-        sender: String::new(),
-        sender_id: None,
-        text,
-        timestamp: std::time::SystemTime::now(),
-        kind: Default::default(),
-        attachment: None,
-        visibility: crate::events::ChatMessageVisibility::System,
-    });
-    // Keep only recent messages
-    if s.chat_messages.len() > 100 {
-        s.chat_messages.remove(0);
-    }
-    drop(s);
-    repaint();
+/// Emit a system notice to the chat log. The projection task does the
+/// actual `chat_messages.push` + trim + repaint.
+fn add_local_message(bus: &crate::projection::EventBus, text: String) {
+    let _ = bus.chat.send(crate::ChatEvent::SystemNotice { text });
 }
 
 /// Handle an incoming server message and update state accordingly.
+#[allow(clippy::too_many_arguments)] // private helper
 fn handle_server_message(
     env: proto::Envelope,
     state: &Arc<RwLock<State>>,
@@ -2166,12 +2107,13 @@ fn handle_server_message(
     audio_task: &AudioTaskHandle,
     command_tx: &mpsc::UnboundedSender<Command>,
     file_transfer: &Option<Arc<dyn FileTransferPlugin>>,
+    bus: &crate::projection::EventBus,
 ) {
     match env.payload {
         Some(Payload::CommandResult(cr)) => {
             // Display command results as local chat messages
             let prefix = if cr.success { "✔" } else { "✖" };
-            add_local_message(state, format!("{} {}", prefix, cr.message), repaint);
+            add_local_message(bus, format!("{} {}", prefix, cr.message));
         }
         Some(Payload::ServerEvent(se)) => {
             if let Some(kind) = se.kind {
@@ -2270,28 +2212,20 @@ fn handle_server_message(
                                 cb.sender,
                                 share.content.messages.len()
                             );
-                            let incoming = share.content.to_messages();
-                            let mut s = write_state(state);
-                            // Collect existing IDs to skip duplicates
-                            let existing_ids: std::collections::HashSet<[u8; 16]> =
-                                s.chat_messages.iter().map(|m| m.id).collect();
-                            let mut added = 0usize;
-                            for msg in incoming {
-                                if !existing_ids.contains(&msg.id) {
-                                    s.chat_messages.push(msg);
-                                    added += 1;
-                                }
-                            }
-                            if added > 0 {
-                                // Sort merged history by timestamp
-                                s.chat_messages.sort_by_key(|m| m.timestamp);
-                                // Trim to 100 most recent
-                                let len = s.chat_messages.len();
-                                if len > 100 {
-                                    s.chat_messages.drain(0..len - 100);
-                                }
-                                drop(s);
-                                repaint();
+                            // Pre-dedup against current state so the
+                            // projection has minimal work to do.
+                            let existing_ids: std::collections::HashSet<[u8; 16]> = {
+                                let s = read_state(state);
+                                s.chat_messages.iter().map(|m| m.id).collect()
+                            };
+                            let to_add: Vec<crate::events::ChatMessage> = share
+                                .content
+                                .to_messages()
+                                .into_iter()
+                                .filter(|m| !existing_ids.contains(&m.id))
+                                .collect();
+                            if !to_add.is_empty() {
+                                let _ = bus.chat.send(crate::ChatEvent::HistoryMerged { msgs: to_add });
                             }
                             return;
                         }
@@ -2304,32 +2238,20 @@ fn handle_server_message(
 
                         let attachment = cb.attachment.map(rumble_protocol::chat_attachment_from_proto);
 
-                        let mut s = write_state(state);
-                        // Dedup by message id: covers history-sync re-arrival
-                        // of a message we already have, including the
-                        // sender's own SenderMirror of an outgoing broadcast
-                        // that comes back via someone else's history share.
-                        if s.chat_messages.iter().any(|m| m.id == id) {
-                            return;
-                        }
-                        s.chat_messages.push(crate::events::ChatMessage {
-                            id,
-                            sender: cb.sender,
-                            // Server populates sender_id from the authenticated
-                            // connection; 0 means a legacy server didn't set it.
-                            sender_id: if cb.sender_id != 0 { Some(cb.sender_id) } else { None },
-                            text: cb.text,
-                            timestamp,
-                            kind,
-                            attachment,
-                            visibility: crate::events::ChatMessageVisibility::Normal,
+                        let _ = bus.chat.send(crate::ChatEvent::MessageAdded {
+                            msg: crate::events::ChatMessage {
+                                id,
+                                sender: cb.sender,
+                                // Server populates sender_id from the authenticated
+                                // connection; 0 means a legacy server didn't set it.
+                                sender_id: if cb.sender_id != 0 { Some(cb.sender_id) } else { None },
+                                text: cb.text,
+                                timestamp,
+                                kind,
+                                attachment,
+                                visibility: crate::events::ChatMessageVisibility::Normal,
+                            },
                         });
-                        // Keep only recent messages
-                        if s.chat_messages.len() > 100 {
-                            s.chat_messages.remove(0);
-                        }
-                        drop(s);
-                        repaint();
                     }
                     proto::server_event::Kind::DirectMessageReceived(dm) => {
                         // Incoming DM from another user (server no longer echoes to sender)
@@ -2340,46 +2262,27 @@ fn handle_server_message(
                             std::time::SystemTime::now()
                         };
 
-                        let mut s = write_state(state);
-                        s.chat_messages.push(crate::events::ChatMessage {
-                            id,
-                            sender: dm.sender_name.clone(),
-                            sender_id: Some(dm.sender_id),
-                            text: dm.text,
-                            timestamp,
-                            kind: crate::events::ChatMessageKind::DirectMessage {
-                                other_user_id: dm.sender_id,
-                                other_username: dm.sender_name,
+                        let _ = bus.chat.send(crate::ChatEvent::MessageAdded {
+                            msg: crate::events::ChatMessage {
+                                id,
+                                sender: dm.sender_name.clone(),
+                                sender_id: Some(dm.sender_id),
+                                text: dm.text,
+                                timestamp,
+                                kind: crate::events::ChatMessageKind::DirectMessage {
+                                    other_user_id: dm.sender_id,
+                                    other_username: dm.sender_name,
+                                },
+                                attachment: None,
+                                visibility: crate::events::ChatMessageVisibility::Normal,
                             },
-                            attachment: None,
-                            visibility: crate::events::ChatMessageVisibility::Normal,
                         });
-                        if s.chat_messages.len() > 100 {
-                            s.chat_messages.remove(0);
-                        }
-                        drop(s);
-                        repaint();
                     }
                     proto::server_event::Kind::KeepAlive(_) => {
                         // Ignore keep-alive for now
                     }
                     proto::server_event::Kind::WelcomeMessage(wm) => {
-                        let mut s = write_state(state);
-                        s.chat_messages.push(crate::events::ChatMessage {
-                            id: uuid::Uuid::new_v4().into_bytes(),
-                            sender: "Server".to_string(),
-                            sender_id: None,
-                            text: wm.text,
-                            timestamp: std::time::SystemTime::now(),
-                            kind: Default::default(),
-                            attachment: None,
-                            visibility: crate::events::ChatMessageVisibility::System,
-                        });
-                        if s.chat_messages.len() > 100 {
-                            s.chat_messages.remove(0);
-                        }
-                        drop(s);
-                        repaint();
+                        let _ = bus.chat.send(crate::ChatEvent::SystemNotice { text: wm.text });
                     }
                 }
             }
