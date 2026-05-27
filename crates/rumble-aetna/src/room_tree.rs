@@ -22,7 +22,8 @@ use std::{
 };
 
 use aetna_core::prelude::*;
-use rumble_protocol::{Command, State, permissions::Permissions};
+use rumble_client::{Command, State};
+use rumble_protocol::permissions::Permissions;
 use uuid::Uuid;
 
 use crate::theme as palette;

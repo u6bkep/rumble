@@ -5,10 +5,8 @@
 use std::collections::HashMap;
 
 use prost::Message as _;
-use rumble_protocol::{
-    ChatMessage, ChatMessageKind, ConnectionState, RoomTree, RoomTreeNode, State, proto, proto::RelayFileSharePayload,
-    uuid_from_room_id,
-};
+use rumble_client::{ChatMessage, ChatMessageKind, ConnectionState, RoomTree, RoomTreeNode, State};
+use rumble_protocol::{proto, proto::RelayFileSharePayload, uuid_from_room_id};
 use rumble_widgets::{TreeNode, TreeNodeId, UserState};
 use uuid::Uuid;
 

@@ -14,8 +14,8 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aetna_core::prelude::*;
+use rumble_client::{ConnectionState, State};
 use rumble_desktop_shell::RecentServer;
-use rumble_protocol::{ConnectionState, State};
 
 // ============================================================
 // State + form

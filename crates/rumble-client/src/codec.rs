@@ -4,7 +4,7 @@
 //! to `rumble-desktop::codec` behind the `VoiceCodec` trait. This module
 //! retains shared constants and small helpers used across the backend.
 
-pub use rumble_protocol::{
+pub use crate::events::{
     DTX_FRAME_MAX_SIZE, EncoderSettings, OPUS_DEFAULT_BITRATE, OPUS_DEFAULT_COMPLEXITY, OPUS_DEFAULT_PACKET_LOSS_PERC,
     OPUS_FRAME_SIZE, OPUS_MAX_PACKET_SIZE, OPUS_SAMPLE_RATE,
 };

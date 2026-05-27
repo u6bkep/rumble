@@ -3,9 +3,8 @@
 //! Same shape as `rumble-next`'s `UiBackend`: the renderer reads `State`
 //! snapshots and pushes `Command`s; tests can swap a mock in.
 
-use rumble_client::{BackendEvent, handle::BackendHandle};
+use rumble_client::{BackendEvent, Command, State, handle::BackendHandle};
 use rumble_client_traits::file_transfer::TransferStatus;
-use rumble_protocol::{Command, State};
 use tokio::sync::mpsc;
 
 pub trait UiBackend: 'static {

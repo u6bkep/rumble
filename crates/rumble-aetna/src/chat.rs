@@ -19,9 +19,10 @@ use std::{
 use aetna_core::{prelude::*, surface::SurfaceAlpha};
 use aetna_markdown::md;
 use linkify::{LinkFinder, LinkKind};
+use rumble_client::{ChatMessage, ChatMessageKind, State};
 use rumble_client_traits::file_transfer::{TransferDirection, TransferStage, TransferStatus};
 use rumble_desktop_shell::ChatSettings;
-use rumble_protocol::{ChatMessage, ChatMessageKind, State, permissions::Permissions, proto::RelayFileSharePayload};
+use rumble_protocol::{permissions::Permissions, proto::RelayFileSharePayload};
 
 use crate::{animated_gpu::AnimatedGpu, media_cache::MediaCache, theme as palette};
 
@@ -599,7 +600,7 @@ enum AttachmentView<'a> {
 /// Classify a `ChatAttachment` into the [`AttachmentView`] variant
 /// that should be rendered. Pure function — no rendering, just data.
 fn attachment_view<'a>(
-    att: &rumble_protocol::types::ChatAttachment,
+    att: &rumble_protocol::ChatAttachment,
     media_cache: &'a MediaCache,
     transfers: &'a TransferMap,
 ) -> AttachmentView<'a> {

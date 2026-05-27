@@ -23,8 +23,7 @@ use std::{
     time::Duration,
 };
 
-use crate::audio::{AudioBackend, AudioCaptureStream, AudioPlaybackStream, FillBufferFn, OnFrameFn};
-use rumble_protocol::AudioDeviceInfo;
+use crate::audio::{AudioBackend, AudioCaptureStream, AudioDeviceInfo, AudioPlaybackStream, FillBufferFn, OnFrameFn};
 
 /// Per-frame size the engine speaks (20ms at 48 kHz mono).
 pub const MOCK_FRAME_SIZE: usize = 960;

@@ -21,8 +21,8 @@
 
 use aetna_core::prelude::*;
 
+use rumble_client::{Command, State};
 use rumble_protocol::{
-    Command, State,
     permissions::{ALL_ROOM_SCOPED, ALL_SERVER_SCOPED, Permissions},
     proto::{GroupInfo, User},
 };

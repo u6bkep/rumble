@@ -6,7 +6,7 @@
 use crate::synth::{Envelope, SAMPLE_RATE, Tone, Waveform, mix_tones};
 use std::collections::HashMap;
 
-pub use rumble_protocol::SfxKind;
+pub use crate::events::SfxKind;
 
 pub struct SfxLibrary {
     sounds: HashMap<SfxKind, Vec<f32>>,

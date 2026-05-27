@@ -13,8 +13,7 @@ pub use cpal::{CpalAudioBackend, CpalCaptureStream, CpalPlaybackStream};
 #[cfg(all(target_os = "linux", feature = "pulse"))]
 pub use pulse::{PulseAudioBackend, PulseCaptureStream, PulsePlaybackStream};
 
-use rumble_client_traits::audio::{AudioBackend, AudioCaptureStream, AudioPlaybackStream};
-use rumble_protocol::AudioDeviceInfo;
+use rumble_client_traits::audio::{AudioBackend, AudioCaptureStream, AudioDeviceInfo, AudioPlaybackStream};
 #[cfg(all(target_os = "linux", feature = "pulse"))]
 use tracing::info;
 

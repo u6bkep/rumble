@@ -32,8 +32,9 @@ use libpulse_binding::{
 use libpulse_simple_binding::Simple;
 use tracing::{debug, error, info, warn};
 
-use rumble_client_traits::audio::{AudioBackend, AudioCaptureStream, AudioPlaybackStream, FillBufferFn, OnFrameFn};
-use rumble_protocol::AudioDeviceInfo;
+use rumble_client_traits::audio::{
+    AudioBackend, AudioCaptureStream, AudioDeviceInfo, AudioPlaybackStream, FillBufferFn, OnFrameFn,
+};
 
 const SAMPLE_RATE: u32 = 48000;
 const CHANNELS: u8 = 1;

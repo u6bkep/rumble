@@ -36,8 +36,9 @@ use rumble_audio;
 use rumble_client_traits::{
     AudioBackend, AudioCaptureStream, DatagramTransport, Platform, VoiceCodec, VoiceDecoder as VoiceDecoderTrait,
     VoiceEncoder as VoiceEncoderTrait,
+    codec::{EncoderSettings, OPUS_MAX_PACKET_SIZE},
 };
-use rumble_protocol::{EncoderSettings, OPUS_MAX_PACKET_SIZE, proto::VoiceDatagram};
+use rumble_protocol::proto::VoiceDatagram;
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     sync::{Arc, Mutex, RwLock},

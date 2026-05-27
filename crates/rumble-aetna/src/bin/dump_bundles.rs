@@ -22,10 +22,13 @@ use aetna_core::prelude::*;
 use rumble_aetna::{
     ElevateState, Identity, RumbleApp, SettingsOpenSelect, SettingsTab, UnlockState, WizardState, backend::UiBackend,
 };
+use rumble_client::{
+    AudioDeviceInfo, AudioState, AudioStats, ChatMessage, ChatMessageKind, ChatMessageVisibility, Command,
+    ConnectionState, PendingCertificate, State, VoiceMode,
+};
 use rumble_desktop_shell::{KeyInfo, RecentServer, SettingsStore};
 use rumble_protocol::{
-    AudioDeviceInfo, AudioState, AudioStats, ChatAttachment, ChatMessage, ChatMessageKind, ChatMessageVisibility,
-    Command, ConnectionState, PendingCertificate, State, Uuid, VoiceMode,
+    ChatAttachment, Uuid,
     permissions::{ADMIN_PERMISSIONS, DEFAULT_PERMISSIONS, Permissions},
     proto::{GroupInfo, RelayFileSharePayload, RoomAclEntry, RoomInfo, User, UserId},
     room_id_from_uuid,

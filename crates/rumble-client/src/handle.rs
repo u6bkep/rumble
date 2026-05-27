@@ -606,7 +606,7 @@ enum DeferredAction {
     /// late-joining peers can fetch it via history sync.
     FinalizeShareUpload {
         message_id: [u8; 16],
-        attachment: rumble_protocol::types::ChatAttachment,
+        attachment: rumble_protocol::ChatAttachment,
         sender: String,
         timestamp: std::time::SystemTime,
     },
@@ -1981,7 +1981,7 @@ async fn watch_share_upload(
     ft: Arc<dyn FileTransferPlugin>,
     transfer_id: String,
     message_id: [u8; 16],
-    attachment: rumble_protocol::types::ChatAttachment,
+    attachment: rumble_protocol::ChatAttachment,
     sender: String,
     timestamp: std::time::SystemTime,
     deferred_tx: mpsc::UnboundedSender<DeferredAction>,

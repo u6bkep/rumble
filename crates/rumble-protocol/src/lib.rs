@@ -1,7 +1,14 @@
 //! Rumble wire protocol API definitions.
 //!
 //! Generated protobuf types live in the `proto` module. This crate also
-//! provides small helpers for framing protobuf messages over QUIC streams.
+//! provides small helpers for framing protobuf messages over QUIC streams,
+//! state hashing, and the [`ChatAttachment`] sidecar type that both
+//! client and server need.
+//!
+//! Client-side in-memory state types (`State`, `Command`, `ChatMessage`,
+//! `AudioState`, etc.) live in `rumble_client::events` — they are
+//! pure-data but client-shaped, and don't belong in a crate named for
+//! the wire format.
 
 use blake3::Hasher;
 use bytes::BytesMut;
@@ -9,10 +16,52 @@ use prost::Message;
 pub use uuid::Uuid;
 
 pub mod permissions;
-pub mod types;
-pub use types::*;
 pub mod proto {
     include!(concat!(env!("OUT_DIR"), "/rumble.api.v1.rs"));
+}
+
+// =============================================================================
+// Chat Attachment (wire-shape sidecar shared by client + traits + plugins)
+// =============================================================================
+
+/// Plugin-namespaced sidecar attached to a chat message. The server
+/// forwards this unchanged; receivers dispatch by `namespace` to find a
+/// matching plugin renderer/handler. Clients without a matching plugin
+/// display `fallback_text`.
+///
+/// Lives at the wire layer because the [`FileTransferPlugin`] trait
+/// (in `rumble-client-traits`) needs to produce and consume these, and
+/// the on-disk chat-history sync format embeds them as JSON.
+///
+/// [`FileTransferPlugin`]: ../rumble_client_traits/file_transfer/trait.FileTransferPlugin.html
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ChatAttachment {
+    /// Reverse-DNS plugin identifier (e.g. "rumble.file_transfer.relay").
+    pub namespace: String,
+    /// Schema version for the payload format, plugin-defined.
+    pub schema_version: u32,
+    /// Opaque plugin-encoded payload (consumed by the matching plugin).
+    pub payload: Vec<u8>,
+    /// Text shown when no plugin matches `namespace`.
+    pub fallback_text: String,
+}
+
+pub fn chat_attachment_from_proto(att: proto::ChatAttachment) -> ChatAttachment {
+    ChatAttachment {
+        namespace: att.namespace,
+        schema_version: att.schema_version,
+        payload: att.payload,
+        fallback_text: att.fallback_text,
+    }
+}
+
+pub fn chat_attachment_to_proto(att: &ChatAttachment) -> proto::ChatAttachment {
+    proto::ChatAttachment {
+        namespace: att.namespace.clone(),
+        schema_version: att.schema_version,
+        payload: att.payload.clone(),
+        fallback_text: att.fallback_text.clone(),
+    }
 }
 
 /// The Root room UUID (all zeros).

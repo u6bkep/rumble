@@ -7,9 +7,9 @@
 //! deeper UI (pipelines, ACL admin) can grow here incrementally.
 
 use eframe::egui::{self, Align, Layout, Margin, RichText, Ui};
-use rumble_client::{PipelineConfig, ProcessorRegistry};
+use rumble_client::{AudioSettings, Command, ConnectionState, PipelineConfig, ProcessorRegistry, State, VoiceMode};
 use rumble_desktop_shell::{PersistentVoiceMode, SettingsStore, TimestampFormat};
-use rumble_protocol::{AudioSettings, Command, ConnectionState, State, VoiceMode, permissions::Permissions};
+use rumble_protocol::permissions::Permissions;
 use rumble_widgets::{
     ButtonArgs, ComboBox, GroupBox, PressableRole, Radio, SurfaceFrame, SurfaceKind, TextRole, UiExt,
 };
@@ -468,7 +468,7 @@ fn device_picker(
     ui: &mut Ui,
     title: &str,
     id_salt: &str,
-    devices: &[rumble_protocol::AudioDeviceInfo],
+    devices: &[rumble_client::AudioDeviceInfo],
     current_id: Option<&str>,
     on_change: impl FnOnce(Option<String>),
 ) {
@@ -503,7 +503,7 @@ fn device_picker(
 /// only way to tell apart entries that share a `name` — ALSA happily
 /// hands us the same physical card under several pcm endpoints — so we
 /// always show it when present and not redundant with the name.
-fn device_label(d: &rumble_protocol::AudioDeviceInfo) -> String {
+fn device_label(d: &rumble_client::AudioDeviceInfo) -> String {
     let mut s = d.name.clone();
     if let Some(pipeline) = &d.pipeline
         && pipeline != &d.name

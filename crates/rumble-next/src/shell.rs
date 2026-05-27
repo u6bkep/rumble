@@ -15,7 +15,8 @@ use eframe::egui::{
     self, Align, Align2, Color32, CornerRadius, FontId, Layout, Margin, Pos2, RichText, ScrollArea, Sense, Stroke,
     StrokeKind, Ui, Vec2, epaint::RectShape,
 };
-use rumble_protocol::{Command, State, permissions::Permissions, proto::RoomAclEntry};
+use rumble_client::{Command, State};
+use rumble_protocol::{permissions::Permissions, proto::RoomAclEntry};
 use rumble_widgets::{
     ButtonArgs, ComboBox, GroupBox, PressableRole, SurfaceFrame, SurfaceKind, TextInput, Tree, TreeNode, TreeNodeId,
     TreeNodeKind, UiExt,

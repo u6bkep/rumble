@@ -223,7 +223,7 @@ pub trait FileTransferPlugin: Send + Sync + 'static {
     /// Encode a `FileOffer` (from `share`) into the `ChatAttachment`
     /// payload format this plugin uses on the wire. The plugin owns its
     /// payload schema; callers just take the bytes and embed them.
-    fn encode_attachment(&self, offer: &FileOffer) -> rumble_protocol::types::ChatAttachment;
+    fn encode_attachment(&self, offer: &FileOffer) -> rumble_protocol::ChatAttachment;
 
     /// Begin downloading a file from opaque share data (e.g., relay metadata).
     fn download(&self, share_data: &str) -> anyhow::Result<TransferId>;

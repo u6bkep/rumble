@@ -15,14 +15,14 @@ use aetna_core::{prelude::*, toast::ToastSpec};
 use aetna_winit_wgpu::WinitWgpuApp;
 
 use rumble_client::{
-    ProcessorRegistry, SfxKind, build_default_tx_pipeline, merge_with_default_tx_pipeline, register_builtin_processors,
+    AudioSettings, Command, ConnectionState, PendingCertificate, ProcessorRegistry, SfxKind, State, VoiceMode,
+    build_default_tx_pipeline, merge_with_default_tx_pipeline, register_builtin_processors,
 };
 use rumble_desktop_shell::{
     AcceptedCertificate, RecentServer, SettingsStore,
     hotkeys::{HotkeyEvent, HotkeyManager},
     identity::{connect_and_list_keys, generate_and_add_to_agent},
 };
-use rumble_protocol::{AudioSettings, Command, ConnectionState, PendingCertificate, State, VoiceMode};
 use tokio::{runtime::Runtime, task::JoinHandle};
 
 use crate::{
@@ -1989,7 +1989,7 @@ impl<B: UiBackend> RumbleApp<B> {
             // is_from_self check below further excludes SenderDrafts.
             if matches!(
                 msg.visibility,
-                rumble_protocol::ChatMessageVisibility::System | rumble_protocol::ChatMessageVisibility::SenderMirror
+                rumble_client::ChatMessageVisibility::System | rumble_client::ChatMessageVisibility::SenderMirror
             ) {
                 continue;
             }
@@ -2039,12 +2039,11 @@ impl<B: UiBackend> RumbleApp<B> {
             for m in snapshot.chat_messages[self.prev_chat_count..].iter().filter(|m| {
                 !matches!(
                     m.visibility,
-                    rumble_protocol::ChatMessageVisibility::System
-                        | rumble_protocol::ChatMessageVisibility::SenderMirror
+                    rumble_client::ChatMessageVisibility::System | rumble_client::ChatMessageVisibility::SenderMirror
                 )
             }) {
                 match m.kind {
-                    rumble_protocol::ChatMessageKind::DirectMessage { .. } => had_dm = true,
+                    rumble_client::ChatMessageKind::DirectMessage { .. } => had_dm = true,
                     _ => had_room = true,
                 }
             }

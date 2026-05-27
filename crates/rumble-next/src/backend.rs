@@ -5,9 +5,8 @@
 //! use `MockBackend` to arrange UI state without starting networking or
 //! the audio pipeline.
 
-use rumble_client::handle::BackendHandle;
+use rumble_client::{Command, State, handle::BackendHandle};
 use rumble_client_traits::file_transfer::{TransferId, TransferStatus};
-use rumble_protocol::{Command, State};
 use std::path::PathBuf;
 
 #[cfg(feature = "test-harness")]

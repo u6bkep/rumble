@@ -25,8 +25,9 @@
 
 use aetna_core::prelude::*;
 
+use rumble_client::{Command, State};
 use rumble_protocol::{
-    Command, ROOT_ROOM_UUID, State,
+    ROOT_ROOM_UUID,
     permissions::Permissions,
     proto::{GroupInfo, RoomAclEntry},
 };

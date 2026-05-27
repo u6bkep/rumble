@@ -4,7 +4,7 @@
 
 use crate::backend::UiBackend;
 use eframe::egui::{self, Align, CornerRadius, Layout, Margin, RichText, Stroke, Ui, epaint::RectShape};
-use rumble_protocol::{Command, State};
+use rumble_client::{Command, State};
 use rumble_widgets::{ButtonArgs, PressableRole, SurfaceFrame, SurfaceKind, UiExt};
 
 use crate::{
@@ -40,7 +40,7 @@ pub fn render<B: UiBackend>(ui: &mut Ui, shell: &mut Shell, state: &State, backe
 
 fn top_bar<B: UiBackend>(ui: &mut Ui, shell: &mut Shell, state: &State, backend: &B) {
     let server_name = match &state.connection {
-        rumble_protocol::ConnectionState::Connected { server_name, .. } => server_name.clone(),
+        rumble_client::ConnectionState::Connected { server_name, .. } => server_name.clone(),
         _ => "disconnected".to_string(),
     };
     let self_name = adapters::my_display_name(state).unwrap_or_else(|| "you".into());

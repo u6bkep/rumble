@@ -4,7 +4,7 @@
 
 use crate::backend::UiBackend;
 use eframe::egui::{self, Align, CornerRadius, Layout, Margin, RichText, Stroke, Ui, epaint::RectShape};
-use rumble_protocol::{Command, ConnectionState, State};
+use rumble_client::{Command, ConnectionState, State};
 use rumble_widgets::{ButtonArgs, PressableRole, SurfaceFrame, SurfaceKind, UiExt};
 
 use crate::{

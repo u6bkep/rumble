@@ -16,8 +16,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::backend::UiBackend;
 use eframe::egui::{self, Align, Layout, Margin, RichText, Ui};
+use rumble_client::{Command, ConnectionState, State};
 use rumble_desktop_shell::{AcceptedCertificate, RecentServer, SettingsStore};
-use rumble_protocol::{Command, ConnectionState, State};
 use rumble_widgets::{ButtonArgs, GroupBox, PressableRole, SurfaceFrame, SurfaceKind, TextInput, TextRole, UiExt};
 
 use crate::identity::Identity;
@@ -373,7 +373,7 @@ fn server_form<B: UiBackend>(
 
 fn cert_prompt_card<B: UiBackend>(
     ui: &mut Ui,
-    cert_info: &rumble_protocol::PendingCertificate,
+    cert_info: &rumble_client::PendingCertificate,
     settings: &mut SettingsStore,
     backend: &B,
 ) {
@@ -410,7 +410,7 @@ fn cert_prompt_card<B: UiBackend>(
 /// Push the freshly-trusted cert into the settings store. We dedup by
 /// `(server_name, fingerprint_hex)` so accepting the same cert twice
 /// (e.g. after a transient connection failure) doesn't grow the file.
-fn persist_accepted_cert(settings: &mut SettingsStore, cert_info: &rumble_protocol::PendingCertificate) {
+fn persist_accepted_cert(settings: &mut SettingsStore, cert_info: &rumble_client::PendingCertificate) {
     let server_name = cert_info.server_name.clone();
     let fingerprint = cert_info.fingerprint_hex();
     let der = cert_info.certificate_der.clone();

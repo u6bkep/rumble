@@ -4,10 +4,9 @@
 
 use eframe::egui::{self, CentralPanel, Context, Layout, Modal, RichText, TopBottomPanel};
 use rumble_client::{
-    AudioSettings, ConnectConfig, ProcessorRegistry, VoiceMode, build_default_tx_pipeline, handle::BackendHandle,
-    merge_with_default_tx_pipeline, register_builtin_processors,
+    AudioSettings, Command, ConnectConfig, ProcessorRegistry, VoiceMode, build_default_tx_pipeline,
+    handle::BackendHandle, merge_with_default_tx_pipeline, register_builtin_processors,
 };
-use rumble_protocol::Command;
 use rumble_widgets::{ButtonArgs, PressableRole, SurfaceFrame, SurfaceKind, UiExt, install_theme};
 
 pub use crate::paradigm::Paradigm;
@@ -140,8 +139,8 @@ enum ConnectionKind {
 }
 
 impl ConnectionKind {
-    fn from(state: &rumble_protocol::ConnectionState) -> Self {
-        use rumble_protocol::ConnectionState as S;
+    fn from(state: &rumble_client::ConnectionState) -> Self {
+        use rumble_client::ConnectionState as S;
         match state {
             S::Disconnected => Self::Disconnected,
             S::Connecting { .. } => Self::Connecting,
@@ -378,7 +377,7 @@ impl<B: UiBackend> eframe::App for App<B> {
         if self.auto_connect_pending
             && self.identity.public_key().is_some()
             && !self.identity.needs_unlock()
-            && matches!(state.connection, rumble_protocol::ConnectionState::Disconnected)
+            && matches!(state.connection, rumble_client::ConnectionState::Disconnected)
         {
             let target = self
                 .settings
@@ -867,7 +866,7 @@ impl<B: UiBackend> App<B> {
     /// reasons. `permission_denied` and `kicked` are `take()`-style
     /// fields on `State` — we drain them via `state_mut()` so a single
     /// event surfaces exactly once.
-    fn pump_toasts(&mut self, state: &rumble_protocol::State) {
+    fn pump_toasts(&mut self, state: &rumble_client::State) {
         let kind = ConnectionKind::from(&state.connection);
         if self.prev_connection != Some(kind) {
             if let Some(prev) = self.prev_connection {
@@ -877,13 +876,13 @@ impl<B: UiBackend> App<B> {
                         self.play_sfx(rumble_client::SfxKind::Connect);
                     }
                     (ConnectionKind::Connected, ConnectionKind::Lost) => {
-                        if let rumble_protocol::ConnectionState::ConnectionLost { error } = &state.connection {
+                        if let rumble_client::ConnectionState::ConnectionLost { error } = &state.connection {
                             self.toasts.error(format!("Connection lost: {error}"));
                             self.play_sfx(rumble_client::SfxKind::Disconnect);
                         }
                     }
                     (ConnectionKind::Connecting, ConnectionKind::Lost) => {
-                        if let rumble_protocol::ConnectionState::ConnectionLost { error } = &state.connection {
+                        if let rumble_client::ConnectionState::ConnectionLost { error } = &state.connection {
                             self.toasts.error(format!("Could not connect: {error}"));
                         }
                     }
@@ -924,7 +923,7 @@ impl<B: UiBackend> App<B> {
     /// from state diffs (rather than command sites) means UI buttons,
     /// hotkeys, and server-driven changes all surface the same sound
     /// without per-call-site instrumentation.
-    fn detect_sfx_events(&mut self, state: &rumble_protocol::State) {
+    fn detect_sfx_events(&mut self, state: &rumble_client::State) {
         let muted = state.audio.self_muted;
         if muted != self.prev_self_muted {
             self.play_sfx(if muted {
@@ -982,7 +981,7 @@ impl<B: UiBackend> App<B> {
     /// clicked Download on. Each accepted offer is recorded in
     /// `Shell::accepted_offers` so the card flips to "Downloading…"
     /// without waiting for the (still-TODO) live transfers panel.
-    fn pump_auto_downloads(&mut self, state: &rumble_protocol::State) {
+    fn pump_auto_downloads(&mut self, state: &rumble_client::State) {
         let prev = self.prev_chat_count;
         let count = state.chat_messages.len();
         // First-frame gate: don't auto-accept historical offers replayed
@@ -1052,7 +1051,7 @@ impl<B: UiBackend> App<B> {
     /// every change (cold connect, manual room hop, server-driven move)
     /// because the user's intent — "always show me what was said
     /// before I arrived" — applies uniformly.
-    fn pump_room_join(&mut self, state: &rumble_protocol::State) {
+    fn pump_room_join(&mut self, state: &rumble_client::State) {
         if state.my_room_id == self.prev_my_room_id {
             return;
         }
@@ -1180,7 +1179,7 @@ impl<B: UiBackend> App<B> {
     ///
     /// Mute/deafen / PTT only act when connected — toggling state
     /// while disconnected would be confusing.
-    fn pump_hotkeys(&mut self, ctx: &eframe::egui::Context, state: &rumble_protocol::State) {
+    fn pump_hotkeys(&mut self, ctx: &eframe::egui::Context, state: &rumble_client::State) {
         for event in self.hotkeys.poll_events() {
             self.dispatch_hotkey(event, state);
         }
@@ -1221,7 +1220,7 @@ impl<B: UiBackend> App<B> {
         }
     }
 
-    fn dispatch_hotkey(&self, event: HotkeyEvent, state: &rumble_protocol::State) {
+    fn dispatch_hotkey(&self, event: HotkeyEvent, state: &rumble_client::State) {
         use rumble_desktop_shell::{HotkeyData, HotkeyFunction};
         if !state.connection.is_connected() {
             return;

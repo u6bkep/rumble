@@ -12,4 +12,4 @@ pub const SAMPLE_RATE: u32 = 48000;
 /// Number of channels (mono for voice).
 pub const CHANNELS: u16 = 1;
 
-pub use rumble_protocol::AudioDeviceInfo;
+pub use crate::events::AudioDeviceInfo;

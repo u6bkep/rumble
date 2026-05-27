@@ -1,6 +1,35 @@
 //! Audio backend abstraction for capture and playback.
 
-pub use rumble_protocol::AudioDeviceInfo;
+/// Information about an audio device returned by the platform's
+/// [`AudioBackend`].
+///
+/// Lives here (rather than in `rumble-client::events`) because platform
+/// impl crates (`rumble-desktop`, future WASM impl) need to produce
+/// these without taking a dep on the engine crate. Both
+/// `rumble-client::events::AudioState` and the platform impls speak
+/// this type via this trait crate.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct AudioDeviceInfo {
+    /// Stable, host-unique identifier (used for selection + persistence).
+    ///
+    /// On ALSA this is the cpal `pcm_id` (e.g. `pipewire`, `pulse`,
+    /// `front:CARD=Generic_1,DEV=0`). On other hosts it's whatever
+    /// `Device::id()` returns. The same physical card can appear under
+    /// multiple ALSA endpoints, so two entries can share `name` but
+    /// always have distinct `id`s.
+    pub id: String,
+    /// Human-readable name (e.g. `"AT2020USB+, USB Audio"`).
+    /// Comes from `Device::description().name()`. Not unique on its own.
+    pub name: String,
+    /// Routing / driver tag the user can use to disambiguate same-named
+    /// entries — typically the ALSA pcm pipeline (`pipewire`, `pulse`,
+    /// `front:CARD=...`, `dsnoop:CARD=...`) or the host driver name
+    /// on other platforms. `None` if the host doesn't expose one.
+    #[serde(default)]
+    pub pipeline: Option<String>,
+    /// Whether this is the default device.
+    pub is_default: bool,
+}
 
 /// Callback invoked with each captured PCM frame (48 kHz mono, 960 samples).
 pub type OnFrameFn = Box<dyn FnMut(&[f32]) + Send>;

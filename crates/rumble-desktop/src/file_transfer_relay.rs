@@ -516,8 +516,8 @@ impl FileTransferPlugin for FileTransferRelayPlugin {
         NAMESPACE
     }
 
-    fn encode_attachment(&self, offer: &FileOffer) -> rumble_protocol::types::ChatAttachment {
-        rumble_protocol::types::ChatAttachment {
+    fn encode_attachment(&self, offer: &FileOffer) -> rumble_protocol::ChatAttachment {
+        rumble_protocol::ChatAttachment {
             namespace: NAMESPACE.to_string(),
             schema_version: PAYLOAD_SCHEMA_VERSION,
             payload: encode_payload(offer),

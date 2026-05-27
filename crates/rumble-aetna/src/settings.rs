@@ -15,12 +15,12 @@ use std::path::PathBuf;
 
 use aetna_core::prelude::*;
 
-use rumble_client::{PipelineConfig, ProcessorConfig, ProcessorRegistry, SfxKind};
+use rumble_client::{AudioSettings, AudioState, PipelineConfig, ProcessorConfig, ProcessorRegistry, SfxKind, State};
 use rumble_desktop_shell::{
     AutoDownloadRule, HotkeyBinding, HotkeyData, HotkeyFunction, HotkeyManager, HotkeyModifiers, KeyboardSettings,
     PersistentVoiceMode, Settings, ShortcutEntry, TimestampFormat,
 };
-use rumble_protocol::{AudioSettings, AudioState, State, permissions::Permissions};
+use rumble_protocol::permissions::Permissions;
 use serde_json::Value as JsonValue;
 
 use crate::{
@@ -384,7 +384,7 @@ pub enum SettingsOutcome {
     OpenDownloadDir(PathBuf),
     /// Fire-and-forget commands surfaced by the Admin tab. Settings
     /// stays open so the user can keep editing.
-    Dispatch(Vec<rumble_protocol::Command>),
+    Dispatch(Vec<rumble_client::Command>),
     /// User edited the Shortcuts table — the new `KeyboardSettings`
     /// should be re-registered with the HotkeyManager so portal /
     /// global-hotkey bindings stay in sync with the pending edits.
@@ -2009,7 +2009,7 @@ fn stat_row(label: impl Into<String>, value: impl Into<String>, color: Option<Co
         .width(Size::Fill(1.0))
 }
 
-fn device_label_for(selected: Option<&str>, devices: &[rumble_protocol::AudioDeviceInfo]) -> String {
+fn device_label_for(selected: Option<&str>, devices: &[rumble_client::AudioDeviceInfo]) -> String {
     match selected {
         None => "System default".to_string(),
         Some(id) => devices

@@ -5,10 +5,8 @@
 
 use anyhow::Context;
 use opus::{Application, Bitrate, Channels, Decoder, Encoder};
-use rumble_client_traits::codec::{EncoderSettings, VoiceCodec, VoiceDecoder, VoiceEncoder};
+use rumble_client_traits::codec::{EncoderSettings, OPUS_SAMPLE_RATE, VoiceCodec, VoiceDecoder, VoiceEncoder};
 use tracing::debug;
-
-use rumble_protocol::OPUS_SAMPLE_RATE;
 
 /// Number of channels (mono for voice).
 const OPUS_CHANNELS: Channels = Channels::Mono;
@@ -143,7 +141,7 @@ impl VoiceDecoder for NativeOpusDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rumble_protocol::OPUS_FRAME_SIZE;
+    use rumble_client_traits::codec::OPUS_FRAME_SIZE;
 
     #[test]
     fn create_encoder() {
