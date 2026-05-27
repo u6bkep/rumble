@@ -414,9 +414,9 @@ fn history(
     let lines: Vec<El> = state
         .chat_messages
         .iter()
-        // remote_only messages are sender-side mirrors of broadcasts the
-        // sender already sees via their local_only card — never render.
-        .filter(|msg| !msg.remote_only)
+        // SenderMirror entries are sender-side history twins of broadcasts
+        // whose SenderDraft card is already on screen — never render.
+        .filter(|msg| msg.visibility.renders_locally())
         .map(|msg| {
             render_message(
                 msg,
@@ -453,7 +453,7 @@ fn render_message(
     // `$USER` by default), and would mis-classify the receiver as the
     // sender. Fall back to username only when `sender_id` is absent (older
     // peers in chat-history sync, legacy servers).
-    let is_own = if msg.is_local {
+    let is_own = if msg.visibility.is_system() {
         false
     } else if let (Some(mine), Some(theirs)) = (my_user_id, msg.sender_id) {
         mine == theirs
@@ -466,10 +466,10 @@ fn render_message(
         String::new()
     };
 
-    // Local system messages with no attachment: plain italic system text.
-    // Local messages WITH an attachment (sender's local_only file card)
-    // fall through to the normal render path so the card displays.
-    if msg.is_local && msg.attachment.is_none() {
+    // System notices with no attachment: plain italic system text.
+    // System entries WITH an attachment (rare in practice) fall through
+    // to the normal render path so the card displays.
+    if msg.visibility.is_system() && msg.attachment.is_none() {
         return paragraph(format!("{prefix}{}", msg.text))
             .font_size(tokens::TEXT_XS.size)
             .text_color(palette::CHAT_SYS)

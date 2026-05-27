@@ -24,8 +24,8 @@ use rumble_aetna::{
 };
 use rumble_desktop_shell::{KeyInfo, RecentServer, SettingsStore};
 use rumble_protocol::{
-    AudioDeviceInfo, AudioState, AudioStats, ChatAttachment, ChatMessage, ChatMessageKind, Command, ConnectionState,
-    PendingCertificate, State, Uuid, VoiceMode,
+    AudioDeviceInfo, AudioState, AudioStats, ChatAttachment, ChatMessage, ChatMessageKind, ChatMessageVisibility,
+    Command, ConnectionState, PendingCertificate, State, Uuid, VoiceMode,
     permissions::{ADMIN_PERMISSIONS, DEFAULT_PERMISSIONS, Permissions},
     proto::{GroupInfo, RelayFileSharePayload, RoomAclEntry, RoomInfo, User, UserId},
     room_id_from_uuid,
@@ -529,7 +529,7 @@ fn make_user(id: u64, name: &str, room: u128, mut tweak: impl FnMut(&mut User)) 
 }
 
 fn make_chat(id: u8, sender: &str, text: &str, kind: ChatMessageKind) -> ChatMessage {
-    make_chat_full(id, sender, text, kind, false, None)
+    make_chat_full(id, sender, text, kind, None)
 }
 
 fn make_chat_full(
@@ -537,7 +537,6 @@ fn make_chat_full(
     sender: &str,
     text: &str,
     kind: ChatMessageKind,
-    is_local: bool,
     attachment: Option<ChatAttachment>,
 ) -> ChatMessage {
     let mut bytes = [0u8; 16];
@@ -548,11 +547,9 @@ fn make_chat_full(
         sender_id: None,
         text: text.into(),
         timestamp: SystemTime::UNIX_EPOCH,
-        is_local,
         kind,
         attachment,
-        local_only: false,
-        remote_only: false,
+        visibility: ChatMessageVisibility::Normal,
     }
 }
 
@@ -757,7 +754,7 @@ fn make_room_with_parent(uuid: u128, name: &str, parent: Option<u128>) -> RoomIn
 }
 
 /// Fixture for the FileShare* scenes: connected session with a single
-/// sender-side local_only file-share message whose card draws state
+/// sender-side SenderDraft file-share message whose card draws state
 /// from the plugin's TransferStatus (set up via `build_transfers`).
 fn file_share_state(scene: Scene) -> State {
     let mut state = connected_state();
@@ -790,8 +787,8 @@ fn file_share_state(scene: Scene) -> State {
         },
         fallback,
     );
-    let mut msg = make_chat_full(20, "alice", summary, ChatMessageKind::Room, false, Some(attachment));
-    msg.local_only = true;
+    let mut msg = make_chat_full(20, "alice", summary, ChatMessageKind::Room, Some(attachment));
+    msg.visibility = ChatMessageVisibility::SenderDraft;
     state.chat_messages.push(msg);
     state
 }
@@ -836,7 +833,6 @@ fn connected_state() -> State {
                     other_user_id: 4,
                     other_username: "diana".into(),
                 },
-                false,
                 None,
             ),
             make_chat_full(
@@ -844,7 +840,6 @@ fn connected_state() -> State {
                 "bob",
                 "shared file: deploy_notes.md (12.3 KB)",
                 ChatMessageKind::Room,
-                false,
                 Some(relay_attachment(
                     RelayFileSharePayload {
                         transfer_id: "demo-offer".into(),

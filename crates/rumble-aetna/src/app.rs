@@ -1984,7 +1984,13 @@ impl<B: UiBackend> RumbleApp<B> {
             .map(|u| u.username.clone());
 
         for msg in &snapshot.chat_messages[prev..] {
-            if msg.is_local || msg.remote_only {
+            // System notices have no payload; SenderMirror twins are own
+            // shares already accounted for by their SenderDraft. The
+            // is_from_self check below further excludes SenderDrafts.
+            if matches!(
+                msg.visibility,
+                rumble_protocol::ChatMessageVisibility::System | rumble_protocol::ChatMessageVisibility::SenderMirror
+            ) {
                 continue;
             }
             let Some(offer) = chat::relay_payload(msg) else {
@@ -2030,10 +2036,13 @@ impl<B: UiBackend> RumbleApp<B> {
         if count > self.prev_chat_count && self.prev_chat_count > 0 {
             let mut had_dm = false;
             let mut had_room = false;
-            for m in snapshot.chat_messages[self.prev_chat_count..]
-                .iter()
-                .filter(|m| !m.is_local && !m.remote_only)
-            {
+            for m in snapshot.chat_messages[self.prev_chat_count..].iter().filter(|m| {
+                !matches!(
+                    m.visibility,
+                    rumble_protocol::ChatMessageVisibility::System
+                        | rumble_protocol::ChatMessageVisibility::SenderMirror
+                )
+            }) {
                 match m.kind {
                     rumble_protocol::ChatMessageKind::DirectMessage { .. } => had_dm = true,
                     _ => had_room = true,

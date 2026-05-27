@@ -596,13 +596,13 @@ async fn send_disconnect_envelope<T: rumble_client_traits::transport::Transport>
 /// connection task. The watcher polls `ft.transfers()` and, once an
 /// upload finishes successfully, asks the connection task to broadcast
 /// the corresponding chat message. Failure does not flow through this
-/// channel: the sender's local_only card reads the error directly from
+/// channel: the sender's SenderDraft card reads the error directly from
 /// the plugin's TransferStatus. Lives entirely inside
 /// [`run_connection_task`].
 #[derive(Debug)]
 enum DeferredAction {
     /// Upload finished successfully — broadcast the chat envelope and
-    /// insert a remote_only mirror of the message in local state so
+    /// insert a SenderMirror of the message in local state so
     /// late-joining peers can fetch it via history sync.
     FinalizeShareUpload {
         message_id: [u8; 16],
@@ -654,7 +654,7 @@ async fn run_connection_task<P: Platform>(
                         let Some(t) = &mut transport else {
                             // Disconnected between upload start and completion.
                             // The file is in the server cache but nobody knows
-                            // about it; the sender's local_only card still
+                            // about it; the sender's SenderDraft card still
                             // shows complete from plugin state. Drop the
                             // broadcast — no peers to deliver to anyway.
                             warn!("FinalizeShareUpload: transport gone, dropping broadcast");
@@ -678,7 +678,7 @@ async fn run_connection_task<P: Platform>(
                         if let Err(e) = send_envelope(t, &env).await {
                             error!("Failed to broadcast file share message: {}", e);
                             // Per design: don't try to surface this on the
-                            // chat card — the user's local_only card reads
+                            // chat card — the user's SenderDraft card reads
                             // upload state from the plugin (which shows
                             // complete). A toast keeps them informed that
                             // nobody else got it.
@@ -689,8 +689,10 @@ async fn run_connection_task<P: Platform>(
                             continue;
                         }
                         // Mirror the broadcast into local chat_messages as a
-                        // remote_only entry so history-sync requests from
-                        // late peers receive it.
+                        // SenderMirror entry so history-sync requests from
+                        // late peers receive it. The SenderDraft twin (same
+                        // id) keeps showing the live transfer state on the
+                        // sender's screen.
                         if let Ok(mut s) = state.write() {
                             s.chat_messages.push(crate::events::ChatMessage {
                                 id: message_id,
@@ -698,11 +700,9 @@ async fn run_connection_task<P: Platform>(
                                 sender_id: None,
                                 text: attachment.fallback_text.clone(),
                                 timestamp,
-                                is_local: false,
                                 kind: Default::default(),
                                 attachment: Some(attachment),
-                                local_only: false,
-                                remote_only: true,
+                                visibility: crate::events::ChatMessageVisibility::SenderMirror,
                             });
                             if s.chat_messages.len() > 100 {
                                 s.chat_messages.remove(0);
@@ -1178,11 +1178,9 @@ async fn run_connection_task<P: Platform>(
                                 sender_id: my_uid,
                                 text,
                                 timestamp,
-                                is_local: false,
                                 kind: crate::events::ChatMessageKind::Room,
                                 attachment: None,
-                                local_only: false,
-                                remote_only: false,
+                                visibility: crate::events::ChatMessageVisibility::Normal,
                             });
                             if s.chat_messages.len() > 100 {
                                 s.chat_messages.remove(0);
@@ -1224,11 +1222,9 @@ async fn run_connection_task<P: Platform>(
                                 sender_id: my_uid,
                                 text,
                                 timestamp,
-                                is_local: false,
                                 kind: crate::events::ChatMessageKind::Tree,
                                 attachment: None,
-                                local_only: false,
-                                remote_only: false,
+                                visibility: crate::events::ChatMessageVisibility::Normal,
                             });
                             if s.chat_messages.len() > 100 {
                                 s.chat_messages.remove(0);
@@ -1267,14 +1263,12 @@ async fn run_connection_task<P: Platform>(
                                 sender_id: my_uid,
                                 text,
                                 timestamp,
-                                is_local: false,
                                 kind: crate::events::ChatMessageKind::DirectMessage {
                                     other_user_id: target_user_id,
                                     other_username: target_username,
                                 },
                                 attachment: None,
-                                local_only: false,
-                                remote_only: false,
+                                visibility: crate::events::ChatMessageVisibility::Normal,
                             });
                             if s.chat_messages.len() > 100 {
                                 s.chat_messages.remove(0);
@@ -1292,11 +1286,9 @@ async fn run_connection_task<P: Platform>(
                             sender_id: None,
                             text,
                             timestamp: std::time::SystemTime::now(),
-                            is_local: true,
                             kind: Default::default(),
                             attachment: None,
-                            local_only: false,
-                            remote_only: false,
+                            visibility: crate::events::ChatMessageVisibility::System,
                         });
                         // Keep only recent messages
                         if s.chat_messages.len() > 100 {
@@ -1407,12 +1399,13 @@ async fn run_connection_task<P: Platform>(
                                 // rumble-client just routes the attachment.
                                 let attachment = ft.encode_attachment(&offer);
                                 let summary = attachment.fallback_text.clone();
-                                // Sender's local_only card. Renders in-flight
+                                // Sender's SenderDraft card. Renders in-flight
                                 // / failed / complete state by reading the
                                 // plugin's TransferStatus by transfer_id.
-                                // `is_local` stays false — it's a real message
-                                // from the sender's perspective; `local_only`
-                                // alone tags it as sender-side ephemeral.
+                                // Excluded from history sync — the matching
+                                // `SenderMirror` entry (inserted by
+                                // FinalizeShareUpload once the broadcast goes
+                                // out) carries that responsibility.
                                 {
                                     let mut s = write_state(&state);
                                     let my_uid = s.my_user_id;
@@ -1422,11 +1415,9 @@ async fn run_connection_task<P: Platform>(
                                         sender_id: my_uid,
                                         text: summary,
                                         timestamp,
-                                        is_local: false,
                                         kind: Default::default(),
                                         attachment: Some(attachment.clone()),
-                                        local_only: true,
-                                        remote_only: false,
+                                        visibility: crate::events::ChatMessageVisibility::SenderDraft,
                                     });
                                     if s.chat_messages.len() > 100 {
                                         s.chat_messages.remove(0);
@@ -1535,11 +1526,9 @@ async fn run_connection_task<P: Platform>(
                                     sender_id: None,
                                     text: "Requesting chat history from peers...".to_string(),
                                     timestamp: SystemTime::now(),
-                                    is_local: true,
                                     kind: Default::default(),
                                     attachment: None,
-                                    local_only: false,
-                                    remote_only: false,
+                                    visibility: crate::events::ChatMessageVisibility::System,
                                 });
                                 repaint();
                             }
@@ -1986,7 +1975,7 @@ async fn run_stream_dispatch<H: BiStreamHandle>(bi_handle: H, file_transfer: Opt
 /// Poll the file-transfer plugin until the named upload finishes
 /// successfully and ask the connection task to broadcast its chat
 /// message. Failure paths (plugin error, plugin dropped entry, cancel)
-/// just terminate the watcher — the sender's local_only card reads
+/// just terminate the watcher — the sender's SenderDraft card reads
 /// state directly from the plugin's TransferStatus.
 async fn watch_share_upload(
     ft: Arc<dyn FileTransferPlugin>,
@@ -2061,11 +2050,9 @@ fn add_local_message(state: &Arc<RwLock<State>>, text: String, repaint: &Arc<dyn
         sender_id: None,
         text,
         timestamp: std::time::SystemTime::now(),
-        is_local: true,
         kind: Default::default(),
         attachment: None,
-        local_only: false,
-        remote_only: false,
+        visibility: crate::events::ChatMessageVisibility::System,
     });
     // Keep only recent messages
     if s.chat_messages.len() > 100 {
@@ -2224,9 +2211,8 @@ fn handle_server_message(
                         let mut s = write_state(state);
                         // Dedup by message id: covers history-sync re-arrival
                         // of a message we already have, including the
-                        // sender's own remote_only mirror of an outgoing
-                        // broadcast that comes back via someone else's
-                        // history share.
+                        // sender's own SenderMirror of an outgoing broadcast
+                        // that comes back via someone else's history share.
                         if s.chat_messages.iter().any(|m| m.id == id) {
                             return;
                         }
@@ -2238,11 +2224,9 @@ fn handle_server_message(
                             sender_id: if cb.sender_id != 0 { Some(cb.sender_id) } else { None },
                             text: cb.text,
                             timestamp,
-                            is_local: false,
                             kind,
                             attachment,
-                            local_only: false,
-                            remote_only: false,
+                            visibility: crate::events::ChatMessageVisibility::Normal,
                         });
                         // Keep only recent messages
                         if s.chat_messages.len() > 100 {
@@ -2267,14 +2251,12 @@ fn handle_server_message(
                             sender_id: Some(dm.sender_id),
                             text: dm.text,
                             timestamp,
-                            is_local: false,
                             kind: crate::events::ChatMessageKind::DirectMessage {
                                 other_user_id: dm.sender_id,
                                 other_username: dm.sender_name,
                             },
                             attachment: None,
-                            local_only: false,
-                            remote_only: false,
+                            visibility: crate::events::ChatMessageVisibility::Normal,
                         });
                         if s.chat_messages.len() > 100 {
                             s.chat_messages.remove(0);
@@ -2293,11 +2275,9 @@ fn handle_server_message(
                             sender_id: None,
                             text: wm.text,
                             timestamp: std::time::SystemTime::now(),
-                            is_local: true,
                             kind: Default::default(),
                             attachment: None,
-                            local_only: false,
-                            remote_only: false,
+                            visibility: crate::events::ChatMessageVisibility::System,
                         });
                         if s.chat_messages.len() > 100 {
                             s.chat_messages.remove(0);

@@ -3003,7 +3003,9 @@ impl RumbleApp {
             let current_count = state.chat_messages.len();
             if current_count > self.prev_chat_count && self.prev_chat_count > 0 {
                 // Check if any of the new messages are non-local
-                let has_new_remote = state.chat_messages[self.prev_chat_count..].iter().any(|m| !m.is_local);
+                let has_new_remote = state.chat_messages[self.prev_chat_count..]
+                    .iter()
+                    .any(|m| !m.visibility.is_system());
                 if has_new_remote {
                     self.play_sfx(SfxKind::Message);
                 }
@@ -3445,8 +3447,8 @@ impl RumbleApp {
                                             String::new()
                                         };
 
-                                        if msg.is_local {
-                                            // Local status messages in gray italics
+                                        if msg.visibility.is_system() {
+                                            // System notices in gray italics
                                             let text = format!("{}{}", timestamp_prefix, msg.text);
                                             ui.label(egui::RichText::new(text).italics().color(egui::Color32::GRAY));
                                         } else {

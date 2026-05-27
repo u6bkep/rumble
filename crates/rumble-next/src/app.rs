@@ -963,7 +963,9 @@ impl<B: UiBackend> App<B> {
         let count = state.chat_messages.len();
         if count > self.prev_chat_count
             && self.prev_chat_count > 0
-            && state.chat_messages[self.prev_chat_count..].iter().any(|m| !m.is_local)
+            && state.chat_messages[self.prev_chat_count..]
+                .iter()
+                .any(|m| !m.visibility.is_system())
         {
             self.play_sfx(rumble_client::SfxKind::Message);
         }
@@ -995,7 +997,7 @@ impl<B: UiBackend> App<B> {
             .map(|u| u.username.clone());
 
         for msg in &state.chat_messages[prev..] {
-            if msg.is_local {
+            if msg.visibility.is_system() {
                 continue;
             }
             let Some(att) = msg.attachment.as_ref() else {

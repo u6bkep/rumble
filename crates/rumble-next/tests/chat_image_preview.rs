@@ -14,8 +14,8 @@ use prost::Message as _;
 use rumble_client_traits::file_transfer::{TransferDirection, TransferId, TransferStage, TransferStatus};
 use rumble_next::TestHarness;
 use rumble_protocol::{
-    ChatAttachment, ChatMessage, ChatMessageKind, ConnectionState, State, proto, proto::RelayFileSharePayload,
-    room_id_from_uuid,
+    ChatAttachment, ChatMessage, ChatMessageKind, ChatMessageVisibility, ConnectionState, State, proto,
+    proto::RelayFileSharePayload, room_id_from_uuid,
 };
 
 /// Build a relay-plugin ChatAttachment from inline metadata for tests.
@@ -123,11 +123,9 @@ fn renders_image_preview_for_completed_file_offer() {
         sender_id: None,
         text: "shared hello.png".to_string(),
         timestamp: std::time::SystemTime::now(),
-        is_local: false,
         kind: ChatMessageKind::Room,
         attachment: Some(relay_attachment("tx-1", "hello.png", 256, "image/png")),
-        local_only: false,
-        remote_only: false,
+        visibility: ChatMessageVisibility::Normal,
     });
 
     let mut harness = TestHarness::with_state(state);
@@ -242,11 +240,9 @@ fn setup_harness_with_image_sized(w: u32, h: u32, name: &str) -> (TestHarness, P
         sender_id: None,
         text: "shared hello.png".to_string(),
         timestamp: std::time::SystemTime::now(),
-        is_local: false,
         kind: ChatMessageKind::Room,
         attachment: Some(relay_attachment("tx-1", "hello.png", 256, "image/png")),
-        local_only: false,
-        remote_only: false,
+        visibility: ChatMessageVisibility::Normal,
     });
 
     let harness = TestHarness::with_state(state);
@@ -411,11 +407,9 @@ fn click_image_preview_in_overflowing_chat() {
             sender_id: None,
             text: format!("filler message #{i} so the scroll area has to scroll"),
             timestamp: std::time::SystemTime::now(),
-            is_local: false,
             kind: ChatMessageKind::Room,
             attachment: None,
-            local_only: false,
-            remote_only: false,
+            visibility: ChatMessageVisibility::Normal,
         });
     }
     // Image FileOffer at the end — that's where stick-to-bottom keeps
@@ -426,11 +420,9 @@ fn click_image_preview_in_overflowing_chat() {
         sender_id: None,
         text: "shared hello.png".to_string(),
         timestamp: std::time::SystemTime::now(),
-        is_local: false,
         kind: ChatMessageKind::Room,
         attachment: Some(relay_attachment("tx-1", "hello.png", 256, "image/png")),
-        local_only: false,
-        remote_only: false,
+        visibility: ChatMessageVisibility::Normal,
     });
 
     let mut harness = TestHarness::with_state(state);
@@ -518,11 +510,9 @@ fn click_image_preview_with_failed_load() {
         sender_id: None,
         text: "shared bogus.png".to_string(),
         timestamp: std::time::SystemTime::now(),
-        is_local: false,
         kind: ChatMessageKind::Room,
         attachment: Some(relay_attachment("tx-1", "bogus.png", 256, "image/png")),
-        local_only: false,
-        remote_only: false,
+        visibility: ChatMessageVisibility::Normal,
     });
 
     let mut harness = TestHarness::with_state(state);

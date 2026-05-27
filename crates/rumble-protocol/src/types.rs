@@ -676,6 +676,73 @@ pub fn chat_attachment_to_proto(att: &ChatAttachment) -> crate::proto::ChatAttac
     }
 }
 
+/// Where a chat entry lives in the local-vs-wire dataflow. Replaces
+/// the older `is_local` / `local_only` / `remote_only` bool triad —
+/// three independent flags allowed 8 combinations but only 4 were
+/// valid. The four variants below are the valid combinations made
+/// explicit, so renderer and history-sync filters can `match`
+/// exhaustively.
+///
+/// `chat_messages` is append-only: each entry is constructed with a
+/// fixed visibility at insertion time. The sender-side file-share
+/// flow inserts a [`SenderDraft`] when the share starts and, once the
+/// upload broadcasts, a separate [`SenderMirror`] entry with the same
+/// `id` — the draft stays on screen (with live transfer state) and
+/// the mirror exists solely to satisfy chat-history-sync requests
+/// from late peers. The variants are independent rather than a
+/// state-machine: nothing mutates an entry's visibility after insert.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatMessageVisibility {
+    /// Locally-generated system notice (welcome banners, command
+    /// results, "Requesting chat history…"). Rendered with italic
+    /// system styling and no sender header; never sent on the wire;
+    /// excluded from chat-history-sync shares.
+    System,
+    /// Default state for wire-roundtripped messages and the sender's
+    /// own locally-inserted copies of outgoing chat. Rendered;
+    /// included in chat-history-sync shares.
+    #[default]
+    Normal,
+    /// Sender-side card for a file share the local client just
+    /// started. Renders the in-flight transfer card driven by the
+    /// plugin's `TransferStatus`. Excluded from chat-history-sync
+    /// shares — late peers learn about the share from the
+    /// [`SenderMirror`] companion (same `id`), inserted after the
+    /// upload broadcast goes out. If the upload fails, the draft
+    /// stays in this state forever (failed card remains sender-only,
+    /// no mirror is ever inserted).
+    SenderDraft,
+    /// Sender-side mirror of an already-broadcast file share. The
+    /// [`SenderDraft`] twin (same `id`) already occupies the sender's
+    /// screen, so this entry is hidden from local rendering; it
+    /// exists solely so chat-history-sync includes the share when a
+    /// late peer asks for history.
+    SenderMirror,
+}
+
+impl ChatMessageVisibility {
+    /// Whether this entry should be rendered in the local chat view.
+    /// `SenderMirror` is the only variant hidden — its `SenderDraft`
+    /// twin is already on screen.
+    pub fn renders_locally(self) -> bool {
+        !matches!(self, Self::SenderMirror)
+    }
+
+    /// Whether this entry is included in chat-history-sync shares
+    /// (the JSON payload sent to peers requesting recent history).
+    /// Only `Normal` and `SenderMirror` cross the wire that way.
+    pub fn included_in_history_sync(self) -> bool {
+        matches!(self, Self::Normal | Self::SenderMirror)
+    }
+
+    /// Whether this entry is a locally-generated system notice
+    /// (styled italic, no sender header).
+    pub fn is_system(self) -> bool {
+        matches!(self, Self::System)
+    }
+}
+
 /// A chat message.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ChatMessage {
@@ -694,8 +761,6 @@ pub struct ChatMessage {
     /// Wall-clock time when the message was received/created.
     #[serde(serialize_with = "serialize_system_time")]
     pub timestamp: std::time::SystemTime,
-    /// True if this is a local status message (not from the server).
-    pub is_local: bool,
     /// The kind of message (room chat, DM, or tree broadcast).
     #[serde(default)]
     pub kind: ChatMessageKind,
@@ -704,19 +769,12 @@ pub struct ChatMessage {
     /// message's `text` if no attachment).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attachment: Option<ChatAttachment>,
-    /// Client-only: sender's view-only message. Never goes on the wire,
-    /// never included in chat-history-sync shares. Used for the
-    /// sender's in-flight file-share card (driven by plugin transfer
-    /// state).
+    /// Where this entry lives in the local-vs-wire dataflow — see
+    /// [`ChatMessageVisibility`]. Client-only; not transmitted (the
+    /// distinctions only matter to the local renderer and history-sync
+    /// filter, and peers receive a clean copy via the normal envelope).
     #[serde(skip)]
-    pub local_only: bool,
-    /// Client-only: sender's local copy of a broadcast they sent.
-    /// NOT rendered to the sender (they have the local_only card for
-    /// the same thing). IS included in history-sync shares so late
-    /// peers can fetch it from the sender; the flag itself is stripped
-    /// on egress.
-    #[serde(skip)]
-    pub remote_only: bool,
+    pub visibility: ChatMessageVisibility,
 }
 
 // =============================================================================
@@ -810,17 +868,16 @@ impl ChatHistoryContent {
 
     /// Create a new chat history content from chat messages.
     ///
-    /// Filters out:
-    /// - `is_local` system messages (preamble lines, "Connect first" notices)
-    /// - `local_only` sender-private cards (in-flight file shares)
-    ///
-    /// `remote_only` messages ARE included — that's the entire reason for
-    /// the flag. The flag itself is sender-local and not serialized over
-    /// the wire; peers receive a clean copy and render normally.
+    /// Includes only entries whose visibility opts into history sync —
+    /// see [`ChatMessageVisibility::included_in_history_sync`]. That is
+    /// `Normal` (regular messages) and `SenderMirror` (the sender-side
+    /// twin of an already-broadcast file share, inserted specifically
+    /// so peers asking for history learn about the share); `System`
+    /// notices and in-flight `SenderDraft` cards are excluded.
     pub fn from_messages(messages: &[ChatMessage]) -> Self {
         let entries = messages
             .iter()
-            .filter(|m| !m.is_local && !m.local_only)
+            .filter(|m| m.visibility.included_in_history_sync())
             .map(|m| ChatHistoryEntry {
                 id: hex::encode(m.id),
                 sender: m.sender.clone(),
@@ -871,11 +928,9 @@ impl ChatHistoryContent {
                     sender_id: e.sender_id,
                     text: e.text.clone(),
                     timestamp,
-                    is_local: false,
                     kind: ChatMessageKind::default(),
                     attachment: e.attachment.clone(),
-                    local_only: false,
-                    remote_only: false,
+                    visibility: ChatMessageVisibility::Normal,
                 })
             })
             .collect()

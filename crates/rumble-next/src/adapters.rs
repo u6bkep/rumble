@@ -137,7 +137,7 @@ pub fn crumbs_for_room(state: &State, room: Uuid) -> Vec<String> {
 
 /// Convert the recent chat messages into the display model.
 ///
-/// - Local messages (`is_local`) become system entries with `Info` tone.
+/// - System notices (`visibility == System`) become system entries with `Info` tone.
 /// - Normal messages keep sender + body.
 /// - Timestamps render according to the supplied `TimestampFormat`,
 ///   or are blank if the caller passes `None` (the user has them
@@ -165,7 +165,7 @@ fn render_entry(
     my_username: Option<&str>,
 ) -> ChatEntry {
     let t = format.map(|f| format_timestamp(m.timestamp, f)).unwrap_or_default();
-    if m.is_local {
+    if m.visibility.is_system() {
         return ChatEntry::Sys(SysMsg {
             tone: tone_for_local(&m.text),
             t,
