@@ -447,7 +447,11 @@ fn apply_room(_state: &Arc<RwLock<State>>, ev: RoomEvent, _repaint: &Arc<dyn Fn(
 }
 
 fn apply_transfer(_state: &Arc<RwLock<State>>, ev: TransferEvent, _repaint: &Arc<dyn Fn() + Send + Sync>) {
-    debug!(target: "rumble_client::projection", "transfer event (stub, not yet applied): {:?}", ev);
+    // Transfers are not stored in `State`; they're queried via
+    // `plugin.transfers()`. This variant exists for external
+    // subscribers (chat card, media cache, auto-download) that want
+    // the typed stream alongside the existing mpsc UX path.
+    tracing::trace!(target: "rumble_client::projection", "transfer event: {:?}", ev);
 }
 
 // Silence unused warnings on the broadcast `TryRecvError` import — it'll

@@ -884,7 +884,7 @@ async fn run_connection_task<P: Platform>(
                                     .unwrap_or_else(|| std::env::temp_dir().join("rumble_downloads"));
                                 let opener: Arc<dyn rumble_client_traits::StreamOpener> =
                                     Arc::new(rumble_client_traits::BiStreamOpener::new(opener_handle));
-                                let event_sink = plugin_event_sink(event_tx.clone());
+                                let event_sink = plugin_event_sink(event_tx.clone(), bus.clone());
                                 let ft_arc: Option<Arc<dyn FileTransferPlugin>> =
                                     P::create_file_transfer_plugin(opener, downloads_dir, Some(event_sink));
 
@@ -1037,7 +1037,7 @@ async fn run_connection_task<P: Platform>(
                                         .unwrap_or_else(|| std::env::temp_dir().join("rumble_downloads"));
                                     let opener: Arc<dyn rumble_client_traits::StreamOpener> =
                                         Arc::new(rumble_client_traits::BiStreamOpener::new(opener_handle));
-                                    let event_sink = plugin_event_sink(event_tx.clone());
+                                    let event_sink = plugin_event_sink(event_tx.clone(), bus.clone());
                                     let ft_arc: Option<Arc<dyn FileTransferPlugin>> =
                                         P::create_file_transfer_plugin(opener, downloads_dir, Some(event_sink));
 
@@ -2040,31 +2040,46 @@ async fn watch_share_upload(
 /// [`BackendEvent`] channel. Defined here so the connection task can
 /// build it inline without `rumble-client-traits` taking a dependency
 /// on `BackendEvent`.
-fn plugin_event_sink(event_tx: mpsc::UnboundedSender<BackendEvent>) -> rumble_client_traits::PluginEventSink {
+fn plugin_event_sink(
+    event_tx: mpsc::UnboundedSender<BackendEvent>,
+    bus: crate::projection::EventBus,
+) -> rumble_client_traits::PluginEventSink {
     use rumble_client_traits::PluginEvent;
     Arc::new(move |event| {
-        let mapped = match event {
+        match event {
             PluginEvent::Notification { level, text } => {
                 let level = match level {
                     rumble_client_traits::PluginNotificationLevel::Info => NotificationLevel::Info,
                     rumble_client_traits::PluginNotificationLevel::Warn => NotificationLevel::Warn,
                     rumble_client_traits::PluginNotificationLevel::Error => NotificationLevel::Error,
                 };
-                BackendEvent::Toast { level, text }
+                let _ = event_tx.send(BackendEvent::Toast { level, text });
             }
             PluginEvent::TransferStageChanged {
                 id,
                 direction,
                 name,
                 stage,
-            } => BackendEvent::TransferStageChanged {
-                id,
-                direction,
-                name,
-                stage,
-            },
-        };
-        let _ = event_tx.send(mapped);
+            } => {
+                // mpsc UX-notification path (legacy): the UI's media
+                // cache drains this each frame.
+                let _ = event_tx.send(BackendEvent::TransferStageChanged {
+                    id: id.clone(),
+                    direction,
+                    name: name.clone(),
+                    stage: stage.clone(),
+                });
+                // Broadcast TransferEvent — same payload, but on the
+                // domain bus so post-cutover subscribers can react
+                // alongside the mpsc consumer.
+                let _ = bus.transfer.send(crate::domain_events::TransferEvent::StageChanged {
+                    id,
+                    direction,
+                    name,
+                    stage,
+                });
+            }
+        }
     })
 }
 

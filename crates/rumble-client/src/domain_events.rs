@@ -29,7 +29,7 @@
 use std::collections::HashMap;
 
 use rumble_audio::{PipelineConfig, UserRxConfig};
-use rumble_client_traits::file_transfer::{TransferId, TransferStage, TransferStatus};
+use rumble_client_traits::file_transfer::{TransferDirection, TransferId, TransferStage};
 use rumble_protocol::{
     Uuid,
     proto::{GroupInfo, RoomAclEntry, RoomInfo, User},
@@ -313,21 +313,21 @@ pub enum RoomEvent {
 /// `PluginEvent` stream into a backend-layer event so consumers
 /// (chat card, media cache, auto-download) all speak one type
 /// without each subscribing to the plugin directly.
+///
+/// One variant for now: the plugin only fires lifecycle transitions
+/// (`PluginEvent::TransferStageChanged`), and the initial transition
+/// into `Active` doubles as a "started" signal. Subscribers needing a
+/// full snapshot can call `plugin.transfers()`.
 #[derive(Debug, Clone)]
 pub enum TransferEvent {
-    /// A new transfer just appeared in the plugin (share started or
-    /// download accepted). Carries the full status snapshot.
-    Started { status: TransferStatus },
     /// An existing transfer transitioned to a new lifecycle stage
-    /// (`Active` → `Done`, `Active` → `Failed`, etc.). Intra-`Active`
-    /// progress updates do NOT fire this — UI progress bars keep
-    /// reading the plugin's snapshot.
+    /// (`Active` on creation, `Active` → `Done`, `Active` → `Failed`,
+    /// etc.). Intra-`Active` progress updates do NOT fire this — UI
+    /// progress bars keep reading the plugin's snapshot.
     StageChanged {
         id: TransferId,
-        direction: rumble_client_traits::file_transfer::TransferDirection,
+        direction: TransferDirection,
         name: String,
         stage: TransferStage,
     },
-    /// Transfer was cancelled (by the user or by the plugin).
-    Cancelled { id: TransferId },
 }
