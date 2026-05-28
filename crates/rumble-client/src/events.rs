@@ -1565,6 +1565,7 @@ mod tests {
                     server_muted: false,
                     is_elevated: false,
                     groups: vec![],
+                    label: None,
                 },
                 User {
                     user_id: Some(UserId { value: 2 }),
@@ -1575,6 +1576,7 @@ mod tests {
                     server_muted: false,
                     is_elevated: false,
                     groups: vec![],
+                    label: None,
                 },
                 User {
                     user_id: Some(UserId { value: 3 }),
@@ -1585,6 +1587,7 @@ mod tests {
                     server_muted: false,
                     is_elevated: false,
                     groups: vec![],
+                    label: None,
                 },
             ],
             audio: AudioState::default(),

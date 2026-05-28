@@ -143,7 +143,7 @@ pub struct BridgeState {
     pub rumble_connected: bool,
 
     // -- Virtual user tracking for bridge protocol --
-    /// Pending registrations: (username, mumble_session) pairs awaiting BridgeUserRegistered.
+    /// Pending registrations: (username, mumble_session) pairs awaiting ParticipantRegistered.
     /// Uses a Vec to support multiple simultaneous registrations with the same username.
     pub pending_registrations: Vec<(String, u32)>,
     /// Mumble session -> Rumble virtual user ID (for registered virtual users).

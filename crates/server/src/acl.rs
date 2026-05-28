@@ -5,7 +5,7 @@
 
 use crate::{
     persistence::Persistence,
-    state::{ClientHandle, ServerState},
+    state::{ClientHandle, Identity, Member, ServerState},
 };
 use rumble_protocol::permissions::{self, AclEntry, Permissions, RoomAclData};
 use std::{collections::HashMap, sync::Arc};
@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use rumble_protocol::proto;
 
-/// Check if a user has the required permission in a room.
+/// Check if a connected client has the required permission in a room.
 /// Returns Ok(()) if allowed, Err(PermissionDenied) if not.
 pub async fn check_permission(
     state: &ServerState,
@@ -23,7 +23,23 @@ pub async fn check_permission(
     persistence: &Option<Arc<Persistence>>,
 ) -> Result<(), proto::PermissionDenied> {
     let effective = evaluate_user_permissions(state, sender, room_uuid, persistence).await;
+    require(effective, required, room_uuid)
+}
 
+/// Check if a roster member (client *or* participant) has the required
+/// permission in a room.
+pub async fn check_member_permission(
+    state: &ServerState,
+    member: &Member,
+    room_uuid: Uuid,
+    required: Permissions,
+    persistence: &Option<Arc<Persistence>>,
+) -> Result<(), proto::PermissionDenied> {
+    let effective = evaluate_member_permissions(state, member, room_uuid, persistence).await;
+    require(effective, required, room_uuid)
+}
+
+fn require(effective: Permissions, required: Permissions, room_uuid: Uuid) -> Result<(), proto::PermissionDenied> {
     if effective.contains(required) {
         Ok(())
     } else {
@@ -38,10 +54,35 @@ pub async fn check_permission(
     }
 }
 
-/// Evaluate effective permissions for a user in a room.
+/// Evaluate effective permissions for a connected client in a room.
 pub async fn evaluate_user_permissions(
     state: &ServerState,
     sender: &ClientHandle,
+    room_uuid: Uuid,
+    persistence: &Option<Arc<Persistence>>,
+) -> Permissions {
+    let is_superuser = sender.is_superuser.load(std::sync::atomic::Ordering::Relaxed);
+    evaluate_identity_permissions(state, is_superuser, &sender.identity, room_uuid, persistence).await
+}
+
+/// Evaluate effective permissions for a roster member (client or participant).
+pub async fn evaluate_member_permissions(
+    state: &ServerState,
+    member: &Member,
+    room_uuid: Uuid,
+    persistence: &Option<Arc<Persistence>>,
+) -> Permissions {
+    evaluate_identity_permissions(state, member.is_superuser(), &member.identity, room_uuid, persistence).await
+}
+
+/// Core ACL evaluation, operating purely on identity (groups + verified
+/// username) and superuser status. The implicit username-group is derived from
+/// the member's *verified* identity name, never from a display name; members
+/// with no verified identity (anonymous participants) get no implicit group.
+async fn evaluate_identity_permissions(
+    state: &ServerState,
+    is_superuser: bool,
+    identity: &Identity,
     room_uuid: Uuid,
     persistence: &Option<Arc<Persistence>>,
 ) -> Permissions {
@@ -50,23 +91,19 @@ pub async fn evaluate_user_permissions(
         return Permissions::all();
     };
 
-    // Check superuser status
-    let is_superuser = sender.is_superuser.load(std::sync::atomic::Ordering::Relaxed);
-
-    // Build user's group list: always in "default" + their explicitly assigned groups
-    // + their username as an implicit group
+    // Build user's group list: always in "default" + their explicitly assigned
+    // groups + their verified username as an implicit group (if verified).
     let mut user_groups = vec!["default".to_string()];
-    {
-        let assigned = sender.groups.read().await;
-        for g in assigned.iter() {
-            if !user_groups.contains(g) {
-                user_groups.push(g.clone());
-            }
+    for g in identity.groups().await {
+        if !user_groups.contains(&g) {
+            user_groups.push(g);
         }
     }
-    // Add username as implicit group
-    let username = sender.get_username().await;
-    if !user_groups.contains(&username) {
+    // Add verified username as implicit group. Anonymous participants have no
+    // verified identity, so they never gain a username-keyed group.
+    if let Some(username) = identity.verified_username().await
+        && !user_groups.contains(&username)
+    {
         user_groups.push(username);
     }
 

@@ -29,6 +29,8 @@ bitflags! {
         const MANAGE_ACL     = 0x100000;
         const SUDO           = 0x200000;
         const BANNED         = 0x400000;
+        // Authority to mint and drive participants (held by controllers/bridges).
+        const MANAGE_PARTICIPANTS = 0x800000;
     }
 }
 
@@ -51,7 +53,8 @@ pub const ALL_SERVER_SCOPED: Permissions = Permissions::KICK
     .union(Permissions::SELF_REGISTER)
     .union(Permissions::MANAGE_ACL)
     .union(Permissions::SUDO)
-    .union(Permissions::BANNED);
+    .union(Permissions::BANNED)
+    .union(Permissions::MANAGE_PARTICIPANTS);
 
 /// All permission bits.
 pub const ALL: Permissions = ALL_ROOM_SCOPED.union(ALL_SERVER_SCOPED);

@@ -79,6 +79,11 @@ pub struct Persistence {
     room_acls: sled::Tree,
     /// Tree for sudo password: fixed key b"sudo" → bcrypt hash string
     sudo_password: sled::Tree,
+    /// Tree for controller participant defaults: controller public_key (32
+    /// bytes) → default participant group name (UTF-8). Separate from the
+    /// controller's own group assignment (which carries MANAGE_PARTICIPANTS),
+    /// so anonymous participants never inherit the controller's authority.
+    participant_defaults: sled::Tree,
 }
 
 impl Persistence {
@@ -92,6 +97,7 @@ impl Persistence {
         let user_groups = db.open_tree("user_groups")?;
         let room_acls = db.open_tree("room_acls")?;
         let sudo_password = db.open_tree("sudo_password")?;
+        let participant_defaults = db.open_tree("participant_defaults")?;
 
         Ok(Self {
             db,
@@ -102,6 +108,7 @@ impl Persistence {
             user_groups,
             room_acls,
             sudo_password,
+            participant_defaults,
         })
     }
 
@@ -115,6 +122,7 @@ impl Persistence {
         let user_groups = db.open_tree("user_groups")?;
         let room_acls = db.open_tree("room_acls")?;
         let sudo_password = db.open_tree("sudo_password")?;
+        let participant_defaults = db.open_tree("participant_defaults")?;
 
         Ok(Self {
             db,
@@ -125,6 +133,7 @@ impl Persistence {
             user_groups,
             room_acls,
             sudo_password,
+            participant_defaults,
         })
     }
 
@@ -369,6 +378,30 @@ impl Persistence {
             .flatten()
             .and_then(|data| bincode::deserialize::<Vec<String>>(&data).ok())
             .unwrap_or_default()
+    }
+
+    /// Set the default participant group for a controller (by its public key).
+    /// Anonymous participants minted by this controller inherit this group.
+    /// Passing `None` clears the setting.
+    pub fn set_participant_default_group(&self, public_key: &[u8; 32], group: Option<&str>) -> Result<()> {
+        match group {
+            Some(g) => {
+                self.participant_defaults.insert(public_key, g.as_bytes())?;
+            }
+            None => {
+                self.participant_defaults.remove(public_key)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Get the default participant group configured for a controller, if any.
+    pub fn get_participant_default_group(&self, public_key: &[u8; 32]) -> Option<String> {
+        self.participant_defaults
+            .get(public_key)
+            .ok()
+            .flatten()
+            .and_then(|data| String::from_utf8(data.to_vec()).ok())
     }
 
     /// Add a user to a group.

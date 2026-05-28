@@ -14,7 +14,10 @@ use crate::{
     acl,
     persistence::Persistence,
     plugin::{ServerCtx, ServerPlugin},
-    state::{ClientHandle, PendingAuth, ServerState, SessionEntry, UserStatus, compute_server_state_hash},
+    state::{
+        Binding, ClientHandle, Identity, Member, OwnerId, PendingAuth, ServerState, SessionEntry, UserStatus,
+        compute_server_state_hash,
+    },
 };
 use anyhow::Result;
 use ed25519_dalek::{Signature, VerifyingKey};
@@ -157,42 +160,42 @@ pub async fn handle_envelope(
             }
             handle_unregister_user(uu, sender, state, persistence).await?;
         }
-        // Bridge messages (70-79)
-        Some(Payload::BridgeHello(bh)) => {
+        // Controller / participant messages (70-79)
+        Some(Payload::ControllerHello(ch)) => {
             if !sender.authenticated.load(Ordering::SeqCst) {
                 return Ok(());
             }
-            handle_bridge_hello(bh, sender, state).await?;
+            handle_controller_hello(ch, sender, state, persistence).await?;
         }
-        Some(Payload::BridgeRegisterUser(bru)) => {
-            if !sender.authenticated.load(Ordering::SeqCst) || !sender.is_bridge.load(Ordering::SeqCst) {
+        Some(Payload::RegisterParticipant(rp)) => {
+            if !sender.authenticated.load(Ordering::SeqCst) || !sender.is_controller.load(Ordering::SeqCst) {
                 return Ok(());
             }
-            handle_bridge_register_user(bru, sender, state).await?;
+            handle_register_participant(rp, sender, state, persistence).await?;
         }
-        Some(Payload::BridgeUnregisterUser(buu)) => {
-            if !sender.authenticated.load(Ordering::SeqCst) || !sender.is_bridge.load(Ordering::SeqCst) {
+        Some(Payload::UnregisterParticipant(up)) => {
+            if !sender.authenticated.load(Ordering::SeqCst) || !sender.is_controller.load(Ordering::SeqCst) {
                 return Ok(());
             }
-            handle_bridge_unregister_user(buu, sender, state).await?;
+            handle_unregister_participant(up, sender, state).await?;
         }
-        Some(Payload::BridgeJoinRoom(bjr)) => {
-            if !sender.authenticated.load(Ordering::SeqCst) || !sender.is_bridge.load(Ordering::SeqCst) {
+        Some(Payload::MoveParticipant(mp)) => {
+            if !sender.authenticated.load(Ordering::SeqCst) || !sender.is_controller.load(Ordering::SeqCst) {
                 return Ok(());
             }
-            handle_bridge_join_room(bjr, sender, state).await?;
+            handle_move_participant(mp, sender, state).await?;
         }
-        Some(Payload::BridgeSetUserStatus(bss)) => {
-            if !sender.authenticated.load(Ordering::SeqCst) || !sender.is_bridge.load(Ordering::SeqCst) {
+        Some(Payload::SetParticipantStatus(sps)) => {
+            if !sender.authenticated.load(Ordering::SeqCst) || !sender.is_controller.load(Ordering::SeqCst) {
                 return Ok(());
             }
-            handle_bridge_set_user_status(bss, sender, state).await?;
+            handle_set_participant_status(sps, sender, state).await?;
         }
-        Some(Payload::BridgeChatMessage(bcm)) => {
-            if !sender.authenticated.load(Ordering::SeqCst) || !sender.is_bridge.load(Ordering::SeqCst) {
+        Some(Payload::ParticipantChat(pc)) => {
+            if !sender.authenticated.load(Ordering::SeqCst) || !sender.is_controller.load(Ordering::SeqCst) {
                 return Ok(());
             }
-            handle_bridge_chat_message(bcm, sender, state).await?;
+            handle_participant_chat(pc, sender, state, persistence).await?;
         }
         // ACL messages (80-90)
         Some(Payload::KickUser(ku)) => {
@@ -255,7 +258,7 @@ pub async fn handle_envelope(
             | Payload::ServerEvent(_)
             | Payload::AuthFailed(_)
             | Payload::CommandResult(_)
-            | Payload::BridgeUserRegistered(_)
+            | Payload::ParticipantRegistered(_)
             | Payload::PermissionDenied(_)
             | Payload::UserKicked(_),
         )
@@ -488,8 +491,12 @@ async fn handle_authenticate(
         warn!("Failed to mark key as known: {e}");
     }
 
-    // 6c. Load user's groups from persistence
-    if let Some(persist) = &persistence {
+    // 6c. Load the user's assigned groups and verified identity from
+    // persistence. The implicit username-group is NOT baked into the assigned
+    // groups here; ACL evaluation derives it from the verified identity name
+    // (see acl::evaluate_identity_permissions), so members without a verified
+    // identity never gain a username-keyed group.
+    let verified_username = if let Some(persist) = &persistence {
         let mut groups = vec!["default".to_string()];
         if let Some(user_groups_data) = persist.get_raw("user_groups", &pending.public_key)
             && let Ok(stored_groups) = bincode::deserialize::<Vec<String>>(&user_groups_data)
@@ -500,25 +507,15 @@ async fn handle_authenticate(
                 }
             }
         }
-        // Add username-as-group (implicit personal group)
-        if let Some(registered) = persist.get_registered_user(&pending.public_key)
-            && !groups.contains(&registered.username)
-        {
-            groups.push(registered.username);
-        }
-        *sender.groups.write().await = groups;
-    }
-
-    // 7. Check for registered username (overrides client-provided)
-    let final_username = if let Some(persist) = &persistence {
-        if let Some(registered) = persist.get_registered_user(&pending.public_key) {
-            registered.username
-        } else {
-            pending.username.clone()
-        }
+        sender.identity.set_groups(groups).await;
+        persist.get_registered_user(&pending.public_key).map(|r| r.username)
     } else {
-        pending.username.clone()
+        None
     };
+    sender.identity.set_verified_username(verified_username.clone()).await;
+
+    // 7. Display name: the registered username overrides the client-provided one.
+    let final_username = verified_username.clone().unwrap_or_else(|| pending.username.clone());
 
     // 8. Set username
     sender.set_username(final_username.clone()).await;
@@ -569,7 +566,8 @@ async fn handle_authenticate(
                 is_deafened: false,
                 server_muted: false,
                 is_elevated: false,
-                groups: sender.groups.read().await.clone(),
+                groups: sender.identity.groups().await,
+                label: None,
             }),
         }),
     )
@@ -774,24 +772,9 @@ async fn handle_chat_message(
     persistence: Option<Arc<Persistence>>,
 ) -> Result<()> {
     let is_tree = msg.tree.unwrap_or(false);
-    let sender_room = state.get_user_room(sender.user_id).await.unwrap_or(ROOT_ROOM_UUID);
-
-    // Permission check: TEXT_MESSAGE in sender's room
-    if let Err(denied) =
-        acl::check_permission(&state, &sender, sender_room, Permissions::TEXT_MESSAGE, &persistence).await
-    {
-        send_permission_denied(&sender, denied).await?;
-        return Ok(());
-    }
-
     // Identity comes from the authenticated connection, NOT the client's
     // `msg.sender` field — otherwise a client could broadcast as anyone.
-    // `msg.sender` is logged for debugging but discarded for the broadcast.
-    let authenticated_sender = sender.get_username().await;
-    info!(
-        "chat from {} (uid={}): {} (tree={})",
-        authenticated_sender, sender.user_id, msg.text, is_tree
-    );
+    info!("chat from uid={}: {} (tree={})", sender.user_id, msg.text, is_tree);
 
     // Use provided message ID and timestamp, or generate new ones if not provided
     let message_id = if msg.id.len() == 16 {
@@ -799,54 +782,109 @@ async fn handle_chat_message(
     } else {
         uuid::Uuid::new_v4().into_bytes().to_vec()
     };
-
     let timestamp_ms = if msg.timestamp_ms > 0 {
         msg.timestamp_ms
     } else {
         now_ms()
     };
 
+    broadcast_chat_as(
+        &state,
+        &persistence,
+        sender.user_id,
+        msg.text,
+        is_tree,
+        message_id,
+        timestamp_ms,
+        msg.attachment,
+    )
+    .await
+}
+
+/// Broadcast a chat message authored by `sender_id` (a real client *or* a
+/// participant) to its room — and descendants if `tree`. The single source of
+/// truth for chat fan-out:
+///
+/// - ACL (`TEXT_MESSAGE`) is enforced via the member's identity, so
+///   participants are subject to the same permission machinery as humans.
+/// - Each recipient is resolved to its *delivery connection* (a participant's
+///   chat reaches its controller), deduped per connection, so a controller with
+///   several participants in the room receives the message once. This is what
+///   makes inbound chat reach bridged users.
+/// - The author's own delivery connection is never echoed: a client inserts its
+///   own copy locally, and a controller already knows the message it sent.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn broadcast_chat_as(
+    state: &Arc<ServerState>,
+    persistence: &Option<Arc<Persistence>>,
+    sender_id: u64,
+    text: String,
+    is_tree: bool,
+    id: Vec<u8>,
+    timestamp_ms: i64,
+    attachment: Option<proto::ChatAttachment>,
+) -> Result<()> {
+    let Some(member) = state.get_member(sender_id) else {
+        return Ok(());
+    };
+    let sender_room = state.get_user_room(sender_id).await.unwrap_or(ROOT_ROOM_UUID);
+
+    // Permission check: TEXT_MESSAGE in the sender's room.
+    if let Err(denied) =
+        acl::check_member_permission(state, &member, sender_room, Permissions::TEXT_MESSAGE, persistence).await
+    {
+        // Only a connected client can be told why; participants are driven by
+        // their controller, which is responsible for its own UX.
+        if let Some(client) = member.client() {
+            send_permission_denied(client, denied).await?;
+        }
+        return Ok(());
+    }
+
     let broadcast = proto::Envelope {
         state_hash: Vec::new(),
         payload: Some(Payload::ServerEvent(proto::ServerEvent {
             kind: Some(proto::server_event::Kind::ChatBroadcast(proto::ChatBroadcast {
-                id: message_id,
+                id,
                 timestamp_ms,
-                sender: authenticated_sender,
-                sender_id: sender.user_id,
-                text: msg.text,
+                sender: member.identity.display_name().await,
+                sender_id,
+                text,
                 tree: if is_tree { Some(true) } else { None },
-                attachment: msg.attachment,
+                attachment,
             })),
         })),
     };
     let frame = encode_frame(&broadcast);
 
-    // Build the set of target rooms
     let target_rooms = if is_tree {
-        collect_descendant_rooms(&state, sender_room).await
+        collect_descendant_rooms(state, sender_room).await
     } else {
         let mut set = std::collections::HashSet::new();
         set.insert(sender_room);
         set
     };
 
-    // Snapshot clients first, then iterate without holding any state locks
-    let clients = state.snapshot_clients();
-    for h in clients {
-        // Don't echo the sender back to itself — the sender's client
-        // inserts its own copy of the message before sending. Universal
-        // rule for chat broadcasts: outbound only.
-        if h.user_id == sender.user_id {
+    let author_conn = state.delivery_client(sender_id).map(|c| c.user_id);
+    let memberships = state.snapshot_room_memberships().await;
+    let mut sent_to = std::collections::HashSet::new();
+    for (room, members) in &memberships {
+        if !target_rooms.contains(room) {
             continue;
         }
-        let user_room = state.get_user_room(h.user_id).await;
-        let in_target = user_room.map(|r| target_rooms.contains(&r)).unwrap_or(false);
-        if !in_target {
-            continue;
-        }
-        if let Err(e) = h.send_frame(&frame).await {
-            error!("broadcast write failed: {e:?}");
+        for &uid in members {
+            let Some(client) = state.delivery_client(uid) else {
+                continue;
+            };
+            if Some(client.user_id) == author_conn {
+                continue;
+            }
+            if !sent_to.insert(client.user_id) {
+                continue;
+            }
+            if let Err(e) = client.send_frame(&frame).await {
+                error!("chat broadcast write failed: {e:?}");
+            }
         }
     }
 
@@ -900,26 +938,20 @@ async fn handle_direct_message(
         sender_name, sender.user_id, dm.target_user_id, dm.text
     );
 
-    // Validate target user exists and resolve target client + username
-    let (target_client, target_username) = match state.get_client(dm.target_user_id) {
-        Some(c) => {
-            let name = c.get_username().await;
-            (c, name)
+    // Validate target exists and resolve the delivery connection + display name.
+    // For a participant this resolves to its controller connection.
+    let (target_client, target_username) = match state.get_member(dm.target_user_id) {
+        Some(member) => {
+            let name = member.identity.display_name().await;
+            match state.delivery_client(dm.target_user_id) {
+                Some(c) => (c, name),
+                None => {
+                    return send_command_result(&sender, "DirectMessage", false, "Target user not found").await;
+                }
+            }
         }
         None => {
-            // Target might be a virtual user on a bridge
-            if let Some(vu) = state.get_virtual_user(dm.target_user_id) {
-                let name = vu.username.clone();
-                // Find the bridge connection
-                match state.get_client(vu.bridge_owner_id) {
-                    Some(c) => (c, name),
-                    None => {
-                        return send_command_result(&sender, "DirectMessage", false, "Target user not found").await;
-                    }
-                }
-            } else {
-                return send_command_result(&sender, "DirectMessage", false, "Target user not found").await;
-            }
+            return send_command_result(&sender, "DirectMessage", false, "Target user not found").await;
         }
     };
 
@@ -1579,18 +1611,18 @@ pub async fn broadcast_state_update(state: &Arc<ServerState>, update: proto::sta
     Ok(())
 }
 
-/// Clean up a client: remove from clients list, remove memberships, broadcast update.
+/// Clean up a client: remove from the member table, remove memberships, broadcast update.
 ///
-/// If the client is a bridge, also cleans up all its virtual users.
+/// If the client is a controller, also cleans up all participants it owned.
 pub async fn cleanup_client(client_handle: &Arc<ClientHandle>, state: &Arc<ServerState>) {
     let user_id = client_handle.user_id;
-    let is_bridge = client_handle.is_bridge.load(Ordering::SeqCst);
+    let is_controller = client_handle.is_controller.load(Ordering::SeqCst);
 
-    // If this is a bridge, clean up all virtual users it owned
-    if is_bridge {
-        let virtual_user_ids = state.get_virtual_users_for_bridge(user_id);
-        for vu_id in virtual_user_ids {
-            state.remove_virtual_user(vu_id);
+    // If this is a controller, clean up all participants it drove.
+    if is_controller {
+        let participant_ids = state.members_by_owner(crate::state::OwnerId::Connection(user_id));
+        for vu_id in participant_ids {
+            state.remove_client(vu_id);
             state.remove_user_membership(vu_id).await;
             if let Err(e) = broadcast_state_update(
                 state,
@@ -1600,13 +1632,17 @@ pub async fn cleanup_client(client_handle: &Arc<ClientHandle>, state: &Arc<Serve
             )
             .await
             {
-                error!(virtual_user_id = vu_id, "failed to broadcast virtual user leave: {e:?}");
+                error!(participant_id = vu_id, "failed to broadcast participant leave: {e:?}");
             }
-            debug!(bridge_id = user_id, virtual_user_id = vu_id, "cleaned up virtual user");
+            debug!(
+                controller_id = user_id,
+                participant_id = vu_id,
+                "cleaned up participant"
+            );
         }
     }
 
-    // Remove client from DashMap (lock-free)
+    // Remove client from the member table (lock-free)
     state.remove_client_by_handle(client_handle);
     // Remove membership
     state.remove_user_membership(user_id).await;
@@ -1617,9 +1653,9 @@ pub async fn cleanup_client(client_handle: &Arc<ClientHandle>, state: &Arc<Serve
 
     debug!(user_id, "server: cleaned up client");
 
-    // Only broadcast if the client was authenticated and not a bridge
-    // (bridge user was already removed from visible state in BridgeHello)
-    if client_handle.authenticated.load(Ordering::SeqCst) && !is_bridge {
+    // Only broadcast if the client was authenticated and not a controller
+    // (controller's own user was already removed from visible state in ControllerHello)
+    if client_handle.authenticated.load(Ordering::SeqCst) && !is_controller {
         // Send incremental update about user leaving
         if let Err(e) = broadcast_state_update(
             state,
@@ -1653,21 +1689,28 @@ pub async fn handle_datagrams(conn: quinn::Connection, state: Arc<ServerState>, 
                 match VoiceDatagram::decode(datagram.as_ref()) {
                     Ok(mut voice_dgram) => {
                         // Determine the effective sender for this datagram.
-                        // For bridge connections, trust the sender_id if it matches
-                        // a virtual user owned by this bridge.
-                        let is_bridge = state
+                        // For controller connections, trust the sender_id if it
+                        // names a participant this controller drives.
+                        let is_controller = state
                             .get_client(sender_user_id)
-                            .is_some_and(|c| c.is_bridge.load(Ordering::SeqCst));
+                            .is_some_and(|c| c.is_controller.load(Ordering::SeqCst));
 
-                        let effective_sender = if is_bridge {
-                            // Bridge: use the datagram's sender_id if it's a valid virtual user
+                        let effective_sender = if is_controller {
+                            // Controller: use the datagram's sender_id if it's one of its participants
                             match voice_dgram.sender_id {
-                                Some(claimed_id) if state.is_virtual_user_of(claimed_id, sender_user_id) => claimed_id,
+                                Some(claimed_id)
+                                    if state.is_participant_of(
+                                        claimed_id,
+                                        crate::state::OwnerId::Connection(sender_user_id),
+                                    ) =>
+                                {
+                                    claimed_id
+                                }
                                 _ => {
                                     debug!(
-                                        bridge_id = sender_user_id,
+                                        controller_id = sender_user_id,
                                         claimed_sender = ?voice_dgram.sender_id,
-                                        "server: bridge datagram with invalid sender_id, dropping"
+                                        "server: controller datagram with invalid sender_id, dropping"
                                     );
                                     continue;
                                 }
@@ -1678,7 +1721,7 @@ pub async fn handle_datagrams(conn: quinn::Connection, state: Arc<ServerState>, 
                         };
 
                         // Check if sender is server-muted — drop voice silently
-                        if !is_bridge
+                        if !is_controller
                             && let Some(client) = state.get_client(sender_user_id)
                             && client.server_muted.load(Ordering::Relaxed)
                         {
@@ -1752,25 +1795,20 @@ pub async fn handle_datagrams(conn: quinn::Connection, state: Arc<ServerState>, 
                                 continue;
                             }
 
-                            // Virtual users don't have their own connections;
-                            // voice for them goes through their bridge's connection.
-                            // Look up the actual client to send to.
-                            let (target_conn_id, target_client) = if let Some(vu) = state.get_virtual_user(recipient_id)
-                            {
-                                // Send to the bridge that owns this virtual user
-                                (vu.bridge_owner_id, state.get_client(vu.bridge_owner_id))
-                            } else {
-                                (recipient_id, state.get_client(recipient_id))
+                            // Resolve the recipient to its delivery connection: a
+                            // participant's voice goes through its controller.
+                            let Some(client) = state.delivery_client(recipient_id) else {
+                                continue;
                             };
 
-                            // Skip if we already sent to this connection
-                            if !sent_to.insert(target_conn_id) {
+                            // Dedup by the connection we actually send to, so a
+                            // controller with multiple participants in the room
+                            // only receives the datagram once.
+                            if !sent_to.insert(client.user_id) {
                                 continue;
                             }
 
-                            if let Some(client) = target_client
-                                && let Err(e) = client.conn.send_datagram(relay_bytes.clone().into())
-                            {
+                            if let Err(e) = client.conn.send_datagram(relay_bytes.clone().into()) {
                                 debug!(
                                     user_id = recipient_id,
                                     error = ?e,
@@ -1830,7 +1868,7 @@ async fn handle_kick_user(
     }
 
     // Cannot kick bridge connections (would disconnect all virtual users)
-    if target_client.is_bridge.load(Ordering::SeqCst) {
+    if target_client.is_controller.load(Ordering::SeqCst) {
         return send_command_result(&sender, "KickUser", false, "Cannot kick a bridge connection").await;
     }
 
@@ -1901,7 +1939,7 @@ async fn handle_ban_user(
     }
 
     // Cannot ban bridge connections
-    if target_client.is_bridge.load(Ordering::SeqCst) {
+    if target_client.is_controller.load(Ordering::SeqCst) {
         return send_command_result(&sender, "BanUser", false, "Cannot ban a bridge connection").await;
     }
 
@@ -1924,9 +1962,10 @@ async fn handle_ban_user(
 
     // Update cached groups if they're connected
     {
-        let mut groups = target_client.groups.write().await;
+        let mut groups = target_client.identity.groups().await;
         if !groups.contains(&"banned".to_string()) {
             groups.push("banned".to_string());
+            target_client.identity.set_groups(groups).await;
         }
     }
 
@@ -2218,10 +2257,10 @@ async fn handle_delete_group(
     // and broadcast UserGroupChanged for each affected user
     let clients = state.snapshot_clients();
     for client in &clients {
-        let mut groups = client.groups.write().await;
+        let mut groups = client.identity.groups().await;
         if groups.contains(&dg.name) {
             groups.retain(|g| g != &dg.name);
-            drop(groups); // Release lock before broadcast
+            client.identity.set_groups(groups).await;
             let _ = broadcast_state_update(
                 &state,
                 proto::state_update::Update::UserGroupChanged(proto::UserGroupChanged {
@@ -2332,13 +2371,17 @@ async fn handle_set_user_group(
 
     // Update the target's cached groups if they're connected
     if let Some(target_client) = state.get_client(target_user_id) {
-        let mut groups = target_client.groups.write().await;
+        let mut groups = target_client.identity.groups().await;
+        let before = groups.len();
         if sug.add {
             if !groups.contains(&sug.group) {
                 groups.push(sug.group.clone());
             }
         } else {
             groups.retain(|g| g != &sug.group);
+        }
+        if groups.len() != before {
+            target_client.identity.set_groups(groups).await;
         }
     }
 
@@ -2485,28 +2528,167 @@ async fn handle_set_room_acl(
 }
 
 // =============================================================================
-// Bridge Handlers
+// Controller / Participant Handlers
 // =============================================================================
 
-/// Handle BridgeHello - mark connection as a bridge and hide its user entry.
-async fn handle_bridge_hello(bh: proto::BridgeHello, sender: Arc<ClientHandle>, state: Arc<ServerState>) -> Result<()> {
-    if sender.is_bridge.load(Ordering::SeqCst) {
-        return send_command_result(&sender, "BridgeHello", false, "Already in bridge mode").await;
+// --- Reusable participant operations (shared by the controller protocol and
+// the in-process plugin capability). Each takes the `owner` / `user_id`
+// directly and performs no ownership check — callers authorize first. ---
+
+/// Mint a participant member owned by `owner`, place it in the root room, and
+/// broadcast its arrival. Returns the assigned user_id.
+pub(crate) async fn create_participant(
+    state: &Arc<ServerState>,
+    owner: OwnerId,
+    username: String,
+    label: Option<String>,
+    verified_username: Option<String>,
+    groups: Vec<String>,
+) -> Result<u64> {
+    let user_id = state.allocate_user_id();
+    let identity = Arc::new(Identity::participant(
+        username.clone(),
+        verified_username,
+        label.clone(),
+        groups.clone(),
+    ));
+    state.register_participant(Arc::new(Member {
+        user_id,
+        identity,
+        binding: Binding::Owned { owner },
+    }));
+    state.set_user_room(user_id, ROOT_ROOM_UUID).await;
+
+    broadcast_state_update(
+        state,
+        proto::state_update::Update::UserJoined(proto::UserJoined {
+            user: Some(proto::User {
+                user_id: Some(proto::UserId { value: user_id }),
+                username,
+                current_room: Some(room_id_from_uuid(ROOT_ROOM_UUID)),
+                is_muted: false,
+                is_deafened: false,
+                server_muted: false,
+                is_elevated: false,
+                groups,
+                label,
+            }),
+        }),
+    )
+    .await?;
+
+    Ok(user_id)
+}
+
+/// Remove a participant member and broadcast its departure.
+pub(crate) async fn remove_participant(state: &Arc<ServerState>, user_id: u64) -> Result<()> {
+    state.remove_client(user_id);
+    state.remove_user_membership(user_id).await;
+    broadcast_state_update(
+        state,
+        proto::state_update::Update::UserLeft(proto::UserLeft {
+            user_id: Some(proto::UserId { value: user_id }),
+        }),
+    )
+    .await
+}
+
+/// Move a participant to a room. Returns false if the room does not exist.
+pub(crate) async fn move_participant_to_room(state: &Arc<ServerState>, user_id: u64, room_uuid: Uuid) -> Result<bool> {
+    let rooms = state.get_rooms().await;
+    if !rooms
+        .iter()
+        .any(|r| r.id.as_ref().and_then(uuid_from_room_id) == Some(room_uuid))
+    {
+        return Ok(false);
+    }
+    state.set_user_room(user_id, room_uuid).await;
+    broadcast_state_update(
+        state,
+        proto::state_update::Update::UserMoved(proto::UserMoved {
+            user_id: Some(proto::UserId { value: user_id }),
+            to_room_id: Some(room_id_from_uuid(room_uuid)),
+        }),
+    )
+    .await?;
+    Ok(true)
+}
+
+/// Update a participant's self-mute/deaf status and broadcast the change.
+pub(crate) async fn set_participant_status_core(
+    state: &Arc<ServerState>,
+    user_id: u64,
+    is_muted: bool,
+    is_deafened: bool,
+) -> Result<()> {
+    let status = UserStatus {
+        is_muted,
+        is_deafened,
+        server_muted: false,
+        is_elevated: false,
+    };
+    state.set_user_status(user_id, status).await;
+    broadcast_state_update(
+        state,
+        proto::state_update::Update::UserStatusChanged(proto::UserStatusChanged {
+            user_id: Some(proto::UserId { value: user_id }),
+            is_muted,
+            is_deafened,
+            server_muted: false,
+            is_elevated: false,
+        }),
+    )
+    .await
+}
+
+// --- Controller protocol handlers (owner = the controller connection). ---
+
+/// Handle ControllerHello - register this connection as a controller and hide
+/// its user entry. Gated by the MANAGE_PARTICIPANTS permission.
+async fn handle_controller_hello(
+    ch: proto::ControllerHello,
+    sender: Arc<ClientHandle>,
+    state: Arc<ServerState>,
+    persistence: Option<Arc<Persistence>>,
+) -> Result<()> {
+    if sender.is_controller.load(Ordering::SeqCst) {
+        return send_command_result(&sender, "ControllerHello", false, "Already a controller").await;
+    }
+
+    // Authority: the connection's identity must hold MANAGE_PARTICIPANTS. This
+    // is separate from any group used for the participants it mints.
+    if acl::check_permission(
+        &state,
+        &sender,
+        Uuid::nil(),
+        Permissions::MANAGE_PARTICIPANTS,
+        &persistence,
+    )
+    .await
+    .is_err()
+    {
+        warn!(
+            user_id = sender.user_id,
+            "ControllerHello denied: missing MANAGE_PARTICIPANTS"
+        );
+        return send_command_result(
+            &sender,
+            "ControllerHello",
+            false,
+            "Missing MANAGE_PARTICIPANTS permission",
+        )
+        .await;
     }
 
     info!(
         user_id = sender.user_id,
-        bridge_name = %bh.bridge_name,
-        "BridgeHello: marking connection as bridge"
+        controller_name = %ch.controller_name,
+        "ControllerHello: registering controller"
     );
+    sender.is_controller.store(true, Ordering::SeqCst);
 
-    sender.is_bridge.store(true, Ordering::SeqCst);
-
-    // Remove the bridge's own user from memberships so it doesn't appear in the user list.
-    // The bridge itself is infrastructure, not a visible user.
+    // A controller is infrastructure, not a visible user — drop it from the roster.
     state.remove_user_membership(sender.user_id).await;
-
-    // Broadcast UserLeft for the bridge user so existing clients remove it
     broadcast_state_update(
         &state,
         proto::state_update::Update::UserLeft(proto::UserLeft {
@@ -2515,230 +2697,108 @@ async fn handle_bridge_hello(bh: proto::BridgeHello, sender: Arc<ClientHandle>, 
     )
     .await?;
 
-    send_command_result(&sender, "BridgeHello", true, "Bridge mode activated").await
+    send_command_result(&sender, "ControllerHello", true, "Controller mode activated").await
 }
 
-/// Handle BridgeRegisterUser - create a virtual user owned by this bridge.
-async fn handle_bridge_register_user(
-    bru: proto::BridgeRegisterUser,
+/// Handle RegisterParticipant - mint a participant driven by this controller.
+async fn handle_register_participant(
+    rp: proto::RegisterParticipant,
     sender: Arc<ClientHandle>,
     state: Arc<ServerState>,
+    persistence: Option<Arc<Persistence>>,
 ) -> Result<()> {
-    let virtual_user_id = state.allocate_user_id();
+    let owner = OwnerId::Connection(sender.user_id);
+
+    // Anonymous participants (external_identity unset) inherit the controller's
+    // configured default participant group — looked up by the controller's
+    // public key, distinct from the controller's own groups, so they never gain
+    // MANAGE_PARTICIPANTS. `external_identity` is reserved for stable
+    // per-participant identity and ignored for now (always anonymous).
+    let groups: Vec<String> = {
+        let pubkey = *sender.public_key.read().await;
+        match (pubkey, persistence.as_ref()) {
+            (Some(pk), Some(persist)) => persist.get_participant_default_group(&pk).into_iter().collect(),
+            _ => Vec::new(),
+        }
+    };
+
+    let user_id = create_participant(&state, owner, rp.username.clone(), rp.label.clone(), None, groups).await?;
 
     info!(
-        bridge_id = sender.user_id,
-        virtual_user_id,
-        username = %bru.username,
-        "BridgeRegisterUser: creating virtual user"
+        controller_id = sender.user_id,
+        participant_id = user_id,
+        username = %rp.username,
+        "registered participant"
     );
 
-    // Register the virtual user in state
-    state.register_virtual_user(virtual_user_id, bru.username.clone(), sender.user_id);
-
-    // Place virtual user in root room by default
-    state.set_user_room(virtual_user_id, ROOT_ROOM_UUID).await;
-
-    // Broadcast UserJoined for the virtual user
-    broadcast_state_update(
-        &state,
-        proto::state_update::Update::UserJoined(proto::UserJoined {
-            user: Some(proto::User {
-                user_id: Some(proto::UserId { value: virtual_user_id }),
-                username: bru.username.clone(),
-                current_room: Some(room_id_from_uuid(ROOT_ROOM_UUID)),
-                is_muted: false,
-                is_deafened: false,
-                server_muted: false,
-                is_elevated: false,
-                groups: vec![],
-            }),
-        }),
-    )
-    .await?;
-
-    // Send the assigned user_id back to the bridge
     let reply = proto::Envelope {
         state_hash: Vec::new(),
-        payload: Some(Payload::BridgeUserRegistered(proto::BridgeUserRegistered {
-            user_id: virtual_user_id,
-            username: bru.username,
+        payload: Some(Payload::ParticipantRegistered(proto::ParticipantRegistered {
+            user_id,
+            username: rp.username,
         })),
     };
-    let frame = encode_frame(&reply);
-    let _ = sender.send_frame(&frame).await;
-
+    let _ = sender.send_frame(&encode_frame(&reply)).await;
     Ok(())
 }
 
-/// Handle BridgeUnregisterUser - remove a virtual user owned by this bridge.
-async fn handle_bridge_unregister_user(
-    buu: proto::BridgeUnregisterUser,
+/// Handle UnregisterParticipant - remove a participant driven by this controller.
+async fn handle_unregister_participant(
+    up: proto::UnregisterParticipant,
     sender: Arc<ClientHandle>,
     state: Arc<ServerState>,
 ) -> Result<()> {
-    // Verify the bridge owns this virtual user
-    if !state.is_virtual_user_of(buu.user_id, sender.user_id) {
-        warn!(
-            bridge_id = sender.user_id,
-            virtual_user_id = buu.user_id,
-            "BridgeUnregisterUser: bridge does not own this virtual user"
-        );
-        return send_command_result(&sender, "BridgeUnregisterUser", false, "Not your virtual user").await;
+    if !state.is_participant_of(up.user_id, OwnerId::Connection(sender.user_id)) {
+        return send_command_result(&sender, "UnregisterParticipant", false, "Not your participant").await;
     }
-
-    info!(
-        bridge_id = sender.user_id,
-        virtual_user_id = buu.user_id,
-        "BridgeUnregisterUser: removing virtual user"
-    );
-
-    // Remove from state
-    state.remove_virtual_user(buu.user_id);
-    state.remove_user_membership(buu.user_id).await;
-
-    // Broadcast UserLeft
-    broadcast_state_update(
-        &state,
-        proto::state_update::Update::UserLeft(proto::UserLeft {
-            user_id: Some(proto::UserId { value: buu.user_id }),
-        }),
-    )
-    .await?;
-
-    send_command_result(&sender, "BridgeUnregisterUser", true, "Virtual user removed").await
+    remove_participant(&state, up.user_id).await?;
+    send_command_result(&sender, "UnregisterParticipant", true, "Participant removed").await
 }
 
-/// Handle BridgeJoinRoom - move a virtual user to a room.
-async fn handle_bridge_join_room(
-    bjr: proto::BridgeJoinRoom,
+/// Handle MoveParticipant - move a participant to a room.
+async fn handle_move_participant(
+    mp: proto::MoveParticipant,
     sender: Arc<ClientHandle>,
     state: Arc<ServerState>,
 ) -> Result<()> {
-    // Verify ownership
-    if !state.is_virtual_user_of(bjr.user_id, sender.user_id) {
-        return send_command_result(&sender, "BridgeJoinRoom", false, "Not your virtual user").await;
+    if !state.is_participant_of(mp.user_id, OwnerId::Connection(sender.user_id)) {
+        return send_command_result(&sender, "MoveParticipant", false, "Not your participant").await;
     }
-
-    let room_uuid = bjr
+    let room_uuid = mp
         .room_id
         .as_ref()
         .and_then(uuid_from_room_id)
         .unwrap_or(ROOT_ROOM_UUID);
-
-    // Verify room exists
-    let rooms = state.get_rooms().await;
-    if !rooms
-        .iter()
-        .any(|r| r.id.as_ref().and_then(uuid_from_room_id) == Some(room_uuid))
-    {
-        return send_command_result(&sender, "BridgeJoinRoom", false, "Room not found").await;
+    if !move_participant_to_room(&state, mp.user_id, room_uuid).await? {
+        return send_command_result(&sender, "MoveParticipant", false, "Room not found").await;
     }
-
-    state.set_user_room(bjr.user_id, room_uuid).await;
-
-    // Broadcast UserMoved
-    broadcast_state_update(
-        &state,
-        proto::state_update::Update::UserMoved(proto::UserMoved {
-            user_id: Some(proto::UserId { value: bjr.user_id }),
-            to_room_id: Some(room_id_from_uuid(room_uuid)),
-        }),
-    )
-    .await?;
-
-    send_command_result(&sender, "BridgeJoinRoom", true, "Virtual user moved").await
+    send_command_result(&sender, "MoveParticipant", true, "Participant moved").await
 }
 
-/// Handle BridgeSetUserStatus - update a virtual user's mute/deaf status.
-async fn handle_bridge_set_user_status(
-    bss: proto::BridgeSetUserStatus,
+/// Handle SetParticipantStatus - update a participant's mute/deaf status.
+async fn handle_set_participant_status(
+    sps: proto::SetParticipantStatus,
     sender: Arc<ClientHandle>,
     state: Arc<ServerState>,
 ) -> Result<()> {
-    if !state.is_virtual_user_of(bss.user_id, sender.user_id) {
-        return send_command_result(&sender, "BridgeSetUserStatus", false, "Not your virtual user").await;
+    if !state.is_participant_of(sps.user_id, OwnerId::Connection(sender.user_id)) {
+        return send_command_result(&sender, "SetParticipantStatus", false, "Not your participant").await;
     }
-
-    let status = UserStatus {
-        is_muted: bss.is_muted,
-        is_deafened: bss.is_deafened,
-        server_muted: false,
-        is_elevated: false,
-    };
-    state.set_user_status(bss.user_id, status).await;
-
-    // Broadcast UserStatusChanged
-    broadcast_state_update(
-        &state,
-        proto::state_update::Update::UserStatusChanged(proto::UserStatusChanged {
-            user_id: Some(proto::UserId { value: bss.user_id }),
-            is_muted: bss.is_muted,
-            is_deafened: bss.is_deafened,
-            server_muted: false,
-            is_elevated: false,
-        }),
-    )
-    .await?;
-
-    Ok(())
+    set_participant_status_core(&state, sps.user_id, sps.is_muted, sps.is_deafened).await
 }
 
-/// Handle BridgeChatMessage - send chat on behalf of a virtual user.
-async fn handle_bridge_chat_message(
-    bcm: proto::BridgeChatMessage,
+/// Handle ParticipantChat - send chat on behalf of a participant.
+async fn handle_participant_chat(
+    pc: proto::ParticipantChat,
     sender: Arc<ClientHandle>,
     state: Arc<ServerState>,
+    persistence: Option<Arc<Persistence>>,
 ) -> Result<()> {
-    if !state.is_virtual_user_of(bcm.user_id, sender.user_id) {
-        return send_command_result(&sender, "BridgeChatMessage", false, "Not your virtual user").await;
+    if !state.is_participant_of(pc.user_id, OwnerId::Connection(sender.user_id)) {
+        return send_command_result(&sender, "ParticipantChat", false, "Not your participant").await;
     }
-
-    let vu = match state.get_virtual_user(bcm.user_id) {
-        Some(vu) => vu,
-        None => return Ok(()),
-    };
-
-    let sender_room = state.get_user_room(bcm.user_id).await.unwrap_or(ROOT_ROOM_UUID);
-
-    info!(
-        virtual_user_id = bcm.user_id,
-        username = %vu.username,
-        "BridgeChatMessage"
-    );
-
-    let message_id = uuid::Uuid::new_v4().into_bytes().to_vec();
-    let timestamp_ms = now_ms();
-
-    let broadcast = proto::Envelope {
-        state_hash: Vec::new(),
-        payload: Some(Payload::ServerEvent(proto::ServerEvent {
-            kind: Some(proto::server_event::Kind::ChatBroadcast(proto::ChatBroadcast {
-                id: message_id,
-                timestamp_ms,
-                sender: vu.username,
-                sender_id: bcm.user_id,
-                text: bcm.text,
-                tree: None,
-                attachment: None,
-            })),
-        })),
-    };
-    let frame = encode_frame(&broadcast);
-
-    // Send to all clients in the same room
-    let clients = state.snapshot_clients();
-    for h in clients {
-        let user_room = state.get_user_room(h.user_id).await;
-        if user_room != Some(sender_room) {
-            continue;
-        }
-        if let Err(e) = h.send_frame(&frame).await {
-            error!("broadcast write failed: {e:?}");
-        }
-    }
-
-    Ok(())
+    let id = uuid::Uuid::new_v4().into_bytes().to_vec();
+    broadcast_chat_as(&state, &persistence, pc.user_id, pc.text, false, id, now_ms(), None).await
 }
 
 #[cfg(test)]

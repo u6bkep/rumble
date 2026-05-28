@@ -6,7 +6,7 @@ use crate::{
     handlers::{cleanup_client, handle_datagrams, handle_envelope},
     persistence::Persistence,
     plugin::{ServerCtx, ServerPlugin, StreamHeader},
-    state::{ClientHandle, ServerState},
+    state::{ClientHandle, Identity, ServerState},
 };
 use anyhow::Result;
 use bytes::BytesMut;
@@ -249,8 +249,10 @@ pub async fn handle_connection(
         handle_datagrams(conn_for_datagrams, state_for_datagrams, user_id).await;
     });
 
-    // Shared state for all streams on this connection
-    let username = Arc::new(RwLock::new(String::new()));
+    // Shared state for all streams on this connection. The identity is the
+    // single home for name/groups/label; every stream's handle and the member
+    // entry share this same Arc.
+    let identity = Arc::new(Identity::empty());
     let public_key = Arc::new(RwLock::new(None));
     let authenticated = Arc::new(AtomicBool::new(false));
 
@@ -269,9 +271,9 @@ pub async fn handle_connection(
                         send_stream,
                         user_id,
                         conn.clone(),
-                        username.clone(),
                         public_key.clone(),
                         authenticated.clone(),
+                        identity.clone(),
                     ));
 
                     // Register client (lock-free DashMap insert)
@@ -299,7 +301,7 @@ pub async fn handle_connection(
                     let persistence = persistence.clone();
                     let state_clone = state.clone();
                     let conn_clone = conn.clone();
-                    let username_clone = username.clone();
+                    let identity_clone = identity.clone();
                     let public_key_clone = public_key.clone();
                     let authenticated_clone = authenticated.clone();
 
@@ -309,7 +311,7 @@ pub async fn handle_connection(
                             recv,
                             user_id,
                             conn_clone,
-                            username_clone,
+                            identity_clone,
                             public_key_clone,
                             authenticated_clone,
                             primary_handle,
@@ -468,7 +470,7 @@ async fn dispatch_secondary_stream(
     mut recv: quinn::RecvStream,
     user_id: u64,
     conn: quinn::Connection,
-    username: Arc<RwLock<String>>,
+    identity: Arc<Identity>,
     public_key: Arc<RwLock<Option<[u8; 32]>>>,
     authenticated: Arc<AtomicBool>,
     primary_handle: Arc<ClientHandle>,
@@ -526,9 +528,9 @@ async fn dispatch_secondary_stream(
             send,
             user_id,
             conn,
-            username,
             public_key,
             authenticated,
+            identity,
         ));
         run_envelope_stream_with_prefix(recv, handle, state, persistence, plugins, ctx, false, seed).await;
     } else {
@@ -540,9 +542,9 @@ async fn dispatch_secondary_stream(
             send,
             user_id,
             conn,
-            username,
             public_key,
             authenticated,
+            identity,
         ));
         run_envelope_stream_with_prefix(recv, handle, state, persistence, plugins, ctx, false, seed).await;
     }

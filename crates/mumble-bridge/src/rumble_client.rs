@@ -169,42 +169,48 @@ pub async fn send_tree_chat(transport: &mut QuinnTransport, sender: &str, text: 
     send_envelope(transport, &msg).await
 }
 
-/// Send BridgeHello to declare this connection as a bridge.
-pub async fn send_bridge_hello(transport: &mut QuinnTransport, bridge_name: &str) -> Result<()> {
+/// Send ControllerHello to declare this connection as a controller.
+pub async fn send_controller_hello(transport: &mut QuinnTransport, controller_name: &str) -> Result<()> {
     let msg = proto::Envelope {
         state_hash: Vec::new(),
-        payload: Some(Payload::BridgeHello(proto::BridgeHello {
-            bridge_name: bridge_name.to_string(),
+        payload: Some(Payload::ControllerHello(proto::ControllerHello {
+            controller_name: controller_name.to_string(),
         })),
     };
     send_envelope(transport, &msg).await
 }
 
-/// Register a virtual user managed by the bridge.
-pub async fn send_bridge_register_user(transport: &mut QuinnTransport, username: &str) -> Result<()> {
+/// Register a participant driven by this controller.
+pub async fn send_register_participant(
+    transport: &mut QuinnTransport,
+    username: &str,
+    label: Option<&str>,
+) -> Result<()> {
     let msg = proto::Envelope {
         state_hash: Vec::new(),
-        payload: Some(Payload::BridgeRegisterUser(proto::BridgeRegisterUser {
+        payload: Some(Payload::RegisterParticipant(proto::RegisterParticipant {
             username: username.to_string(),
+            label: label.map(|s| s.to_string()),
+            external_identity: None,
         })),
     };
     send_envelope(transport, &msg).await
 }
 
-/// Unregister a virtual user managed by the bridge.
-pub async fn send_bridge_unregister_user(transport: &mut QuinnTransport, user_id: u64) -> Result<()> {
+/// Unregister a participant driven by this controller.
+pub async fn send_unregister_participant(transport: &mut QuinnTransport, user_id: u64) -> Result<()> {
     let msg = proto::Envelope {
         state_hash: Vec::new(),
-        payload: Some(Payload::BridgeUnregisterUser(proto::BridgeUnregisterUser { user_id })),
+        payload: Some(Payload::UnregisterParticipant(proto::UnregisterParticipant { user_id })),
     };
     send_envelope(transport, &msg).await
 }
 
-/// Move a virtual user to a room.
-pub async fn send_bridge_join_room(transport: &mut QuinnTransport, user_id: u64, room_id: proto::RoomId) -> Result<()> {
+/// Move a participant to a room.
+pub async fn send_move_participant(transport: &mut QuinnTransport, user_id: u64, room_id: proto::RoomId) -> Result<()> {
     let msg = proto::Envelope {
         state_hash: Vec::new(),
-        payload: Some(Payload::BridgeJoinRoom(proto::BridgeJoinRoom {
+        payload: Some(Payload::MoveParticipant(proto::MoveParticipant {
             user_id,
             room_id: Some(room_id),
         })),
@@ -212,8 +218,8 @@ pub async fn send_bridge_join_room(transport: &mut QuinnTransport, user_id: u64,
     send_envelope(transport, &msg).await
 }
 
-/// Update a virtual user's mute/deaf status.
-pub async fn send_bridge_set_user_status(
+/// Update a participant's mute/deaf status.
+pub async fn send_set_participant_status(
     transport: &mut QuinnTransport,
     user_id: u64,
     is_muted: bool,
@@ -221,7 +227,7 @@ pub async fn send_bridge_set_user_status(
 ) -> Result<()> {
     let msg = proto::Envelope {
         state_hash: Vec::new(),
-        payload: Some(Payload::BridgeSetUserStatus(proto::BridgeSetUserStatus {
+        payload: Some(Payload::SetParticipantStatus(proto::SetParticipantStatus {
             user_id,
             is_muted,
             is_deafened,
@@ -230,11 +236,11 @@ pub async fn send_bridge_set_user_status(
     send_envelope(transport, &msg).await
 }
 
-/// Send a chat message on behalf of a virtual user.
-pub async fn send_bridge_chat_message(transport: &mut QuinnTransport, user_id: u64, text: &str) -> Result<()> {
+/// Send a chat message on behalf of a participant.
+pub async fn send_participant_chat(transport: &mut QuinnTransport, user_id: u64, text: &str) -> Result<()> {
     let msg = proto::Envelope {
         state_hash: Vec::new(),
-        payload: Some(Payload::BridgeChatMessage(proto::BridgeChatMessage {
+        payload: Some(Payload::ParticipantChat(proto::ParticipantChat {
             user_id,
             text: text.to_string(),
         })),

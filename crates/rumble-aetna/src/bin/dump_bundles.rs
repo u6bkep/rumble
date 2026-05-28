@@ -573,6 +573,7 @@ fn make_user(id: u64, name: &str, room: u128, mut tweak: impl FnMut(&mut User)) 
         server_muted: false,
         is_elevated: false,
         groups: Vec::new(),
+        label: None,
     };
     tweak(&mut u);
     u

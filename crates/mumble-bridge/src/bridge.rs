@@ -116,7 +116,7 @@ pub async fn run_bridge(
     let client_senders = &mut loop_state.client_senders;
     let rumble_outbound_seq = &mut loop_state.rumble_outbound_seq;
     let mumble_to_rumble_seq = &mut loop_state.mumble_to_rumble_seq;
-    // (virtual_user_id, mumble_session) pairs that need BridgeJoinRoom after registration
+    // (virtual_user_id, mumble_session) pairs that need MoveParticipant after registration
     let mut pending_join_rooms: Vec<(u64, u32)> = Vec::new();
     // Virtual user IDs that arrived late (Mumble client already left) and need cleanup
     let mut pending_unregister: Vec<u64> = Vec::new();
@@ -161,8 +161,8 @@ pub async fn run_bridge(
                     let mut state = write_bridge(&bridge_state);
                     state.pending_registrations.push((username.clone(), session));
                 }
-                if let Err(e) = rumble_client::send_bridge_register_user(rumble_send, &username).await {
-                    warn!(error = %e, %username, "Failed to send BridgeRegisterUser");
+                if let Err(e) = rumble_client::send_register_participant(rumble_send, &username, Some("Mumble")).await {
+                    warn!(error = %e, %username, "Failed to send RegisterParticipant");
                 }
             }
 
@@ -185,9 +185,9 @@ pub async fn run_bridge(
 
                 // Unregister the virtual user on the Rumble server
                 if let Some(vid) = virtual_user_id
-                    && let Err(e) = rumble_client::send_bridge_unregister_user(rumble_send, vid).await
+                    && let Err(e) = rumble_client::send_unregister_participant(rumble_send, vid).await
                 {
-                    warn!(error = %e, vid, "Failed to send BridgeUnregisterUser");
+                    warn!(error = %e, vid, "Failed to send UnregisterParticipant");
                 }
 
                 // Notify remaining Mumble clients
@@ -315,8 +315,8 @@ pub async fn run_bridge(
                     }
                 } else if let Some(vid) = virtual_user_id {
                     // Normal channel message - send as the virtual user via bridge protocol
-                    if let Err(e) = rumble_client::send_bridge_chat_message(rumble_send, vid, &message).await {
-                        warn!(error = %e, "Failed to send BridgeChatMessage to Rumble");
+                    if let Err(e) = rumble_client::send_participant_chat(rumble_send, vid, &message).await {
+                        warn!(error = %e, "Failed to send ParticipantChat to Rumble");
                     }
                 } else {
                     // Virtual user not registered yet, fall back to prefixed bridge chat
@@ -362,8 +362,8 @@ pub async fn run_bridge(
                 // Move the virtual user to the corresponding Rumble room
                 if let (Some(vid), Some(uuid)) = (virtual_user_id, room_uuid) {
                     let room_id = rumble_protocol::room_id_from_uuid(uuid);
-                    if let Err(e) = rumble_client::send_bridge_join_room(rumble_send, vid, room_id).await {
-                        warn!(error = %e, vid, "Failed to send BridgeJoinRoom");
+                    if let Err(e) = rumble_client::send_move_participant(rumble_send, vid, room_id).await {
+                        warn!(error = %e, vid, "Failed to send MoveParticipant");
                     }
                 }
 
@@ -406,9 +406,9 @@ pub async fn run_bridge(
 
                 if let Some(vid) = virtual_user_id
                     && let Err(e) =
-                        rumble_client::send_bridge_set_user_status(rumble_send, vid, final_muted, final_deafened).await
+                        rumble_client::send_set_participant_status(rumble_send, vid, final_muted, final_deafened).await
                 {
-                    warn!(error = %e, vid, "Failed to send BridgeSetUserStatus");
+                    warn!(error = %e, vid, "Failed to send SetParticipantStatus");
                 }
 
                 // Broadcast the enforced mute/deaf state to other Mumble clients
@@ -431,7 +431,7 @@ pub async fn run_bridge(
                     &mut pending_unregister,
                 );
 
-                // Process any pending join-room requests from BridgeUserRegistered
+                // Process any pending join-room requests from ParticipantRegistered
                 for (vid, session) in pending_join_rooms.drain(..) {
                     let (room_id, is_muted, is_deafened) = {
                         let state = read_bridge(&bridge_state);
@@ -445,13 +445,13 @@ pub async fn run_bridge(
                         let is_deafened = client.map(|c| c.is_deafened).unwrap_or(false);
                         (room_id, is_muted, is_deafened)
                     };
-                    if let Err(e) = rumble_client::send_bridge_join_room(rumble_send, vid, room_id).await {
-                        warn!(error = %e, vid, "Failed to send BridgeJoinRoom for new virtual user");
+                    if let Err(e) = rumble_client::send_move_participant(rumble_send, vid, room_id).await {
+                        warn!(error = %e, vid, "Failed to send MoveParticipant for new virtual user");
                     }
                     // Sync mute/deaf state for the newly registered virtual user
                     if (is_muted || is_deafened)
                         && let Err(e) =
-                            rumble_client::send_bridge_set_user_status(rumble_send, vid, is_muted, is_deafened).await
+                            rumble_client::send_set_participant_status(rumble_send, vid, is_muted, is_deafened).await
                     {
                         warn!(error = %e, vid, "Failed to sync mute/deaf state for new virtual user");
                     }
@@ -459,8 +459,8 @@ pub async fn run_bridge(
 
                 // Clean up orphaned virtual users (Mumble client left before registration completed)
                 for vid in pending_unregister.drain(..) {
-                    if let Err(e) = rumble_client::send_bridge_unregister_user(rumble_send, vid).await {
-                        warn!(error = %e, vid, "Failed to send BridgeUnregisterUser for orphaned virtual user");
+                    if let Err(e) = rumble_client::send_unregister_participant(rumble_send, vid).await {
+                        warn!(error = %e, vid, "Failed to send UnregisterParticipant for orphaned virtual user");
                     }
                 }
             }
@@ -481,7 +481,7 @@ pub async fn run_bridge(
         if !virtual_users.is_empty() {
             info!(count = virtual_users.len(), "Unregistering virtual users on shutdown");
             for vid in virtual_users {
-                if let Err(e) = rumble_client::send_bridge_unregister_user(rumble_send, vid).await {
+                if let Err(e) = rumble_client::send_unregister_participant(rumble_send, vid).await {
                     warn!(error = %e, vid, "Failed to unregister virtual user on shutdown");
                 }
             }
@@ -604,7 +604,7 @@ fn handle_rumble_envelope(
                 }
             }
         }
-        Some(Payload::BridgeUserRegistered(bur)) => {
+        Some(Payload::ParticipantRegistered(bur)) => {
             let mut state = write_bridge(bridge_state);
             let pending_idx = state
                 .pending_registrations
@@ -628,7 +628,7 @@ fn handle_rumble_envelope(
                 warn!(
                     username = %bur.username,
                     user_id = bur.user_id,
-                    "BridgeUserRegistered for departed client, scheduling cleanup"
+                    "ParticipantRegistered for departed client, scheduling cleanup"
                 );
                 pending_unregister.push(bur.user_id);
             }
@@ -661,7 +661,7 @@ fn handle_state_update(
                     return;
                 }
                 // Also skip if this user matches a pending registration —
-                // the UserJoined can arrive before BridgeUserRegistered,
+                // the UserJoined can arrive before ParticipantRegistered,
                 // and we don't want to broadcast the virtual user as a
                 // duplicate to Mumble clients who already have their own session.
                 if state

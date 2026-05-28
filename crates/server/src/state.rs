@@ -74,22 +74,135 @@ impl VoiceRateLimit {
     }
 }
 
-/// Handle to a connected client's control stream.
-///
-/// This represents a single client connection and provides access to:
-/// - The send side of their control stream (locked per-message)
-/// - Their username (immutable after set)
-/// - Their server-assigned user_id
-/// - Their QUIC connection for datagram sending
-/// - Their Ed25519 public key (set after authentication)
+/// A roster member's identity — the single home for display name, ACL groups,
+/// and display marker. Orthogonal to how the member is connected or driven
+/// (see [`Binding`]). A connected client and its [`Member`] entry hold the
+/// *same* `Arc<Identity>`, so there is exactly one home for these fields.
+#[derive(Debug)]
+pub struct Identity {
+    /// Display name (roster + chat attribution). Mutable over a session.
+    display_name: RwLock<String>,
+    /// Verified ACL-identity name. Drives the implicit username-group during
+    /// ACL evaluation. `None` for anonymous participants (no verified
+    /// identity), which is exactly why they never mint an implicit
+    /// username-group — see `acl::evaluate_user_permissions`.
+    verified_username: RwLock<Option<String>>,
+    /// Freeform display marker set by a controller/plugin (e.g. "Mumble",
+    /// "bot"). `None` for humans. Immutable after construction.
+    pub label: Option<String>,
+    /// Permission groups (loaded from persistence on auth for humans; set at
+    /// mint time for participants).
+    groups: RwLock<Vec<String>>,
+}
+
+impl Identity {
+    /// A fresh, empty identity for a just-connected client (filled in at auth).
+    pub fn empty() -> Self {
+        Self {
+            display_name: RwLock::new(String::new()),
+            verified_username: RwLock::new(None),
+            label: None,
+            groups: RwLock::new(Vec::new()),
+        }
+    }
+
+    /// Identity for a minted participant.
+    pub fn participant(
+        display_name: String,
+        verified_username: Option<String>,
+        label: Option<String>,
+        groups: Vec<String>,
+    ) -> Self {
+        Self {
+            display_name: RwLock::new(display_name),
+            verified_username: RwLock::new(verified_username),
+            label,
+            groups: RwLock::new(groups),
+        }
+    }
+
+    pub async fn display_name(&self) -> String {
+        self.display_name.read().await.clone()
+    }
+    pub async fn set_display_name(&self, name: String) {
+        *self.display_name.write().await = name;
+    }
+    pub async fn verified_username(&self) -> Option<String> {
+        self.verified_username.read().await.clone()
+    }
+    pub async fn set_verified_username(&self, name: Option<String>) {
+        *self.verified_username.write().await = name;
+    }
+    pub async fn groups(&self) -> Vec<String> {
+        self.groups.read().await.clone()
+    }
+    pub async fn set_groups(&self, groups: Vec<String>) {
+        *self.groups.write().await = groups;
+    }
+}
+
+/// Who controls (and bounds the lifetime of) an owned participant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnerId {
+    /// An in-process plugin, identified by its registration index.
+    Plugin(u64),
+    /// An out-of-process controller connection, by its user_id.
+    Connection(u64),
+}
+
+/// How a roster [`Member`] is connected and driven.
+#[derive(Debug, Clone)]
+pub enum Binding {
+    /// A live client connection. Self-owned; dies with the connection.
+    Client(Arc<ClientHandle>),
+    /// A participant with no connection of its own, driven by a controller.
+    Owned { owner: OwnerId },
+}
+
+/// A roster member: identity plus binding. Covers humans and participants
+/// alike — the unification of the old client table and virtual-user table.
+#[derive(Debug, Clone)]
+pub struct Member {
+    pub user_id: u64,
+    pub identity: Arc<Identity>,
+    pub binding: Binding,
+}
+
+impl Member {
+    /// True if this member is an out-of-process controller connection, which
+    /// is hidden from the visible roster.
+    pub fn is_controller(&self) -> bool {
+        match &self.binding {
+            Binding::Client(h) => h.is_controller.load(Ordering::SeqCst),
+            Binding::Owned { .. } => false,
+        }
+    }
+
+    /// True if this member is an elevated superuser (only connections can be).
+    pub fn is_superuser(&self) -> bool {
+        match &self.binding {
+            Binding::Client(h) => h.is_superuser.load(Ordering::Relaxed),
+            Binding::Owned { .. } => false,
+        }
+    }
+
+    /// The connection handle if this member is itself a live client.
+    pub fn client(&self) -> Option<&Arc<ClientHandle>> {
+        match &self.binding {
+            Binding::Client(h) => Some(h),
+            Binding::Owned { .. } => None,
+        }
+    }
+}
+
+/// Handle to a connected client's control stream — connection runtime only.
+/// Identity (name/groups/label) lives on the member's [`Identity`], shared by
+/// `Arc` with this handle.
 #[derive(Debug)]
 pub struct ClientHandle {
     /// Send stream for the client's control channel.
     /// Locked only for the duration of a single message write.
     pub send: Mutex<quinn::SendStream>,
-    /// The client's display name (set once from ClientHello, then immutable).
-    /// Use `set_username` and `get_username` for access.
-    username: Arc<RwLock<String>>,
     /// Server-assigned user ID (immutable after creation).
     pub user_id: u64,
     /// The underlying QUIC connection (for datagrams).
@@ -98,63 +211,50 @@ pub struct ClientHandle {
     pub public_key: Arc<RwLock<Option<[u8; 32]>>>,
     /// Whether authentication is complete.
     pub authenticated: Arc<AtomicBool>,
-    /// Whether this connection is a bridge (set after BridgeHello).
-    pub is_bridge: AtomicBool,
+    /// Whether this connection has registered as a controller (ControllerHello).
+    pub is_controller: AtomicBool,
     /// Whether this user has been elevated to superuser (session-only).
     pub is_superuser: AtomicBool,
     /// Whether this user is server-muted (effective state, checked on voice relay).
     pub server_muted: AtomicBool,
     /// Whether a moderator manually server-muted this user.
     pub manually_server_muted: AtomicBool,
-    /// Permission groups this user belongs to (loaded from persistence on auth).
-    pub groups: RwLock<Vec<String>>,
-}
-
-/// A virtual user managed by a bridge connection.
-#[derive(Debug, Clone)]
-pub struct VirtualUser {
-    /// Server-assigned user ID for this virtual user.
-    pub user_id: u64,
-    /// Display name.
-    pub username: String,
-    /// The bridge connection's user_id that owns this virtual user.
-    pub bridge_owner_id: u64,
+    /// Shared identity — the same `Arc<Identity>` held by this client's [`Member`].
+    pub identity: Arc<Identity>,
 }
 
 impl ClientHandle {
-    /// Create a new client handle.
+    /// Create a new client handle, sharing the given identity with its member.
     pub fn new(
         send: quinn::SendStream,
         user_id: u64,
         conn: Connection,
-        username: Arc<RwLock<String>>,
         public_key: Arc<RwLock<Option<[u8; 32]>>>,
         authenticated: Arc<AtomicBool>,
+        identity: Arc<Identity>,
     ) -> Self {
         Self {
             send: Mutex::new(send),
-            username,
             user_id,
             conn,
             public_key,
             authenticated,
-            is_bridge: AtomicBool::new(false),
+            is_controller: AtomicBool::new(false),
             is_superuser: AtomicBool::new(false),
             server_muted: AtomicBool::new(false),
             manually_server_muted: AtomicBool::new(false),
-            groups: RwLock::new(Vec::new()),
+            identity,
         }
     }
 
-    /// Set the username (should only be called once during ClientHello).
+    /// Set the display name. Delegates to the shared identity.
     pub async fn set_username(&self, name: String) {
-        let mut guard = self.username.write().await;
-        *guard = name;
+        self.identity.set_display_name(name).await;
     }
 
-    /// Get the current username.
+    /// Get the display name. Delegates to the shared identity.
     pub async fn get_username(&self) -> String {
-        self.username.read().await.clone()
+        self.identity.display_name().await
     }
 
     /// Send a framed message to this client.
@@ -274,9 +374,10 @@ pub struct SessionEntry {
 /// - State mutations acquire a write lock on `state_data`
 /// - User ID allocation is lock-free via AtomicU64
 pub struct ServerState {
-    /// All connected clients, keyed by user_id.
-    /// DashMap allows lock-free reads and fine-grained locking per entry.
-    clients: DashMap<u64, Arc<ClientHandle>>,
+    /// All roster members, keyed by user_id — connected clients and
+    /// controller-driven participants alike. DashMap allows lock-free reads
+    /// and fine-grained locking per entry.
+    members: DashMap<u64, Arc<Member>>,
     /// Consolidated state data (rooms + memberships).
     state_data: RwLock<StateData>,
     /// Counter for assigning unique user IDs.
@@ -289,8 +390,6 @@ pub struct ServerState {
     sessions_by_id: DashMap<[u8; 32], u64>,
     /// Server's TLS certificate DER bytes (for computing cert hash).
     server_cert_der: Vec<u8>,
-    /// Virtual users managed by bridge connections: virtual_user_id → VirtualUser.
-    virtual_users: DashMap<u64, VirtualUser>,
     /// Per-user voice datagram rate limiters: user_id → VoiceRateLimit.
     voice_rate_limits: DashMap<u64, VoiceRateLimit>,
     /// Welcome message (MOTD) sent to clients after authentication.
@@ -301,14 +400,13 @@ impl ServerState {
     /// Create a new server state with the default Root room.
     pub fn new() -> Self {
         Self {
-            clients: DashMap::new(),
+            members: DashMap::new(),
             state_data: RwLock::new(StateData::new()),
             next_user_id: AtomicU64::new(1),
             pending_auth: DashMap::new(),
             sessions: DashMap::new(),
             sessions_by_id: DashMap::new(),
             server_cert_der: Vec::new(),
-            virtual_users: DashMap::new(),
             voice_rate_limits: DashMap::new(),
             welcome_message: None,
         }
@@ -317,14 +415,13 @@ impl ServerState {
     /// Create a new server state with the given server certificate.
     pub fn with_cert(cert_der: Vec<u8>) -> Self {
         Self {
-            clients: DashMap::new(),
+            members: DashMap::new(),
             state_data: RwLock::new(StateData::new()),
             next_user_id: AtomicU64::new(1),
             pending_auth: DashMap::new(),
             sessions: DashMap::new(),
             sessions_by_id: DashMap::new(),
             server_cert_der: cert_der,
-            virtual_users: DashMap::new(),
             voice_rate_limits: DashMap::new(),
             welcome_message: None,
         }
@@ -396,44 +493,102 @@ impl ServerState {
 
     /// Register a new client.
     pub fn register_client(&self, handle: Arc<ClientHandle>) {
-        self.clients.insert(handle.user_id, handle);
+        let member = Arc::new(Member {
+            user_id: handle.user_id,
+            identity: handle.identity.clone(),
+            binding: Binding::Client(handle.clone()),
+        });
+        self.members.insert(handle.user_id, member);
     }
 
-    /// Remove a client by user_id.
+    /// Remove a member (client or participant) by user_id.
     pub fn remove_client(&self, user_id: u64) {
-        self.clients.remove(&user_id);
+        self.members.remove(&user_id);
     }
 
-    /// Remove a client by Arc pointer comparison (for backward compatibility).
+    /// Remove a member by the handle's user_id.
     pub fn remove_client_by_handle(&self, handle: &Arc<ClientHandle>) {
-        self.clients.remove(&handle.user_id);
+        self.members.remove(&handle.user_id);
     }
 
-    /// Get a client by user_id.
+    /// Get the connection handle for a user_id, if that member is a live client.
     pub fn get_client(&self, user_id: u64) -> Option<Arc<ClientHandle>> {
-        self.clients.get(&user_id).map(|r| r.value().clone())
+        self.members.get(&user_id).and_then(|m| m.client().cloned())
     }
 
-    /// Get the number of connected clients.
+    /// Get a roster member (client or participant) by user_id.
+    pub fn get_member(&self, user_id: u64) -> Option<Arc<Member>> {
+        self.members.get(&user_id).map(|r| r.value().clone())
+    }
+
+    /// Get the number of connected clients (excludes participants).
     pub fn client_count(&self) -> usize {
-        self.clients.len()
+        self.members.iter().filter(|m| m.client().is_some()).count()
     }
 
-    /// Iterate over all clients. The closure receives each client handle.
-    /// This is lock-free for reading.
+    /// Iterate over all live client connections. The closure receives each
+    /// client handle. This is lock-free for reading.
     pub fn for_each_client<F>(&self, mut f: F)
     where
         F: FnMut(&Arc<ClientHandle>),
     {
-        for entry in self.clients.iter() {
-            f(entry.value());
+        for entry in self.members.iter() {
+            if let Some(handle) = entry.value().client() {
+                f(handle);
+            }
         }
     }
 
-    /// Get a snapshot of all clients for iteration outside the map.
-    /// Use this when you need to perform async operations on clients.
+    /// Get a snapshot of all live client connections for iteration outside the
+    /// map. Use this when you need to perform async operations on clients.
     pub fn snapshot_clients(&self) -> Vec<Arc<ClientHandle>> {
-        self.clients.iter().map(|r| r.value().clone()).collect()
+        self.members
+            .iter()
+            .filter_map(|r| r.value().client().cloned())
+            .collect()
+    }
+
+    // =========================================================================
+    // Participant / Member Methods
+    // =========================================================================
+
+    /// Register a controller-driven participant member.
+    pub fn register_participant(&self, member: Arc<Member>) {
+        self.members.insert(member.user_id, member);
+    }
+
+    /// True if `user_id` is a participant driven by the given owner.
+    pub fn is_participant_of(&self, user_id: u64, owner: OwnerId) -> bool {
+        self.members.get(&user_id).is_some_and(|m| match &m.binding {
+            Binding::Owned { owner: o } => *o == owner,
+            Binding::Client(_) => false,
+        })
+    }
+
+    /// All participant user_ids driven by the given owner.
+    pub fn members_by_owner(&self, owner: OwnerId) -> Vec<u64> {
+        self.members
+            .iter()
+            .filter(|m| matches!(&m.binding, Binding::Owned { owner: o } if *o == owner))
+            .map(|m| m.user_id)
+            .collect()
+    }
+
+    /// Resolve a member to the connection that voice/chat for it should be
+    /// delivered over: a live client delivers to itself; an owned participant
+    /// delivers to its controller connection; a plugin-owned participant has
+    /// no QUIC delivery target.
+    pub fn delivery_client(&self, user_id: u64) -> Option<Arc<ClientHandle>> {
+        let member = self.members.get(&user_id)?;
+        match &member.binding {
+            Binding::Client(h) => Some(h.clone()),
+            Binding::Owned {
+                owner: OwnerId::Connection(c),
+            } => self.get_client(*c),
+            Binding::Owned {
+                owner: OwnerId::Plugin(_),
+            } => None,
+        }
     }
 
     /// Add a user to a room, replacing any existing membership.
@@ -719,32 +874,31 @@ impl ServerState {
                 .map(|(_, s)| *s)
                 .unwrap_or_default();
 
-            // Try real client first, then virtual user
-            let (username, srv_muted, elevated, user_groups) = if let Some(client) = self.get_client(uid) {
-                // Skip bridge connections - they are not visible users
-                if client.is_bridge.load(std::sync::atomic::Ordering::SeqCst) {
-                    continue;
-                }
-                let name = client.get_username().await;
-                let sm = client.server_muted.load(std::sync::atomic::Ordering::Relaxed);
-                let el = client.is_superuser.load(std::sync::atomic::Ordering::Relaxed);
-                let groups = client.groups.read().await.clone();
-                (name, sm, el, groups)
-            } else if let Some(vu) = self.get_virtual_user(uid) {
-                (vu.username, false, false, vec![])
-            } else {
+            let Some(member) = self.get_member(uid) else {
                 continue;
+            };
+            // Controller connections are infrastructure, not visible users.
+            if member.is_controller() {
+                continue;
+            }
+
+            // Server-mute is connection runtime for clients; for participants
+            // it lives in the membership status snapshot.
+            let srv_muted = match &member.binding {
+                Binding::Client(h) => h.server_muted.load(Ordering::Relaxed),
+                Binding::Owned { .. } => status.server_muted,
             };
 
             users.push(User {
                 user_id: Some(UserId { value: uid }),
                 current_room: Some(room_id_from_uuid(rid)),
-                username,
+                username: member.identity.display_name().await,
                 is_muted: status.is_muted,
                 is_deafened: status.is_deafened,
                 server_muted: srv_muted,
-                is_elevated: elevated,
-                groups: user_groups,
+                is_elevated: member.is_superuser(),
+                groups: member.identity.groups().await,
+                label: member.identity.label.clone(),
             });
         }
         users
@@ -779,48 +933,6 @@ impl ServerState {
     /// Remove rate limit state for a user (called on disconnect).
     pub fn remove_voice_rate(&self, user_id: u64) {
         self.voice_rate_limits.remove(&user_id);
-    }
-
-    // =========================================================================
-    // Bridge / Virtual User Methods
-    // =========================================================================
-
-    /// Register a virtual user owned by a bridge connection.
-    pub fn register_virtual_user(&self, user_id: u64, username: String, bridge_owner_id: u64) {
-        self.virtual_users.insert(
-            user_id,
-            VirtualUser {
-                user_id,
-                username,
-                bridge_owner_id,
-            },
-        );
-    }
-
-    /// Remove a virtual user.
-    pub fn remove_virtual_user(&self, user_id: u64) -> Option<VirtualUser> {
-        self.virtual_users.remove(&user_id).map(|(_, v)| v)
-    }
-
-    /// Get a virtual user by user_id.
-    pub fn get_virtual_user(&self, user_id: u64) -> Option<VirtualUser> {
-        self.virtual_users.get(&user_id).map(|r| r.value().clone())
-    }
-
-    /// Check if a given user_id is a virtual user owned by the specified bridge.
-    pub fn is_virtual_user_of(&self, user_id: u64, bridge_owner_id: u64) -> bool {
-        self.virtual_users
-            .get(&user_id)
-            .is_some_and(|vu| vu.bridge_owner_id == bridge_owner_id)
-    }
-
-    /// Get all virtual user IDs owned by a specific bridge connection.
-    pub fn get_virtual_users_for_bridge(&self, bridge_owner_id: u64) -> Vec<u64> {
-        self.virtual_users
-            .iter()
-            .filter(|entry| entry.value().bridge_owner_id == bridge_owner_id)
-            .map(|entry| *entry.key())
-            .collect()
     }
 }
 

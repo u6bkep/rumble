@@ -34,6 +34,9 @@ message User {
   bool is_elevated = 7;  // User has elevated to superuser via sudo
   // Permission groups this user belongs to (populated for self always, for all users if viewer has MANAGE_ACL).
   repeated string groups = 8;
+  // Freeform display marker set by a controller/plugin (e.g. "Mumble", "bot").
+  // Meaning is defined by whatever minted the participant; empty for humans.
+  optional string label = 9;
 }
 
 // Room definition.
@@ -153,14 +156,16 @@ message Envelope {
     PermissionDenied permission_denied = 91;
     UserKicked user_kicked = 92;
 
-    // Bridge Messages (70-79)
-    BridgeHello bridge_hello = 70;
-    BridgeRegisterUser bridge_register_user = 71;
-    BridgeUnregisterUser bridge_unregister_user = 72;
-    BridgeJoinRoom bridge_join_room = 73;
-    BridgeSetUserStatus bridge_set_user_status = 74;
-    BridgeChatMessage bridge_chat_message = 75;
-    BridgeUserRegistered bridge_user_registered = 76;
+    // Controller / Participant Messages (70-79)
+    // A "controller" is an out-of-process extension (e.g. a bridge) that mints
+    // and drives "participants" — roster members with no connection of their own.
+    ControllerHello controller_hello = 70;
+    RegisterParticipant register_participant = 71;
+    UnregisterParticipant unregister_participant = 72;
+    MoveParticipant move_participant = 73;
+    SetParticipantStatus set_participant_status = 74;
+    ParticipantChat participant_chat = 75;
+    ParticipantRegistered participant_registered = 76;
 
     // File relay (94-99) — reserved, no longer uses envelope payloads
   }
@@ -627,48 +632,57 @@ message UserGroupChanged {
 }
 
 // =============================================================================
-// Bridge Messages
+// Controller / Participant Messages
 // =============================================================================
 
-// Client -> Server: Declare this connection as a bridge.
-// Sent after authentication. The bridge's own user entry is hidden from clients.
-message BridgeHello {
-  // Display name for the bridge (e.g., "Mumble Bridge").
-  string bridge_name = 1;
+// Client -> Server: Declare this connection as a controller (e.g. a bridge).
+// Sent after authentication; gated by the MANAGE_PARTICIPANTS permission.
+// The controller's own user entry is hidden from the roster.
+message ControllerHello {
+  // Display name for the controller (e.g., "Mumble Bridge").
+  string controller_name = 1;
 }
 
-// Client -> Server: Register a virtual user managed by the bridge.
+// Client -> Server: Register a participant driven by this controller.
 // Server assigns a user_id and broadcasts UserJoined.
-message BridgeRegisterUser {
+message RegisterParticipant {
+  // Display name shown in the roster.
   string username = 1;
+  // Freeform display marker (e.g. "Mumble"). Optional.
+  optional string label = 2;
+  // Stable external identity token. When set, the participant maps to a known
+  // identity and inherits its groups; when unset the participant is anonymous
+  // and inherits the controller's configured default_participant_group.
+  // Unused for now — reserved for stable per-participant ACL.
+  optional bytes external_identity = 3;
 }
 
-// Server -> Client: Confirmation of virtual user registration with assigned ID.
-message BridgeUserRegistered {
+// Server -> Client: Confirmation of participant registration with assigned ID.
+message ParticipantRegistered {
   uint64 user_id = 1;
   string username = 2;
 }
 
-// Client -> Server: Remove a virtual user.
-message BridgeUnregisterUser {
+// Client -> Server: Remove a participant.
+message UnregisterParticipant {
   uint64 user_id = 1;
 }
 
-// Client -> Server: Move a virtual user to a room.
-message BridgeJoinRoom {
+// Client -> Server: Move a participant to a room.
+message MoveParticipant {
   uint64 user_id = 1;
   RoomId room_id = 2;
 }
 
-// Client -> Server: Update a virtual user's mute/deaf status.
-message BridgeSetUserStatus {
+// Client -> Server: Update a participant's mute/deaf status.
+message SetParticipantStatus {
   uint64 user_id = 1;
   bool is_muted = 2;
   bool is_deafened = 3;
 }
 
-// Client -> Server: Send a chat message on behalf of a virtual user.
-message BridgeChatMessage {
+// Client -> Server: Send a chat message on behalf of a participant.
+message ParticipantChat {
   uint64 user_id = 1;
   string text = 2;
 }

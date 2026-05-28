@@ -5,8 +5,9 @@
 //! stream creation, and persistence.
 
 use crate::{
+    handlers,
     persistence::Persistence,
-    state::{ClientHandle, ServerState},
+    state::{ClientHandle, OwnerId, ServerState},
 };
 use anyhow::Result;
 use prost::Message;
@@ -232,6 +233,78 @@ impl ServerCtx {
     /// Access the shared server state.
     pub fn state(&self) -> &Arc<ServerState> {
         &self.state
+    }
+
+    /// Mint a participant driven by this plugin — a roster member with no
+    /// connection of its own (e.g. a bot). The returned [`ParticipantHandle`]
+    /// drives the participant and removes it when dropped.
+    ///
+    /// `groups` are the participant's ACL groups; participants are subject to
+    /// the same permission machinery as humans. They carry no verified identity,
+    /// so they never gain an implicit username-group.
+    pub async fn register_participant(
+        &self,
+        username: String,
+        label: Option<String>,
+        groups: Vec<String>,
+    ) -> Result<ParticipantHandle> {
+        // Each plugin participant gets a unique owner token so its lifetime is
+        // independent; cleanup is handled by the returned handle on drop.
+        let owner = OwnerId::Plugin(self.state.allocate_user_id());
+        let user_id = handlers::create_participant(&self.state, owner, username, label, None, groups).await?;
+        Ok(ParticipantHandle {
+            user_id,
+            state: self.state.clone(),
+            persistence: self.persistence.clone(),
+        })
+    }
+}
+
+/// A handle to a plugin-owned participant. Drives the participant's room,
+/// status, and chat; removes it from the roster when dropped.
+pub struct ParticipantHandle {
+    user_id: u64,
+    state: Arc<ServerState>,
+    persistence: Option<Arc<Persistence>>,
+}
+
+impl ParticipantHandle {
+    /// The participant's server-assigned user_id.
+    pub fn user_id(&self) -> u64 {
+        self.user_id
+    }
+
+    /// Move this participant to a room. Returns false if the room is unknown.
+    pub async fn move_to_room(&self, room_uuid: Uuid) -> Result<bool> {
+        handlers::move_participant_to_room(&self.state, self.user_id, room_uuid).await
+    }
+
+    /// Update this participant's self-mute/deaf status.
+    pub async fn set_status(&self, is_muted: bool, is_deafened: bool) -> Result<()> {
+        handlers::set_participant_status_core(&self.state, self.user_id, is_muted, is_deafened).await
+    }
+
+    /// Post a chat message as this participant to its current room. Subject to
+    /// the participant's ACL (TEXT_MESSAGE) like any other member.
+    pub async fn post_chat(&self, text: String) -> Result<()> {
+        let id = Uuid::new_v4().into_bytes().to_vec();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        handlers::broadcast_chat_as(&self.state, &self.persistence, self.user_id, text, false, id, ts, None).await
+    }
+}
+
+impl Drop for ParticipantHandle {
+    fn drop(&mut self) {
+        // Best-effort removal + UserLeft broadcast when the plugin releases the
+        // handle (including when the plugin itself is dropped).
+        let state = self.state.clone();
+        let user_id = self.user_id;
+        tokio::spawn(async move {
+            let _ = handlers::remove_participant(&state, user_id).await;
+        });
     }
 }
 

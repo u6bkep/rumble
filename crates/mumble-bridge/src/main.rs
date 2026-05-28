@@ -146,8 +146,8 @@ async fn main() -> Result<()> {
         info!(user_id = rumble_conn.user_id, "Connected to Rumble server");
 
         // Declare this connection as a bridge
-        if let Err(e) = rumble_client::send_bridge_hello(&mut rumble_conn.transport, &config.bridge_name).await {
-            error!(error = %e, "Failed to send BridgeHello");
+        if let Err(e) = rumble_client::send_controller_hello(&mut rumble_conn.transport, &config.bridge_name).await {
+            error!(error = %e, "Failed to send ControllerHello");
             info!(backoff_secs, "Reconnecting after backoff");
             let mut shutdown_wait = shutdown_rx.clone();
             tokio::select! {
@@ -160,7 +160,7 @@ async fn main() -> Result<()> {
             backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
             continue;
         }
-        info!("Sent BridgeHello");
+        info!("Sent ControllerHello");
 
         // Update bridge state with fresh Rumble state
         {
@@ -212,12 +212,14 @@ async fn main() -> Result<()> {
                     let mut state = write_bridge(&bridge_state);
                     state.pending_registrations.push((username.clone(), *session));
                 }
-                if let Err(e) = rumble_client::send_bridge_register_user(&mut rumble_conn.transport, username).await {
-                    warn!(error = %e, %username, "Failed to re-register virtual user");
+                if let Err(e) =
+                    rumble_client::send_register_participant(&mut rumble_conn.transport, username, Some("Mumble")).await
+                {
+                    warn!(error = %e, %username, "Failed to re-register participant");
                 }
             }
             // Room joins and mute/deaf sync happen automatically when
-            // BridgeUserRegistered responses arrive in the bridge event loop
+            // ParticipantRegistered responses arrive in the bridge event loop
             // (pending_join_rooms logic + MumbleMuteDeafChange events)
         }
 

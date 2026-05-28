@@ -62,7 +62,7 @@ pub mod state;
 // Re-export main types for convenience
 pub use config::{ServerConfig, generate_self_signed_cert, load_pem_certificates};
 pub use persistence::{PersistedGroup, PersistedRoom, PersistedRoomAcl, Persistence, RegisteredUser};
-pub use plugin::{PluginFactory, ServerCtx, ServerPlugin, StreamHeader};
+pub use plugin::{ParticipantHandle, PluginFactory, ServerCtx, ServerPlugin, StreamHeader};
 pub use relay_plugin::{FileTransferRelayFactory, FileTransferRelayPlugin};
 pub use server::{Config, Server};
-pub use state::{ClientHandle, ServerState, StateData};
+pub use state::{Binding, ClientHandle, Identity, Member, OwnerId, ServerState, StateData};

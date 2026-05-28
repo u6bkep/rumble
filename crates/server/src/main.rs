@@ -13,6 +13,8 @@
 //!
 //! - `add-admin <base64-public-key>` - Add a public key to the admin group
 //! - `set-sudo-password <password>` - Set the sudo elevation password
+//! - `add-controller <base64-public-key>` - Grant a key MANAGE_PARTICIPANTS (controllers group)
+//! - `set-participant-group <base64-public-key> <group>` - Set a controller's default participant group
 //!
 //! Run with `--help` for available options.
 
@@ -78,6 +80,72 @@ fn handle_subcommand() -> Result<Option<()>> {
         persistence.flush()?;
 
         println!("Sudo password set successfully.");
+        println!("Database: {db_path}");
+
+        return Ok(Some(()));
+    }
+
+    if args.len() >= 3 && args[1] == "add-controller" {
+        let key_b64 = &args[2];
+        let data_dir = args.get(3).cloned().unwrap_or_else(|| "data".to_string());
+
+        let key_bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, key_b64)
+            .map_err(|e| anyhow::anyhow!("Invalid base64 public key: {e}"))?;
+        if key_bytes.len() != 32 {
+            anyhow::bail!(
+                "Public key must be 32 bytes (got {}). Provide a base64-encoded Ed25519 public key.",
+                key_bytes.len()
+            );
+        }
+        let key: [u8; 32] = key_bytes.try_into().unwrap();
+
+        std::fs::create_dir_all(&data_dir)?;
+        let db_path = format!("{}/rumble.db", data_dir);
+        let persistence = Persistence::open(&db_path)?;
+        persistence.ensure_default_groups()?;
+
+        // Ensure a "controllers" group exists granting only MANAGE_PARTICIPANTS —
+        // the authority to mint participants, kept separate from the group whose
+        // permissions minted participants inherit.
+        if persistence.get_group("controllers").is_none() {
+            persistence.create_group(
+                "controllers",
+                rumble_protocol::permissions::Permissions::MANAGE_PARTICIPANTS.bits(),
+            )?;
+        }
+        persistence.add_user_to_group(&key, "controllers")?;
+        persistence.flush()?;
+
+        println!("Added public key to controllers group (grants MANAGE_PARTICIPANTS).");
+        println!("Key: {key_b64}");
+        println!("Database: {db_path}");
+
+        return Ok(Some(()));
+    }
+
+    if args.len() >= 4 && args[1] == "set-participant-group" {
+        let key_b64 = &args[2];
+        let group = &args[3];
+        let data_dir = args.get(4).cloned().unwrap_or_else(|| "data".to_string());
+
+        let key_bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, key_b64)
+            .map_err(|e| anyhow::anyhow!("Invalid base64 public key: {e}"))?;
+        if key_bytes.len() != 32 {
+            anyhow::bail!(
+                "Public key must be 32 bytes (got {}). Provide a base64-encoded Ed25519 public key.",
+                key_bytes.len()
+            );
+        }
+        let key: [u8; 32] = key_bytes.try_into().unwrap();
+
+        std::fs::create_dir_all(&data_dir)?;
+        let db_path = format!("{}/rumble.db", data_dir);
+        let persistence = Persistence::open(&db_path)?;
+        persistence.set_participant_default_group(&key, Some(group))?;
+        persistence.flush()?;
+
+        println!("Set default participant group for controller to '{group}'.");
+        println!("Anonymous participants minted by this controller will inherit it.");
         println!("Database: {db_path}");
 
         return Ok(Some(()));
