@@ -78,6 +78,20 @@ domain = "localhost"
 # max_file_size = "256 MiB"      # Max single file upload
 # max_total_size = "1 GiB"       # Max total cache size
 # evict_on_room_clear = true     # Evict when room empties
+
+# Link cleaner: a bot that strips tracking params from posted URLs and replies
+# with the cleaned link. Omit rule fields to use sensible built-in defaults.
+# [plugins.link-cleaner]
+# username = "LinkCleaner"
+# label = "bot"
+# max_message_length = 5000
+# global_strip_params = ["utm_*", "gclid", "fbclid", "igshid"]
+#
+# [plugins.link-cleaner.domains."youtube.com"]
+# allowed_params = ["v", "t"]
+#
+# [plugins.link-cleaner.domains."twitter.com"]
+# remove_all_params = true
 "#;
 
 /// Command-line arguments for the server.

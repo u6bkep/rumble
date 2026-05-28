@@ -53,6 +53,7 @@
 pub mod acl;
 pub mod config;
 pub mod handlers;
+pub mod link_cleaner;
 pub mod persistence;
 pub mod plugin;
 pub mod relay_plugin;
@@ -61,6 +62,7 @@ pub mod state;
 
 // Re-export main types for convenience
 pub use config::{ServerConfig, generate_self_signed_cert, load_pem_certificates};
+pub use link_cleaner::{LinkCleanerFactory, LinkCleanerPlugin};
 pub use persistence::{PersistedGroup, PersistedRoom, PersistedRoomAcl, Persistence, RegisteredUser};
 pub use plugin::{ParticipantHandle, PluginFactory, ServerCtx, ServerPlugin, StreamHeader};
 pub use relay_plugin::{FileTransferRelayFactory, FileTransferRelayPlugin};

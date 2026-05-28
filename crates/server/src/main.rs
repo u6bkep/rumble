@@ -19,7 +19,9 @@
 //! Run with `--help` for available options.
 
 use anyhow::Result;
-use server::{Config, FileTransferRelayFactory, Persistence, Server, ServerConfig, plugin::PluginFactory};
+use server::{
+    Config, FileTransferRelayFactory, LinkCleanerFactory, Persistence, Server, ServerConfig, plugin::PluginFactory,
+};
 use tracing::{info, warn};
 
 /// Handle admin CLI subcommands that run against the database and then exit.
@@ -186,7 +188,7 @@ async fn main() -> Result<()> {
     }
 
     // Construct plugins via factories, passing config sections from TOML
-    let factories: Vec<Box<dyn PluginFactory>> = vec![Box::new(FileTransferRelayFactory)];
+    let factories: Vec<Box<dyn PluginFactory>> = vec![Box::new(FileTransferRelayFactory), Box::new(LinkCleanerFactory)];
 
     let mut plugins: Vec<Box<dyn server::ServerPlugin>> = Vec::new();
     for factory in &factories {

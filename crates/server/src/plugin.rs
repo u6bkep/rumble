@@ -235,6 +235,33 @@ impl ServerCtx {
         &self.state
     }
 
+    /// Post a chat message authored by `author_id` (a participant or client)
+    /// into a specific `room`, regardless of the author's own room. Subject to
+    /// the author's `TEXT_MESSAGE` ACL in `room`.
+    ///
+    /// Chat bots use this to reply into the room a triggering message came from
+    /// without relocating the bot. A fresh message id and timestamp are minted;
+    /// the reply is non-tree and carries no attachment.
+    pub async fn post_chat_as(&self, author_id: u64, room: Uuid, text: String) -> Result<()> {
+        let id = Uuid::new_v4().into_bytes().to_vec();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        handlers::broadcast_chat_in_room(
+            &self.state,
+            &self.persistence,
+            author_id,
+            room,
+            text,
+            false,
+            id,
+            ts,
+            None,
+        )
+        .await
+    }
+
     /// Mint a participant driven by this plugin — a roster member with no
     /// connection of its own (e.g. a bot). The returned [`ParticipantHandle`]
     /// drives the participant and removes it when dropped.

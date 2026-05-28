@@ -33,6 +33,7 @@ async-trait = { workspace = true }
 tokio-util = { workspace = true }
 bytesize = { version = "2", features = ["serde"] }
 humantime-serde = "1"
+url = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

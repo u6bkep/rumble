@@ -6462,6 +6462,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
  "webpki-roots",
 ]

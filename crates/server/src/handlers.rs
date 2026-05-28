@@ -802,17 +802,8 @@ async fn handle_chat_message(
 }
 
 /// Broadcast a chat message authored by `sender_id` (a real client *or* a
-/// participant) to its room — and descendants if `tree`. The single source of
-/// truth for chat fan-out:
-///
-/// - ACL (`TEXT_MESSAGE`) is enforced via the member's identity, so
-///   participants are subject to the same permission machinery as humans.
-/// - Each recipient is resolved to its *delivery connection* (a participant's
-///   chat reaches its controller), deduped per connection, so a controller with
-///   several participants in the room receives the message once. This is what
-///   makes inbound chat reach bridged users.
-/// - The author's own delivery connection is never echoed: a client inserts its
-///   own copy locally, and a controller already knows the message it sent.
+/// participant) to its *current* room — and descendants if `tree`. Thin wrapper
+/// over [`broadcast_chat_in_room`] that resolves the author's room.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn broadcast_chat_as(
     state: &Arc<ServerState>,
@@ -824,14 +815,55 @@ pub(crate) async fn broadcast_chat_as(
     timestamp_ms: i64,
     attachment: Option<proto::ChatAttachment>,
 ) -> Result<()> {
+    let sender_room = state.get_user_room(sender_id).await.unwrap_or(ROOT_ROOM_UUID);
+    broadcast_chat_in_room(
+        state,
+        persistence,
+        sender_id,
+        sender_room,
+        text,
+        is_tree,
+        id,
+        timestamp_ms,
+        attachment,
+    )
+    .await
+}
+
+/// Broadcast a chat message authored by `sender_id` into an explicit `room`
+/// (and descendants if `tree`), rather than the author's current room. This is
+/// the single source of truth for chat fan-out:
+///
+/// - ACL (`TEXT_MESSAGE`) is enforced in `room` via the member's identity, so
+///   participants are subject to the same permission machinery as humans.
+/// - Each recipient is resolved to its *delivery connection* (a participant's
+///   chat reaches its controller), deduped per connection, so a controller with
+///   several participants in the room receives the message once. This is what
+///   makes inbound chat reach bridged users.
+/// - The author's own delivery connection is never echoed: a client inserts its
+///   own copy locally, and a controller already knows the message it sent.
+///
+/// [`broadcast_chat_as`] targets the author's own room (the common case);
+/// plugins use this directly to reply into a room the bot is not a member of.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn broadcast_chat_in_room(
+    state: &Arc<ServerState>,
+    persistence: &Option<Arc<Persistence>>,
+    sender_id: u64,
+    room: Uuid,
+    text: String,
+    is_tree: bool,
+    id: Vec<u8>,
+    timestamp_ms: i64,
+    attachment: Option<proto::ChatAttachment>,
+) -> Result<()> {
     let Some(member) = state.get_member(sender_id) else {
         return Ok(());
     };
-    let sender_room = state.get_user_room(sender_id).await.unwrap_or(ROOT_ROOM_UUID);
 
-    // Permission check: TEXT_MESSAGE in the sender's room.
+    // Permission check: TEXT_MESSAGE in the target room.
     if let Err(denied) =
-        acl::check_member_permission(state, &member, sender_room, Permissions::TEXT_MESSAGE, persistence).await
+        acl::check_member_permission(state, &member, room, Permissions::TEXT_MESSAGE, persistence).await
     {
         // Only a connected client can be told why; participants are driven by
         // their controller, which is responsible for its own UX.
@@ -858,18 +890,18 @@ pub(crate) async fn broadcast_chat_as(
     let frame = encode_frame(&broadcast);
 
     let target_rooms = if is_tree {
-        collect_descendant_rooms(state, sender_room).await
+        collect_descendant_rooms(state, room).await
     } else {
         let mut set = std::collections::HashSet::new();
-        set.insert(sender_room);
+        set.insert(room);
         set
     };
 
     let author_conn = state.delivery_client(sender_id).map(|c| c.user_id);
     let memberships = state.snapshot_room_memberships().await;
     let mut sent_to = std::collections::HashSet::new();
-    for (room, members) in &memberships {
-        if !target_rooms.contains(room) {
+    for (member_room, members) in &memberships {
+        if !target_rooms.contains(member_room) {
             continue;
         }
         for &uid in members {
