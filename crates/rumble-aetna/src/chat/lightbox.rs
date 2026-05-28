@@ -5,10 +5,9 @@ use aetna_core::{prelude::*, surface::SurfaceAlpha};
 use crate::animated_gpu::AnimatedGpu;
 
 use super::{
-    image_preview::{next_frame_deadline, svg_contain_fill, CachedImage, GifPlayback},
-    LIGHTBOX_ZOOM_MAX, LIGHTBOX_ZOOM_MIN, LIGHTBOX_ZOOM_STEP,
-    KEY_LIGHTBOX_CLOSE, KEY_LIGHTBOX_DISMISS, KEY_LIGHTBOX_IMAGE, KEY_LIGHTBOX_ZOOM_FIT,
-    KEY_LIGHTBOX_ZOOM_IN, KEY_LIGHTBOX_ZOOM_NATURAL, KEY_LIGHTBOX_ZOOM_OUT,
+    KEY_LIGHTBOX_CLOSE, KEY_LIGHTBOX_DISMISS, KEY_LIGHTBOX_IMAGE, KEY_LIGHTBOX_ZOOM_FIT, KEY_LIGHTBOX_ZOOM_IN,
+    KEY_LIGHTBOX_ZOOM_NATURAL, KEY_LIGHTBOX_ZOOM_OUT, LIGHTBOX_ZOOM_MAX, LIGHTBOX_ZOOM_MIN, LIGHTBOX_ZOOM_STEP,
+    image_preview::{CachedImage, GifPlayback, next_frame_deadline, svg_contain_fill},
 };
 
 /// State for the image lightbox. Keyed by `transfer_id` so a re-render

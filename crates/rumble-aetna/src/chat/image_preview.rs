@@ -134,13 +134,15 @@ impl CachedImage {
 
 // Player-control SVG icons. Loaded once via `parse_current_color` so
 // `.text_color(...)` tints them.
-static SVG_PLAY: LazyLock<SvgIcon> =
-    LazyLock::new(|| SvgIcon::parse_current_color(include_str!("../../assets/icons/play.svg")).expect("play.svg parses"));
+static SVG_PLAY: LazyLock<SvgIcon> = LazyLock::new(|| {
+    SvgIcon::parse_current_color(include_str!("../../assets/icons/play.svg")).expect("play.svg parses")
+});
 static SVG_PAUSE: LazyLock<SvgIcon> = LazyLock::new(|| {
     SvgIcon::parse_current_color(include_str!("../../assets/icons/pause.svg")).expect("pause.svg parses")
 });
 static SVG_LIGHTBOX_OPEN: LazyLock<SvgIcon> = LazyLock::new(|| {
-    SvgIcon::parse_current_color(include_str!("../../assets/icons/lightbox_open.svg")).expect("lightbox_open.svg parses")
+    SvgIcon::parse_current_color(include_str!("../../assets/icons/lightbox_open.svg"))
+        .expect("lightbox_open.svg parses")
 });
 
 /// Returns true if `name`'s extension is one we can decode for inline

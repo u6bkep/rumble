@@ -14,17 +14,13 @@ pub mod file_card;
 pub mod image_preview;
 pub mod lightbox;
 
-pub use file_card::{render_file_context_menu, FileContextMenu};
+pub use file_card::{FileContextMenu, render_file_context_menu};
 pub use image_preview::{
     AnimatedTextureMap, CachedImage, GifPlayback, ImageCache, VideoThumbMap, is_image_name, is_svg_name,
 };
 pub use lightbox::{Lightbox, PanDrag, ZoomDirection, render_lightbox};
 
-use std::{
-    collections::HashMap,
-    sync::LazyLock,
-    time::Instant,
-};
+use std::{collections::HashMap, sync::LazyLock, time::Instant};
 
 use aetna_core::prelude::*;
 use aetna_markdown::md;
@@ -367,7 +363,9 @@ enum AttachmentView<'a> {
         offer: RelayFileSharePayload,
         reason: String,
     },
-    UnknownPlugin { text: String },
+    UnknownPlugin {
+        text: String,
+    },
 }
 
 fn attachment_view<'a>(

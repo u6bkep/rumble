@@ -5,8 +5,8 @@ use rumble_protocol::proto::RelayFileSharePayload;
 use crate::theme as palette;
 
 use super::{
-    cancel_key, download_key, file_card_key, format_size, open_key, reveal_key,
-    KEY_FILE_CTX_OPEN, KEY_FILE_CTX_OPEN_FOLDER, KEY_FILE_CTX_SAVE_AS,
+    KEY_FILE_CTX_OPEN, KEY_FILE_CTX_OPEN_FOLDER, KEY_FILE_CTX_SAVE_AS, cancel_key, download_key, file_card_key,
+    format_size, open_key, reveal_key,
 };
 
 /// State for the right-click file context menu.
