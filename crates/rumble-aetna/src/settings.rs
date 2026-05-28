@@ -616,6 +616,7 @@ fn parse_proc_route(route: &str) -> Option<(usize, ProcRouteSlot<'_>)> {
 /// independent overlay layers — popovers must paint above the modal
 /// panel they were anchored to. Returns `None` for the panel when the
 /// dialog is closed.
+#[allow(clippy::too_many_arguments)]
 pub fn render(
     state: &SettingsState,
     app_state: &State,
@@ -1439,8 +1440,7 @@ fn vu_meter(level: Level, vad_overlay: Option<&PipelineConfig>) -> El {
     let mut children: Vec<El> = vec![
         row([bar, text(level_label).mono().font_size(tokens::TEXT_XS.size)])
             .gap(tokens::SPACE_2)
-            .align(Align::Center)
-            .into(),
+            .align(Align::Center),
     ];
     // Threshold-label sub-line: only printed when the caller opted into
     // the VAD overlay. The Devices meter is just "is your mic alive?"
@@ -1454,7 +1454,7 @@ fn vu_meter(level: Level, vad_overlay: Option<&PipelineConfig>) -> El {
             (None, _, true) => "Voice gate active (RNNoise) — bar shows post-pipeline level".to_string(),
             (None, _, false) => "VAD disabled — bar shows post-pipeline level only".to_string(),
         };
-        children.push(text(threshold_label).muted().font_size(tokens::TEXT_XS.size).into());
+        children.push(text(threshold_label).muted().font_size(tokens::TEXT_XS.size));
     }
 
     column(children).gap(tokens::SPACE_1).width(Size::Fill(1.0))

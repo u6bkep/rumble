@@ -1453,11 +1453,7 @@ impl Lightbox {
     }
 }
 
-fn fit_step_zoom(
-    body_size: Option<(f32, f32)>,
-    image_size: Option<(u32, u32)>,
-    direction: ZoomDirection,
-) -> f32 {
+fn fit_step_zoom(body_size: Option<(f32, f32)>, image_size: Option<(u32, u32)>, direction: ZoomDirection) -> f32 {
     fit_scale(body_size, image_size)
         .map(|scale| next_zoom_step(scale, direction))
         .unwrap_or_else(|| next_zoom_step(1.0, direction))
@@ -1894,7 +1890,11 @@ mod tests {
         assert!(!lb.image_overflows_body(huge, body));
 
         // Large image at <100%: scaled is 4000*0.3 = 1200 > 800 → pannable.
-        let lb = Lightbox { fit_to_window: false, zoom: 0.3, ..lb };
+        let lb = Lightbox {
+            fit_to_window: false,
+            zoom: 0.3,
+            ..lb
+        };
         assert!(lb.image_overflows_body(huge, body));
 
         // Small image at 200% still fits: 200*2 = 400 < 800 → not pannable.
