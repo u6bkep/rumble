@@ -669,7 +669,7 @@ fn processing_page<B: UiBackend>(
     GroupBox::new("Input level")
         .inner_margin(Margin::symmetric(12, 10))
         .show(ui, |ui| {
-            input_level_meter(ui, state, &original);
+            input_level_meter(ui, backend.meter().input_post.as_db(), &original);
         });
 }
 
@@ -809,8 +809,7 @@ fn render_schema_field(
 /// Input-level bar with a vertical line at the current VAD threshold.
 /// Helps the user calibrate VAD: the line sits where the gate opens,
 /// the coloured bar shows what the mic is picking up right now.
-fn input_level_meter(ui: &mut Ui, state: &State, pipeline: &PipelineConfig) {
-    let level_db = state.audio.input_level_db;
+fn input_level_meter(ui: &mut Ui, level_db: Option<f32>, pipeline: &PipelineConfig) {
     let vad_threshold = pipeline
         .processors
         .iter()
@@ -988,15 +987,18 @@ fn statistics_page<B: UiBackend>(ui: &mut Ui, state: &State, backend: &B) {
     ui.add_space(6.0);
 
     let audio = &state.audio;
-    let stats = &audio.stats;
+    let stats = backend.stats();
+    let stats = &stats;
     GroupBox::new("Audio")
         .inner_margin(Margin::symmetric(12, 10))
         .show(ui, |ui| {
             stat_row(
                 ui,
                 "Input level (dB)",
-                &audio
-                    .input_level_db
+                &backend
+                    .meter()
+                    .input_post
+                    .as_db()
                     .map(|v| format!("{v:.1}"))
                     .unwrap_or_else(|| "—".into()),
             );

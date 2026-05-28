@@ -510,6 +510,13 @@ pub struct AudioTaskConfig<P: Platform> {
     /// `MockAudioBackend` here to bypass cpal entirely; production code
     /// passes `P::AudioBackend::default()`.
     pub audio_backend: P::AudioBackend,
+    /// Writer for the live meter snapshot. Cloned into each capture
+    /// callback (single active stream → single active producer); the UI
+    /// loads via `BackendHandle::meter()`.
+    pub meter_writer: crate::snapshot::SnapshotWriter<crate::meter::MeterSnapshot>,
+    /// Writer for the periodic stats roll-up, driven from the async
+    /// loop's stats timer. UI loads via `BackendHandle::stats()`.
+    pub stats_writer: crate::snapshot::SnapshotWriter<crate::events::AudioStats>,
 }
 
 /// Spawn the audio task and return a handle for sending commands.
@@ -539,6 +546,8 @@ async fn run_audio_task<P: Platform>(
     let state = config.state;
     let repaint = config.repaint;
     let bus = config.bus;
+    let meter_writer = config.meter_writer;
+    let mut stats_writer = config.stats_writer;
     let audio_dumper = config.audio_dumper.unwrap_or_else(AudioDumper::disabled);
 
     // Audio backend for device access (lives on this thread)
@@ -780,6 +789,7 @@ async fn run_audio_task<P: Platform>(
                                 &mut audio_input,
                                 &bus.voice,
                                 &audio_dumper,
+                                &meter_writer,
                             );
                         }
 
@@ -846,6 +856,7 @@ async fn run_audio_task<P: Platform>(
                                 &mut audio_input,
                                 &bus.voice,
                                 &audio_dumper,
+                                &meter_writer,
                             );
                         }
                         sync_transmission!();
@@ -976,6 +987,7 @@ async fn run_audio_task<P: Platform>(
                                 &mut audio_input,
                                 &bus.voice,
                                 &audio_dumper,
+                                &meter_writer,
                             );
                         }
                         sync_transmission!();
@@ -994,9 +1006,7 @@ async fn run_audio_task<P: Platform>(
                             user_state.bytes_received = 0;
                         }
 
-                        let _ = bus.voice.send(VoiceEvent::StatsUpdated {
-                            stats: AudioStats::default(),
-                        });
+                        stats_writer.store(AudioStats::default());
                     }
 
                     AudioCommand::UpdateTxPipeline { config } => {
@@ -1023,6 +1033,7 @@ async fn run_audio_task<P: Platform>(
                                 &mut audio_input,
                                 &bus.voice,
                                 &audio_dumper,
+                                &meter_writer,
                             );
                         }
                         sync_transmission!();
@@ -1305,7 +1316,7 @@ async fn run_audio_task<P: Platform>(
 
             // Periodic stats update
             _ = stats_interval.tick() => {
-                update_stats(&user_audio, packets_sent, bytes_sent, &bus.voice);
+                update_stats(&user_audio, packets_sent, bytes_sent, &mut stats_writer);
             }
         }
     }
@@ -1329,6 +1340,7 @@ fn start_transmission<P: Platform>(
     audio_input: &mut Option<CapStream<P>>,
     voice_tx: &tokio::sync::broadcast::Sender<VoiceEvent>,
     audio_dumper: &AudioDumper,
+    meter_writer: &crate::snapshot::SnapshotWriter<crate::meter::MeterSnapshot>,
 ) {
     if audio_input.is_some() {
         return; // Stream already exists
@@ -1377,9 +1389,17 @@ fn start_transmission<P: Platform>(
     };
     let pipeline_mutex = std::sync::Arc::new(std::sync::Mutex::new(tx_pipeline));
 
-    // Voice event sender for InputLevel + TransmittingChanged emissions
-    // from the capture callback.
+    // Voice event sender for TransmittingChanged edges from the capture
+    // callback. (Per-frame level events have moved off the bus onto the
+    // ArcSwap meter snapshot.)
     let voice_tx_for_callback = voice_tx.clone();
+
+    // Meter snapshot writer for the capture callback. A fresh clone per
+    // stream incarnation — only one capture stream is ever live, so the
+    // single-producer contract holds. Published once per frame; the UI
+    // samples on repaint. `mut` because the writer recycles its backing
+    // buffer across stores.
+    let mut meter_for_callback = meter_writer.clone();
 
     // Track whether we were transmitting (for detecting suppress transitions)
     let was_transmitting = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1393,6 +1413,13 @@ fn start_transmission<P: Platform>(
 
     // Audio dumper for debugging
     let dumper_for_callback = audio_dumper.clone();
+
+    // Reusable scratch buffer for the per-frame mutable copy. The cpal
+    // callback hands us `&[f32]`, but the pipeline needs `&mut [f32]`.
+    // Stashing the Vec in the FnMut closure avoids a fresh allocation
+    // every ~20 ms — small in absolute terms, but free to fix since
+    // we're moving to FnMut anyway.
+    let mut sample_scratch: Vec<f32> = Vec::with_capacity(2048);
 
     // Create audio input via AudioBackend trait
     let encoded_tx = encoded_tx.clone();
@@ -1409,26 +1436,46 @@ fn start_transmission<P: Platform>(
             // Dump raw mic samples (before any processing)
             dumper_for_callback.write_mic_raw(samples);
 
-            // Run samples through the TX pipeline
-            // We make a mutable copy since the callback receives &[f32]
-            let mut processed_samples = samples.to_vec();
+            // RMS dB of the raw capture frame, before the pipeline
+            // runs. This is the "is the mic working" signal — shown on
+            // the Devices tab and independent of whatever processors
+            // the user has composed.
+            let pre_level_db = rumble_audio::calculate_rms_db(samples);
+
+            // Run samples through the TX pipeline. Reuse the scratch
+            // buffer rather than allocating a fresh Vec per frame.
+            sample_scratch.clear();
+            sample_scratch.extend_from_slice(samples);
 
             let pipeline_result = if let Ok(mut pipe) = pipeline_mutex.lock() {
-                pipe.process(&mut processed_samples, 48000)
+                pipe.process(&mut sample_scratch, 48000)
             } else {
                 rumble_audio::ProcessorResult::default()
             };
+
+            // RMS dB after the pipeline runs — what's actually about
+            // to be encoded. Measured here (not via a processor) so the
+            // value stays meaningful even if the user disables or
+            // removes every level-reporting stage.
+            let post_level_db = rumble_audio::calculate_rms_db(&sample_scratch);
 
             // Track previous transmitting state to detect changes
             let was_tx = was_transmitting_for_callback.load(std::sync::atomic::Ordering::Relaxed);
             let is_tx_now = !pipeline_result.suppress;
 
-            // Emit input level every frame (high-frequency; projection
-            // suppresses to trace! so the log isn't flooded).
-            if let Some(level_db) = pipeline_result.level_db {
-                let _ = voice_tx_for_callback.send(VoiceEvent::InputLevel { db: level_db });
-            }
+            // Publish a fresh meter snapshot for the UI. The writer
+            // recycles its buffer, so in steady state this doesn't
+            // allocate in the audio callback. No event-bus traffic for
+            // the 50 Hz metering rate.
+            meter_for_callback.store(crate::meter::MeterSnapshot {
+                input_pre: crate::meter::Level::Db(pre_level_db),
+                input_post: crate::meter::Level::Db(post_level_db),
+            });
             // Emit a transmitting transition only on edge (VAD on/off).
+            // This is still an edge-triggered event the projection
+            // folds into AudioState::is_transmitting and that SFX/toast
+            // listeners subscribe to — distinct from the per-frame
+            // `transmitting` field on the snapshot.
             if was_tx != is_tx_now {
                 let _ = voice_tx_for_callback.send(VoiceEvent::TransmittingChanged { active: is_tx_now });
             }
@@ -1452,7 +1499,7 @@ fn start_transmission<P: Platform>(
                 && let Some(enc) = guard.as_mut()
             {
                 let mut opus_buf = [0u8; OPUS_MAX_PACKET_SIZE];
-                match enc.encode(&processed_samples, &mut opus_buf) {
+                match enc.encode(&sample_scratch, &mut opus_buf) {
                     Ok(len) => {
                         let encoded = &opus_buf[..len];
                         // Dump TX opus packet (after encoding)
@@ -1723,12 +1770,12 @@ fn cleanup_stale_users<D: VoiceDecoderTrait>(
     }
 }
 
-/// Emit an updated stats roll-up.
+/// Publish an updated stats roll-up to the stats snapshot.
 fn update_stats<D: VoiceDecoderTrait>(
     user_audio: &HashMap<u64, UserAudioState<D>>,
     packets_sent: u64,
     bytes_sent: u64,
-    voice_tx: &tokio::sync::broadcast::Sender<VoiceEvent>,
+    stats_writer: &mut crate::snapshot::SnapshotWriter<AudioStats>,
 ) {
     // Aggregate stats from all users
     let mut total_packets_received: u64 = 0;
@@ -1772,7 +1819,7 @@ fn update_stats<D: VoiceDecoderTrait>(
         buffer_underruns: 0,
         last_update: Some(Instant::now()),
     };
-    let _ = voice_tx.send(VoiceEvent::StatsUpdated { stats });
+    stats_writer.store(stats);
 }
 
 #[cfg(test)]

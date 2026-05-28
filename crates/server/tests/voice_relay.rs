@@ -255,10 +255,14 @@ fn voice_relay_end_to_end() {
     }
 
     // Wait until client2 has received some opus packets from the relay.
+    // Stats now ride a snapshot channel on the handle, not State, so
+    // read them via `handle.stats()` (ignoring the State passed to the
+    // condition closure).
     assert!(
-        wait_for(&handle2, Duration::from_secs(3), |s| s.audio.stats.bytes_received > 200),
+        wait_for(&handle2, Duration::from_secs(3), |_s| handle2.stats().bytes_received
+            > 200),
         "client2 should receive bytes from relay (got {})",
-        handle2.state().audio.stats.bytes_received,
+        handle2.stats().bytes_received,
     );
 
     // Give the audio task a few mix ticks to fill the playback buffer.
@@ -275,19 +279,13 @@ fn voice_relay_end_to_end() {
     assert!(e > 1.0, "client2 playback should have non-trivial energy, got {e}");
 
     // Sanity: client1 transmitted, client2 received.
-    let s1 = handle1.state();
-    let s2 = handle2.state();
-    assert!(
-        s1.audio.stats.packets_sent > 0,
-        "client1 should report packets_sent > 0"
-    );
-    assert!(
-        s2.audio.stats.packets_received > 0,
-        "client2 should report packets_received > 0"
-    );
+    let s1 = handle1.stats();
+    let s2 = handle2.stats();
+    assert!(s1.packets_sent > 0, "client1 should report packets_sent > 0");
+    assert!(s2.packets_received > 0, "client2 should report packets_received > 0");
     println!(
         "stats — sent: {}, received: {}, bytes_received: {}",
-        s1.audio.stats.packets_sent, s2.audio.stats.packets_received, s2.audio.stats.bytes_received,
+        s1.packets_sent, s2.packets_received, s2.bytes_received,
     );
 }
 
@@ -378,13 +376,9 @@ fn no_relay_when_ptt_not_held() {
     std::thread::sleep(Duration::from_millis(500));
 
     assert_eq!(
-        handle1.state().audio.stats.packets_sent,
+        handle1.stats().packets_sent,
         0,
         "no packets should be sent without PTT held in PTT mode"
     );
-    assert_eq!(
-        handle2.state().audio.stats.bytes_received,
-        0,
-        "client2 should receive nothing"
-    );
+    assert_eq!(handle2.stats().bytes_received, 0, "client2 should receive nothing");
 }

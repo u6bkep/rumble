@@ -68,12 +68,13 @@ pub struct ProcessorResult {
     ///
     /// Pipeline uses OR logic: any processor returning `true` suppresses the frame.
     pub suppress: bool,
-
-    /// Audio level in dB (for metering UI).
-    ///
-    /// Processors that measure audio level can set this. The pipeline
-    /// reports the last `Some(x)` value from the chain.
-    pub level_db: Option<f32>,
+    // Note: level metering used to live here as `level_db: Option<f32>`,
+    // reduced "last-wins" by the pipeline. That coupled the meter to a
+    // specific processor's identity — removing the level-reporting
+    // processor killed the meter. Metering is now done by the audio task
+    // itself at deterministic pre/post-pipeline taps and published via
+    // `rumble_client::MeterHandle`; `ProcessorResult` carries only
+    // control-flow signals.
 }
 
 impl ProcessorResult {
@@ -84,18 +85,7 @@ impl ProcessorResult {
 
     /// Create a result indicating the frame should be suppressed.
     pub fn suppressed() -> Self {
-        Self {
-            suppress: true,
-            level_db: None,
-        }
-    }
-
-    /// Create a result with a level measurement.
-    pub fn with_level(level_db: f32) -> Self {
-        Self {
-            suppress: false,
-            level_db: Some(level_db),
-        }
+        Self { suppress: true }
     }
 }
 
@@ -484,8 +474,8 @@ pub fn backfill_settings_from_schema(value: &mut serde_json::Value, schema: &ser
 /// A chain of audio processors.
 ///
 /// The pipeline executes processors in order, passing the output of each
-/// to the next. Results are aggregated using OR logic for `suppress` and
-/// last-wins for `level_db`.
+/// to the next. The aggregated `ProcessorResult` uses OR logic for
+/// `suppress` (any processor can gate the frame).
 pub struct AudioPipeline {
     processors: Vec<Box<dyn AudioProcessor>>,
     frame_size: usize,
@@ -523,26 +513,16 @@ impl AudioPipeline {
     /// Process a frame of audio samples.
     ///
     /// Runs all enabled processors in sequence, modifying samples in-place.
-    ///
-    /// # Returns
-    /// Aggregated result from all processors:
-    /// - `suppress`: true if ANY processor returned suppress=true
-    /// - `level_db`: the LAST Some(x) value from the chain
+    /// The aggregated result's `suppress` is the OR of every enabled
+    /// processor's `suppress`.
     pub fn process(&mut self, samples: &mut [f32], sample_rate: u32) -> ProcessorResult {
         let mut result = ProcessorResult::default();
 
         for processor in &mut self.processors {
             if processor.is_enabled() {
                 let r = processor.process(samples, sample_rate);
-
-                // OR logic for suppress
                 if r.suppress {
                     result.suppress = true;
-                }
-
-                // Last level_db wins
-                if r.level_db.is_some() {
-                    result.level_db = r.level_db;
                 }
             }
         }
@@ -638,7 +618,6 @@ mod tests {
     fn test_processor_result_default() {
         let result = ProcessorResult::default();
         assert!(!result.suppress);
-        assert!(result.level_db.is_none());
     }
 
     #[test]

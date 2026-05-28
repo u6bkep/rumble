@@ -5,7 +5,7 @@
 //! use `MockBackend` to arrange UI state without starting networking or
 //! the audio pipeline.
 
-use rumble_client::{Command, State, handle::BackendHandle};
+use rumble_client::{AudioStats, Command, MeterSnapshot, State, handle::BackendHandle};
 use rumble_client_traits::file_transfer::{TransferId, TransferStatus};
 use std::path::PathBuf;
 
@@ -16,6 +16,17 @@ pub trait UiBackend: 'static {
     fn state(&self) -> State;
     fn send(&self, command: Command);
     fn update_state<R>(&self, f: impl FnOnce(&mut State) -> R) -> R;
+
+    /// Live meter snapshot. Default returns the empty snapshot so test
+    /// backends don't have to provide one.
+    fn meter(&self) -> MeterSnapshot {
+        MeterSnapshot::default()
+    }
+
+    /// Audio stats roll-up. Default returns the all-zero roll-up.
+    fn stats(&self) -> AudioStats {
+        AudioStats::default()
+    }
 
     /// Snapshot the current set of file transfers. Returns an empty
     /// vec when not connected or when no plugin is installed.
@@ -63,6 +74,14 @@ impl UiBackend for NativeUiBackend {
     fn update_state<R>(&self, f: impl FnOnce(&mut State) -> R) -> R {
         let mut state = self.inner.state_mut();
         f(&mut state)
+    }
+
+    fn meter(&self) -> MeterSnapshot {
+        self.inner.meter()
+    }
+
+    fn stats(&self) -> AudioStats {
+        self.inner.stats()
     }
 
     fn transfers(&self) -> Vec<TransferStatus> {

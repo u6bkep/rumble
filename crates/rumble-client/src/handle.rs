@@ -141,6 +141,14 @@ pub struct BackendHandle<P: Platform> {
     _connect_config: ConnectConfig,
     /// Pre-generated sound effects library.
     sfx_library: crate::sfx::SfxLibrary,
+    /// Reader for the live metering snapshot. The audio task publishes a
+    /// fresh value per capture frame; the UI samples it each repaint.
+    /// Decoupled from the projection path so 50 Hz updates don't ride
+    /// the broadcast channel.
+    meter: crate::snapshot::Snapshot<crate::meter::MeterSnapshot>,
+    /// Reader for the periodic stats roll-up. Same transport as the
+    /// meter; written ~2×/s by the audio task's stats loop.
+    stats: crate::snapshot::Snapshot<crate::events::AudioStats>,
     /// Sender half of the backend-event channel. Internal client code
     /// calls `push_event` to enqueue a [`BackendEvent`]; the UI drains
     /// the receiver each frame.
@@ -270,11 +278,9 @@ impl<P: Platform> BackendHandle<P> {
                 is_transmitting: false,
                 talking_users: HashSet::new(),
                 settings: Default::default(),
-                stats: Default::default(),
                 tx_pipeline: Default::default(),
                 rx_pipeline_defaults: Default::default(),
                 per_user_rx: Default::default(),
-                input_level_db: None,
             },
             chat_messages: Vec::new(),
             room_tree: Default::default(),
@@ -294,6 +300,10 @@ impl<P: Platform> BackendHandle<P> {
         // writer of `State`. External subscribers attach via the
         // `subscribe_*` methods on `BackendHandle`.
         let bus = crate::projection::EventBus::new();
+        // Sampled-signal channels: writers go to the audio task, readers
+        // stay on the handle for the UI. See `crate::snapshot`.
+        let (meter_writer, meter) = crate::snapshot::Snapshot::new(crate::meter::MeterSnapshot::default());
+        let (stats_writer, stats) = crate::snapshot::Snapshot::new(crate::events::AudioStats::default());
 
         // Spawn the audio task (runs on its own thread)
         let audio_task = spawn_audio_task::<P>(AudioTaskConfig {
@@ -302,6 +312,8 @@ impl<P: Platform> BackendHandle<P> {
             bus: bus.clone(),
             audio_dumper,
             audio_backend,
+            meter_writer,
+            stats_writer,
         });
 
         // Clone handles for the connection task
@@ -359,10 +371,24 @@ impl<P: Platform> BackendHandle<P> {
             runtime_thread: Some(runtime_thread),
             _connect_config: connect_config,
             sfx_library: crate::sfx::SfxLibrary::new(),
+            meter,
+            stats,
             event_tx,
             event_rx: std::sync::Mutex::new(Some(event_rx)),
             _phantom: std::marker::PhantomData,
         }
+    }
+
+    /// Load the current live meter snapshot. Cheap (bumps an `Arc`);
+    /// safe to call from the UI thread per repaint.
+    pub fn meter(&self) -> crate::meter::MeterSnapshot {
+        self.meter.load()
+    }
+
+    /// Load the current audio stats roll-up. Same sampled-snapshot
+    /// transport as [`Self::meter`]; updated ~2×/s by the audio task.
+    pub fn stats(&self) -> crate::events::AudioStats {
+        self.stats.load()
     }
 
     // -------------------------------------------------------------

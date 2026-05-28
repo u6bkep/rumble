@@ -499,6 +499,8 @@ impl<B: UiBackend> App for RumbleApp<B> {
             settings::render(
                 &self.settings_state,
                 &state,
+                &self.backend.meter(),
+                &self.backend.stats(),
                 &self.identity,
                 &self.selection,
                 &self.processor_registry,
@@ -1019,9 +1021,8 @@ impl<B: UiBackend> App for RumbleApp<B> {
             // overflows the body" rather than `zoom > 1.0`: a large
             // image at <100% can still extend past the viewport, and
             // the user expects to be able to pan it in that case.
-            let overflows = lightbox_image_size.is_some_and(|(w, h)| {
-                lightbox.image_overflows_body((w as f32, h as f32), lightbox_body_size)
-            });
+            let overflows = lightbox_image_size
+                .is_some_and(|(w, h)| lightbox.image_overflows_body((w as f32, h as f32), lightbox_body_size));
             if event.route() == Some(chat::KEY_LIGHTBOX_IMAGE) && overflows {
                 match event.kind {
                     UiEventKind::PointerDown => {

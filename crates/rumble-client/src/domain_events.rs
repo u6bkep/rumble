@@ -35,7 +35,7 @@ use rumble_protocol::{
     proto::{GroupInfo, RoomAclEntry, RoomInfo, User},
 };
 
-use crate::events::{AudioDeviceInfo, AudioSettings, AudioStats, ChatMessage, PendingCertificate, VoiceMode};
+use crate::events::{AudioDeviceInfo, AudioSettings, ChatMessage, PendingCertificate, VoiceMode};
 
 /// Capacity used for every `broadcast::channel` in the backend.
 /// 1024 is generous enough that the projection task — which is the
@@ -127,13 +127,12 @@ pub enum VoiceEvent {
     /// self-mute + server-mute + transmit-active).
     TransmittingChanged { active: bool },
 
-    /// Microphone input level in dB, sampled from the TX pipeline.
-    InputLevel { db: f32 },
-
-    /// Periodic stats roll-up (packets sent/received/lost, FEC recovery,
-    /// jitter buffer depth, etc.).
-    StatsUpdated { stats: AudioStats },
-
+    // Sampled audio signals — per-frame input levels and the periodic
+    // stats roll-up — are published over `snapshot` channels (see
+    // `crate::snapshot`, read via `BackendHandle::meter()` / `stats()`)
+    // rather than this event bus. The UI samples them on repaint; the
+    // audio task writes them on its own cadence. No VoiceEvent variant
+    // carries level or stats data.
     /// Device enumeration result, after `Command::RefreshAudioDevices`
     /// or a hotplug-triggered re-enum.
     DevicesEnumerated {

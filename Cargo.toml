@@ -51,6 +51,7 @@ aetna-winit-wgpu = { git = "https://github.com/computer-whisperer/aetna", rev = 
 # at the older line — bump them in dedicated commits. Currently held
 # back: bincode 3 (sled on-disk format compatibility).
 anyhow = "1"
+arc-swap = "1"
 async-trait = "0.1"
 base64 = "0.22"
 bitflags = "2"

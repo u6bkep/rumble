@@ -209,7 +209,6 @@ impl AudioProcessor for DenoiseProcessor {
 
         ProcessorResult {
             suppress: want_vad && !self.shaper.is_active(),
-            level_db: None,
         }
     }
 

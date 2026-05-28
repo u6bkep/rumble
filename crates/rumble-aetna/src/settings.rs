@@ -15,7 +15,10 @@ use std::path::PathBuf;
 
 use aetna_core::prelude::*;
 
-use rumble_client::{AudioSettings, AudioState, PipelineConfig, ProcessorConfig, ProcessorRegistry, SfxKind, State};
+use rumble_client::{
+    AudioSettings, AudioState, AudioStats, Level, MeterSnapshot, PipelineConfig, ProcessorConfig, ProcessorRegistry,
+    SfxKind, State,
+};
 use rumble_desktop_shell::{
     AutoDownloadRule, HotkeyBinding, HotkeyData, HotkeyFunction, HotkeyManager, HotkeyModifiers, KeyboardSettings,
     PersistentVoiceMode, Settings, ShortcutEntry, TimestampFormat,
@@ -134,6 +137,8 @@ pub enum OpenSelect {
     InputDevice,
     OutputDevice,
     TimestampFormat,
+    /// "Add processor" dropdown on the Processing tab.
+    AddProcessor,
     /// Function dropdown open on the shortcut entry with this id.
     ShortcutFunction(String),
     /// Data dropdown open on the shortcut entry with this id.
@@ -528,6 +533,11 @@ fn shortcut_field_kind(field_path: &str) -> &str {
 /// shared prefix lets [`handle_event`] cheaply ignore unrelated routes.
 const PROC_PREFIX: &str = "settings:proc:";
 
+/// Trigger for the "Add processor" dropdown at the bottom of the
+/// Processing tab. Not parsed by [`parse_proc_route`] — handled with
+/// `select::classify_event` like the other dropdowns.
+const KEY_PROC_ADD: &str = "settings:proc-add";
+
 /// Limits clamp KB/s sliders. 5000 KB/s ≈ 5 MB/s — well above any
 /// realistic rumble file-transfer cap.
 const MAX_SPEED_KBPS: u32 = 5000;
@@ -542,32 +552,59 @@ fn sfx_preview_key(idx: usize) -> String {
 /// Route key for a processor's enable switch. The slot is identified by
 /// the processor's index in the pipeline rather than its `type_id` so
 /// keys stay short and the parsing in `handle_event` is a single
-/// `parse::<usize>()`. Pipelines never reorder behind the user's back
-/// while the dialog is open, so the index is stable.
+/// `parse::<usize>()`. Indices are stable within a render cycle; the
+/// reorder / remove / add buttons mutate the underlying `Vec` *after*
+/// the event has been handled, so the route → index mapping in flight
+/// matches the tree that produced the event.
 fn proc_enabled_key(idx: usize) -> String {
     format!("{PROC_PREFIX}{idx}:enabled")
 }
 
 /// Route key for one schema field of a processor. Layout:
 /// `settings:proc:<idx>:f:<field>`. The `:f:` separator avoids
-/// collisions with `enabled` even if a schema were ever to define a
-/// field literally named `enabled`.
+/// collisions with `enabled` / `up` / `down` / `remove` even if a
+/// schema were ever to define a field literally named one of those.
 fn proc_field_key(idx: usize, field: &str) -> String {
     format!("{PROC_PREFIX}{idx}:f:{field}")
 }
 
-/// Inverse of [`proc_enabled_key`] / [`proc_field_key`]. Returns the
-/// (processor index, optional field name) for routes under the
-/// processing namespace, or `None` for unrelated routes.
-fn parse_proc_route(route: &str) -> Option<(usize, Option<&str>)> {
+fn proc_move_up_key(idx: usize) -> String {
+    format!("{PROC_PREFIX}{idx}:up")
+}
+fn proc_move_down_key(idx: usize) -> String {
+    format!("{PROC_PREFIX}{idx}:down")
+}
+fn proc_remove_key(idx: usize) -> String {
+    format!("{PROC_PREFIX}{idx}:remove")
+}
+
+/// Per-processor route slots. Builders above produce the strings;
+/// [`parse_proc_route`] inverts them back to (idx, slot).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcRouteSlot<'a> {
+    Enabled,
+    Field(&'a str),
+    MoveUp,
+    MoveDown,
+    Remove,
+}
+
+/// Inverse of the `proc_*_key` helpers. Returns the
+/// (processor index, slot) for routes under the processing namespace,
+/// or `None` for unrelated routes (including [`KEY_PROC_ADD`], which is
+/// matched separately).
+fn parse_proc_route(route: &str) -> Option<(usize, ProcRouteSlot<'_>)> {
     let rest = route.strip_prefix(PROC_PREFIX)?;
     let (idx_str, tail) = rest.split_once(':')?;
     let idx: usize = idx_str.parse().ok()?;
-    if tail == "enabled" {
-        return Some((idx, None));
-    }
-    let field = tail.strip_prefix("f:")?;
-    Some((idx, Some(field)))
+    let slot = match tail {
+        "enabled" => ProcRouteSlot::Enabled,
+        "up" => ProcRouteSlot::MoveUp,
+        "down" => ProcRouteSlot::MoveDown,
+        "remove" => ProcRouteSlot::Remove,
+        other => ProcRouteSlot::Field(other.strip_prefix("f:")?),
+    };
+    Some((idx, slot))
 }
 
 // ============================================================
@@ -582,6 +619,8 @@ fn parse_proc_route(route: &str) -> Option<(usize, Option<&str>)> {
 pub fn render(
     state: &SettingsState,
     app_state: &State,
+    meter: &MeterSnapshot,
+    stats: &AudioStats,
     identity: &Identity,
     selection: &Selection,
     processor_registry: &ProcessorRegistry,
@@ -605,14 +644,14 @@ pub fn render(
 
     let body = match tab {
         SettingsTab::Connection => render_connection(pending, identity, app_state),
-        SettingsTab::Devices => render_devices(pending, &app_state.audio),
+        SettingsTab::Devices => render_devices(pending, &app_state.audio, meter),
         SettingsTab::Voice => render_voice(pending),
-        SettingsTab::Processing => render_processing(pending, &app_state.audio, processor_registry, selection),
+        SettingsTab::Processing => render_processing(pending, meter, processor_registry, selection),
         SettingsTab::Sounds => render_sounds(pending),
         SettingsTab::Chat => render_chat(pending),
         SettingsTab::Shortcuts => render_shortcuts(pending, state, hotkeys),
         SettingsTab::Files => render_files(pending, selection),
-        SettingsTab::Stats => render_stats(&app_state.audio),
+        SettingsTab::Stats => render_stats(stats),
         SettingsTab::Admin => admin::render(&state.admin, app_state, selection),
         SettingsTab::About => render_about(),
     };
@@ -711,6 +750,13 @@ pub fn render(
                 .iter()
                 .enumerate()
                 .map(|(idx, fmt)| (idx.to_string(), fmt.label().to_string())),
+        )),
+        OpenSelect::AddProcessor => Some(select_menu(
+            KEY_PROC_ADD,
+            processor_registry
+                .list_available()
+                .into_iter()
+                .map(|(type_id, name, _desc)| (type_id.to_string(), name.to_string())),
         )),
         OpenSelect::ShortcutFunction(entry_id) => Some(select_menu(
             shortcut_function_key(entry_id),
@@ -978,14 +1024,21 @@ fn render_superuser_section(app_state: &State) -> Option<Vec<El>> {
     Some(out)
 }
 
-fn render_devices(pending: &PendingSettings, audio: &AudioState) -> El {
+fn render_devices(pending: &PendingSettings, audio: &AudioState, meter: &MeterSnapshot) -> El {
     let input_label = device_label_for(pending.input_device.as_deref(), &audio.input_devices);
     let output_label = device_label_for(pending.output_device.as_deref(), &audio.output_devices);
 
     column([
         section_card(
             "Input device",
-            [select_trigger(KEY_INPUT_DEVICE, input_label).width(Size::Fill(1.0))],
+            [
+                select_trigger(KEY_INPUT_DEVICE, input_label).width(Size::Fill(1.0)),
+                // Pre-pipeline level: lets the user confirm the selected
+                // mic is actually capturing before they ever open the
+                // Processing tab. No VAD overlay here — the threshold
+                // belongs to the processing chain, not to device choice.
+                vu_meter(meter.input_pre, None),
+            ],
         ),
         section_card(
             "Output device",
@@ -1097,51 +1150,82 @@ fn render_voice(pending: &PendingSettings) -> El {
 
 fn render_processing(
     pending: &PendingSettings,
-    audio: &AudioState,
+    meter: &MeterSnapshot,
     registry: &ProcessorRegistry,
     selection: &Selection,
 ) -> El {
     let mut cards: Vec<El> = Vec::new();
+    let processor_count = pending.tx_pipeline.processors.len();
+    // Look up display metadata once per render. `list_available` walks
+    // the registry's BTreeMap and allocates a Vec, so doing it inside
+    // the per-processor loop (as the previous code did) was O(n * m).
+    let available: Vec<(String, String, String)> = registry
+        .list_available()
+        .into_iter()
+        .map(|(type_id, name, desc)| (type_id.to_string(), name.to_string(), desc.to_string()))
+        .collect();
 
     cards.push(section_card(
         "Processor pipeline",
         [paragraph(
-            "Audio processors applied to your microphone before encoding. Order is fixed; toggle individual stages \
-             on/off.",
+            "Audio processors applied to your microphone before encoding. Drag stages with the arrow buttons to \
+             change order, add or remove stages with the controls below.",
         )
         .muted()
         .font_size(tokens::TEXT_XS.size)],
     ));
 
-    if pending.tx_pipeline.processors.is_empty() {
+    if processor_count == 0 {
         cards.push(section_card(
             "Processors",
-            [paragraph("No processors registered.").muted()],
+            [paragraph("No processors in the pipeline. Add one below to get started.").muted()],
         ));
     }
 
     for (idx, proc_config) in pending.tx_pipeline.processors.iter().enumerate() {
-        let display_name = registry
-            .list_available()
-            .into_iter()
-            .find(|(type_id, _, _)| *type_id == proc_config.type_id.as_str())
-            .map(|(_, name, _)| name.to_string())
-            .unwrap_or_else(|| proc_config.type_id.clone());
-        let description = registry
-            .list_available()
-            .into_iter()
-            .find(|(type_id, _, _)| *type_id == proc_config.type_id.as_str())
-            .map(|(_, _, desc)| desc.to_string())
-            .unwrap_or_default();
+        let (display_name, description) = available
+            .iter()
+            .find(|(type_id, _, _)| type_id == &proc_config.type_id)
+            .map(|(_, name, desc)| (name.clone(), desc.clone()))
+            .unwrap_or_else(|| (proc_config.type_id.clone(), String::new()));
 
-        // Build the card body: header (toggle + description), then any
-        // per-processor schema fields when the processor is enabled.
+        let is_first = idx == 0;
+        let is_last = idx + 1 == processor_count;
+
+        let mut move_up_btn = icon_button(IconName::ChevronUp)
+            .key(proc_move_up_key(idx))
+            .ghost()
+            .tooltip("Move up");
+        if is_first {
+            move_up_btn = move_up_btn.disabled();
+        }
+        let mut move_down_btn = icon_button(IconName::ChevronDown)
+            .key(proc_move_down_key(idx))
+            .ghost()
+            .tooltip("Move down");
+        if is_last {
+            move_down_btn = move_down_btn.disabled();
+        }
+        let remove_btn = icon_button(IconName::X)
+            .key(proc_remove_key(idx))
+            .ghost()
+            .tooltip("Remove from pipeline");
+
+        // Header row: action buttons on the left, enable switch flush
+        // right. The `spacer` separates the two clusters and absorbs any
+        // extra width as the dialog resizes.
         let mut body: Vec<El> = Vec::new();
         body.push(
-            row([spacer(), switch(proc_config.enabled).key(proc_enabled_key(idx))])
-                .gap(tokens::SPACE_3)
-                .align(Align::Center)
-                .width(Size::Fill(1.0)),
+            row([
+                move_up_btn,
+                move_down_btn,
+                remove_btn,
+                spacer(),
+                switch(proc_config.enabled).key(proc_enabled_key(idx)),
+            ])
+            .gap(tokens::SPACE_2)
+            .align(Align::Center)
+            .width(Size::Fill(1.0)),
         );
         if !description.is_empty() {
             body.push(paragraph(description).muted().font_size(tokens::TEXT_XS.size));
@@ -1164,9 +1248,24 @@ fn render_processing(
         cards.push(section_card(display_name, body));
     }
 
+    // "Add processor" card sits at the bottom of the list so the action
+    // is visible without scrolling past meters. The trigger always shows
+    // the same label — picking an option fires Add and the dropdown
+    // closes; there is no "selected" state to display.
     cards.push(section_card(
-        "Input level",
-        [input_level_meter(&pending.tx_pipeline, audio)],
+        "Add processor",
+        [row([
+            select_trigger(KEY_PROC_ADD, "Add a processor…").width(Size::Fixed(280.0)),
+            spacer(),
+        ])
+        .gap(tokens::SPACE_2)
+        .align(Align::Center)
+        .width(Size::Fill(1.0))],
+    ));
+
+    cards.push(section_card(
+        "Transmit level",
+        [vu_meter(meter.input_post, Some(&pending.tx_pipeline))],
     ));
 
     column(cards).gap(tokens::SPACE_3).width(Size::Fill(1.0))
@@ -1240,35 +1339,47 @@ fn render_schema_field(
     }
 }
 
-/// Mumble-style VU meter that splits at the VAD threshold. Below the
-/// threshold the bar paints in red ("won't transmit"); above the
-/// threshold in green ("will transmit"). The break in colour follows
-/// the threshold position, so dragging the threshold slider is
-/// reflected immediately on the bar — that's the visual aid Mumble
-/// users tune against.
-///
-/// When the VAD processor is disabled there's no threshold to break
-/// against, so the meter falls back to a plain green/yellow/red
-/// loudness display via [`progress`].
 fn bool_setting(proc: &ProcessorConfig, key: &str) -> bool {
     proc.settings.get(key).and_then(|v| v.as_bool()).unwrap_or(false)
 }
 
-fn input_level_meter(pipeline: &PipelineConfig, audio: &AudioState) -> El {
-    const MIN_DB: f32 = -60.0;
-    const MAX_DB: f32 = 0.0;
-    const SPAN_DB: f32 = MAX_DB - MIN_DB;
-    const BAR_W: f32 = 280.0;
-    const BAR_H: f32 = 14.0;
+/// Dynamic range for the meter, in dB. -60 dB is roughly the floor for
+/// "audible" speech; 0 dB is digital full-scale. The bar normalises
+/// `level_db` linearly across this span.
+const VU_MIN_DB: f32 = -60.0;
+const VU_MAX_DB: f32 = 0.0;
+const VU_SPAN_DB: f32 = VU_MAX_DB - VU_MIN_DB;
+const VU_BAR_W: f32 = 280.0;
+const VU_BAR_H: f32 = 14.0;
 
-    let level_db = audio.input_level_db;
-    let normalize = |db: f32| ((db - MIN_DB) / SPAN_DB).clamp(0.0, 1.0);
-    let value_n = level_db.map(normalize).unwrap_or(0.0);
+fn vu_normalize(db: f32) -> f32 {
+    ((db - VU_MIN_DB) / VU_SPAN_DB).clamp(0.0, 1.0)
+}
 
-    let vad_proc = pipeline
-        .processors
-        .iter()
-        .find(|p| p.type_id == "builtin.vad" && p.enabled);
+/// Shared VU meter used by both the Devices and Processing tabs.
+///
+/// `level` is the value to render — Devices passes `meter.input_pre`,
+/// Processing passes `meter.input_post`. `Level::Unmeasured` paints an
+/// empty bar and shows "—" for the readout.
+///
+/// `vad_overlay` controls the Mumble-style split colouring. When `Some`,
+/// the meter probes the pipeline config for an enabled `builtin.vad`
+/// processor and, if found, paints "won't transmit" / "will transmit"
+/// zones either side of its threshold. When the VAD processor isn't
+/// present (or `vad_overlay` is `None`) the meter falls back to a plain
+/// green/yellow/red loudness display.
+///
+/// This is the only place the meter's visual contract is defined —
+/// callers just pass a level and decide whether the overlay applies.
+fn vu_meter(level: Level, vad_overlay: Option<&PipelineConfig>) -> El {
+    let level_db = level.as_db();
+    let value_n = level.normalized(VU_MIN_DB, VU_MAX_DB);
+
+    // Resolve VAD overlay state. With no pipeline provided (Devices
+    // tab), or no enabled VAD processor in it, the meter degrades to
+    // plain loudness — that's the whole point of letting the caller
+    // opt out of the overlay.
+    let vad_proc = vad_overlay.and_then(|p| p.processors.iter().find(|p| p.type_id == "builtin.vad" && p.enabled));
     let vad_threshold_db = vad_proc
         .and_then(|p| p.settings.get("threshold_db"))
         .and_then(|v| v.as_f64())
@@ -1289,26 +1400,27 @@ fn input_level_meter(pipeline: &PipelineConfig, audio: &AudioState) -> El {
     // to know it's the one gating, so label it but skip the threshold
     // tick. Energy VAD wins the visualization if both are enabled.
     let rnnoise_vad_gating = vad_threshold_db.is_none()
-        && pipeline
-            .processors
-            .iter()
-            .any(|p| p.type_id == "builtin.denoise" && p.enabled && bool_setting(p, "vad_enabled"));
+        && vad_overlay
+            .map(|p| {
+                p.processors
+                    .iter()
+                    .any(|p| p.type_id == "builtin.denoise" && p.enabled && bool_setting(p, "vad_enabled"))
+            })
+            .unwrap_or(false);
 
     let level_label = match level_db {
         Some(db) => format!("{db:.0} dB"),
         None => "—".to_string(),
     };
-    let threshold_label = match (vad_threshold_db, vad_release_db, rnnoise_vad_gating) {
-        (Some(trigger), Some(release), _) => {
-            format!("VAD: trigger {trigger:.0} dB · release {release:.0} dB")
-        }
-        (Some(trigger), None, _) => format!("VAD threshold: {trigger:.0} dB"),
-        (None, _, true) => "Voice gate active (RNNoise) — bar shows mic loudness".to_string(),
-        (None, _, false) => "VAD disabled — bar shows mic loudness only".to_string(),
-    };
 
     let bar = match vad_threshold_db {
-        Some(t_db) => threshold_bar(value_n, normalize(t_db), vad_release_db.map(normalize), BAR_W, BAR_H),
+        Some(t_db) => threshold_bar(
+            value_n,
+            vu_normalize(t_db),
+            vad_release_db.map(vu_normalize),
+            VU_BAR_W,
+            VU_BAR_H,
+        ),
         None => {
             // No threshold to break against — fall back to a plain
             // loudness meter coloured by current level.
@@ -1319,19 +1431,33 @@ fn input_level_meter(pipeline: &PipelineConfig, audio: &AudioState) -> El {
                 None => tokens::MUTED,
             };
             progress(value_n, color)
-                .width(Size::Fixed(BAR_W))
-                .height(Size::Fixed(BAR_H))
+                .width(Size::Fixed(VU_BAR_W))
+                .height(Size::Fixed(VU_BAR_H))
         }
     };
 
-    column([
+    let mut children: Vec<El> = vec![
         row([bar, text(level_label).mono().font_size(tokens::TEXT_XS.size)])
             .gap(tokens::SPACE_2)
-            .align(Align::Center),
-        text(threshold_label).muted().font_size(tokens::TEXT_XS.size),
-    ])
-    .gap(tokens::SPACE_1)
-    .width(Size::Fill(1.0))
+            .align(Align::Center)
+            .into(),
+    ];
+    // Threshold-label sub-line: only printed when the caller opted into
+    // the VAD overlay. The Devices meter is just "is your mic alive?"
+    // — adding a VAD comment there would be noise.
+    if vad_overlay.is_some() {
+        let threshold_label = match (vad_threshold_db, vad_release_db, rnnoise_vad_gating) {
+            (Some(trigger), Some(release), _) => {
+                format!("VAD: trigger {trigger:.0} dB · release {release:.0} dB")
+            }
+            (Some(trigger), None, _) => format!("VAD threshold: {trigger:.0} dB"),
+            (None, _, true) => "Voice gate active (RNNoise) — bar shows post-pipeline level".to_string(),
+            (None, _, false) => "VAD disabled — bar shows post-pipeline level only".to_string(),
+        };
+        children.push(text(threshold_label).muted().font_size(tokens::TEXT_XS.size).into());
+    }
+
+    column(children).gap(tokens::SPACE_1).width(Size::Fill(1.0))
 }
 
 /// Four-segment bar mirroring `Mumble::AudioBar`: a darkened "won't
@@ -1814,8 +1940,7 @@ fn rule_row(idx: usize, rule: &PendingAutoDownloadRule, selection: &Selection, e
     r
 }
 
-fn render_stats(audio: &AudioState) -> El {
-    let stats = &audio.stats;
+fn render_stats(stats: &AudioStats) -> El {
     let loss_pct = stats.packet_loss_percent();
     let loss_color = if loss_pct > 5.0 {
         tokens::DESTRUCTIVE
@@ -2560,16 +2685,49 @@ pub fn handle_event(
 
     // ---------- Processing tab: dynamic per-processor controls ----------
     //
-    // Routes here are built at render time as `settings:proc:<idx>:enabled`
-    // (the per-processor switch) or `settings:proc:<idx>:f:<field>` (a
-    // schema-defined property). We dispatch text/switch/slider events
-    // against whichever shape the schema picked, so the keyboard +
-    // pointer codepaths converge into a single update of `pending.tx_pipeline`.
+    // Routes here are built at render time as `settings:proc:<idx>:<slot>`
+    // — see [`ProcRouteSlot`] for the slot vocabulary (enable switch,
+    // schema field, move-up / move-down / remove buttons). We dispatch
+    // text/switch/slider events against whichever shape the schema
+    // picked, so the keyboard + pointer codepaths converge into a
+    // single update of `pending.tx_pipeline`.
+
+    // "Add processor" dropdown. Picking a type appends a fresh
+    // `ProcessorConfig` (defaults from the registry) to the end of the
+    // pipeline — the user then moves / reorders / configures from
+    // there. Duplicates of the same type_id are allowed; the pipeline
+    // is keyed by index, not type, and a chain like "gain → denoise →
+    // gain" is a legitimate use case.
+    if let Some(action) = select::classify_event(event, KEY_PROC_ADD) {
+        match action {
+            select::SelectAction::Toggle => {
+                state.open_select = if state.open_select == OpenSelect::AddProcessor {
+                    OpenSelect::None
+                } else {
+                    OpenSelect::AddProcessor
+                };
+            }
+            select::SelectAction::Dismiss => state.open_select = OpenSelect::None,
+            select::SelectAction::Pick(value) => {
+                if let Some(mut new_config) = processor_registry.default_config(&value) {
+                    // Default to enabled — that's what the user just
+                    // explicitly asked for. The factory's
+                    // `default_settings()` already populates each
+                    // schema field, so no backfill is needed.
+                    new_config.enabled = true;
+                    pending.tx_pipeline.processors.push(new_config);
+                }
+                state.open_select = OpenSelect::None;
+            }
+            _ => {}
+        }
+        return SettingsOutcome::Handled;
+    }
 
     // Text-input events arrive on `target_key` rather than `route`, so
     // check this before the generic `route()`-driven handlers.
     if let Some(target) = event.target_key()
-        && let Some((idx, Some(field))) = parse_proc_route(target)
+        && let Some((idx, ProcRouteSlot::Field(field))) = parse_proc_route(target)
         && let Some(proc_config) = pending.tx_pipeline.processors.get_mut(idx)
         && schema_field_type(processor_registry, &proc_config.type_id, field) == Some("string")
     {
@@ -2588,21 +2746,54 @@ pub fn handle_event(
     if let Some(route) = event.route()
         && let Some((idx, slot)) = parse_proc_route(route)
     {
+        // Mutating actions on the pipeline list itself. These can fire
+        // even when `idx` would otherwise be out of bounds for a
+        // settings access, so handle them before the per-processor
+        // `get_mut` below — though in practice the route was just
+        // produced by the render at `idx`, so it should always be live.
+        if matches!(event.kind, UiEventKind::Click | UiEventKind::Activate) {
+            match slot {
+                ProcRouteSlot::MoveUp => {
+                    if idx > 0 && idx < pending.tx_pipeline.processors.len() {
+                        pending.tx_pipeline.processors.swap(idx - 1, idx);
+                    }
+                    return SettingsOutcome::Handled;
+                }
+                ProcRouteSlot::MoveDown => {
+                    if idx + 1 < pending.tx_pipeline.processors.len() {
+                        pending.tx_pipeline.processors.swap(idx, idx + 1);
+                    }
+                    return SettingsOutcome::Handled;
+                }
+                ProcRouteSlot::Remove => {
+                    if idx < pending.tx_pipeline.processors.len() {
+                        pending.tx_pipeline.processors.remove(idx);
+                    }
+                    return SettingsOutcome::Handled;
+                }
+                _ => {}
+            }
+        }
+
         let Some(proc_config) = pending.tx_pipeline.processors.get_mut(idx) else {
             return SettingsOutcome::Ignored;
         };
 
         match slot {
             // Per-processor enable switch.
-            None => {
+            ProcRouteSlot::Enabled => {
                 if switch::apply_event(&mut proc_config.enabled, event, route) {
                     return SettingsOutcome::Handled;
                 }
             }
+            // Action buttons handled above; we only get here for non-
+            // Click/Activate events (e.g. focus traversal), which the
+            // ghost icon-button surface absorbs on its own.
+            ProcRouteSlot::MoveUp | ProcRouteSlot::MoveDown | ProcRouteSlot::Remove => {}
             // Schema-driven field. The schema lookup is the source of
             // truth for "what control type was rendered" — the event
             // codepaths can't peek at the rendered tree.
-            Some(field) => {
+            ProcRouteSlot::Field(field) => {
                 let prop_type = schema_field_type(processor_registry, &proc_config.type_id, field);
                 let prop_schema = processor_registry
                     .settings_schema(&proc_config.type_id)

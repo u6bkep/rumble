@@ -303,8 +303,12 @@ impl AudioSettings {
 
 /// Runtime audio statistics for monitoring and debugging.
 ///
-/// These are read-only values updated by the audio pipeline.
-#[derive(Debug, Clone, Default, serde::Serialize)]
+/// Published over a [`crate::snapshot`] channel (read via
+/// `BackendHandle::stats()`), not stored on [`AudioState`] — it's a
+/// sampled roll-up the UI reads on repaint, not a discrete fact the
+/// projection needs to fold. `Copy` so the snapshot writer can recycle
+/// its backing buffer without cloning heap data.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
 pub struct AudioStats {
     /// Number of voice packets sent.
     pub packets_sent: u64,
@@ -568,8 +572,6 @@ pub struct AudioState {
     pub talking_users: HashSet<u64>,
     /// Configurable audio pipeline settings (legacy, for Opus encoder config).
     pub settings: AudioSettings,
-    /// Runtime audio statistics.
-    pub stats: AudioStats,
 
     // Pipeline configuration
     /// TX (transmit) pipeline configuration.
@@ -578,9 +580,13 @@ pub struct AudioState {
     pub rx_pipeline_defaults: PipelineConfig,
     /// Per-user RX configuration overrides.
     pub per_user_rx: HashMap<u64, UserRxConfig>,
-
-    /// Current audio input level in dB (from TX pipeline, for UI metering).
-    pub input_level_db: Option<f32>,
+    // Sampled signals — per-frame input levels ([`crate::meter`]) and the
+    // periodic stats roll-up ([`AudioStats`]) — live on `snapshot`
+    // channels read via `BackendHandle::meter()` / `stats()`, not here.
+    // Keeping them off `AudioState` means a meter tick or stats refresh
+    // doesn't take the `State` RwLock or wake the projection task. Only
+    // discrete facts (device list, mute/transmit/talking, pipeline
+    // config) live on `AudioState`.
 }
 
 impl AudioState {

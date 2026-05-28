@@ -45,6 +45,8 @@ use rumble_protocol::{
 struct MockBackend {
     state: State,
     transfers: Vec<rumble_client_traits::file_transfer::TransferStatus>,
+    meter: rumble_client::MeterSnapshot,
+    stats: AudioStats,
 }
 
 impl UiBackend for MockBackend {
@@ -52,6 +54,12 @@ impl UiBackend for MockBackend {
         self.state.clone()
     }
     fn send(&self, _command: Command) {}
+    fn meter(&self) -> rumble_client::MeterSnapshot {
+        self.meter
+    }
+    fn stats(&self) -> AudioStats {
+        self.stats
+    }
     fn transfers(&self) -> Vec<rumble_client_traits::file_transfer::TransferStatus> {
         self.transfers.clone()
     }
@@ -308,15 +316,54 @@ impl Scene {
                 audio: device_state(),
                 ..State::default()
             },
-            Scene::SettingsStats => State {
-                audio: stats_state(),
-                ..State::default()
-            },
+            // Stats values come from the MockBackend's stats() snapshot
+            // (see build_stats), not from State — the read-only grid
+            // reads them via the backend, not app_state.
+            Scene::SettingsStats => State::default(),
             Scene::SettingsAdmin => admin_state(),
             Scene::RoomAclModal => room_acl_state(),
             Scene::ElevatePrompt | Scene::SettingsConnectionSudo => sudo_capable_state(false),
             Scene::SettingsConnectionElevated => sudo_capable_state(true),
             Scene::FileSharePending | Scene::FileShareFailed => file_share_state(self),
+        }
+    }
+
+    /// Meter snapshot the MockBackend hands to the UI on `meter()`.
+    /// Scenes that show level bars seed representative dB values so the
+    /// dumped SVG looks like a real session; everything else uses the
+    /// default (`Unmeasured`) snapshot.
+    fn build_meter(self) -> rumble_client::MeterSnapshot {
+        use rumble_client::{Level, MeterSnapshot};
+        match self {
+            Scene::SettingsDevices => MeterSnapshot {
+                input_pre: Level::Db(-18.0),
+                ..MeterSnapshot::default()
+            },
+            Scene::SettingsProcessing => MeterSnapshot {
+                input_pre: Level::Db(-18.0),
+                input_post: Level::Db(-22.0),
+            },
+            _ => MeterSnapshot::default(),
+        }
+    }
+
+    /// Stats roll-up the MockBackend hands to the UI on `stats()`. Only
+    /// the Stats scene needs realistic counters; others use the default
+    /// (all-zero) roll-up.
+    fn build_stats(self) -> AudioStats {
+        match self {
+            Scene::SettingsStats => AudioStats {
+                actual_bitrate_bps: 64_000.0,
+                avg_frame_size_bytes: 159.4,
+                packets_sent: 12_804,
+                packets_received: 12_731,
+                packets_lost: 73,
+                packets_recovered_fec: 41,
+                frames_concealed: 14,
+                playback_buffer_packets: 3,
+                ..AudioStats::default()
+            },
+            _ => AudioStats::default(),
         }
     }
 
@@ -938,25 +985,6 @@ fn processing_state() -> AudioState {
     }
     AudioState {
         tx_pipeline,
-        input_level_db: Some(-22.0),
-        ..AudioState::default()
-    }
-}
-
-fn stats_state() -> AudioState {
-    let stats = AudioStats {
-        actual_bitrate_bps: 64_000.0,
-        avg_frame_size_bytes: 159.4,
-        packets_sent: 12_804,
-        packets_received: 12_731,
-        packets_lost: 73,
-        packets_recovered_fec: 41,
-        frames_concealed: 14,
-        playback_buffer_packets: 3,
-        ..AudioStats::default()
-    };
-    AudioState {
-        stats,
         ..AudioState::default()
     }
 }
@@ -1088,6 +1116,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let backend = MockBackend {
             state: scene.build_state(),
             transfers: scene.build_transfers(),
+            meter: scene.build_meter(),
+            stats: scene.build_stats(),
         };
         let identity = Identity::load(scratch.clone())?;
         let settings = SettingsStore::load_from_path(Some(scratch.join("settings.json")));

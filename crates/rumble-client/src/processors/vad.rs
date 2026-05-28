@@ -159,14 +159,14 @@ impl Default for VadProcessor {
 
 impl AudioProcessor for VadProcessor {
     fn process(&mut self, samples: &mut [f32], sample_rate: u32) -> ProcessorResult {
+        // RMS is still needed internally to feed the shaper's
+        // trigger/release decision, but is no longer reported back to
+        // the pipeline — metering taps live in the audio task instead.
         let level_db = calculate_rms_db(samples);
         let active = self
             .shaper
             .update(level_db, samples.len() as u32, sample_rate, &self.shaper_settings());
-        ProcessorResult {
-            suppress: !active,
-            level_db: Some(level_db),
-        }
+        ProcessorResult { suppress: !active }
     }
 
     fn name(&self) -> &'static str {
@@ -355,19 +355,11 @@ mod tests {
         assert!(!processor.is_voice_active());
     }
 
-    #[test]
-    fn test_vad_level_reporting() {
-        let mut processor = VadProcessor::new();
-
-        let mut samples = vec![0.5f32; 960];
-        let result = processor.process(&mut samples, 48000);
-
-        // Should report level
-        assert!(result.level_db.is_some());
-        let level = result.level_db.unwrap();
-        // 0.5 amplitude ~= -6dB
-        assert!(level > -10.0 && level < 0.0);
-    }
+    // Note: VAD used to report `result.level_db` so the UI meter could
+    // read it. Metering has moved into the audio task (RMS taps before
+    // and after the pipeline), so VAD now only reports `suppress`. The
+    // shaper still uses an internal RMS computation for its trigger
+    // decision — see `test_vad_suppress_with_loud_signal`.
 
     #[test]
     fn test_factory_create() {

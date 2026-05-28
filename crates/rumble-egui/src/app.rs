@@ -1467,7 +1467,7 @@ impl RumbleApp {
 
         // Audio Input Level Meter
         ui.label("Input Level:");
-        if let Some(level_db) = audio.input_level_db {
+        if let Some(level_db) = self.backend.meter().input_post.as_db() {
             ui.horizontal(|ui| {
                 // Normalize level_db to 0.0-1.0 range (assuming -60dB to 0dB range)
                 let normalized = ((level_db + 60.0_f32) / 60.0_f32).clamp(0.0, 1.0);
@@ -1746,7 +1746,7 @@ impl RumbleApp {
 
         let audio = &state.audio;
         ui.label("Input Level (with VAD threshold):");
-        if let Some(level_db) = audio.input_level_db {
+        if let Some(level_db) = self.backend.meter().input_post.as_db() {
             ui.horizontal(|ui| {
                 let normalized = ((level_db + 60.0_f32) / 60.0_f32).clamp(0.0, 1.0);
                 let color = if level_db > -3.0 {
@@ -1900,11 +1900,12 @@ impl RumbleApp {
     }
 
     /// Render the Statistics settings category.
-    fn render_settings_statistics(&mut self, ui: &mut egui::Ui, state: &rumble_client::State) {
+    fn render_settings_statistics(&mut self, ui: &mut egui::Ui, _state: &rumble_client::State) {
         ui.heading("Audio Statistics");
         ui.add_space(8.0);
 
-        let stats = &state.audio.stats;
+        let stats = self.backend.stats();
+        let stats = &stats;
 
         egui::Grid::new("stats_grid")
             .num_columns(2)

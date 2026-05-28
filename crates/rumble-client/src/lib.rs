@@ -112,6 +112,17 @@ pub mod synth;
 pub mod sfx;
 pub use sfx::{SfxKind, SfxLibrary};
 
+// Single-writer / multi-reader "latest value wins" transport for
+// sampled, lossy-tolerant signals (meter levels, stats roll-up). Kept
+// off the projection event bus so high-frequency updates don't pressure
+// the broadcast channel or force a per-event repaint carve-out.
+pub mod snapshot;
+pub use snapshot::{Snapshot, SnapshotWriter};
+
+// Live audio metering value types, published over a `snapshot` channel.
+pub mod meter;
+pub use meter::{Level, MeterSnapshot};
+
 // Audio processing pipeline - processors
 pub mod processors;
 pub use processors::{

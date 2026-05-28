@@ -266,13 +266,10 @@ fn apply_chat(state: &Arc<RwLock<State>>, ev: ChatEvent, repaint: &Arc<dyn Fn() 
 }
 
 fn apply_voice(state: &Arc<RwLock<State>>, ev: VoiceEvent, repaint: &Arc<dyn Fn() + Send + Sync>) {
-    // High-frequency events (InputLevel fires per audio frame ~50Hz,
-    // StatsUpdated every 500ms): write state but skip repaint. The UI
-    // reads `audio.input_level_db` and `audio.stats` on its next
-    // already-scheduled redraw — no need to wake it just for a meter
-    // tick.
-    let suppress_repaint = matches!(ev, VoiceEvent::InputLevel { .. } | VoiceEvent::StatsUpdated { .. });
-
+    // Every voice event here is a discrete fact worth a repaint. The
+    // high-frequency sampled signals (meter levels, stats roll-up) ride
+    // `snapshot` channels instead and never reach this path, so there's
+    // no longer a "suppress repaint for noisy events" carve-out.
     let mut s = match state.write() {
         Ok(g) => g,
         Err(p) => p.into_inner(),
@@ -306,17 +303,6 @@ fn apply_voice(state: &Arc<RwLock<State>>, ev: VoiceEvent, repaint: &Arc<dyn Fn(
         VoiceEvent::TransmittingChanged { active } => {
             s.audio.is_transmitting = active;
         }
-        VoiceEvent::InputLevel { db } => {
-            s.audio.input_level_db = Some(db);
-        }
-        VoiceEvent::StatsUpdated { stats } => {
-            // Preserve buffer_underruns — nothing increments it today,
-            // but if/when it gets wired up, the audio task's roll-up
-            // doesn't know about it.
-            let preserved_underruns = s.audio.stats.buffer_underruns;
-            s.audio.stats = stats;
-            s.audio.stats.buffer_underruns = preserved_underruns;
-        }
         VoiceEvent::DevicesEnumerated { input, output } => {
             s.audio.input_devices = input;
             s.audio.output_devices = output;
@@ -345,9 +331,7 @@ fn apply_voice(state: &Arc<RwLock<State>>, ev: VoiceEvent, repaint: &Arc<dyn Fn(
         }
     }
     drop(s);
-    if !suppress_repaint {
-        repaint();
-    }
+    repaint();
 }
 
 fn apply_connection(state: &Arc<RwLock<State>>, ev: ConnectionEvent, repaint: &Arc<dyn Fn() + Send + Sync>) {
