@@ -4,12 +4,10 @@ members = [
     "crates/*",
     "xtask",
 ]
-# Active set built by `cargo build` / `cargo test` without -p. The
-# deprecated crates (rumble-egui, rumble-next, rumble-widgets,
-# harness-cli — see "Deprecated Crates" in CLAUDE.md) stay workspace
-# members so dependency resolution and `cargo build -p rumble-egui`
-# still work, but they're skipped by default so cross-cutting
-# refactors don't pay their compile-time tax.
+# `default-members` and `members` are currently identical — every crate
+# under `crates/` is part of the active build. The split is kept so a
+# future reference-only or experimental crate can be added to `members`
+# without being pulled into the default `cargo build` / `cargo test`.
 default-members = [
     "crates/mumble-bridge",
     "crates/rumble-aetna",
@@ -60,7 +58,6 @@ bytes = "1"
 clap = { version = "4", features = ["derive"] }
 dashmap = "6.1"
 directories = "6.0"
-eframe = "0.33.3"
 hex = "0.4"
 prost = "0.14"
 prost-build = "0.14"
@@ -85,26 +82,6 @@ url = "2"
 uuid = { version = "1.19", features = ["v4"] }
 webpki-roots = "1"
 wgpu = "29"
-
-# Local fork of egui 0.33.3 with a small hit_test fix: also filter
-# NaN out of `WidgetRect.rect` (not just `interact_rect`). egui's
-# upstream filter only checks `interact_rect`, but `WidgetRect` derives
-# `PartialEq` over every field — so a NaN in `rect` makes
-# `position(...).unwrap()` at hit_test.rs:364 panic. See
-# https://github.com/emilk/egui/issues/7870 (still open as of writing).
-# Drop this block when the upstream fix lands.
-[patch.crates-io]
-egui = { git = "https://github.com/u6bkep/egui.git", branch = "rumble-fix-hit-test-nan-rect" }
-emath = { git = "https://github.com/u6bkep/egui.git", branch = "rumble-fix-hit-test-nan-rect" }
-epaint = { git = "https://github.com/u6bkep/egui.git", branch = "rumble-fix-hit-test-nan-rect" }
-epaint_default_fonts = { git = "https://github.com/u6bkep/egui.git", branch = "rumble-fix-hit-test-nan-rect" }
-ecolor = { git = "https://github.com/u6bkep/egui.git", branch = "rumble-fix-hit-test-nan-rect" }
-eframe = { git = "https://github.com/u6bkep/egui.git", branch = "rumble-fix-hit-test-nan-rect" }
-egui-winit = { git = "https://github.com/u6bkep/egui.git", branch = "rumble-fix-hit-test-nan-rect" }
-egui_extras = { git = "https://github.com/u6bkep/egui.git", branch = "rumble-fix-hit-test-nan-rect" }
-egui_glow = { git = "https://github.com/u6bkep/egui.git", branch = "rumble-fix-hit-test-nan-rect" }
-egui-wgpu = { git = "https://github.com/u6bkep/egui.git", branch = "rumble-fix-hit-test-nan-rect" }
-egui_kittest = { git = "https://github.com/u6bkep/egui.git", branch = "rumble-fix-hit-test-nan-rect" }
 
 # Optimize MSDF-generation crates in dev builds. aetna's
 # `Runner::warm_default_glyphs` pre-rasterizes printable ASCII for

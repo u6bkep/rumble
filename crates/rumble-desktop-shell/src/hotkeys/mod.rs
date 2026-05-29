@@ -1,4 +1,4 @@
-//! Global hotkey service shared between `rumble-egui` and `rumble-next`.
+//! Global hotkey service for the desktop client.
 //!
 //! Three platform backends, all hidden behind one `HotkeyManager` API:
 //! - **Windows / macOS / Linux X11** via `global-hotkey` (the
@@ -9,10 +9,6 @@
 //!   to `init_portal_backend`.
 //! - **Anywhere else** the manager exists but is dormant — callers can
 //!   still query `is_available()`, `is_wayland()`, etc. without `cfg`.
-//!
-//! Lifted from `rumble-egui/src/{hotkeys,portal_hotkeys}.rs`. The API
-//! surface is intentionally identical so rumble-egui can re-export and
-//! its existing call sites compile unchanged.
 
 use std::collections::HashMap;
 
@@ -109,7 +105,7 @@ impl KeyboardSettings {
 
     /// First binding configured for `(function, data)`, if any. Useful
     /// for callers that conceptually only care about one binding per
-    /// action (e.g. the deprecated rumble-egui keyboard panel).
+    /// action (e.g. a keyboard-shortcuts settings panel).
     pub fn primary_binding(&self, function: HotkeyFunction, data: HotkeyData) -> Option<&HotkeyBinding> {
         self.shortcuts
             .iter()
@@ -794,173 +790,6 @@ impl HotkeyManager {
             _ => Err(format!("Unknown key: {key}")),
         }
     }
-
-    /// Convert egui Key to our string representation.
-    #[cfg(feature = "egui-keys")]
-    pub fn egui_key_to_string(key: eframe::egui::Key) -> Option<String> {
-        use eframe::egui::Key;
-        let s = match key {
-            Key::Space => "Space",
-            Key::Enter => "Enter",
-            Key::Tab => "Tab",
-            Key::Backspace => "Backspace",
-            Key::Escape => "Escape",
-            Key::Insert => "Insert",
-            Key::Delete => "Delete",
-            Key::Home => "Home",
-            Key::End => "End",
-            Key::PageUp => "PageUp",
-            Key::PageDown => "PageDown",
-            Key::ArrowUp => "ArrowUp",
-            Key::ArrowDown => "ArrowDown",
-            Key::ArrowLeft => "ArrowLeft",
-            Key::ArrowRight => "ArrowRight",
-            Key::F1 => "F1",
-            Key::F2 => "F2",
-            Key::F3 => "F3",
-            Key::F4 => "F4",
-            Key::F5 => "F5",
-            Key::F6 => "F6",
-            Key::F7 => "F7",
-            Key::F8 => "F8",
-            Key::F9 => "F9",
-            Key::F10 => "F10",
-            Key::F11 => "F11",
-            Key::F12 => "F12",
-            Key::A => "A",
-            Key::B => "B",
-            Key::C => "C",
-            Key::D => "D",
-            Key::E => "E",
-            Key::F => "F",
-            Key::G => "G",
-            Key::H => "H",
-            Key::I => "I",
-            Key::J => "J",
-            Key::K => "K",
-            Key::L => "L",
-            Key::M => "M",
-            Key::N => "N",
-            Key::O => "O",
-            Key::P => "P",
-            Key::Q => "Q",
-            Key::R => "R",
-            Key::S => "S",
-            Key::T => "T",
-            Key::U => "U",
-            Key::V => "V",
-            Key::W => "W",
-            Key::X => "X",
-            Key::Y => "Y",
-            Key::Z => "Z",
-            Key::Num0 => "0",
-            Key::Num1 => "1",
-            Key::Num2 => "2",
-            Key::Num3 => "3",
-            Key::Num4 => "4",
-            Key::Num5 => "5",
-            Key::Num6 => "6",
-            Key::Num7 => "7",
-            Key::Num8 => "8",
-            Key::Num9 => "9",
-            Key::Minus => "Minus",
-            Key::Equals => "Equal",
-            Key::OpenBracket => "BracketLeft",
-            Key::CloseBracket => "BracketRight",
-            Key::Backslash => "Backslash",
-            Key::Semicolon => "Semicolon",
-            Key::Quote => "Quote",
-            Key::Backtick => "Backquote",
-            Key::Comma => "Comma",
-            Key::Period => "Period",
-            Key::Slash => "Slash",
-            _ => return None,
-        };
-        Some(s.to_string())
-    }
-
-    /// Convert key string to egui Key (for window-focused fallback).
-    #[cfg(feature = "egui-keys")]
-    pub fn key_string_to_egui_key(key: &str) -> Option<eframe::egui::Key> {
-        use eframe::egui::Key;
-        match key.to_lowercase().as_str() {
-            "space" => Some(Key::Space),
-            "enter" | "return" => Some(Key::Enter),
-            "tab" => Some(Key::Tab),
-            "backspace" => Some(Key::Backspace),
-            "escape" | "esc" => Some(Key::Escape),
-            "insert" => Some(Key::Insert),
-            "delete" => Some(Key::Delete),
-            "home" => Some(Key::Home),
-            "end" => Some(Key::End),
-            "pageup" => Some(Key::PageUp),
-            "pagedown" => Some(Key::PageDown),
-            "arrowup" | "up" => Some(Key::ArrowUp),
-            "arrowdown" | "down" => Some(Key::ArrowDown),
-            "arrowleft" | "left" => Some(Key::ArrowLeft),
-            "arrowright" | "right" => Some(Key::ArrowRight),
-            "f1" => Some(Key::F1),
-            "f2" => Some(Key::F2),
-            "f3" => Some(Key::F3),
-            "f4" => Some(Key::F4),
-            "f5" => Some(Key::F5),
-            "f6" => Some(Key::F6),
-            "f7" => Some(Key::F7),
-            "f8" => Some(Key::F8),
-            "f9" => Some(Key::F9),
-            "f10" => Some(Key::F10),
-            "f11" => Some(Key::F11),
-            "f12" => Some(Key::F12),
-            "a" | "keya" => Some(Key::A),
-            "b" | "keyb" => Some(Key::B),
-            "c" | "keyc" => Some(Key::C),
-            "d" | "keyd" => Some(Key::D),
-            "e" | "keye" => Some(Key::E),
-            "f" | "keyf" => Some(Key::F),
-            "g" | "keyg" => Some(Key::G),
-            "h" | "keyh" => Some(Key::H),
-            "i" | "keyi" => Some(Key::I),
-            "j" | "keyj" => Some(Key::J),
-            "k" | "keyk" => Some(Key::K),
-            "l" | "keyl" => Some(Key::L),
-            "m" | "keym" => Some(Key::M),
-            "n" | "keyn" => Some(Key::N),
-            "o" | "keyo" => Some(Key::O),
-            "p" | "keyp" => Some(Key::P),
-            "q" | "keyq" => Some(Key::Q),
-            "r" | "keyr" => Some(Key::R),
-            "s" | "keys" => Some(Key::S),
-            "t" | "keyt" => Some(Key::T),
-            "u" | "keyu" => Some(Key::U),
-            "v" | "keyv" => Some(Key::V),
-            "w" | "keyw" => Some(Key::W),
-            "x" | "keyx" => Some(Key::X),
-            "y" | "keyy" => Some(Key::Y),
-            "z" | "keyz" => Some(Key::Z),
-            "0" | "digit0" => Some(Key::Num0),
-            "1" | "digit1" => Some(Key::Num1),
-            "2" | "digit2" => Some(Key::Num2),
-            "3" | "digit3" => Some(Key::Num3),
-            "4" | "digit4" => Some(Key::Num4),
-            "5" | "digit5" => Some(Key::Num5),
-            "6" | "digit6" => Some(Key::Num6),
-            "7" | "digit7" => Some(Key::Num7),
-            "8" | "digit8" => Some(Key::Num8),
-            "9" | "digit9" => Some(Key::Num9),
-            "minus" | "-" => Some(Key::Minus),
-            "equal" | "=" => Some(Key::Equals),
-            "bracketleft" | "[" => Some(Key::OpenBracket),
-            "bracketright" | "]" => Some(Key::CloseBracket),
-            "backslash" | "\\" => Some(Key::Backslash),
-            "semicolon" | ";" => Some(Key::Semicolon),
-            "quote" | "'" => Some(Key::Quote),
-            "backquote" | "`" => Some(Key::Backtick),
-            "comma" | "," => Some(Key::Comma),
-            "period" | "." => Some(Key::Period),
-            "slash" | "/" => Some(Key::Slash),
-            _ => None,
-        }
-    }
 }
 
 impl Default for HotkeyManager {
@@ -1084,15 +913,5 @@ mod tests {
         assert!(kb.legacy_ptt.is_none(), "legacy field drained");
         kb.normalize_legacy();
         assert_eq!(kb.shortcuts.len(), 1, "second call is a no-op");
-    }
-
-    #[cfg(feature = "egui-keys")]
-    #[test]
-    fn key_string_to_egui_roundtrip() {
-        use eframe::egui::Key;
-        for key in [Key::Space, Key::F1, Key::A, Key::Num0, Key::Enter] {
-            let s = HotkeyManager::egui_key_to_string(key).unwrap();
-            assert_eq!(HotkeyManager::key_string_to_egui_key(&s), Some(key));
-        }
     }
 }

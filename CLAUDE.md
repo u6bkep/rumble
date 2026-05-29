@@ -76,14 +76,16 @@ RUST_LOG=debug cargo run -p rumble-aetna  # Run with debug logging
 - **server**: Server binary — room management, user auth, message relay, persistence (sled), ACL system
 - **mumble-bridge**: Bidirectional bridge between Mumble and Rumble servers, proxying voice and chat
 
-### Deprecated Crates (reference only)
+## Documentation
 
-These are kept around as references when porting functionality forward. **Do not add features to them** unless explicitly asked.
+Authoritative subsystem docs live in `docs/`. Start with the overview, then drill in:
 
-- **rumble-egui** — egui-based GUI client; the most feature-complete pre-aetna implementation. Consult when porting flows (settings UI, file transfer, hotkey config, ACL editor) to aetna.
-- **rumble-next** — egui-based testbed for a theming/visual-redesign pass on top of `rumble-widgets`. Useful as visual-design reference only.
-- **rumble-widgets** — custom egui widget library (radio, toggle, slider, tree, combo box, Luna theme). Consumed only by `rumble-next`.
-- **harness-cli** — daemon-based CLI for automating the egui client. Superseded by aetna's bundle-dump tooling (see GUI Testing below).
+- **`docs/architecture.md`** — top-level map: crate roles, end-to-end data flow, and the core runtime patterns (state-driven UI, projection sole-writer, two-task client, lock-free server).
+- **`docs/quic-protocol.md`** — the wire protocol: QUIC transport, protobuf `Envelope` framing, the Ed25519 auth handshake, state sync, and voice datagrams.
+- **`docs/acl-system.md`** — permission bitflags, groups (incl. the implicit username-as-group), per-room ACLs, and the root→target evaluation algorithm.
+- **`docs/audio-subsystem.md`** — Opus codec, the audio task, jitter buffers, the processor pipeline, and the per-peer decoder-lifetime invariant (see also below).
+- **`docs/testing-strategy.md`** — server integration tests and the aetna `dump_bundles` lint/snapshot pipeline.
+- **`docs/v2-architecture.md`** — *historical* design doc for the platform-trait decoupling; kept for rationale, not as a current API reference.
 
 ## Key Architecture Patterns
 
@@ -101,7 +103,7 @@ The client exposes a shared `State` via `Arc<RwLock<State>>`. The UI reads state
 - Voice relay uses snapshots to avoid holding locks during I/O
 
 ### State Synchronization
-Server sends incremental `StateUpdate` messages with BLAKE3 hash. Client verifies hash after applying; requests full resync on mismatch.
+Server sends incremental `StateUpdate` messages, each carrying a BLAKE3 hash of the post-apply state. The resync round-trip (`RequestStateSync` → full-state push) exists server-side, but the client does **not** yet recompute/verify the hash or trigger resync — client-side verification is a known gap, not a guarantee. See `docs/quic-protocol.md`.
 
 ## Protocol Details
 
@@ -138,5 +140,3 @@ Cargo consumes these from upstream GitHub at a pinned rev rather than crates.io.
 
 - **aetna** — UI library powering `rumble-aetna`. Pinned in the root `Cargo.toml` `[workspace.dependencies]` block to a rev of `https://github.com/computer-whisperer/aetna`; consumers (`rumble-aetna`, `rumble-video`) inherit via `{ workspace = true }`, so bumping the rev is a single-line change. To iterate locally against `vendor/aetna` without touching tracked files, run cargo through `scripts/aetna-local.sh` (e.g. `scripts/aetna-local.sh build -p rumble-aetna`). It applies the gitignored `.cargo/local-aetna.toml` overlay as a `--config` patch and restores `Cargo.lock` afterwards, so CI and other machines stay on the git pin.
 - **opus-rs** — Opus audio codec bindings, pinned via `opus = { git = "...", rev = "..." }` in `crates/rumble-desktop/Cargo.toml`.
-- **egui** family — patched workspace-wide via `[patch.crates-io]` to a rumble fork (see comment at top of root `Cargo.toml`).
-- **egui_ltreeview** — tree widget consumed only by the deprecated `rumble-egui` crate.

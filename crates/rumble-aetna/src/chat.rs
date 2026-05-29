@@ -1,10 +1,8 @@
 //! Chat sidebar: history rendering, FileOffer attachment cards, and
 //! the composer (multi-line text area + paperclip + sync button).
 //!
-//! This module is the aetna port of `rumble-egui`'s chat panel
-//! (see `docs/rumble-egui-feature-spec/12-chat-panel.md`) plus the
-//! file-offer card / auto-download behaviour that originally only
-//! shipped in `rumble-next`.
+//! Renders the chat panel: message history, file-offer attachment
+//! cards with auto-download behaviour, and the composer.
 //!
 //! The render side is pure: it consumes `(state, settings, chat_input,
 //! selection)` and returns an `El`. The App owns event handling, slash

@@ -27,13 +27,8 @@ ssh-agent = ["dep:ssh-agent-lib", "dep:ssh-key", "dep:service-binding"]
 global-hotkeys = ["dep:global-hotkey"]
 # Enables the Linux XDG GlobalShortcuts portal backend.
 wayland-portal = ["dep:ashpd", "dep:futures-util"]
-# Enables egui Key <-> string helpers on `HotkeyManager`. Only the
-# egui-based clients (deprecated) need these; aetna doesn't, so we keep
-# the eframe dep off the default build path.
-egui-keys = ["dep:eframe"]
 
 [dependencies]
-eframe = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 directories = { workspace = true }

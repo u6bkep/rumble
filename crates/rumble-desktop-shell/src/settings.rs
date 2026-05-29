@@ -1,24 +1,17 @@
-//! Settings schema + JSON persistence shared by `rumble-egui` and
-//! `rumble-next`. See `docs/rumble-next-bringup.md` §7.
+//! Settings schema + JSON persistence for the desktop client.
 //!
-//! The schema is small on purpose. Each field lands as the matching
-//! feature lands; the only fields that exist today are the ones rumble-
-//! next needs to fix the cert-reprompt and remember the user's UI
-//! choices (`paradigm`, `dark`, `recent_servers`,
-//! `accepted_certificates`).
+//! The schema grows as features land — fields cover UI choices and
+//! connection state such as `paradigm`, `dark`, `recent_servers`, and
+//! `accepted_certificates`.
 //!
 //! Forward / backward compatibility:
 //! - `#[serde(default)]` on the struct → missing fields use defaults,
 //!   so older config files load cleanly when we add new fields.
 //! - The `_extra` map captures unknown fields and round-trips them on
-//!   save, so when a *newer* client (or `rumble-egui`) writes fields
-//!   this version doesn't know about, an older `rumble-next` won't
-//!   silently delete them.
+//!   save, so when a *newer* client writes fields this version doesn't
+//!   know about, an older client won't silently delete them.
 //!
-//! The store path defaults to `<ProjectDirs>/desktop-shell.json`,
-//! distinct from rumble-egui's existing `settings.json` so the two
-//! schemas don't fight during the transition. They unify when
-//! rumble-egui adopts this store (see bringup doc).
+//! The store path defaults to `<ProjectDirs>/desktop-shell.json`.
 
 use std::{
     collections::{HashMap, HashSet},
