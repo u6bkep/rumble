@@ -25,3 +25,10 @@
 - maybe a multi host server mode where a single server process can manage multiple host:port combinations, each with their own server state like mumble-server does with virtual servers.
   - this coudld be done with a declarative config file that defines the various hosts and their settings.
   - different or the same database backends for each virtual server?
+
+
+
+
+- rnnoise triggers on fully silent audio.
+- link previews. maybe server side plugin?
+
