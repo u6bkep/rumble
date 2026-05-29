@@ -17,8 +17,6 @@ cargo +nightly fmt             # Format code
 RUST_LOG=debug cargo run -p rumble-aetna  # Run with debug logging
 ```
 
-When fixing build issues, run `cargo build -p rumble-aetna` and address the **first** error (later errors are often cascading).
-
 ## Crate Architecture
 
 ```
@@ -51,11 +49,11 @@ When fixing build issues, run `cargo build -p rumble-aetna` and address the **fi
                         │
          ┌──────────────┼──────────────┐
          ▼              ▼              ▼
-┌──────────────┐ ┌─────────────┐ ┌────────────┐
+┌───────────────┐ ┌─────────────┐ ┌────────────┐
 │rumble-protocol│ │ rumble-audio│ │   server   │
-│    proto     │ │   audio     │ │  handlers  │
-│    types     │ │   procs     │ │  state     │
-└──────────────┘ └─────────────┘ └────────────┘
+│    proto      │ │   audio     │ │  handlers  │
+│    types      │ │   procs     │ │  state     │
+└───────────────┘ └─────────────┘ └────────────┘
                                       ▲
                                       │ Bridge protocol
                                ┌──────┴──────┐
@@ -136,7 +134,7 @@ To add a new scene, extend the `Scene` enum and `drive_setup` in `crates/rumble-
 
 ## External Dependencies (git-pinned)
 
-Cargo consumes these from upstream GitHub at a pinned rev rather than crates.io. The `vendor/` directory is gitignored and holds local working copies for iterating alongside rumble; Cargo does not consult it for builds.
+Cargo consumes these from upstream GitHub at a pinned rev rather than crates.io. The `vendor/` directory is gitignored and holds local working copies for easy reference; Cargo does not consult it for builds.
 
 - **aetna** — UI library powering `rumble-aetna`. Pinned in the root `Cargo.toml` `[workspace.dependencies]` block to a rev of `https://github.com/computer-whisperer/aetna`; consumers (`rumble-aetna`, `rumble-video`) inherit via `{ workspace = true }`, so bumping the rev is a single-line change. To iterate locally against `vendor/aetna` without touching tracked files, run cargo through `scripts/aetna-local.sh` (e.g. `scripts/aetna-local.sh build -p rumble-aetna`). It applies the gitignored `.cargo/local-aetna.toml` overlay as a `--config` patch and restores `Cargo.lock` afterwards, so CI and other machines stay on the git pin.
 - **opus-rs** — Opus audio codec bindings, pinned via `opus = { git = "...", rev = "..." }` in `crates/rumble-desktop/Cargo.toml`.
