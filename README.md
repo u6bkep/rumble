@@ -1,7 +1,7 @@
 # Rumble
 
-Rumble is a voice + text chat application written in Rust, in the spirit of Mumble and
-Discord. Users join a hierarchical tree of rooms and talk over low-latency voice (Opus)
+Rumble is a voice + text chat application written in Rust, in the spirit of Mumble.
+Users join a hierarchical tree of rooms and talk over low-latency voice (Opus)
 and text chat. It uses a client/server architecture with a QUIC transport, Ed25519
 identities, and a permission/ACL system modeled loosely on Mumble.
 
