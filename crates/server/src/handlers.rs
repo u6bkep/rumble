@@ -1702,147 +1702,178 @@ pub async fn cleanup_client(client_handle: &Arc<ClientHandle>, state: &Arc<Serve
     }
 }
 
+/// The connection-independent result of routing an inbound voice datagram.
+///
+/// Holds the server-authoritative re-encoded bytes plus the roster members that
+/// should receive them (the sender already excluded). Delivery-connection
+/// resolution and dedup are applied separately by [`dedup_delivery_targets`].
+#[derive(Debug, Clone)]
+pub struct RelayPacket {
+    /// Re-encoded datagram with server-stamped `sender_id` and `room_id`.
+    pub bytes: Vec<u8>,
+    /// Member user_ids in the sender's room, excluding the sender. These are
+    /// roster member ids, *not* yet resolved to delivery connections.
+    pub recipients: Vec<u64>,
+}
+
+/// Route an inbound voice datagram: validate the sender (incl. controller
+/// sender-id spoofing checks), apply the server-mute / self-mute / rate-limit
+/// drops, locate the sender's room, stamp the server-authoritative
+/// `sender_id`/`room_id`, re-encode, and gather the room's other members.
+///
+/// This is the connection-independent core of [`handle_datagrams`]: it touches
+/// only `state`, never a `quinn::Connection`, so it is unit-testable with
+/// participant fixtures and serves as the relay benchmark seam. The caller maps
+/// the returned `recipients` to delivery connections via
+/// [`dedup_delivery_targets`] and performs the actual sends.
+///
+/// Returns `None` when the datagram must be dropped: an invalid
+/// controller-claimed sender, a server-muted or self-muted sender, an exceeded
+/// rate limit, or a sender not currently in any room.
+pub async fn build_relay_packet(
+    state: &ServerState,
+    sender_user_id: u64,
+    mut voice_dgram: VoiceDatagram,
+    datagram_len: usize,
+) -> Option<RelayPacket> {
+    // Determine the effective sender. A controller connection may speak on
+    // behalf of one of its participants; a normal client always uses its own id.
+    let is_controller = state
+        .get_client(sender_user_id)
+        .is_some_and(|c| c.is_controller.load(Ordering::SeqCst));
+
+    let effective_sender = if is_controller {
+        match voice_dgram.sender_id {
+            Some(claimed_id) if state.is_participant_of(claimed_id, OwnerId::Connection(sender_user_id)) => claimed_id,
+            _ => {
+                debug!(
+                    controller_id = sender_user_id,
+                    claimed_sender = ?voice_dgram.sender_id,
+                    "server: controller datagram with invalid sender_id, dropping"
+                );
+                return None;
+            }
+        }
+    } else {
+        sender_user_id
+    };
+
+    // Server-muted senders are dropped silently.
+    if !is_controller
+        && let Some(client) = state.get_client(sender_user_id)
+        && client.server_muted.load(Ordering::Relaxed)
+    {
+        return None;
+    }
+
+    // Self-muted senders are dropped silently.
+    let status = state.get_user_status(effective_sender).await;
+    if status.is_muted {
+        debug!(sender = effective_sender, "server: dropping voice from muted user");
+        return None;
+    }
+
+    // Rate limit by the connection owner so bridge traffic is limited as a
+    // whole, not per virtual user.
+    if !state.check_voice_rate(sender_user_id, datagram_len) {
+        debug!(
+            user_id = sender_user_id,
+            bytes = datagram_len,
+            "server: voice datagram rate limited, dropping"
+        );
+        return None;
+    }
+    debug!(
+        sender = effective_sender,
+        seq = voice_dgram.sequence,
+        data_len = voice_dgram.opus_data.len(),
+        "server: received voice datagram"
+    );
+
+    // Snapshot room memberships to avoid holding locks during relay.
+    let room_memberships = state.snapshot_room_memberships().await;
+
+    // Only relay if the sender is actually in a room.
+    let Some(actual_room) = room_memberships
+        .iter()
+        .find_map(|(rid, users)| users.contains(&effective_sender).then_some(*rid))
+    else {
+        debug!(
+            sender = effective_sender,
+            "server: sender not in any room, dropping datagram"
+        );
+        return None;
+    };
+
+    // Stamp server-authoritative sender/room, then re-encode.
+    voice_dgram.sender_id = Some(effective_sender);
+    voice_dgram.room_id = Some(actual_room.as_bytes().to_vec());
+    let bytes = voice_dgram.encode_to_vec();
+
+    let recipients = room_memberships
+        .get(&actual_room)
+        .map(|members| members.iter().copied().filter(|&id| id != effective_sender).collect())
+        .unwrap_or_default();
+
+    Some(RelayPacket { bytes, recipients })
+}
+
+/// Resolve room members to their delivery connections and deduplicate, so a
+/// controller driving several participants in the same room receives a datagram
+/// only once. `resolve` maps a member id to its delivery-connection id, or
+/// `None` if the member has no QUIC delivery target; production passes
+/// `|id| state.delivery_client(id).map(|c| c.user_id)`. Order is preserved.
+pub fn dedup_delivery_targets(recipients: &[u64], resolve: impl Fn(u64) -> Option<u64>) -> Vec<u64> {
+    let mut seen = std::collections::HashSet::new();
+    let mut targets = Vec::new();
+    for &recipient_id in recipients {
+        let Some(delivery_id) = resolve(recipient_id) else {
+            continue;
+        };
+        if seen.insert(delivery_id) {
+            targets.push(delivery_id);
+        }
+    }
+    targets
+}
+
 /// Handle incoming QUIC datagrams for voice relay.
 ///
-/// Datagrams are relayed to all other clients in the same room.
-/// The sender_user_id is determined by the connection, not by the datagram content.
+/// Each datagram is routed by [`build_relay_packet`] (the connection-independent
+/// core) and then fanned out to the resolved, deduplicated delivery connections.
+/// The `sender_user_id` is determined by the connection, not by datagram content.
 ///
 /// # Locking Behavior
 ///
 /// This handler is optimized for the audio path:
-/// - Uses snapshot of room memberships to avoid holding locks during relay
+/// - Uses a snapshot of room memberships to avoid holding locks during relay
 /// - Client iteration is lock-free via DashMap
 /// - Datagram sends don't hold any locks
 pub async fn handle_datagrams(conn: quinn::Connection, state: Arc<ServerState>, sender_user_id: u64) {
     loop {
         match conn.read_datagram().await {
             Ok(datagram) => {
-                // Decode the VoiceDatagram protobuf
+                let datagram_len = datagram.len();
                 match VoiceDatagram::decode(datagram.as_ref()) {
-                    Ok(mut voice_dgram) => {
-                        // Determine the effective sender for this datagram.
-                        // For controller connections, trust the sender_id if it
-                        // names a participant this controller drives.
-                        let is_controller = state
-                            .get_client(sender_user_id)
-                            .is_some_and(|c| c.is_controller.load(Ordering::SeqCst));
-
-                        let effective_sender = if is_controller {
-                            // Controller: use the datagram's sender_id if it's one of its participants
-                            match voice_dgram.sender_id {
-                                Some(claimed_id)
-                                    if state.is_participant_of(
-                                        claimed_id,
-                                        crate::state::OwnerId::Connection(sender_user_id),
-                                    ) =>
-                                {
-                                    claimed_id
-                                }
-                                _ => {
-                                    debug!(
-                                        controller_id = sender_user_id,
-                                        claimed_sender = ?voice_dgram.sender_id,
-                                        "server: controller datagram with invalid sender_id, dropping"
-                                    );
-                                    continue;
-                                }
-                            }
-                        } else {
-                            // Normal client: always use the connection's user_id
-                            sender_user_id
+                    Ok(voice_dgram) => {
+                        let Some(packet) = build_relay_packet(&state, sender_user_id, voice_dgram, datagram_len).await
+                        else {
+                            continue;
                         };
 
-                        // Check if sender is server-muted — drop voice silently
-                        if !is_controller
-                            && let Some(client) = state.get_client(sender_user_id)
-                            && client.server_muted.load(Ordering::Relaxed)
-                        {
-                            continue;
-                        }
-
-                        // Check if sender is self-muted — drop voice silently
-                        let status = state.get_user_status(effective_sender).await;
-                        if status.is_muted {
-                            debug!(sender = effective_sender, "server: dropping voice from muted user");
-                            continue;
-                        }
-
-                        // Rate limit check: use sender_user_id (connection owner) so
-                        // bridge traffic is rate-limited as a whole, not per virtual user.
-                        if !state.check_voice_rate(sender_user_id, datagram.len()) {
-                            debug!(
-                                user_id = sender_user_id,
-                                bytes = datagram.len(),
-                                "server: voice datagram rate limited, dropping"
-                            );
-                            continue;
-                        }
-                        debug!(
-                            sender = effective_sender,
-                            seq = voice_dgram.sequence,
-                            data_len = voice_dgram.opus_data.len(),
-                            "server: received voice datagram"
-                        );
-
-                        // Take a snapshot of room memberships to avoid holding locks during relay
-                        let room_memberships = state.snapshot_room_memberships().await;
-
-                        // Find effective sender's room from the snapshot
-                        let sender_room = room_memberships.iter().find_map(|(rid, users)| {
-                            if users.contains(&effective_sender) {
-                                Some(*rid)
-                            } else {
-                                None
-                            }
+                        // Resolve members to delivery connections (a participant's
+                        // voice goes through its controller) and dedup.
+                        let targets = dedup_delivery_targets(&packet.recipients, |id| {
+                            state.delivery_client(id).map(|c| c.user_id)
                         });
 
-                        // Only relay if sender is actually in a room
-                        let Some(actual_room) = sender_room else {
-                            debug!(
-                                sender = effective_sender,
-                                "server: sender not in any room, dropping datagram"
-                            );
-                            continue;
-                        };
-
-                        // Set sender_id and room_id (server-authoritative)
-                        voice_dgram.sender_id = Some(effective_sender);
-                        voice_dgram.room_id = Some(actual_room.as_bytes().to_vec());
-
-                        // Re-encode with corrected sender_id and room_id
-                        let relay_bytes = voice_dgram.encode_to_vec();
-
-                        // Get recipients from the snapshot (no lock needed)
-                        let recipients = room_memberships.get(&actual_room).map(|v| v.as_slice()).unwrap_or(&[]);
-
-                        // Track which connections already received this datagram to avoid
-                        // sending duplicates when multiple virtual users from the same
-                        // bridge are in the room.
-                        let mut sent_to = std::collections::HashSet::new();
-
-                        // Relay to each recipient (lock-free client lookup via DashMap)
-                        for &recipient_id in recipients {
-                            // Skip the effective sender
-                            if recipient_id == effective_sender {
-                                continue;
-                            }
-
-                            // Resolve the recipient to its delivery connection: a
-                            // participant's voice goes through its controller.
-                            let Some(client) = state.delivery_client(recipient_id) else {
+                        for delivery_id in targets {
+                            let Some(client) = state.get_client(delivery_id) else {
                                 continue;
                             };
-
-                            // Dedup by the connection we actually send to, so a
-                            // controller with multiple participants in the room
-                            // only receives the datagram once.
-                            if !sent_to.insert(client.user_id) {
-                                continue;
-                            }
-
-                            if let Err(e) = client.conn.send_datagram(relay_bytes.clone().into()) {
+                            if let Err(e) = client.conn.send_datagram(packet.bytes.clone().into()) {
                                 debug!(
-                                    user_id = recipient_id,
+                                    user_id = delivery_id,
                                     error = ?e,
                                     "server: failed to relay voice datagram"
                                 );
@@ -2835,6 +2866,165 @@ async fn handle_participant_chat(
 
 #[cfg(test)]
 mod tests {
-    // Handler tests will require mock clients, which we'll add in a future step.
-    // For now, the state module tests cover the core logic.
+    use super::*;
+    use std::collections::HashSet;
+
+    /// A controller-driven participant needs no `quinn::Connection`, so the
+    /// whole routing core ([`build_relay_packet`]) is exercisable in a unit
+    /// test. Delivery resolution (which *does* need a live connection) is
+    /// covered separately through [`dedup_delivery_targets`]'s injected
+    /// resolver.
+    fn participant(uid: u64) -> Arc<Member> {
+        Arc::new(Member {
+            user_id: uid,
+            identity: Arc::new(Identity::participant(format!("user{uid}"), None, None, vec![])),
+            binding: Binding::Owned {
+                owner: OwnerId::Plugin(1),
+            },
+        })
+    }
+
+    /// A client-sent datagram. `sender_id`/`room_id` are left unset (or spoofed
+    /// in the stamping test) — the server is supposed to overwrite them.
+    fn client_dgram(seq: u32) -> VoiceDatagram {
+        VoiceDatagram {
+            opus_data: vec![0xAA; 40],
+            sequence: seq,
+            ..Default::default()
+        }
+    }
+
+    // ---- build_relay_packet: routing ---------------------------------------
+
+    /// The recipient set is exactly the *other* members of the sender's room:
+    /// the sender is excluded and members of unrelated rooms never appear. This
+    /// pins the core relay routing contract independent of how the snapshot is
+    /// structured.
+    #[tokio::test]
+    async fn relay_targets_room_peers_and_excludes_sender_and_other_rooms() {
+        let state = ServerState::new();
+        let room_a = state.create_room("A".to_string()).await;
+        let room_b = state.create_room("B".to_string()).await;
+
+        for uid in [1, 2, 3, 4] {
+            state.register_participant(participant(uid));
+        }
+        // 1 (sender), 2, 3 in room A; 4 in room B.
+        state.set_user_room(1, room_a).await;
+        state.set_user_room(2, room_a).await;
+        state.set_user_room(3, room_a).await;
+        state.set_user_room(4, room_b).await;
+
+        let packet = build_relay_packet(&state, 1, client_dgram(7), 40)
+            .await
+            .expect("datagram from an in-room sender should relay");
+
+        let got: HashSet<u64> = packet.recipients.iter().copied().collect();
+        assert_eq!(got, HashSet::from([2, 3]), "recipients must be room-A peers only");
+    }
+
+    /// The server overwrites the client-supplied `sender_id`/`room_id` with the
+    /// authenticated sender and its real room — a client cannot spoof identity
+    /// or inject audio into another room.
+    #[tokio::test]
+    async fn relay_stamps_server_authoritative_sender_and_room() {
+        let state = ServerState::new();
+        let room_a = state.create_room("A".to_string()).await;
+
+        state.register_participant(participant(1));
+        state.register_participant(participant(2));
+        state.set_user_room(1, room_a).await;
+        state.set_user_room(2, room_a).await;
+
+        // Client lies about who it is and which room it's in.
+        let mut spoofed = client_dgram(1);
+        spoofed.sender_id = Some(99_999);
+        spoofed.room_id = Some(Uuid::new_v4().as_bytes().to_vec());
+
+        let packet = build_relay_packet(&state, 1, spoofed, 40).await.unwrap();
+        let relayed = VoiceDatagram::decode(packet.bytes.as_slice()).unwrap();
+
+        assert_eq!(relayed.sender_id, Some(1), "sender_id must be the authenticated sender");
+        assert_eq!(
+            relayed.room_id.as_deref(),
+            Some(room_a.as_bytes().as_slice()),
+            "room_id must be the sender's actual room"
+        );
+    }
+
+    /// A self-muted sender's voice is dropped.
+    #[tokio::test]
+    async fn relay_drops_self_muted_sender() {
+        let state = ServerState::new();
+        let room_a = state.create_room("A".to_string()).await;
+        state.register_participant(participant(1));
+        state.set_user_room(1, room_a).await;
+        state
+            .set_user_status(
+                1,
+                UserStatus {
+                    is_muted: true,
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        assert!(build_relay_packet(&state, 1, client_dgram(1), 40).await.is_none());
+    }
+
+    /// A sender that belongs to no room produces nothing to relay.
+    #[tokio::test]
+    async fn relay_drops_sender_not_in_a_room() {
+        let state = ServerState::new();
+        state.register_participant(participant(1)); // registered but never placed in a room
+
+        assert!(build_relay_packet(&state, 1, client_dgram(1), 40).await.is_none());
+    }
+
+    /// A datagram that exceeds the per-second byte budget on its own is dropped.
+    #[tokio::test]
+    async fn relay_drops_when_rate_limited() {
+        let state = ServerState::new();
+        let room_a = state.create_room("A".to_string()).await;
+        state.register_participant(participant(1));
+        state.set_user_room(1, room_a).await;
+
+        // 40 KB in one datagram is over the 32 KB/s window.
+        assert!(build_relay_packet(&state, 1, client_dgram(1), 40_000).await.is_none());
+    }
+
+    // ---- dedup_delivery_targets --------------------------------------------
+
+    /// Several participants delivering through the same controller connection
+    /// collapse to a single send.
+    #[test]
+    fn dedup_collapses_participants_sharing_a_controller() {
+        // Members 10 and 11 deliver via controller 100; member 12 via 101.
+        let resolve = |id: u64| match id {
+            10 | 11 => Some(100),
+            12 => Some(101),
+            _ => None,
+        };
+        let targets = dedup_delivery_targets(&[10, 11, 12], resolve);
+        assert_eq!(targets, vec![100, 101]);
+    }
+
+    /// Undeliverable members (no QUIC target) are skipped and source order is
+    /// otherwise preserved.
+    #[test]
+    fn dedup_preserves_order_and_skips_undeliverable() {
+        let resolve = |id: u64| match id {
+            20 => Some(20),
+            21 => None, // e.g. a plugin-owned participant
+            22 => Some(22),
+            _ => None,
+        };
+        let targets = dedup_delivery_targets(&[22, 21, 20], resolve);
+        assert_eq!(targets, vec![22, 20]);
+    }
+
+    #[test]
+    fn dedup_of_empty_recipients_is_empty() {
+        assert!(dedup_delivery_targets(&[], |_| Some(1)).is_empty());
+    }
 }

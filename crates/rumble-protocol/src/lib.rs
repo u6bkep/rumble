@@ -307,3 +307,91 @@ mod auth_tests {
         assert_ne!(hash, hash3);
     }
 }
+
+#[cfg(test)]
+mod state_hash_tests {
+    //! Characterization tests for `compute_server_state_hash`. Clients compare
+    //! this hash to detect state divergence, so two things matter and are
+    //! pinned here: it must be *independent of room/user ordering* (the server
+    //! assembles state from nondeterministic maps), and the exact wire hash for
+    //! a fixed fixture must be *stable* (a change means the encoding changed and
+    //! every client will resync — update the pinned value deliberately).
+    use super::*;
+
+    fn room(uuid: u128, name: &str) -> proto::RoomInfo {
+        proto::RoomInfo {
+            id: Some(proto::RoomId {
+                uuid: uuid.to_be_bytes().to_vec(),
+            }),
+            name: name.to_string(),
+            parent_id: None,
+            description: None,
+            inherit_acl: true,
+            acls: vec![],
+            effective_permissions: 0,
+        }
+    }
+
+    fn user(id: u64, name: &str) -> proto::User {
+        proto::User {
+            user_id: Some(proto::UserId { value: id }),
+            username: name.to_string(),
+            current_room: None,
+            is_muted: false,
+            is_deafened: false,
+            server_muted: false,
+            is_elevated: false,
+            groups: vec![],
+            label: None,
+        }
+    }
+
+    fn to_hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    #[test]
+    fn state_hash_is_order_independent() {
+        let rooms = vec![room(1, "a"), room(2, "b"), room(3, "c")];
+        let users = vec![user(10, "x"), user(20, "y"), user(30, "z")];
+
+        let forward = proto::ServerState {
+            rooms: rooms.clone(),
+            users: users.clone(),
+            groups: vec![],
+        };
+
+        let mut rooms_rev = rooms;
+        rooms_rev.reverse();
+        let mut users_rev = users;
+        users_rev.reverse();
+        let reversed = proto::ServerState {
+            rooms: rooms_rev,
+            users: users_rev,
+            groups: vec![],
+        };
+
+        assert_eq!(
+            compute_server_state_hash(&forward),
+            compute_server_state_hash(&reversed),
+            "the state hash must not depend on room/user ordering"
+        );
+    }
+
+    #[test]
+    fn state_hash_matches_pinned_value() {
+        let state = proto::ServerState {
+            rooms: vec![room(1, "Root")],
+            users: vec![user(1, "alice")],
+            groups: vec![],
+        };
+
+        // Golden value: update ONLY when the ServerState wire encoding changes
+        // on purpose — a silent change here means clients will resync.
+        assert_eq!(
+            to_hex(&compute_server_state_hash(&state)),
+            "7b83a5d8da7bc18c942bdf3a7ea6e5a2068611ef8cfdc6a1f1c5861f8ebc5660",
+            "ServerState hash encoding changed"
+        );
+    }
+}

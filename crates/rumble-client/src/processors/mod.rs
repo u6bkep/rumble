@@ -326,3 +326,51 @@ mod merge_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod pipeline_exec_tests {
+    use super::*;
+    use rumble_client_traits::codec::{OPUS_FRAME_SIZE, OPUS_SAMPLE_RATE};
+
+    /// A pipeline of [Gain, VAD] must (a) apply the gain to the samples in
+    /// chain order and (b) gate transmission via the aggregated suppress flag.
+    ///
+    /// This is the only test that drives a real processor *chain* end to end.
+    /// It pins inter-processor ordering and the suppress-OR aggregation the
+    /// audio task depends on — without constraining how any single processor
+    /// is implemented internally.
+    #[test]
+    fn gain_then_vad_applies_gain_and_gates_on_level() {
+        let gain_db = 6.0;
+        let mut pipeline = rumble_audio::AudioPipeline::new(OPUS_FRAME_SIZE);
+        pipeline.add(Box::new(GainProcessor::new(gain_db)));
+        pipeline.add(Box::new(VadProcessor::with_settings(super::vad::VadSettings {
+            threshold_db: -30.0,
+            release_threshold_db: -30.0, // == threshold: disable hysteresis
+            attack_ms: 0,                // gate per-frame: no attack delay...
+            holdoff_ms: 0,               // ...and no release hold
+        })));
+
+        let gain = rumble_audio::db_to_linear(gain_db);
+
+        // Loud frames sit above the VAD threshold after gain (→ pass); the
+        // quiet frame sits below it (→ gated). Either way, the samples leaving
+        // the pipeline must equal input * gain — proof the gain stage ran in
+        // the chain ahead of the (non-mutating) VAD stage.
+        for (amp, expect_suppress) in [(0.2f32, false), (0.001f32, true), (0.2f32, false)] {
+            let mut samples = vec![amp; OPUS_FRAME_SIZE];
+            let result = pipeline.process(&mut samples, OPUS_SAMPLE_RATE);
+
+            assert_eq!(
+                result.suppress, expect_suppress,
+                "VAD gate decision for amplitude {amp}"
+            );
+
+            let expected = (amp * gain).clamp(-1.0, 1.0);
+            assert!(
+                samples.iter().all(|s| (s - expected).abs() < 1e-6),
+                "gain must be applied in-chain: {amp} * {gain} = {expected}"
+            );
+        }
+    }
+}

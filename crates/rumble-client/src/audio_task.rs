@@ -539,6 +539,50 @@ pub fn spawn_audio_task<P: Platform>(config: AudioTaskConfig<P>) -> AudioTaskHan
 }
 
 /// Main audio task loop.
+/// Determine if we should be processing captured audio based on current state.
+/// Note: VAD is a pipeline processor, not a voice mode. In Continuous mode
+/// with VAD enabled, the pipeline's suppress flag gates actual transmission.
+#[inline]
+fn should_capture(
+    voice_mode: VoiceMode,
+    self_muted: bool,
+    server_muted: bool,
+    ptt_active: bool,
+    connected: bool,
+) -> bool {
+    if !connected || self_muted || server_muted {
+        return false;
+    }
+    match voice_mode {
+        VoiceMode::Continuous => true,
+        VoiceMode::PushToTalk => ptt_active,
+    }
+}
+
+/// The capture-state change implied by a desired vs. current capture state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaptureTransition {
+    /// Desired and current state already agree — do nothing.
+    None,
+    /// Begin processing captured samples.
+    Activate,
+    /// Stop processing captured samples. The caller MUST emit an end-of-stream
+    /// marker before deactivating, otherwise receivers conceal (PLC) forever
+    /// waiting for packets that never arrive.
+    Deactivate,
+}
+
+/// Decide the capture transition from the desired state (`want`, typically from
+/// [`should_capture`]) and the current `active` flag.
+#[inline]
+fn capture_transition(want: bool, active: bool) -> CaptureTransition {
+    match (want, active) {
+        (true, false) => CaptureTransition::Activate,
+        (false, true) => CaptureTransition::Deactivate,
+        _ => CaptureTransition::None,
+    }
+}
+
 async fn run_audio_task<P: Platform>(
     mut command_rx: mpsc::UnboundedReceiver<AudioCommand>,
     config: AudioTaskConfig<P>,
@@ -667,26 +711,6 @@ async fn run_audio_task<P: Platform>(
     // The stream is only recreated for device changes, settings changes, or
     // disconnection.
 
-    /// Determine if we should be processing captured audio based on current state.
-    /// Note: VAD is a pipeline processor, not a voice mode. In Continuous mode
-    /// with VAD enabled, the pipeline's suppress flag gates actual transmission.
-    #[inline]
-    fn should_capture(
-        voice_mode: VoiceMode,
-        self_muted: bool,
-        server_muted: bool,
-        ptt_active: bool,
-        connected: bool,
-    ) -> bool {
-        if !connected || self_muted || server_muted {
-            return false;
-        }
-        match voice_mode {
-            VoiceMode::Continuous => true,
-            VoiceMode::PushToTalk => ptt_active,
-        }
-    }
-
     // Whether the capture callback should process samples or discard them.
     // This is a local bool because the callback uses AudioCaptureStream::set_active()
     // to be gated, rather than checking a shared atomic flag.
@@ -715,23 +739,27 @@ async fn run_audio_task<P: Platform>(
         () => {{
             let want = should_capture(voice_mode, self_muted, server_muted, ptt_active, connection.is_some());
 
-            if want && !capture_is_active {
-                capture_is_active = true;
-                if let Some(stream) = audio_input.as_ref() {
-                    stream.set_active(true);
+            match capture_transition(want, capture_is_active) {
+                CaptureTransition::Activate => {
+                    capture_is_active = true;
+                    if let Some(stream) = audio_input.as_ref() {
+                        stream.set_active(true);
+                    }
+                    let _ = bus.voice.send(VoiceEvent::TransmittingChanged { active: true });
+                    info!("Capture activated (samples will be processed)");
                 }
-                let _ = bus.voice.send(VoiceEvent::TransmittingChanged { active: true });
-                info!("Capture activated (samples will be processed)");
-            } else if !want && capture_is_active {
-                // Send end-of-stream before deactivating
-                // (PTT released, muted, disconnected, etc.)
-                let _ = encoded_tx.send(CaptureMessage::EndOfStream);
-                capture_is_active = false;
-                if let Some(stream) = audio_input.as_ref() {
-                    stream.set_active(false);
+                CaptureTransition::Deactivate => {
+                    // Send end-of-stream before deactivating
+                    // (PTT released, muted, disconnected, etc.)
+                    let _ = encoded_tx.send(CaptureMessage::EndOfStream);
+                    capture_is_active = false;
+                    if let Some(stream) = audio_input.as_ref() {
+                        stream.set_active(false);
+                    }
+                    let _ = bus.voice.send(VoiceEvent::TransmittingChanged { active: false });
+                    info!("Capture deactivated (samples will be discarded)");
                 }
-                let _ = bus.voice.send(VoiceEvent::TransmittingChanged { active: false });
-                info!("Capture deactivated (samples will be discarded)");
+                CaptureTransition::None => {}
             }
         }};
     }
@@ -1826,29 +1854,64 @@ fn update_stats<D: VoiceDecoderTrait>(
 mod tests {
     use super::*;
 
-    /// Minimal mock decoder for testing jitter buffer logic.
-    /// Returns silence for all decode operations.
-    struct MockDecoder;
+    // ====================================================================
+    // Jitter-buffer characterization tests.
+    //
+    // These pin OBSERVABLE behavior — the sequence of frames the buffer
+    // produces and its loss/conceal/FEC stat counters — NOT internal
+    // bookkeeping (next_play_seq, started, buffered counters, raw buffer
+    // contents). That keeps them as a safety net for jitter-buffer
+    // optimizations: any rework that preserves the played-frame sequence
+    // and the loss accounting will keep these green, while a behavior
+    // change (wrong order, phantom loss, missed PLC/FEC) will trip them.
+    //
+    // The decoder is mocked so each produced frame is *identifiable*:
+    //   - a normal decode stamps the packet's marker byte into every sample
+    //   - PLC stamps PLC_TAG
+    //   - FEC stamps FEC_TAG_BASE + the recovering packet's marker
+    // so a frame's first sample tells us exactly how it was produced.
+    // ====================================================================
 
-    impl VoiceDecoderTrait for MockDecoder {
-        fn decode(&mut self, _data: &[u8], output: &mut [f32]) -> anyhow::Result<usize> {
-            output.fill(0.0);
+    /// First-sample tag a PLC (packet-loss-concealment) frame carries.
+    const PLC_TAG: f32 = -1.0;
+    /// FEC-recovered frames carry `FEC_TAG_BASE + next_packet_marker`.
+    const FEC_TAG_BASE: f32 = 1000.0;
+
+    /// Decoder that stamps the *source* of each frame into its samples so a
+    /// frame's first sample identifies how it was produced (see module note).
+    struct MarkerDecoder;
+
+    impl VoiceDecoderTrait for MarkerDecoder {
+        fn decode(&mut self, data: &[u8], output: &mut [f32]) -> anyhow::Result<usize> {
+            output.fill(data.first().copied().unwrap_or(0) as f32);
             Ok(output.len())
         }
 
         fn decode_plc(&mut self, output: &mut [f32]) -> anyhow::Result<usize> {
-            output.fill(0.0);
+            output.fill(PLC_TAG);
             Ok(output.len())
         }
 
-        fn decode_fec(&mut self, _data: &[u8], output: &mut [f32]) -> anyhow::Result<usize> {
-            output.fill(0.0);
+        fn decode_fec(&mut self, data: &[u8], output: &mut [f32]) -> anyhow::Result<usize> {
+            output.fill(FEC_TAG_BASE + data.first().copied().unwrap_or(0) as f32);
             Ok(output.len())
         }
     }
 
-    fn make_state(jitter_delay: u32) -> UserAudioState<MockDecoder> {
-        UserAudioState::new(MockDecoder, jitter_delay)
+    fn make_state(jitter_delay: u32) -> UserAudioState<MarkerDecoder> {
+        UserAudioState::new(MarkerDecoder, jitter_delay)
+    }
+
+    /// A packet whose decoded frame is tagged with `marker` (keep markers < 256
+    /// so they fit a byte and round-trip through f32 exactly).
+    fn packet(marker: u8) -> Vec<u8> {
+        vec![marker; 20]
+    }
+
+    /// Pull `n` frames, returning each frame's identifying tag (its first
+    /// sample), or `None` where the buffer produced no frame.
+    fn drain_tags(state: &mut UserAudioState<MarkerDecoder>, n: usize) -> Vec<Option<f32>> {
+        (0..n).map(|_| state.get_next_frame().map(|f| f[0])).collect()
     }
 
     #[test]
@@ -1867,194 +1930,252 @@ mod tests {
     }
 
     #[test]
-    fn test_user_audio_state_creation() {
-        let _state = make_state(3);
-    }
-
-    #[test]
-    fn test_user_audio_state_sequence_restart_detection() {
+    fn jitter_buffers_until_delay_then_plays() {
+        // With delay=3, playback must not begin until 3 packets are buffered.
         let mut state = make_state(3);
-
-        // Simulate initial stream: packets 0, 1, 2, 3, 4
-        for seq in 0..5 {
-            state.insert_packet(seq, vec![0u8; 20]);
-        }
-
-        // Start playback (sets started = true)
-        assert!(state.ready_to_play());
-        let _ = state.get_next_frame();
-        assert!(state.started);
-
-        // Advance next_play_seq to simulate having played some frames
-        state.next_play_seq = 100;
-
-        // Now simulate sender restart: new packets starting at 0
-        state.insert_packet(0, vec![0u8; 20]);
-
-        // The state should have been reset
-        assert_eq!(state.next_play_seq, 0, "next_play_seq should reset to new stream start");
-        assert!(
-            state.jitter_buffer.contains_key(&0),
-            "jitter buffer should contain new packet"
-        );
-        assert!(!state.started, "started should be reset for buffering");
-    }
-
-    #[test]
-    fn test_user_audio_state_no_reset_for_normal_packets() {
-        let mut state = make_state(3);
-
-        // Simulate initial stream
-        for seq in 0..5 {
-            state.insert_packet(seq, vec![0u8; 20]);
-        }
-        let _ = state.get_next_frame();
-
-        // next_play_seq should be 1 now (just played 0)
-        assert_eq!(state.next_play_seq, 1);
-
-        // Insert next expected packet - should NOT reset
-        state.insert_packet(5, vec![0u8; 20]);
+        state.insert_packet(0, packet(0));
+        state.insert_packet(1, packet(1));
+        assert!(!state.ready_to_play(), "should still be buffering at 2/3 packets");
         assert_eq!(
-            state.next_play_seq, 1,
-            "next_play_seq should not change for normal packets"
+            state.get_next_frame(),
+            None,
+            "no frame should play before the delay is met"
+        );
+
+        state.insert_packet(2, packet(2));
+        assert!(state.ready_to_play(), "should be ready once 3 packets are buffered");
+        assert_eq!(drain_tags(&mut state, 3), vec![Some(0.0), Some(1.0), Some(2.0)]);
+    }
+
+    #[test]
+    fn jitter_plays_in_order_packets_in_order() {
+        let mut state = make_state(3);
+        for seq in 0..5u8 {
+            state.insert_packet(seq as u32, packet(seq));
+        }
+        assert_eq!(
+            drain_tags(&mut state, 5),
+            vec![Some(0.0), Some(1.0), Some(2.0), Some(3.0), Some(4.0)]
+        );
+        assert_eq!(state.packets_lost, 0);
+        assert_eq!(state.frames_concealed, 0);
+        assert_eq!(state.packets_recovered_fec, 0);
+    }
+
+    #[test]
+    fn jitter_reorders_out_of_order_arrivals() {
+        // First arrival (seq 0) anchors the stream start; later packets arrive
+        // out of order but must play back in sequence order.
+        let mut state = make_state(3);
+        for seq in [0u8, 2, 1, 3] {
+            state.insert_packet(seq as u32, packet(seq));
+        }
+        assert_eq!(
+            drain_tags(&mut state, 4),
+            vec![Some(0.0), Some(1.0), Some(2.0), Some(3.0)]
+        );
+        assert_eq!(state.packets_lost, 0);
+    }
+
+    #[test]
+    fn jitter_dedupes_duplicate_sequence() {
+        // A duplicated sequence number must collapse to a single played frame.
+        let mut state = make_state(3);
+        for seq in [0u8, 1, 1, 2] {
+            state.insert_packet(seq as u32, packet(seq));
+        }
+        assert_eq!(drain_tags(&mut state, 3), vec![Some(0.0), Some(1.0), Some(2.0)]);
+        assert_eq!(state.packets_lost, 0);
+    }
+
+    #[test]
+    fn jitter_conceals_missing_packet_with_plc() {
+        // A gap with no following packet to recover from → PLC, counted as both
+        // a lost packet and a concealed frame.
+        let mut state = make_state(3);
+        for seq in 0..3u8 {
+            state.insert_packet(seq as u32, packet(seq));
+        }
+        // Fourth pull reaches seq 3, which never arrived and has no successor.
+        assert_eq!(
+            drain_tags(&mut state, 4),
+            vec![Some(0.0), Some(1.0), Some(2.0), Some(PLC_TAG)]
+        );
+        assert_eq!(state.packets_lost, 1);
+        assert_eq!(state.frames_concealed, 1);
+        assert_eq!(state.packets_recovered_fec, 0);
+    }
+
+    #[test]
+    fn jitter_recovers_missing_packet_with_fec() {
+        // seq 3 is missing but seq 4 arrived: recover seq 3 from seq 4's FEC,
+        // then still play seq 4 normally (FEC must not consume the next packet).
+        let mut state = make_state(3);
+        for seq in [0u8, 1, 2, 4] {
+            state.insert_packet(seq as u32, packet(seq));
+        }
+        assert_eq!(
+            drain_tags(&mut state, 5),
+            vec![
+                Some(0.0),
+                Some(1.0),
+                Some(2.0),
+                Some(FEC_TAG_BASE + 4.0), // seq 3 recovered from seq 4
+                Some(4.0),                // seq 4 still played normally
+            ]
+        );
+        assert_eq!(state.packets_lost, 1);
+        assert_eq!(state.packets_recovered_fec, 1);
+        assert_eq!(state.frames_concealed, 0);
+    }
+
+    #[test]
+    fn jitter_restarts_cleanly_on_backward_sequence_jump() {
+        // Play a stream, then the sender restarts at seq 0 (a backward jump).
+        // The buffer must re-buffer and play the new stream from its start,
+        // without counting the discontinuity as packet loss.
+        let mut state = make_state(3);
+        for seq in 0..3u8 {
+            state.insert_packet(seq as u32, packet(seq));
+        }
+        assert_eq!(drain_tags(&mut state, 3), vec![Some(0.0), Some(1.0), Some(2.0)]);
+
+        // Sender restart: sequence jumps back to 0.
+        for seq in [0u8, 1, 2] {
+            state.insert_packet(seq as u32, packet(seq));
+        }
+        assert_eq!(
+            drain_tags(&mut state, 3),
+            vec![Some(0.0), Some(1.0), Some(2.0)],
+            "new stream should play from its start"
+        );
+        assert_eq!(state.packets_lost, 0, "a sender restart is not packet loss");
+    }
+
+    #[test]
+    fn jitter_resumes_after_eos_without_phantom_loss() {
+        // A clean end-of-stream followed by a new talk spurt must resume
+        // cleanly: no frames from the gap counted as lost, new stream plays.
+        let mut state = make_state(3);
+        for seq in 0..3u8 {
+            state.insert_packet(seq as u32, packet(seq));
+        }
+        assert_eq!(drain_tags(&mut state, 3), vec![Some(0.0), Some(1.0), Some(2.0)]);
+
+        // Simulate the end-of-stream marker the datagram handler sets on the
+        // state when the sender signals EOS (UserAudioState has no public
+        // setter for this; the field is the documented effect of that path).
+        state.stream_ended = true;
+
+        // New talk spurt at a fresh sequence base.
+        for seq in [10u8, 11, 12] {
+            state.insert_packet(seq as u32, packet(seq));
+        }
+        assert_eq!(
+            drain_tags(&mut state, 3),
+            vec![Some(10.0), Some(11.0), Some(12.0)],
+            "new stream after EOS should play from its start"
+        );
+        assert_eq!(state.packets_lost, 0, "the EOS gap must not be counted as loss");
+        assert_eq!(state.frames_concealed, 0);
+    }
+
+    // ====================================================================
+    // Capture-decision tests.
+    //
+    // These exercise the REAL production `should_capture` (5 args, incl.
+    // `server_muted`) and `capture_transition` — not a copy. The previous
+    // tests reimplemented a 4-arg `should_capture` inside the test module,
+    // which silently shadowed the real one and was blind to `server_muted`
+    // entirely. Args: (voice_mode, self_muted, server_muted, ptt_active,
+    // connected).
+    // ====================================================================
+
+    #[test]
+    fn should_capture_continuous_when_connected() {
+        assert!(should_capture(VoiceMode::Continuous, false, false, false, true));
+    }
+
+    #[test]
+    fn should_capture_blocked_by_self_mute() {
+        assert!(!should_capture(VoiceMode::Continuous, true, false, false, true));
+    }
+
+    #[test]
+    fn should_capture_blocked_by_server_mute() {
+        // The old test copy lacked this argument and could not catch a
+        // server-mute regression.
+        assert!(!should_capture(VoiceMode::Continuous, false, true, false, true));
+        assert!(!should_capture(VoiceMode::PushToTalk, false, true, true, true));
+    }
+
+    #[test]
+    fn should_capture_blocked_when_disconnected() {
+        assert!(!should_capture(VoiceMode::Continuous, false, false, false, false));
+    }
+
+    #[test]
+    fn should_capture_ptt_follows_button() {
+        assert!(should_capture(VoiceMode::PushToTalk, false, false, true, true));
+        assert!(!should_capture(VoiceMode::PushToTalk, false, false, false, true));
+    }
+
+    #[test]
+    fn should_capture_ptt_held_but_self_muted() {
+        // Holding PTT must not override mute.
+        assert!(!should_capture(VoiceMode::PushToTalk, true, false, true, true));
+    }
+
+    // `capture_transition(want, active)` is the real decision the
+    // `sync_transmission!` macro acts on. The macro's I/O (set_active, EOS
+    // send, event broadcast) needs the full task to test, but the transition
+    // decision — including that stopping capture is a distinct `Deactivate`
+    // (which obliges the caller to send EOS) — is pinned here.
+
+    #[test]
+    fn capture_transition_activates_when_wanted_and_idle() {
+        assert_eq!(capture_transition(true, false), CaptureTransition::Activate);
+    }
+
+    #[test]
+    fn capture_transition_deactivates_when_unwanted_and_active() {
+        assert_eq!(capture_transition(false, true), CaptureTransition::Deactivate);
+    }
+
+    #[test]
+    fn capture_transition_no_change_when_already_in_desired_state() {
+        assert_eq!(capture_transition(true, true), CaptureTransition::None);
+        assert_eq!(capture_transition(false, false), CaptureTransition::None);
+    }
+
+    // The documented capture scenarios, composed from the real functions:
+    // the desired state comes from `should_capture`, the action from
+    // `capture_transition` against the current flag.
+
+    #[test]
+    fn capture_scenario_mute_stops_active_capture() {
+        let want = should_capture(VoiceMode::Continuous, /* self_muted */ true, false, false, true);
+        assert_eq!(
+            capture_transition(want, /* active */ true),
+            CaptureTransition::Deactivate
         );
     }
 
-    // Helper: simulate should_capture logic (renamed from should_transmit)
-    fn should_capture(voice_mode: VoiceMode, self_muted: bool, ptt_active: bool, connected: bool) -> bool {
-        if !connected || self_muted {
-            return false;
-        }
-        match voice_mode {
-            VoiceMode::Continuous => true,
-            VoiceMode::PushToTalk => ptt_active,
-        }
-    }
-
     #[test]
-    fn test_should_capture_continuous_connected() {
-        assert!(should_capture(VoiceMode::Continuous, false, false, true));
-    }
-
-    #[test]
-    fn test_should_capture_continuous_muted() {
-        assert!(!should_capture(VoiceMode::Continuous, true, false, true));
-    }
-
-    #[test]
-    fn test_should_capture_continuous_disconnected() {
-        assert!(!should_capture(VoiceMode::Continuous, false, false, false));
-    }
-
-    #[test]
-    fn test_should_capture_ptt_active() {
-        assert!(should_capture(VoiceMode::PushToTalk, false, true, true));
-    }
-
-    #[test]
-    fn test_should_capture_ptt_inactive() {
-        assert!(!should_capture(VoiceMode::PushToTalk, false, false, true));
-    }
-
-    #[test]
-    fn test_should_capture_ptt_muted() {
-        // Even if PTT is active, mute should prevent capture
-        assert!(!should_capture(VoiceMode::PushToTalk, true, true, true));
-    }
-
-    /// Test sync_transmission logic: activates capture flag in continuous mode
-    #[test]
-    fn test_sync_transmission_continuous_mode() {
-        let voice_mode = VoiceMode::Continuous;
-        let self_muted = false;
-        let ptt_active = false;
-        let connected = true;
-
-        // sync_transmission! now toggles capture_active flag, not stream existence
-        let mut capture_active = false;
-
-        let want = should_capture(voice_mode, self_muted, ptt_active, connected);
-        let have = capture_active;
-
-        if want && !have {
-            capture_active = true; // Flag activated
-        } else if !want && have {
-            capture_active = false; // Flag deactivated
-        }
-
-        assert!(capture_active, "Should activate capture in continuous mode");
-    }
-
-    /// Test sync_transmission logic: muting deactivates capture flag
-    #[test]
-    fn test_sync_transmission_mute() {
-        let voice_mode = VoiceMode::Continuous;
-        let self_muted = true; // NOW MUTED
-        let ptt_active = false;
-        let connected = true;
-        let mut capture_active = true; // Currently active
-
-        let want = should_capture(voice_mode, self_muted, ptt_active, connected);
-        let have = capture_active;
-
-        if want && !have {
-            capture_active = true;
-        } else if !want && have {
-            capture_active = false; // Flag deactivated
-        }
-
-        assert!(!capture_active, "Should deactivate capture when muted");
-    }
-
-    /// Test sync_transmission logic: unmuting reactivates capture flag
-    #[test]
-    fn test_sync_transmission_unmute() {
-        let voice_mode = VoiceMode::Continuous;
-        let self_muted = false; // UNMUTED
-        let ptt_active = false;
-        let connected = true;
-        let mut capture_active = false; // Currently inactive (was muted)
-
-        let want = should_capture(voice_mode, self_muted, ptt_active, connected);
-        let have = capture_active;
-
-        if want && !have {
-            capture_active = true; // Flag activated
-        } else if !want && have {
-            capture_active = false;
-        }
-
-        assert!(
-            capture_active,
-            "Should reactivate capture when unmuted in continuous mode"
+    fn capture_scenario_unmute_resumes_capture() {
+        let want = should_capture(VoiceMode::Continuous, /* self_muted */ false, false, false, true);
+        assert_eq!(
+            capture_transition(want, /* active */ false),
+            CaptureTransition::Activate
         );
     }
 
-    /// Test sync_transmission logic: PTT release deactivates capture flag
-    /// but does NOT destroy the audio stream (stream is connection-scoped)
     #[test]
-    fn test_sync_transmission_ptt_release() {
-        let voice_mode = VoiceMode::PushToTalk;
-        let self_muted = false;
-        let ptt_active = false; // PTT released
-        let connected = true;
-        let mut capture_active = true; // Was active
-        let audio_stream_alive = true; // Stream is connection-scoped
-
-        let want = should_capture(voice_mode, self_muted, ptt_active, connected);
-        let have = capture_active;
-
-        if want && !have {
-            capture_active = true;
-        } else if !want && have {
-            capture_active = false; // Flag deactivated, but stream stays alive
-        }
-
-        assert!(!capture_active, "Should deactivate capture when PTT released");
-        assert!(
-            audio_stream_alive,
-            "Audio stream should remain alive (connection-scoped)"
+    fn capture_scenario_ptt_release_stops_capture() {
+        let want = should_capture(VoiceMode::PushToTalk, false, false, /* ptt_active */ false, true);
+        assert_eq!(
+            capture_transition(want, /* active */ true),
+            CaptureTransition::Deactivate
         );
     }
 }

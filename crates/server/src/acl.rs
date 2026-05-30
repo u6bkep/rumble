@@ -187,3 +187,159 @@ async fn build_room_chain_owned(
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    //! Characterization tests for the *server ACL wiring* — the work this
+    //! module does on top of `permissions::effective_permissions` (which has
+    //! its own algorithm tests in `rumble-protocol`). What's pinned here:
+    //! how the user's group list is assembled (default + identity groups +
+    //! the implicit *verified-username* group), that an unverified display
+    //! name never mints an implicit group, and that the room chain is walked
+    //! from root to target so parent grants are inherited.
+    use super::*;
+    use crate::{
+        persistence::{PersistedAclEntry, PersistedRoomAcl, Persistence},
+        state::{Binding, Identity, Member, OwnerId, ServerState},
+    };
+    use rumble_protocol::{
+        ROOT_ROOM_UUID,
+        permissions::{DEFAULT_PERMISSIONS, Permissions},
+    };
+
+    fn persistence_with_default() -> Arc<Persistence> {
+        let p = Persistence::in_memory().unwrap();
+        p.create_group("default", DEFAULT_PERMISSIONS.bits()).unwrap();
+        Arc::new(p)
+    }
+
+    /// An owned (controller-driven) participant carrying the given identity.
+    fn member(uid: u64, display: &str, verified: Option<&str>, groups: &[&str]) -> Member {
+        Member {
+            user_id: uid,
+            identity: Arc::new(Identity::participant(
+                display.to_string(),
+                verified.map(str::to_string),
+                None,
+                groups.iter().map(|s| s.to_string()).collect(),
+            )),
+            binding: Binding::Owned {
+                owner: OwnerId::Plugin(1),
+            },
+        }
+    }
+
+    /// Put a single grant entry on the root room's ACL.
+    fn grant_at_root(p: &Persistence, group: &str, grant: Permissions, apply_subs: bool) {
+        p.set_room_acl(
+            ROOT_ROOM_UUID.as_bytes(),
+            &PersistedRoomAcl {
+                inherit_acl: true,
+                entries: vec![PersistedAclEntry {
+                    group: group.to_string(),
+                    grant: grant.bits(),
+                    deny: 0,
+                    apply_here: true,
+                    apply_subs,
+                }],
+            },
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn default_group_only_yields_default_permissions() {
+        let state = ServerState::new();
+        let persist = persistence_with_default();
+        let m = member(1, "anon", None, &[]);
+
+        let perms = evaluate_member_permissions(&state, &m, ROOT_ROOM_UUID, &Some(persist)).await;
+        assert_eq!(perms, DEFAULT_PERMISSIONS);
+    }
+
+    #[tokio::test]
+    async fn verified_username_acts_as_implicit_group() {
+        let state = ServerState::new();
+        let persist = persistence_with_default();
+        // The root ACL grants MUTE_DEAFEN to a group named "alice".
+        grant_at_root(&persist, "alice", Permissions::MUTE_DEAFEN, false);
+
+        // alice, verified, picks the grant up via her implicit username-group.
+        let alice = member(1, "alice", Some("alice"), &[]);
+        let aperms = evaluate_member_permissions(&state, &alice, ROOT_ROOM_UUID, &Some(persist.clone())).await;
+        assert_eq!(aperms, DEFAULT_PERMISSIONS | Permissions::MUTE_DEAFEN);
+
+        // bob, verified as someone else, does not.
+        let bob = member(2, "bob", Some("bob"), &[]);
+        let bperms = evaluate_member_permissions(&state, &bob, ROOT_ROOM_UUID, &Some(persist)).await;
+        assert_eq!(bperms, DEFAULT_PERMISSIONS);
+    }
+
+    #[tokio::test]
+    async fn unverified_display_name_is_not_an_implicit_group() {
+        // Security property: an anonymous participant whose *display* name is
+        // "alice" must NOT inherit the "alice" group's grants — only a
+        // *verified* identity mints the implicit username-group.
+        let state = ServerState::new();
+        let persist = persistence_with_default();
+        grant_at_root(&persist, "alice", Permissions::MUTE_DEAFEN, false);
+
+        let impostor = member(1, "alice", None, &[]);
+        let perms = evaluate_member_permissions(&state, &impostor, ROOT_ROOM_UUID, &Some(persist)).await;
+        assert_eq!(
+            perms, DEFAULT_PERMISSIONS,
+            "an unverified display name must not mint an implicit group"
+        );
+    }
+
+    #[tokio::test]
+    async fn parent_grant_inherited_through_room_chain() {
+        // A grant placed on root with apply_subs must reach a grandchild —
+        // exercises the root→target parent-walk in build_room_chain_owned.
+        let state = ServerState::new();
+        let persist = persistence_with_default();
+        grant_at_root(&persist, "default", Permissions::MUTE_DEAFEN, true);
+
+        let child = state
+            .create_room_with_parent("child".into(), Some(ROOT_ROOM_UUID))
+            .await;
+        let grandchild = state.create_room_with_parent("grandchild".into(), Some(child)).await;
+
+        let m = member(1, "anon", None, &[]);
+        let perms = evaluate_member_permissions(&state, &m, grandchild, &Some(persist)).await;
+
+        // The room-scoped MUTE_DEAFEN grant is inherited down the chain; the
+        // server-scoped SELF_REGISTER bit from the default group is stripped
+        // because server-scoped permissions only apply at the root room.
+        let expected = (DEFAULT_PERMISSIONS & rumble_protocol::permissions::ALL_ROOM_SCOPED) | Permissions::MUTE_DEAFEN;
+        assert_eq!(
+            perms, expected,
+            "an apply_subs grant at root must be inherited by descendants"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_group_membership_unions_in() {
+        // An explicitly-assigned group's permissions union into the base.
+        let state = ServerState::new();
+        let persist = persistence_with_default();
+        persist
+            .create_group("moderators", Permissions::MUTE_DEAFEN.bits())
+            .unwrap();
+
+        let m = member(1, "anon", None, &["moderators"]);
+        let perms = evaluate_member_permissions(&state, &m, ROOT_ROOM_UUID, &Some(persist)).await;
+        assert_eq!(perms, DEFAULT_PERMISSIONS | Permissions::MUTE_DEAFEN);
+    }
+
+    #[tokio::test]
+    async fn no_persistence_grants_all_permissions() {
+        // Without a persistence layer there is no ACL data, so evaluation
+        // falls back to granting everything.
+        let state = ServerState::new();
+        let m = member(1, "anon", None, &[]);
+
+        let perms = evaluate_member_permissions(&state, &m, ROOT_ROOM_UUID, &None).await;
+        assert_eq!(perms, Permissions::all());
+    }
+}

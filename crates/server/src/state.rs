@@ -958,19 +958,22 @@ mod tests {
         assert!(is_root_room(rooms[0].id.as_ref().unwrap()));
     }
 
-    /// Test user ID allocation is sequential and lock-free.
+    /// User ID allocation is lock-free and yields unique, increasing IDs.
     #[tokio::test]
     async fn test_user_id_allocation() {
         let state = ServerState::new();
 
-        // No longer async - allocation is lock-free
         let id1 = state.allocate_user_id();
         let id2 = state.allocate_user_id();
         let id3 = state.allocate_user_id();
 
-        assert_eq!(id1, 1);
-        assert_eq!(id2, 2);
-        assert_eq!(id3, 3);
+        // Contract: IDs are unique and strictly increasing. The exact base
+        // value and step are implementation details — pinning them (1, 2, 3)
+        // would fight a pooled/offset allocator change that is still correct.
+        assert!(
+            id1 < id2 && id2 < id3,
+            "user IDs must be strictly increasing: {id1}, {id2}, {id3}"
+        );
     }
 
     /// Test room creation generates UUIDs.
@@ -1175,5 +1178,105 @@ mod tests {
 
         assert_eq!(map.get(&room_a).unwrap().len(), 2);
         assert_eq!(map.get(&ROOT_ROOM_UUID).unwrap().len(), 1);
+    }
+
+    /// Build an owned participant member for the state-projection tests.
+    fn participant(uid: u64, name: &str, label: Option<&str>, groups: &[&str]) -> Arc<Member> {
+        Arc::new(Member {
+            user_id: uid,
+            identity: Arc::new(Identity::participant(
+                name.to_string(),
+                None,
+                label.map(str::to_string),
+                groups.iter().map(|s| s.to_string()).collect(),
+            )),
+            binding: Binding::Owned {
+                owner: OwnerId::Plugin(1),
+            },
+        })
+    }
+
+    /// `build_user_list` projects roster members with a room membership into
+    /// the wire `User` list, carrying username/room/groups/label and the
+    /// mute/deafen/server-mute status. Members without a membership are
+    /// omitted. (Controller-connection exclusion is not covered here — it
+    /// requires a live client connection; see the integration tests.)
+    #[tokio::test]
+    async fn build_user_list_projects_members_rooms_and_status() {
+        let state = ServerState::new();
+        let room_a = state.create_room("Room A".to_string()).await;
+
+        state.register_participant(participant(1, "alice", Some("Mumble"), &["mods"]));
+        state.register_participant(participant(2, "bob", None, &[]));
+        state.set_user_room(1, room_a).await;
+        state.set_user_room(2, ROOT_ROOM_UUID).await;
+        state
+            .set_user_status(
+                1,
+                UserStatus {
+                    is_muted: true,
+                    is_deafened: false,
+                    server_muted: true,
+                    is_elevated: false,
+                },
+            )
+            .await;
+
+        // Registered but never placed in a room → must not surface.
+        state.register_participant(participant(3, "ghost", None, &[]));
+
+        let mut users = state.build_user_list().await;
+        users.sort_by_key(|u| u.user_id.as_ref().unwrap().value);
+
+        assert_eq!(users.len(), 2, "only members with a room membership are listed");
+
+        let alice = &users[0];
+        assert_eq!(alice.user_id.as_ref().unwrap().value, 1);
+        assert_eq!(alice.username, "alice");
+        assert_eq!(alice.current_room.as_ref().and_then(uuid_from_room_id), Some(room_a));
+        assert_eq!(alice.groups, vec!["mods".to_string()]);
+        assert_eq!(alice.label.as_deref(), Some("Mumble"));
+        assert!(alice.is_muted && alice.server_muted && !alice.is_deafened);
+
+        let bob = &users[1];
+        assert_eq!(bob.username, "bob");
+        assert_eq!(
+            bob.current_room.as_ref().and_then(uuid_from_room_id),
+            Some(ROOT_ROOM_UUID)
+        );
+        assert!(!bob.is_muted && !bob.server_muted);
+        assert!(bob.groups.is_empty());
+        assert_eq!(bob.label, None);
+    }
+
+    /// The server hashes a rebuilt `ServerState` on every state change and
+    /// clients use that hash to detect divergence. Rebuilding the same logical
+    /// state must produce an identical hash — the hash sorts rooms/users, so
+    /// the nondeterministic `DashMap` iteration order must not leak through.
+    #[tokio::test]
+    async fn server_state_hash_is_stable_across_rebuilds() {
+        let state = ServerState::new();
+        let room = state.create_room("Room A".to_string()).await;
+        for uid in 1..=5u64 {
+            state.register_participant(participant(uid, &format!("u{uid}"), None, &[]));
+            state
+                .set_user_room(uid, if uid % 2 == 0 { room } else { ROOT_ROOM_UUID })
+                .await;
+        }
+
+        let hash_now = || async {
+            let rooms = state.build_room_list(&None).await;
+            let users = state.build_user_list().await;
+            compute_server_state_hash(&rumble_protocol::proto::ServerState {
+                rooms,
+                users,
+                groups: vec![],
+            })
+        };
+
+        let h1 = hash_now().await;
+        let h2 = hash_now().await;
+        assert!(!h1.is_empty());
+        assert_eq!(h1, h2, "rebuilding the same logical state must hash identically");
     }
 }
