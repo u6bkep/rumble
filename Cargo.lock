@@ -4808,6 +4808,7 @@ dependencies = [
  "rand 0.10.1",
  "rumble-audio",
  "rumble-client-traits",
+ "rumble-desktop",
  "rumble-protocol",
  "serde",
  "serde_json",

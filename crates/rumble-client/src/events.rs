@@ -337,11 +337,22 @@ pub struct AudioStats {
     /// Estimated actual bitrate in bits per second (rolling average).
     pub actual_bitrate_bps: f32,
 
-    /// Current playback buffer level in packets (for jitter buffer monitoring).
+    /// Current jitter buffer level in packets, summed across peers (compressed,
+    /// pre-decode — absorbs *network* jitter, not playback timing jitter).
     pub playback_buffer_packets: u32,
 
-    /// Number of buffer underruns (playback starvation events).
+    /// Current PCM playback buffer depth in samples (decoded, post-mix — the
+    /// cushion the audio device drains). 48000 = 1 s; healthy is a few frames
+    /// (960 = 20 ms). Near zero means underrun risk.
+    pub playback_buffer_samples: u32,
+
+    /// Number of buffer underruns: output callbacks that drained the PCM buffer
+    /// mid-block and had to zero-fill (a click). The headline starvation metric.
     pub buffer_underruns: u64,
+
+    /// Number of buffer overflows: mix ticks that grew the PCM buffer past its
+    /// cap and dropped about-to-play samples from the front (also a click).
+    pub buffer_overflows: u64,
 
     /// Timestamp of last stats update.
     #[serde(serialize_with = "serialize_opt_instant")]

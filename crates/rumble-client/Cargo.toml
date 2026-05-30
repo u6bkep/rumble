@@ -30,6 +30,11 @@ rand = { workspace = true }
 [dev-dependencies]
 tempfile = "3"
 criterion = { workspace = true }
+# The real Opus codec lives in the desktop platform crate. rumble-desktop depends
+# only on rumble-client-traits/-protocol (NOT rumble-client), so this dev-only
+# edge is acyclic. Used by the RX onset-pop reproduction test in audio_task.rs to
+# exercise the jitter buffer against a genuine decoder instead of a marker stub.
+rumble-desktop = { path = "../rumble-desktop" }
 
 [[bench]]
 name = "audio_pipeline"

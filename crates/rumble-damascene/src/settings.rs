@@ -1981,14 +1981,42 @@ fn render_stats(stats: &AudioStats) -> El {
         ],
     );
 
+    // PCM playback cushion in ms (48 samples = 1 ms at 48 kHz mono). One frame
+    // is 20 ms; a healthy cushion is a few frames. Underruns/overflows are
+    // clicks, so any nonzero count is flagged.
+    let cushion_ms = stats.playback_buffer_samples as f32 / 48.0;
+    let cushion_color = if cushion_ms < 20.0 {
+        tokens::DESTRUCTIVE
+    } else if cushion_ms < 40.0 {
+        tokens::WARNING
+    } else {
+        tokens::SUCCESS
+    };
+    let flag_color = |n: u64| if n > 0 { Some(tokens::DESTRUCTIVE) } else { None };
+
     let playback = section_card(
         "Playback",
         [
             stat_row("Frames concealed", stats.frames_concealed.to_string(), None),
             stat_row(
-                "Buffer level",
+                "Jitter buffer",
                 format!("{} packets", stats.playback_buffer_packets),
                 None,
+            ),
+            stat_row(
+                "PCM cushion",
+                format!("{cushion_ms:.0} ms ({} samples)", stats.playback_buffer_samples),
+                Some(cushion_color),
+            ),
+            stat_row(
+                "Underruns",
+                stats.buffer_underruns.to_string(),
+                flag_color(stats.buffer_underruns),
+            ),
+            stat_row(
+                "Overflows",
+                stats.buffer_overflows.to_string(),
+                flag_color(stats.buffer_overflows),
             ),
             row([spacer(), button("Reset statistics").key(KEY_STATS_RESET).secondary()]).width(Size::Fill(1.0)),
         ],
