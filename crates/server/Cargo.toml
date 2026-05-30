@@ -3,6 +3,16 @@ name = "server"
 version = "0.1.0"
 edition = "2024"
 
+# Disable the default libtest bench harness on the lib and binary so
+# `cargo bench -p server` dispatches only to the criterion bench below
+# (the libtest harness rejects criterion's CLI flags like --save-baseline).
+[lib]
+bench = false
+
+[[bin]]
+name = "server"
+bench = false
+
 [dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "net", "time", "io-util"] }
 quinn = { workspace = true, features = ["rustls-aws-lc-rs", "bloom", "log", "runtime-tokio"] }
@@ -42,3 +52,8 @@ rumble-client-traits = { path = "../rumble-client-traits" }
 rumble-desktop = { path = "../rumble-desktop" }
 tempfile = "3"
 rustls-pemfile = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "server_hotpaths"
+harness = false

@@ -1,8 +1,14 @@
 # Performance Testing & Optimization Plan
 
 A plan for making rumble's performance-critical paths *safe to optimize* and
-*measurable*. This is a planning document, not a description of code that exists
-— there are **no benchmarks in the workspace today**.
+*measurable*.
+
+**Status (2026-05-29):** the regression-test nets are in place for all four hot
+paths (client audio, server state-sync, server relay, GUI goldens), and the
+**server benchmark scaffold has landed**: `crates/server/benches/server_hotpaths.rs`
+(criterion) covers `relay_fanout`, `state_rebuild`, `state_hash`, and `acl_eval`.
+Run with `cargo bench -p server`. The audio and GUI benches below are not yet
+written.
 
 The premise: the workspace already has strong behavioral test coverage (~220
 unit tests, 58 server integration tests, end-to-end voice over real Quinn+Opus
@@ -163,12 +169,20 @@ The relay core and state-sync builders are the targets. Two integration styles:
   `Identity`, no connection) → `set_user_room` → `set_user_status`. See the
   refactoring note below for what's callable as-is vs. what needs extraction.
 
-| Bench | Measures | Parameterize over |
-|-------|----------|-------------------|
-| `relay_fanout` | snapshot + encode + per-recipient clone | recipients = 10 / 50 / 200 |
-| `state_rebuild` | full `build_user_list` + room list | users × rooms grid |
-| `state_hash` | BLAKE3 over assembled `ServerState` | state size |
-| `acl_eval` | `evaluate_user_permissions` for one user | room depth, group count |
+| Bench | Measures | Parameterize over | Status |
+|-------|----------|-------------------|--------|
+| `relay_fanout` | `build_relay_packet`: snapshot + room scan + re-encode + recipient gather | recipients = 10 / 50 / 200 | **done** |
+| `state_rebuild` | full `build_user_list` + `build_room_list` projection | users × rooms grid (10×4, 50×8, 200×16) | **done** |
+| `state_hash` | BLAKE3 over assembled `ServerState` | same grid | **done** |
+| `acl_eval` | `evaluate_member_permissions` for one member | room-chain depth = 1 / 4 / 16 | **done** |
+
+All four live in `crates/server/benches/server_hotpaths.rs`. The synthetic state
+uses owned participants (`Binding::Owned { OwnerId::Plugin }`) — no connection.
+`relay_fanout` resets the per-sender voice-rate window each iteration so a long
+criterion sample doesn't trip the 32 KB/s limiter and start timing the
+early-return path instead of the full relay. The lib + binary targets set
+`bench = false` so `cargo bench -p server` dispatches only to the criterion
+target (the libtest harness rejects criterion's `--save-baseline` flags).
 
 `relay_fanout` quantifies the per-recipient clone cost; `state_rebuild` +
 `state_hash` quantify the churn cost that dominates under many users.
