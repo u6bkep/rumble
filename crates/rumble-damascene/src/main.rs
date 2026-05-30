@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use damascene_core::Rect;
+use damascene_core::{Rect, color::ColorPreferences};
 use damascene_winit_wgpu::HostConfig;
 use rumble_client::{ConnectConfig, handle::BackendHandle};
 use rumble_damascene::{Identity, NativeUiBackend, RumbleApp};
@@ -80,7 +80,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // to the compositor and the XDG GlobalShortcuts portal is a stable
         // "com.rumble.Rumble" instead of a generic `surface-transient`
         // placeholder. This is what the system hotkeys UI groups us under.
-        .with_app_id("com.rumble.Rumble");
+        .with_app_id("com.rumble.Rumble")
+        // Opt into the extended-range linear HDR ladder
+        // ([scRGB-linear, Display-P3-linear, Display-P3, sRGB]). On a
+        // genuinely HDR output the host selects an `Rgba16Float` (scRGB)
+        // swapchain so `>1.0` color values reach the display; on SDR
+        // outputs every entry negotiates down to the 8-bit sRGB
+        // baseline, so this is safe to set unconditionally.
+        .with_color_preferences(ColorPreferences::hdr_extended());
     damascene_winit_wgpu::run_host_app_with_config("Rumble", viewport, app, host_config)?;
     Ok(())
 }
