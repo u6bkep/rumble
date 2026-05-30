@@ -4,8 +4,16 @@
 //! Run:
 //!   cargo run -p rumble-aetna --bin dump_bundles
 //!   cargo run -p rumble-aetna --bin dump_bundles -- connected cert_pending
+//!   cargo run -p rumble-aetna --bin dump_bundles -- --bless           # re-bless goldens
+//!   cargo run -p rumble-aetna --bin dump_bundles -- --check           # diff vs goldens (CI-style)
 //!
 //! Output: `crates/rumble-aetna/out/rumble_<scene>.{svg,tree.txt,draw_ops.txt,lint.txt,shader_manifest.txt}`.
+//!
+//! Golden regression check: `--bless` writes the deterministic subset
+//! (`draw_ops.txt` + `lint.txt`) to the tracked `crates/rumble-aetna/goldens/`
+//! dir; `--check` re-renders and fails (exit 1) if any scene drifts. Both modes
+//! accept an optional scene-name filter, same as the default dump. The goldens
+//! are pinned to the current git-pinned aetna rev — re-bless after an aetna bump.
 //!
 //! Mirrors the `aetna-volume::render_artifacts` shape: a small
 //! `MockBackend` that returns a canned `State`, a `Scene` enum that
@@ -1017,7 +1025,9 @@ fn demo_recent_servers() -> Vec<RecentServer> {
             addr: "voice.team-blue.example:5000".into(),
             label: "Team Blue".into(),
             username: "alice@team-blue".into(),
-            last_used_unix: 0,
+            // now-relative (not absolute 0) so the rendered "Nd ago" stays
+            // fixed across days — an absolute epoch would drift daily.
+            last_used_unix: now.saturating_sub(12 * 86_400),
         },
     ]
 }
@@ -1103,8 +1113,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let scratch = std::env::temp_dir().join("rumble_aetna_dump_bundles");
     std::fs::create_dir_all(&scratch)?;
 
-    let requested: Vec<Scene> = std::env::args()
-        .skip(1)
+    // First positional arg may select a mode; the rest are scene names.
+    let mut raw_args = std::env::args().skip(1).peekable();
+    let mode = match raw_args.peek().map(String::as_str) {
+        Some("--bless") => {
+            raw_args.next();
+            Mode::Bless
+        }
+        Some("--check") => {
+            raw_args.next();
+            Mode::Check
+        }
+        _ => Mode::Dump,
+    };
+
+    let requested: Vec<Scene> = raw_args
         .map(|raw| parse_scene(&raw).unwrap_or_else(|| panic!("unknown scene `{raw}`")))
         .collect();
     let scenes: Vec<Scene> = if requested.is_empty() {
@@ -1113,44 +1136,157 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         requested
     };
 
-    for scene in scenes {
-        let backend = MockBackend {
-            state: scene.build_state(),
-            transfers: scene.build_transfers(),
-            meter: scene.build_meter(),
-            stats: scene.build_stats(),
-        };
-        let identity = Identity::load(scratch.clone())?;
-        let settings = SettingsStore::load_from_path(Some(scratch.join("settings.json")));
-        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-        let mut app = RumbleApp::new(backend, identity, settings, runtime);
-        // Bypass the first-run wizard for connection-state scenes — they
-        // illustrate the main shell, not the wizard. Wizard / unlock
-        // scenes drive the wizard explicitly and need the suppression
-        // *not* applied.
-        if !scene.keeps_first_run() {
-            app.suppress_first_run_for_test();
+    match mode {
+        Mode::Dump => {
+            for scene in scenes {
+                let bundle = render_scene(scene, &scratch, viewport)?;
+                let basename = format!("rumble_{}", scene.slug());
+                let written = write_bundle(&bundle, &out_dir, &basename)?;
+                for path in &written {
+                    println!("wrote {}", path.display());
+                }
+                if !bundle.lint.findings.is_empty() {
+                    eprintln!("\n{basename} lint findings ({}):", bundle.lint.findings.len());
+                    eprint!("{}", bundle.lint.text());
+                }
+            }
         }
-        scene.drive_setup(&mut app);
-
-        let theme = app.theme();
-        let cx = BuildCx::new(&theme);
-        let mut tree = app.build(&cx);
-        let bundle = render_bundle(&mut tree, viewport);
-
-        let basename = format!("rumble_{}", scene.slug());
-        let written = write_bundle(&bundle, &out_dir, &basename)?;
-        for path in &written {
-            println!("wrote {}", path.display());
+        Mode::Bless => {
+            let goldens = goldens_dir();
+            std::fs::create_dir_all(&goldens)?;
+            for scene in scenes {
+                let bundle = render_scene(scene, &scratch, viewport)?;
+                let basename = format!("rumble_{}", scene.slug());
+                for (ext, content) in golden_artifacts(&bundle) {
+                    std::fs::write(goldens.join(format!("{basename}.{ext}")), content)?;
+                }
+                println!("blessed {basename}");
+            }
         }
-
-        if !bundle.lint.findings.is_empty() {
-            eprintln!("\n{basename} lint findings ({}):", bundle.lint.findings.len());
-            eprint!("{}", bundle.lint.text());
+        Mode::Check => {
+            let goldens = goldens_dir();
+            let mut failures = 0usize;
+            let mut checked = 0usize;
+            for scene in &scenes {
+                let bundle = render_scene(*scene, &scratch, viewport)?;
+                let basename = format!("rumble_{}", scene.slug());
+                for (ext, actual) in golden_artifacts(&bundle) {
+                    checked += 1;
+                    let path = goldens.join(format!("{basename}.{ext}"));
+                    let Ok(expected) = std::fs::read_to_string(&path) else {
+                        failures += 1;
+                        eprintln!("MISSING  {basename}.{ext} — no golden; run `--bless`");
+                        continue;
+                    };
+                    if let Some((line, exp, act, n)) = first_diff(&expected, &actual) {
+                        failures += 1;
+                        eprintln!(
+                            "MISMATCH {basename}.{ext}: {n} line(s) differ; first at line {line}:\n  golden: {exp}\n  \
+                             actual: {act}"
+                        );
+                    }
+                }
+            }
+            if failures > 0 {
+                eprintln!(
+                    "\n{failures} golden mismatch(es) over {checked} artifact(s) in {} scene(s).\nReview the change, \
+                     then re-bless with `dump_bundles --bless` and inspect `git diff goldens/`.",
+                    scenes.len()
+                );
+                std::process::exit(1);
+            }
+            println!(
+                "OK: {checked} golden artifact(s) across {} scene(s) match",
+                scenes.len()
+            );
         }
     }
 
     Ok(())
+}
+
+/// What `dump_bundles` does with the rendered scenes.
+#[derive(Clone, Copy, Debug)]
+enum Mode {
+    /// Write the full artifact set (svg/tree/draw_ops/manifest/lint) to `out/`.
+    Dump,
+    /// Overwrite the checked-in goldens with freshly rendered output.
+    Bless,
+    /// Render and diff against the checked-in goldens; exit non-zero on drift.
+    Check,
+}
+
+/// Directory holding the checked-in golden artifacts (tracked, unlike `out/`).
+fn goldens_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("goldens")
+}
+
+/// The subset of bundle artifacts promoted to goldens. We pin `draw_ops` (the
+/// flat paint IR — geometry, colors, fonts, layering, the same stream the wgpu
+/// runner consumes) and `lint` (quality findings). We deliberately do *not* pin
+/// `tree.txt` (its `source=app.rs:NNN` references churn on unrelated edits),
+/// the SVG, or the shader manifest (both redundant re-renderings of `draw_ops`).
+fn golden_artifacts(bundle: &Bundle) -> [(&'static str, String); 2] {
+    [
+        ("draw_ops.txt", draw_ops_text(&bundle.draw_ops)),
+        ("lint.txt", bundle.lint.text()),
+    ]
+}
+
+/// Build a scene's `RumbleApp` against the `MockBackend` and render one bundle.
+/// Shared by every mode so the dump and the golden check exercise an identical
+/// path.
+fn render_scene(scene: Scene, scratch: &std::path::Path, viewport: Rect) -> Result<Bundle, Box<dyn std::error::Error>> {
+    let backend = MockBackend {
+        state: scene.build_state(),
+        transfers: scene.build_transfers(),
+        meter: scene.build_meter(),
+        stats: scene.build_stats(),
+    };
+    // Each scene gets its own freshly-wiped config dir. Identity and settings
+    // persist to disk, so a shared dir would let one scene's generated key or
+    // saved-server list bleed into later scenes (and across tool runs),
+    // breaking golden reproducibility.
+    let cfg = scratch.join(scene.slug());
+    let _ = std::fs::remove_dir_all(&cfg);
+    std::fs::create_dir_all(&cfg)?;
+    let identity = Identity::load(cfg.clone())?;
+    let settings = SettingsStore::load_from_path(Some(cfg.join("settings.json")));
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    let mut app = RumbleApp::new(backend, identity, settings, runtime);
+    // Bypass the first-run wizard for connection-state scenes — they illustrate
+    // the main shell, not the wizard. Wizard / unlock scenes drive the wizard
+    // explicitly and need the suppression *not* applied.
+    if !scene.keeps_first_run() {
+        app.suppress_first_run_for_test();
+    }
+    scene.drive_setup(&mut app);
+
+    let theme = app.theme();
+    let cx = BuildCx::new(&theme);
+    let mut tree = app.build(&cx);
+    Ok(render_bundle(&mut tree, viewport))
+}
+
+/// First diverging line between two multi-line strings, with the total count of
+/// differing lines. Returns `(line_no, golden_line, actual_line, total_diffs)`,
+/// or `None` when the two are identical.
+fn first_diff(expected: &str, actual: &str) -> Option<(usize, String, String, usize)> {
+    let exp: Vec<&str> = expected.lines().collect();
+    let act: Vec<&str> = actual.lines().collect();
+    let mut first = None;
+    let mut count = 0;
+    for i in 0..exp.len().max(act.len()) {
+        let e = exp.get(i).copied().unwrap_or("<missing>");
+        let a = act.get(i).copied().unwrap_or("<missing>");
+        if e != a {
+            count += 1;
+            if first.is_none() {
+                first = Some((i + 1, e.to_string(), a.to_string()));
+            }
+        }
+    }
+    first.map(|(n, e, a)| (n, e, a, count))
 }
 
 fn parse_scene(raw: &str) -> Option<Scene> {

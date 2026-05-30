@@ -57,8 +57,8 @@ For each `Scene` it:
 
 Portal init is disabled (`RUMBLE_DISABLE_PORTAL=1`, set in `main` before any
 thread spawns) so repeated `RumbleApp` construction doesn't hang on the XDG
-GlobalShortcuts portal. Identity/`SettingsStore` are pointed at a temp scratch
-dir.
+GlobalShortcuts portal. Identity/`SettingsStore` are pointed at a per-scene,
+freshly-wiped temp scratch dir (see the golden-check section on determinism).
 
 ### Artifacts
 
@@ -80,11 +80,36 @@ focus indication, and scrollbar overlap. They are written to `<scene>.lint.txt`
 and also echoed to stderr at the end of a run. **Review `lint.txt` before
 declaring a UI change done.**
 
+### Golden regression check
+
+`dump_bundles` doubles as a snapshot regression net. `--bless` writes the
+deterministic subset of artifacts — `draw_ops.txt` (the flat paint IR: geometry,
+colors, fonts, layering) and `lint.txt` — to the **tracked** `crates/rumble-aetna/goldens/`
+dir. `--check` re-renders every scene and diffs against those goldens, exiting
+non-zero (with a first-divergence report per artifact) on any drift. We pin only
+those two artifacts: `tree.txt` carries `source=app.rs:NNN` line references that
+churn on unrelated edits, and the SVG / shader manifest are redundant
+re-renderings of `draw_ops`.
+
+Determinism is a hard requirement for the goldens to be useful — flaky snapshots
+are worse than none. Two things enforce it: each scene renders against its **own
+freshly-wiped config dir** (so a generated key or saved-server list from one
+scene can't bleed into another or across runs), and identity fixtures install a
+**fixed** signing key rather than generating a random one. New fixtures must
+avoid wall-clock-absolute timestamps (anchor them now-relative) and random key
+material.
+
+Goldens are pinned to the current git-pinned aetna rev; re-bless after an aetna
+bump. CI runs fmt + clippy only, so `--check` is a local/pre-commit gate — run it
+after any UI change.
+
 ### Commands
 
 ```bash
 cargo run -p rumble-aetna --bin dump_bundles                       # dump every scene
 cargo run -p rumble-aetna --bin dump_bundles -- connected cert_pending  # specific scenes by slug
+cargo run -p rumble-aetna --bin dump_bundles -- --check             # diff vs goldens (exit 1 on drift)
+cargo run -p rumble-aetna --bin dump_bundles -- --bless             # re-bless goldens after an intended change
 ```
 
 Scene names are matched case-insensitively against each `Scene::slug()` (e.g.

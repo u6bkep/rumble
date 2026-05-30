@@ -2622,9 +2622,14 @@ impl<B: UiBackend> RumbleApp<B> {
 
     /// Test/scene-dump hook: install a plaintext local identity so
     /// `dump_bundles` can render the Connection-tab Identity section
-    /// for a non-blank user.
+    /// for a non-blank user. Uses a **fixed** signing key (not
+    /// `generate_local_key`, which is random) so the rendered fingerprint
+    /// and public key are reproducible across runs — golden snapshots
+    /// depend on it.
     pub fn set_local_identity_for_test(&mut self) {
-        let _ = self.identity.generate_local_key(None);
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]);
+        let _ = self.identity.manager_mut().import_signing_key(signing_key);
+        self.identity.refresh_public_key();
     }
 
     /// Test/scene-dump hook: install an ssh-agent–bound identity. No

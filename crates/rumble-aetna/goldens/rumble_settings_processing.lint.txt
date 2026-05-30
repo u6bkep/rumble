@@ -1,0 +1,2 @@
+RawColor node=root.overlay.1.modal.1.group.1.scroll.1.group.0.group.0.card.5.group.1.group.0.group.0.group.0.vu-below-track.0 <no-source> :: fill is a raw rgba(0.06778845,0.0042860196,0.0042860056,1) — use a token
+RawColor node=root.overlay.1.modal.1.group.1.scroll.1.group.0.group.0.card.5.group.1.group.0.group.0.group.0.vu-above-track.1 <no-source> :: fill is a raw rgba(0.0018074721,0.11828821,0.06952976,1) — use a token

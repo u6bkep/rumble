@@ -128,11 +128,15 @@ aetna has its own bundle/lint pipeline that replaces the old egui screenshot har
 ```bash
 cargo run -p rumble-aetna --bin dump_bundles                       # dump every scene
 cargo run -p rumble-aetna --bin dump_bundles -- connected cert_pending  # specific scenes
+cargo run -p rumble-aetna --bin dump_bundles -- --check             # diff vs checked-in goldens (exit 1 on drift)
+cargo run -p rumble-aetna --bin dump_bundles -- --bless             # re-bless goldens after an intended UI change
 ```
 
 Each scene produces `rumble_<scene>.{svg,tree.txt,draw_ops.txt,lint.txt,shader_manifest.txt}`. The SVG fallback renders the same draw-op stream as the wgpu Runner, so layout regressions are visible without spinning up a window or device. Lint findings (raw colors, overflow, weak focus, scrollbar overlap, etc.) land in `lint.txt` — review them before declaring a UI change done.
 
-To add a new scene, extend the `Scene` enum and `drive_setup` in `crates/rumble-aetna/src/bin/dump_bundles.rs`.
+**Golden regression check.** `--check` re-renders every scene and diffs the deterministic subset (`draw_ops.txt` + `lint.txt`) against the checked-in goldens in `crates/rumble-aetna/goldens/` (tracked, unlike `out/`); it exits non-zero on any drift. Run it after touching UI code. When a change is intentional, run `--bless`, then review `git diff crates/rumble-aetna/goldens/` to confirm only the expected scenes moved. Goldens are pinned to the current git-pinned aetna rev — re-bless after an aetna bump. For new fixtures, keep them deterministic (no wall-clock or random keys): each scene renders against its own freshly-wiped config dir, and identity hooks install a fixed key.
+
+To add a new scene, extend the `Scene` enum and `drive_setup` in `crates/rumble-aetna/src/bin/dump_bundles.rs`, then `--bless` to capture its goldens.
 
 ## External Dependencies (git-pinned)
 
