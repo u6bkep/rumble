@@ -11,7 +11,11 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
-use aetna_core::{prelude::*, toast::ToastSpec};
+use aetna_core::{
+    prelude::*,
+    scroll::{ScrollAlignment, ScrollRequest},
+    toast::ToastSpec,
+};
 use aetna_winit_wgpu::WinitWgpuApp;
 
 use rumble_client::{
@@ -125,6 +129,12 @@ pub struct RumbleApp<B: UiBackend = crate::backend::NativeUiBackend> {
     /// `state.chat_messages.len()` at the previous frame. Used to detect
     /// new arrivals so we can fire `SfxKind::Message` once per batch.
     prev_chat_count: usize,
+
+    /// Row key the chat-history virtual list should stick to bottom on next
+    /// `drain_scroll_requests`. Set when the backlog grows (new message, initial
+    /// load); consumed into a `ScrollRequest::ToRowKey(.., End)`. Virtual lists
+    /// don't auto-pin like `scroll().pin_end()`, so we drive it explicitly.
+    pending_scroll_to_bottom: Option<String>,
 
     /// `connection.is_connected()` at the previous frame, to fire
     /// `SfxKind::Connect`/`Disconnect` on transitions.
@@ -318,6 +328,7 @@ impl<B: UiBackend> RumbleApp<B> {
             processor_registry,
             room_tree: RoomTreeState::default(),
             prev_chat_count: 0,
+            pending_scroll_to_bottom: None,
             prev_connected: false,
             prev_room_id: None,
             prev_room_members: HashSet::new(),
@@ -391,6 +402,17 @@ impl<B: UiBackend> App for RumbleApp<B> {
 
     fn drain_link_opens(&mut self) -> Vec<String> {
         std::mem::take(&mut self.pending_link_opens)
+    }
+
+    fn drain_scroll_requests(&mut self) -> Vec<ScrollRequest> {
+        match self.pending_scroll_to_bottom.take() {
+            Some(row_key) => vec![ScrollRequest::to_row_key(
+                chat::CHAT_HISTORY_KEY,
+                row_key,
+                ScrollAlignment::End,
+            )],
+            None => Vec::new(),
+        }
     }
 
     fn theme(&self) -> Theme {
@@ -2058,6 +2080,20 @@ impl<B: UiBackend> RumbleApp<B> {
 
         // New remote chat messages. Direct messages get a distinct cue.
         let count = snapshot.chat_messages.len();
+
+        // Backlog grew (initial load or a new message) → stick the virtual chat
+        // history to the newest renderable row on the next layout. Replaces the
+        // old `scroll().pin_end()`, which virtual lists don't carry.
+        if count > self.prev_chat_count
+            && let Some(last) = snapshot
+                .chat_messages
+                .iter()
+                .rev()
+                .find(|m| m.visibility.renders_locally())
+        {
+            self.pending_scroll_to_bottom = Some(chat::chat_row_key(last));
+        }
+
         if count > self.prev_chat_count && self.prev_chat_count > 0 {
             let mut had_dm = false;
             let mut had_room = false;

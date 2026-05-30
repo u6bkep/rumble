@@ -18,7 +18,11 @@ pub use image_preview::{
 };
 pub use lightbox::{Lightbox, PanDrag, ZoomDirection, render_lightbox};
 
-use std::{collections::HashMap, sync::LazyLock, time::Instant};
+use std::{
+    collections::HashMap,
+    sync::{Arc, LazyLock},
+    time::{Instant, SystemTime},
+};
 
 use aetna_core::prelude::*;
 use aetna_markdown::md;
@@ -216,64 +220,132 @@ fn history(
             .pin_end();
     }
 
-    let lines: Vec<El> = state
+    // SenderMirror entries are sender-side history twins of broadcasts whose
+    // SenderDraft card is already on screen — never render.
+    let msgs: Vec<&ChatMessage> = state
         .chat_messages
         .iter()
-        // SenderMirror entries are sender-side history twins of broadcasts
-        // whose SenderDraft card is already on screen — never render.
         .filter(|msg| msg.visibility.renders_locally())
-        .map(|msg| {
-            render_message(
-                msg,
-                chat_settings,
-                media_cache,
-                transfers,
-                pending_cancel_confirm,
-                my_user_id,
-                own_username,
-            )
-        })
         .collect();
+    let count = msgs.len();
 
-    scroll(lines)
-        .padding(Sides::xy(tokens::SPACE_4, tokens::SPACE_2))
-        .gap(tokens::SPACE_1)
-        .width(Size::Fill(1.0))
-        .height(Size::Fill(1.0))
-        .pin_end()
+    // Owned, 'static row data for the lazy text path. The virtual list realizes
+    // a row's El only when it scrolls into view, so `build_row` can't borrow the
+    // frame's `&State` — it captures these owned snapshots instead. Cheap:
+    // O(messages) String clones, vs the O(visible) markdown-parse + layout that
+    // virtualization now defers.
+    let rows: Vec<ChatRow> = msgs
+        .iter()
+        .map(|m| ChatRow::from_msg(m, my_user_id, own_username))
+        .collect();
+    let keys: Vec<String> = msgs.iter().map(|m| chat_row_key(m)).collect();
+
+    // Attachments (images/gifs/video thumbs/file cards) borrow live GPU textures
+    // and transfer state out of the media cache, which `build_row` can't capture.
+    // Pre-render just the attachment messages here, eagerly (O(attachments) — a
+    // small fraction of a backlog) and clone the El into the row when realized.
+    // NOTE: this keeps every backlog image's texture resident even off-screen;
+    // culling invisible media is tracked separately (needs a visible-range →
+    // cache-eviction loop the virtual list can't express today). See issue #16.
+    let mut attachment_els: HashMap<usize, El> = HashMap::new();
+    for (i, msg) in msgs.iter().enumerate() {
+        if let Some(att) = msg.attachment.as_ref() {
+            let view = attachment_view(att, media_cache, transfers);
+            attachment_els.insert(i, render_attachment_view(view, rows[i].is_own, pending_cancel_confirm));
+        }
+    }
+
+    let rows = Arc::new(rows);
+    let keys = Arc::new(keys);
+    let keys_for_key = keys.clone();
+    let settings = chat_settings.clone();
+
+    virtual_list_dyn(
+        count,
+        CHAT_ROW_EST_HEIGHT,
+        move |i| keys_for_key[i].clone(),
+        move |i| {
+            let attachment = attachment_els.get(&i).cloned();
+            render_chat_row(&rows[i], &settings, attachment)
+        },
+    )
+    .key(CHAT_HISTORY_KEY)
+    // Append-at-bottom feed: re-anchor rebuilds on the last visible row so new
+    // messages don't shift what the user is reading. Stick-to-bottom on new
+    // messages is driven separately via `ScrollRequest::ToRowKey(.., End)`.
+    .virtual_anchor_policy(VirtualAnchorPolicy::LastVisible)
+    .padding(Sides::xy(tokens::SPACE_4, tokens::SPACE_2))
+    .gap(tokens::SPACE_1)
 }
 
-fn render_message(
-    msg: &ChatMessage,
-    chat_settings: &ChatSettings,
-    media_cache: &MediaCache,
-    transfers: &TransferMap,
-    pending_cancel_confirm: &HashMap<String, Instant>,
-    my_user_id: Option<u64>,
-    own_username: &str,
-) -> El {
-    let msg_key = u128::from_le_bytes(msg.id);
-    // Prefer server-assigned `sender_id` for identity matching — usernames
-    // are client-supplied, not unique (two clients on one machine share
-    // `$USER` by default), and would mis-classify the receiver as the
-    // sender. Fall back to username only when `sender_id` is absent (older
-    // peers in chat-history sync, legacy servers).
-    let is_own = if msg.visibility.is_system() {
-        false
-    } else if let (Some(mine), Some(theirs)) = (my_user_id, msg.sender_id) {
-        mine == theirs
-    } else {
-        msg.sender_id.is_none() && msg.sender == own_username
-    };
+/// Estimated chat-row height (logical px) seeding the virtual list's
+/// content-height total + visible-range walk for rows not yet measured. Real
+/// heights are measured as rows realize; this only needs to be in the ballpark
+/// of a typical 1–2 line message so the scrollbar doesn't lurch.
+const CHAT_ROW_EST_HEIGHT: f32 = 44.0;
+
+/// Key of the chat-history virtual list. Shared with the app's
+/// `drain_scroll_requests` so stick-to-bottom targets the right list.
+pub const CHAT_HISTORY_KEY: &str = "chat:history";
+
+/// Stable per-message row identity for the virtual list (survives rebuilds, so
+/// measurement caching + `ScrollRequest::ToRowKey` resolve to the same row).
+pub(crate) fn chat_row_key(msg: &ChatMessage) -> String {
+    format!("chat:row:{}", u128::from_le_bytes(msg.id))
+}
+
+/// Owned text-render inputs for one chat row — everything `render_chat_row`
+/// needs that isn't the (eagerly pre-rendered) attachment El. Cloned out of the
+/// borrowed `ChatMessage` so the virtual list's `build_row` closure can be
+/// `'static + Send + Sync`.
+struct ChatRow {
+    text: String,
+    sender: String,
+    kind: ChatMessageKind,
+    timestamp: SystemTime,
+    msg_key: u128,
+    is_own: bool,
+    is_system: bool,
+}
+
+impl ChatRow {
+    fn from_msg(msg: &ChatMessage, my_user_id: Option<u64>, own_username: &str) -> Self {
+        // Prefer server-assigned `sender_id` for identity matching — usernames
+        // are client-supplied, not unique (two clients on one machine share
+        // `$USER` by default), and would mis-classify the receiver as the
+        // sender. Fall back to username only when `sender_id` is absent (older
+        // peers in chat-history sync, legacy servers).
+        let is_system = msg.visibility.is_system();
+        let is_own = if is_system {
+            false
+        } else if let (Some(mine), Some(theirs)) = (my_user_id, msg.sender_id) {
+            mine == theirs
+        } else {
+            msg.sender_id.is_none() && msg.sender == own_username
+        };
+        ChatRow {
+            text: msg.text.clone(),
+            sender: msg.sender.clone(),
+            kind: msg.kind.clone(),
+            timestamp: msg.timestamp,
+            msg_key: u128::from_le_bytes(msg.id),
+            is_own,
+            is_system,
+        }
+    }
+}
+
+fn render_chat_row(entry: &ChatRow, chat_settings: &ChatSettings, attachment: Option<El>) -> El {
+    let msg_key = entry.msg_key;
     let prefix = if chat_settings.show_timestamps {
-        format!("[{}] ", chat_settings.timestamp_format.format(msg.timestamp))
+        format!("[{}] ", chat_settings.timestamp_format.format(entry.timestamp))
     } else {
         String::new()
     };
 
     // System notices with no attachment: plain italic system text.
-    if msg.visibility.is_system() && msg.attachment.is_none() {
-        return paragraph(format!("{prefix}{}", msg.text))
+    if entry.is_system && attachment.is_none() {
+        return paragraph(format!("{prefix}{}", entry.text))
             .font_size(tokens::TEXT_XS.size)
             .text_color(palette::CHAT_SYS)
             .italic()
@@ -281,10 +353,10 @@ fn render_message(
             .selectable();
     }
 
-    let (header_text, header_color) = match &msg.kind {
-        ChatMessageKind::Room => (format!("{prefix}{}:", msg.sender), None),
-        ChatMessageKind::DirectMessage { .. } => (format!("{prefix}[DM] {}:", msg.sender), Some(palette::CHAT_DM)),
-        ChatMessageKind::Tree => (format!("{prefix}[Tree] {}:", msg.sender), Some(palette::CHAT_TREE)),
+    let (header_text, header_color) = match &entry.kind {
+        ChatMessageKind::Room => (format!("{prefix}{}:", entry.sender), None),
+        ChatMessageKind::DirectMessage { .. } => (format!("{prefix}[DM] {}:", entry.sender), Some(palette::CHAT_DM)),
+        ChatMessageKind::Tree => (format!("{prefix}[Tree] {}:", entry.sender), Some(palette::CHAT_TREE)),
     };
     let mut header = text(header_text)
         .semibold()
@@ -298,16 +370,11 @@ fn render_message(
 
     // Messages that use markdown syntax go through the markdown renderer.
     // Everything else takes a plain-text path that linkifies bare URLs.
-    let body = if looks_like_markdown(&msg.text) {
-        md(&msg.text).width(Size::Fill(1.0))
+    let body = if looks_like_markdown(&entry.text) {
+        md(&entry.text).width(Size::Fill(1.0))
     } else {
-        plain_with_links(&msg.text, msg_key).width(Size::Fill(1.0))
+        plain_with_links(&entry.text, msg_key).width(Size::Fill(1.0))
     };
-
-    let attachment: Option<El> = msg.attachment.as_ref().map(|att| {
-        let view = attachment_view(att, media_cache, transfers);
-        render_attachment_view(view, is_own, pending_cancel_confirm)
-    });
 
     let mut parts: Vec<El> = vec![header, body];
     if let Some(att) = attachment {
@@ -316,7 +383,7 @@ fn render_message(
     let content = column(parts).gap(tokens::SPACE_1).width(Size::Fill(1.0));
 
     // Own messages: subtle left accent stripe for visual differentiation.
-    if is_own {
+    if entry.is_own {
         let accent_stripe = spacer()
             .width(Size::Fixed(2.0))
             .height(Size::Fill(1.0))
