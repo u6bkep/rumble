@@ -32,7 +32,9 @@ use rumble_client::{
     ConnectionState, PendingCertificate, State, VoiceMode,
 };
 use rumble_damascene::{
-    ElevateState, Identity, RumbleApp, SettingsOpenSelect, SettingsTab, UnlockState, WizardState, backend::UiBackend,
+    ElevateState, Identity, RumbleApp, SettingsOpenSelect, SettingsTab, UnlockState, WizardState,
+    backend::UiBackend,
+    settings::{GitBuildInfo, set_git_build_info_override},
 };
 use rumble_desktop_shell::{KeyInfo, RecentServer, SettingsStore};
 use rumble_protocol::{
@@ -1102,6 +1104,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     unsafe {
         std::env::set_var("RUMBLE_DISABLE_PORTAL", "1");
     }
+
+    // Pin the About-tab build metadata to a fixed fixture. The real values
+    // come from `build.rs` (live `git rev-parse` / `git describe`), so they
+    // move every commit and made `settings_about` drift on each rebless.
+    // Layout is unchanged — same 7+40 char hash shape, empty tag, clean
+    // tree — so the scene still exercises ellipsis/fill-width and the
+    // clean-state color token under lint.
+    set_git_build_info_override(GitBuildInfo {
+        describe: "v0.1.1-0-g0123456".to_string(),
+        short_hash: "0123456".to_string(),
+        full_hash: "0123456789abcdef0123456789abcdef01234567".to_string(),
+        tag: String::new(),
+        dirty: false,
+    });
 
     // Match the real app's window viewport so layout matches what users see.
     let viewport = Rect::new(0.0, 0.0, 1280.0, 800.0);
