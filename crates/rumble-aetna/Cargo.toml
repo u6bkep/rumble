@@ -5,13 +5,23 @@ edition = "2024"
 description = "Rumble client built on the aetna UI library"
 default-run = "rumble-aetna"
 
+# Disable the default libtest bench harness on the lib/bins so
+# `cargo bench -p rumble-aetna` dispatches only to the criterion bench
+# (libtest rejects criterion flags like --save-baseline).
 [lib]
 name = "rumble_aetna"
 path = "src/lib.rs"
+bench = false
 
 [[bin]]
 name = "rumble-aetna"
 path = "src/main.rs"
+bench = false
+
+[[bin]]
+name = "dump_bundles"
+path = "src/bin/dump_bundles.rs"
+bench = false
 
 [dependencies]
 # Aetna UI. Pin lives in the workspace [workspace.dependencies] block.
@@ -56,4 +66,11 @@ linkify = "0.11"
 [target.'cfg(target_os = "linux")'.dependencies]
 rumble-desktop = { path = "../rumble-desktop", features = ["pulse"] }
 rumble-desktop-shell = { path = "../rumble-desktop-shell", features = ["wayland-portal"] }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "projection"
+harness = false
 

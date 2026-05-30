@@ -4796,6 +4796,7 @@ dependencies = [
  "anyhow",
  "arboard",
  "base64",
+ "criterion",
  "directories",
  "ed25519-dalek 3.0.0-pre.7",
  "image",
