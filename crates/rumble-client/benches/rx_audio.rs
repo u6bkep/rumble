@@ -56,21 +56,22 @@ fn payload() -> Vec<u8> {
 /// (0 = no loss). When `reorder` is set, adjacent packets arrive swapped.
 fn run_stream(n: u32, gap: u32, reorder: bool) {
     let mut state = UserAudioState::new(BenchDecoder, 2);
+    let mut frame = [0.0f32; OPUS_FRAME_SIZE];
     let mut seq = 0u32;
     while seq < n {
         if reorder && seq + 1 < n {
             // Adjacent pair arrives out of order.
             state.insert_packet(seq + 1, payload());
             state.insert_packet(seq, payload());
-            black_box(state.get_next_frame());
-            black_box(state.get_next_frame());
+            black_box(state.decode_next_into(&mut frame));
+            black_box(state.decode_next_into(&mut frame));
             seq += 2;
         } else {
             // Drop every `gap`-th packet to exercise the FEC/PLC paths.
             if gap == 0 || !seq.is_multiple_of(gap) {
                 state.insert_packet(seq, payload());
             }
-            black_box(state.get_next_frame());
+            black_box(state.decode_next_into(&mut frame));
             seq += 1;
         }
     }

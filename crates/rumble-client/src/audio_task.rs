@@ -353,13 +353,18 @@ impl<D: VoiceDecoderTrait> UserAudioState<D> {
         self.buffered_since_stream_start >= self.jitter_buffer_delay
     }
 
-    /// Get the next frame to play, decoding from jitter buffer.
-    /// Returns decoded PCM samples, using FEC recovery or PLC if packet is missing.
+    /// Decode the next frame to play into `out`, returning the number of valid
+    /// samples written (or `None` when nothing should play this tick).
+    ///
+    /// Writes directly into a caller-owned buffer so the per-peer/per-tick mix
+    /// can reuse one scratch frame instead of heap-allocating a fresh `Vec` on
+    /// every decode. Only `out[..returned_len]` is meaningful; bytes beyond the
+    /// returned length are left untouched (may hold stale data from a prior peer).
     ///
     /// FEC (Forward Error Correction) recovery works by using data embedded in the
     /// *next* packet to reconstruct a lost packet. This provides better quality than
     /// pure PLC (Packet Loss Concealment) which just interpolates/generates comfort noise.
-    pub fn get_next_frame(&mut self) -> Option<Vec<f32>> {
+    pub fn decode_next_into(&mut self, out: &mut [f32; OPUS_FRAME_SIZE]) -> Option<usize> {
         if !self.ready_to_play() {
             return None;
         }
@@ -406,31 +411,22 @@ impl<D: VoiceDecoderTrait> UserAudioState<D> {
 
         if let Some(opus_data) = self.jitter_buffer.remove(&seq) {
             // Packet present - decode it
-            let mut pcm = vec![0.0f32; OPUS_FRAME_SIZE];
-            match self.decoder.decode(&opus_data, &mut pcm) {
+            match self.decoder.decode(&opus_data, out) {
                 Ok(samples) => {
-                    pcm.truncate(samples);
                     // Log first frame for diagnostics
-                    if is_first_frame && pcm.len() >= 8 {
+                    if is_first_frame && samples >= 8 {
                         debug!(
                             "First decoded frame: samples=[{:.4}, {:.4}, {:.4}, {:.4}, ...]",
-                            pcm[0], pcm[1], pcm[2], pcm[3]
+                            out[0], out[1], out[2], out[3]
                         );
                     }
-                    Some(pcm)
+                    Some(samples)
                 }
                 Err(e) => {
                     warn!("Decode error for seq {}: {}", seq, e);
                     // Try PLC on decode error
                     self.frames_concealed += 1;
-                    let mut plc_buf = vec![0.0f32; OPUS_FRAME_SIZE];
-                    match self.decoder.decode_plc(&mut plc_buf) {
-                        Ok(samples) => {
-                            plc_buf.truncate(samples);
-                            Some(plc_buf)
-                        }
-                        Err(_) => None,
-                    }
+                    self.decoder.decode_plc(out).ok()
                 }
             }
         } else {
@@ -448,38 +444,22 @@ impl<D: VoiceDecoderTrait> UserAudioState<D> {
             if let Some(next_opus_data) = self.jitter_buffer.get(&next_seq) {
                 // We have the next packet - use its FEC data to recover this frame
                 warn!("Missing packet seq {}, recovering with FEC from seq {}", seq, next_seq);
-                let mut fec_buf = vec![0.0f32; OPUS_FRAME_SIZE];
-                match self.decoder.decode_fec(next_opus_data, &mut fec_buf) {
+                match self.decoder.decode_fec(next_opus_data, out) {
                     Ok(samples) => {
-                        fec_buf.truncate(samples);
                         self.packets_recovered_fec += 1;
-                        Some(fec_buf)
+                        Some(samples)
                     }
                     Err(e) => {
                         warn!("FEC recovery failed for seq {}: {}, falling back to PLC", seq, e);
                         self.frames_concealed += 1;
-                        let mut plc_buf = vec![0.0f32; OPUS_FRAME_SIZE];
-                        match self.decoder.decode_plc(&mut plc_buf) {
-                            Ok(samples) => {
-                                plc_buf.truncate(samples);
-                                Some(plc_buf)
-                            }
-                            Err(_) => None,
-                        }
+                        self.decoder.decode_plc(out).ok()
                     }
                 }
             } else {
                 // No next packet available - fall back to pure PLC
                 warn!("Missing packet seq {}, no FEC available, using PLC", seq);
                 self.frames_concealed += 1;
-                let mut plc_buf = vec![0.0f32; OPUS_FRAME_SIZE];
-                match self.decoder.decode_plc(&mut plc_buf) {
-                    Ok(samples) => {
-                        plc_buf.truncate(samples);
-                        Some(plc_buf)
-                    }
-                    Err(_) => None,
-                }
+                self.decoder.decode_plc(out).ok()
             }
         }
     }
@@ -1714,6 +1694,10 @@ pub fn mix_peer_frames<D: VoiceDecoderTrait>(
     audio_dumper: &AudioDumper,
 ) -> Option<[f32; OPUS_FRAME_SIZE]> {
     let mut mixed_buffer = [0.0f32; OPUS_FRAME_SIZE];
+    // One scratch frame reused across every peer this tick — each peer decodes
+    // into it, runs its RX pipeline, then mixes in. Avoids a fresh heap alloc
+    // per peer per 20 ms tick.
+    let mut frame = [0.0f32; OPUS_FRAME_SIZE];
     let mut has_audio = false;
 
     for user_state in user_audio.values_mut() {
@@ -1722,14 +1706,15 @@ pub fn mix_peer_frames<D: VoiceDecoderTrait>(
             continue;
         }
 
-        // Get next frame (decoded or PLC)
-        if let Some(mut pcm) = user_state.get_next_frame() {
+        // Get next frame (decoded or PLC) into the shared scratch
+        if let Some(len) = user_state.decode_next_into(&mut frame) {
+            let pcm = &mut frame[..len];
             // Dump decoded audio (before RX pipeline processing)
-            audio_dumper.write_rx_decoded(&pcm);
+            audio_dumper.write_rx_decoded(pcm);
 
             // Run through user's RX pipeline if present
             if let Some(ref mut pipeline) = user_state.rx_pipeline {
-                let result = pipeline.process(&mut pcm, 48000);
+                let result = pipeline.process(pcm, 48000);
                 // For RX, suppress means don't play this frame (noise gate, etc.)
                 if result.suppress {
                     continue;
@@ -1737,7 +1722,7 @@ pub fn mix_peer_frames<D: VoiceDecoderTrait>(
             }
 
             // Apply per-user volume adjustment
-            user_state.apply_volume(&mut pcm);
+            user_state.apply_volume(pcm);
 
             has_audio = true;
             // Mix by summing with clamping to [-1.0, 1.0]
@@ -1940,7 +1925,12 @@ mod tests {
     /// Pull `n` frames, returning each frame's identifying tag (its first
     /// sample), or `None` where the buffer produced no frame.
     fn drain_tags(state: &mut UserAudioState<MarkerDecoder>, n: usize) -> Vec<Option<f32>> {
-        (0..n).map(|_| state.get_next_frame().map(|f| f[0])).collect()
+        (0..n)
+            .map(|_| {
+                let mut buf = [0.0f32; OPUS_FRAME_SIZE];
+                state.decode_next_into(&mut buf).map(|_| buf[0])
+            })
+            .collect()
     }
 
     #[test]
@@ -1965,8 +1955,9 @@ mod tests {
         state.insert_packet(0, packet(0));
         state.insert_packet(1, packet(1));
         assert!(!state.ready_to_play(), "should still be buffering at 2/3 packets");
+        let mut buf = [0.0f32; OPUS_FRAME_SIZE];
         assert_eq!(
-            state.get_next_frame(),
+            state.decode_next_into(&mut buf),
             None,
             "no frame should play before the delay is met"
         );

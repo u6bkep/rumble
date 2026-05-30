@@ -165,8 +165,15 @@ impl AudioProcessor for DenoiseProcessor {
         let shaper_settings = self.shaper_settings();
 
         while self.input_buffer.len() >= DENOISE_FRAME_SIZE {
-            let chunk: Vec<f32> = self.input_buffer.drain(..DENOISE_FRAME_SIZE).collect();
-            let scaled: Vec<f32> = chunk.iter().map(|&s| s * 32767.0).collect();
+            // Scale the leading 10 ms chunk into a stack scratch (RNNoise wants
+            // i16-range floats), run inference, then drop the consumed input.
+            // Stack arrays here avoid two heap allocs per chunk (2 chunks per
+            // 20 ms frame) on the always-on capture path.
+            let mut scaled = [0.0f32; DENOISE_FRAME_SIZE];
+            for (dst, &src) in scaled.iter_mut().zip(&self.input_buffer[..DENOISE_FRAME_SIZE]) {
+                *dst = src * 32767.0;
+            }
+            self.input_buffer.drain(..DENOISE_FRAME_SIZE);
 
             let mut out_buf = [0.0f32; DENOISE_FRAME_SIZE];
             let vad_prob = self.denoise_state.process_frame(&mut out_buf, &scaled);
@@ -193,8 +200,8 @@ impl AudioProcessor for DenoiseProcessor {
         // wanted pass-through, we then overwrite with the original input.
         let copy_len = samples.len().min(self.output_buffer.len());
         if copy_len > 0 {
-            let output: Vec<f32> = self.output_buffer.drain(..copy_len).collect();
-            samples[..copy_len].copy_from_slice(&output);
+            samples[..copy_len].copy_from_slice(&self.output_buffer[..copy_len]);
+            self.output_buffer.drain(..copy_len);
         }
         if copy_len < samples.len() {
             samples[copy_len..].fill(0.0);
