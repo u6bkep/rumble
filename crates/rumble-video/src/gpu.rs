@@ -1,8 +1,8 @@
 //! GPU-side mirror of a [`crate::VideoStream`]: a single
 //! `wgpu::Texture` per stream, written in-place each time the
 //! decode worker hands us a fresh frame. The texture is wrapped in
-//! aetna's [`AppTexture`] so it can be handed to `surface()` for
-//! compositing — analogous to `rumble-aetna::animated_gpu`'s
+//! damascene's [`AppTexture`] so it can be handed to `surface()` for
+//! compositing — analogous to `rumble-damascene::animated_gpu`'s
 //! pattern for animated images.
 //!
 //! Lifecycle: allocate once on first use (sized to the stream's
@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 
-use aetna_core::surface::AppTexture;
+use damascene_core::surface::AppTexture;
 
 use crate::VideoStream;
 
@@ -23,9 +23,9 @@ use crate::VideoStream;
 #[derive(Debug)]
 pub struct VideoGpu {
     /// App-owned wgpu texture. `queue.write_texture` writes into
-    /// it; aetna composites by sampling.
+    /// it; damascene composites by sampling.
     texture: Arc<wgpu::Texture>,
-    /// Aetna wrapper around `texture`. Cheap to clone (`Arc`-
+    /// Damascene wrapper around `texture`. Cheap to clone (`Arc`-
     /// backed); the underlying id is stable across frames.
     app_texture: AppTexture,
     /// Last frame seq we uploaded. Compared against
@@ -60,7 +60,7 @@ impl VideoGpu {
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         }));
-        let app_texture = aetna_wgpu::app_texture(texture.clone());
+        let app_texture = damascene_wgpu::app_texture(texture.clone());
         Self {
             texture,
             app_texture,

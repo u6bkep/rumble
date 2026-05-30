@@ -10,7 +10,7 @@ members = [
 # without being pulled into the default `cargo build` / `cargo test`.
 default-members = [
     "crates/mumble-bridge",
-    "crates/rumble-aetna",
+    "crates/rumble-damascene",
     "crates/rumble-audio",
     "crates/rumble-client",
     "crates/rumble-client-traits",
@@ -25,7 +25,7 @@ exclude = [
     "docker/p2p-test",
     "docker/backend-p2p-test",
     # Vendored UI library — has its own workspace.
-    "vendor/aetna",
+    "vendor/damascene",
 ]
 
 [workspace.dependencies]
@@ -34,13 +34,14 @@ exclude = [
 ed25519-dalek = { version = "3.0.0-pre.4", features = ["rand_core"] }
 rand = "0.10.0-rc.3"
 
-# Aetna UI library — pinned by git rev to upstream computer-whisperer/aetna.
-# Override locally with `[patch."https://github.com/computer-whisperer/aetna"]`
-# (or `scripts/aetna-local.sh`) if iterating on aetna alongside rumble.
-aetna-core = { git = "https://github.com/computer-whisperer/aetna", rev = "cc23e0ec91e11d52aed36704b8ea7dbd8d5a39f4" }
-aetna-markdown = { git = "https://github.com/computer-whisperer/aetna", rev = "cc23e0ec91e11d52aed36704b8ea7dbd8d5a39f4" }
-aetna-wgpu = { git = "https://github.com/computer-whisperer/aetna", rev = "cc23e0ec91e11d52aed36704b8ea7dbd8d5a39f4" }
-aetna-winit-wgpu = { git = "https://github.com/computer-whisperer/aetna", rev = "cc23e0ec91e11d52aed36704b8ea7dbd8d5a39f4" }
+# Damascene UI library (formerly aetna) — pinned by git rev to upstream
+# computer-whisperer/damascene. Override locally with
+# `[patch."https://github.com/computer-whisperer/damascene"]` (or
+# `scripts/damascene-local.sh`) if iterating on damascene alongside rumble.
+damascene-core = { git = "https://github.com/computer-whisperer/damascene", rev = "e4ec29d9f74498e1142c29390b40ac94d0937c5a" }
+damascene-markdown = { git = "https://github.com/computer-whisperer/damascene", rev = "e4ec29d9f74498e1142c29390b40ac94d0937c5a" }
+damascene-wgpu = { git = "https://github.com/computer-whisperer/damascene", rev = "e4ec29d9f74498e1142c29390b40ac94d0937c5a" }
+damascene-winit-wgpu = { git = "https://github.com/computer-whisperer/damascene", rev = "e4ec29d9f74498e1142c29390b40ac94d0937c5a" }
 
 # Shared third-party deps. Per-crate feature picks live at each consumer
 # so the workspace stays neutral about what each crate actually uses;
@@ -84,11 +85,11 @@ uuid = { version = "1.19", features = ["v4"] }
 webpki-roots = "1"
 wgpu = "29"
 
-# Optimize MSDF-generation crates in dev builds. aetna's
+# Optimize MSDF-generation crates in dev builds. damascene's
 # `Runner::warm_default_glyphs` pre-rasterizes printable ASCII for
 # Inter + JetBrains Mono at startup using `fdsm` (pure-Rust MSDF
 # generator) over `nalgebra` / `image` numerics. Unoptimized, those
-# ~190 glyphs take ~20s and dominate aetna-app launch time; with -O3
+# ~190 glyphs take ~20s and dominate damascene-app launch time; with -O3
 # on just these leaves it drops to ~0.9s. Application crates stay
 # unoptimized, so debug/edit-compile cycles are unaffected.
 [profile.dev.package.fdsm]

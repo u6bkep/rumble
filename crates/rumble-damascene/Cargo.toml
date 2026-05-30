@@ -1,0 +1,76 @@
+[package]
+name = "rumble-damascene"
+version = "0.1.1"
+edition = "2024"
+description = "Rumble client built on the damascene UI library"
+default-run = "rumble-damascene"
+
+# Disable the default libtest bench harness on the lib/bins so
+# `cargo bench -p rumble-damascene` dispatches only to the criterion bench
+# (libtest rejects criterion flags like --save-baseline).
+[lib]
+name = "rumble_damascene"
+path = "src/lib.rs"
+bench = false
+
+[[bin]]
+name = "rumble-damascene"
+path = "src/main.rs"
+bench = false
+
+[[bin]]
+name = "dump_bundles"
+path = "src/bin/dump_bundles.rs"
+bench = false
+
+[dependencies]
+# Damascene UI. Pin lives in the workspace [workspace.dependencies] block.
+damascene-core = { workspace = true }
+damascene-markdown = { workspace = true }
+damascene-winit-wgpu = { workspace = true }
+damascene-wgpu = { workspace = true }
+wgpu = { workspace = true }
+
+# Rumble client backend.
+rumble-client = { path = "../rumble-client" }
+rumble-client-traits = { path = "../rumble-client-traits" }
+rumble-desktop = { path = "../rumble-desktop" }
+rumble-desktop-shell = { path = "../rumble-desktop-shell" }
+rumble-protocol = { path = "../rumble-protocol" }
+rumble-video = { path = "../rumble-video" }
+prost = { workspace = true }
+
+ed25519-dalek = { workspace = true }
+rand = { workspace = true }
+
+serde_json = { workspace = true }
+uuid = { workspace = true }
+directories = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+anyhow = { workspace = true }
+rfd = "0.17"
+image = { version = "0.25", default-features = false, features = ["bmp", "gif", "ico", "jpeg", "png", "tiff", "webp"] }
+arboard = "3"
+tempfile = "3"
+base64 = { workspace = true }
+linkify = "0.11"
+
+# Platform-conditional feature opt-ins. Linux-only PulseAudio output
+# (rumble-desktop::pulse) + XDG GlobalShortcuts portal
+# (rumble-desktop-shell::wayland-portal) are gated to Linux builds.
+# Splitting these out of the crates' `default` features keeps non-Linux
+# builds from depending on cargo silently dropping feature references
+# to target-gated optional deps.
+[target.'cfg(target_os = "linux")'.dependencies]
+rumble-desktop = { path = "../rumble-desktop", features = ["pulse"] }
+rumble-desktop-shell = { path = "../rumble-desktop-shell", features = ["wayland-portal"] }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "projection"
+harness = false
+

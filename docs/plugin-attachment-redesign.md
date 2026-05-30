@@ -173,12 +173,12 @@ Future: when we have multiple file-transfer plugins, the backend grows a `HashMa
 
 ---
 
-## UI rendering (rumble-aetna)
+## UI rendering (rumble-damascene)
 
 ### Renderer registry
 
 ```rust
-// In rumble-aetna, somewhere central (app.rs or a new chat_attachments.rs).
+// In rumble-damascene, somewhere central (app.rs or a new chat_attachments.rs).
 struct AttachmentRenderer {
     render: fn(&ChatAttachment, &RenderContext) -> El,
 }
@@ -194,11 +194,11 @@ The `RenderContext` bundles whatever the renderer needs that isn't on the attach
 
 ### Plugin-specific rendering
 
-Aetna renderers are plugin-specific by design (per Ben's call). A `rumble.file_transfer.relay` renderer reads relay-specific payload fields (`share_data` interpretation, peer detail format, progress shape). A future `rumble.file_transfer.bittorrent` renderer would have its own renderer file with bittorrent-specific UI (peer list, seed/leech counts, ratio).
+Damascene renderers are plugin-specific by design (per Ben's call). A `rumble.file_transfer.relay` renderer reads relay-specific payload fields (`share_data` interpretation, peer detail format, progress shape). A future `rumble.file_transfer.bittorrent` renderer would have its own renderer file with bittorrent-specific UI (peer list, seed/leech counts, ratio).
 
 ### Shared helpers
 
-Content-rendering helpers stay generic and live in `rumble-aetna` outside any specific renderer:
+Content-rendering helpers stay generic and live in `rumble-damascene` outside any specific renderer:
 
 - `image_preview(bytes, fit, hover_state)` — image card body
 - `video_poster(thumb_bytes, duration)` — video card body
@@ -235,7 +235,7 @@ Currently `app.rs:935` inserts a separate italic "Sharing /path" line synchronou
 - `ChatMessage.local_only` and `ChatMessage.remote_only` boolean fields.
 - `FileTransferPlugin::namespace()` trait method.
 - Relay plugin payload encoder/decoder in `rumble-desktop` (private to that crate).
-- Aetna `RENDERERS` registry + `relay_render` function.
+- Damascene `RENDERERS` registry + `relay_render` function.
 - Server skip-sender filter in `broadcast_chat_message`.
 
 ---
@@ -246,7 +246,7 @@ Currently `app.rs:935` inserts a separate italic "Sharing /path" line synchronou
 
 ## Resolved decisions (recorded for future reference)
 
-- **Relay payload schema is public**, defined in `rumble-desktop` and re-exported, so the aetna renderer can `prost::decode` directly without a runtime call into the plugin.
+- **Relay payload schema is public**, defined in `rumble-desktop` and re-exported, so the damascene renderer can `prost::decode` directly without a runtime call into the plugin.
 - **No server-side ACL on attachments.** The server forwards `ChatAttachment` unchanged; admission control lives in the plugin's upload stream handshake (size, quota, room mismatch), not in chat-message broadcast.
 - **Keep `remote_only`.** It's required for history-sync correctness — without it, late-joining peers who ask the sender for history wouldn't see the share.
 
@@ -264,8 +264,8 @@ Order matters — proto first so types compile, then traits, then internals, the
 6. **Server.** Skip sender in `broadcast_chat_message`. Drop any references to the typed `FileOffer` (server doesn't inspect it, but the type goes away from the import list).
 7. **Receive handler.** Dedup by message id before inserting. Drop the old `chat_attachment_from_proto` typed conversion.
 8. **History sync.** Filter `local_only` out of share-outgoing; strip the `remote_only` flag (but keep the message) so peers receive a clean copy.
-9. **Aetna renderer registry.** New module. Move file-offer-specific code from `chat.rs` into `attachments/relay.rs` (or similar). Keep generic helpers (image_preview, format_size, progress_indeterminate) at chat.rs / module top.
-10. **Aetna chat.rs.** Drop `is_local` short-circuit; the new code path dispatches by namespace for messages with attachments and renders plain text + system styling for `is_local` without attachment.
+9. **Damascene renderer registry.** New module. Move file-offer-specific code from `chat.rs` into `attachments/relay.rs` (or similar). Keep generic helpers (image_preview, format_size, progress_indeterminate) at chat.rs / module top.
+10. **Damascene chat.rs.** Drop `is_local` short-circuit; the new code path dispatches by namespace for messages with attachments and renders plain text + system styling for `is_local` without attachment.
 11. **app.rs:935.** Drop the "Sharing /path" preamble.
 12. **Bridge audit.** Run a Mumble↔Rumble round-trip end-to-end after server skip-sender lands.
 13. **dump_bundles scenes.** Add `file_share_pending`, `file_share_failed`, `file_share_complete` scenes so the new states have lint/SVG coverage.

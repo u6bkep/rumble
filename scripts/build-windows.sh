@@ -3,8 +3,8 @@
 # and package the binaries + DLLs into a zip under `dist/`.
 #
 # Usage:
-#   scripts/build-windows.sh                  # builds rumble-aetna + server + mumble-bridge
-#   scripts/build-windows.sh rumble-aetna     # builds only the listed crate(s)
+#   scripts/build-windows.sh                  # builds rumble-damascene + server + mumble-bridge
+#   scripts/build-windows.sh rumble-damascene     # builds only the listed crate(s)
 #
 # Requires:
 #   - x86_64-w64-mingw32-gcc / -objdump (mingw-w64 toolchain)
@@ -23,7 +23,7 @@ TARGET="x86_64-pc-windows-gnu"
 PROFILE="release"
 MINGW_SYSROOT="/usr/x86_64-w64-mingw32/bin"
 
-DEFAULT_CRATES=(rumble-aetna server mumble-bridge)
+DEFAULT_CRATES=(rumble-damascene server mumble-bridge)
 if [[ $# -gt 0 ]]; then
     CRATES=("$@")
 else
@@ -31,12 +31,12 @@ else
 fi
 
 # Translate crate names to the .exe filenames cargo produces. Crates
-# with a `[[bin]] name = "..."` override (e.g. `rumble-aetna` -> the
-# bin section names it `rumble-aetna`) all happen to match the crate
+# with a `[[bin]] name = "..."` override (e.g. `rumble-damascene` -> the
+# bin section names it `rumble-damascene`) all happen to match the crate
 # name in this workspace, so 1:1 mapping is fine.
 crate_exe() {
     case "$1" in
-        rumble-aetna)   echo "rumble-aetna.exe" ;;
+        rumble-damascene)   echo "rumble-damascene.exe" ;;
         server)         echo "server.exe" ;;
         mumble-bridge)  echo "mumble-bridge.exe" ;;
         *)              echo "$1.exe" ;;
@@ -96,7 +96,7 @@ for c in "${CRATES[@]}"; do
 done
 
 # 2. libmpv-2.dll — rumble-video's build.rs drops it next to the
-#    binary, so it lives alongside the .exes when rumble-aetna is in
+#    binary, so it lives alongside the .exes when rumble-damascene is in
 #    the build set. Skip silently for builds that don't pull it in.
 if [[ -f "$BIN_DIR/libmpv-2.dll" ]]; then
     cp "$BIN_DIR/libmpv-2.dll" "$STAGE/"

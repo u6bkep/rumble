@@ -10,9 +10,9 @@ client_configs/
 reference/
 .claude/worktrees/
 
-# Generated artifacts from `cargo run -p rumble-aetna --bin dump_bundles`
-crates/rumble-aetna/out/
+# Generated artifacts from `cargo run -p rumble-damascene --bin dump_bundles`
+crates/rumble-damascene/out/
 
-# Local-only patch override for iterating against vendor/aetna; invoked via
-# `cargo aetna-local …` (see .cargo/config.toml).
-.cargo/local-aetna.toml
+# Local-only patch override for iterating against vendor/damascene; invoked via
+# `scripts/damascene-local.sh` (see .cargo/config.toml).
+.cargo/local-damascene.toml

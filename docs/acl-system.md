@@ -2,7 +2,7 @@
 
 Rumble's access-control system is a hybrid of **server-wide permission groups** and **per-room ACL overrides**, modeled loosely on Mumble. Permissions are a `u32` bitflag set; a user's effective permissions in a given room are computed by unioning their groups' base permissions and then walking the room tree from root to target applying per-room grant/deny deltas. The flag definitions and the pure evaluation function live in `crates/rumble-protocol/src/permissions.rs`; the server-side glue that loads groups/ACLs from sled and feeds them to the evaluator lives in `crates/server/src/acl.rs`. All persistent ACL state (groups, user→group assignments, room ACLs, sudo password) is stored in sled trees in `crates/server/src/persistence.rs`. Identity and membership tie-in is in `crates/server/src/state.rs`.
 
-A companion UI plan is `docs/acl-ui-plan.md` (admin UI surfacing these features in `rumble-aetna`).
+A companion UI plan is `docs/acl-ui-plan.md` (admin UI surfacing these features in `rumble-damascene`).
 
 ## Permission flags
 

@@ -8,11 +8,11 @@ libc = "0.2"
 tracing = { workspace = true }
 thiserror = { workspace = true }
 
-# GPU mirror: shape `VideoStream` frames into an aetna `AppTexture`
-# the same way `rumble-aetna::AnimatedGpu` does for animated images.
-# Aetna pin lives in the workspace [workspace.dependencies] block.
-aetna-core = { workspace = true }
-aetna-wgpu = { workspace = true }
+# GPU mirror: shape `VideoStream` frames into a damascene `AppTexture`
+# the same way `rumble-damascene::AnimatedGpu` does for animated images.
+# Damascene pin lives in the workspace [workspace.dependencies] block.
+damascene-core = { workspace = true }
+damascene-wgpu = { workspace = true }
 wgpu = { workspace = true }
 
 # build.rs picks pkg-config (Linux/macOS targets) or fetch-and-extract
@@ -30,4 +30,4 @@ sha2 = { workspace = true }
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["png"] }
 tracing-subscriber = { workspace = true }
-aetna-winit-wgpu = { workspace = true }
+damascene-winit-wgpu = { workspace = true }

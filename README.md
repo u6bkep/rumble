@@ -20,7 +20,7 @@ identities, and a permission/ACL system modeled loosely on Mumble.
 - **Access control** — server-wide permission groups plus per-room grant/deny ACLs, kick
   and ban, server-mute, and session-only superuser elevation. See
   [`docs/acl-system.md`](docs/acl-system.md).
-- **Native desktop GUI** — `rumble-aetna`, built on the [aetna](https://github.com/computer-whisperer/aetna)
+- **Native desktop GUI** — `rumble-damascene`, built on the [damascene](https://github.com/computer-whisperer/damascene)
   UI library, with global push-to-talk hotkeys (incl. the XDG GlobalShortcuts portal on
   Wayland).
 - **Mumble bridge** — `mumble-bridge` proxies a real Mumble server's clients into a Rumble
@@ -44,10 +44,10 @@ cargo build
 cargo run --bin server
 
 # Run the desktop GUI client
-cargo run -p rumble-aetna
+cargo run -p rumble-damascene
 
 # ...with debug logging
-RUST_LOG=debug cargo run -p rumble-aetna
+RUST_LOG=debug cargo run -p rumble-damascene
 ```
 
 The server reads configuration from `rumble-server.toml` (auto-created with commented
@@ -72,7 +72,7 @@ See [`docs/acl-system.md`](docs/acl-system.md) for the permission model behind t
 ## Architecture
 
 ```
-rumble-aetna (GUI)  →  rumble-client (engine)  →  rumble-protocol (QUIC + protobuf)  →  server
+rumble-damascene (GUI)  →  rumble-client (engine)  →  rumble-protocol (QUIC + protobuf)  →  server
                                                                                           ▲
                                                                           mumble-bridge ──┘ (controller)
 ```
@@ -88,7 +88,7 @@ references:
 - [`docs/quic-protocol.md`](docs/quic-protocol.md) — wire protocol, framing, auth, state sync, voice
 - [`docs/acl-system.md`](docs/acl-system.md) — permissions, groups, per-room ACLs, evaluation
 - [`docs/audio-subsystem.md`](docs/audio-subsystem.md) — Opus codec, jitter buffers, processor pipeline
-- [`docs/testing-strategy.md`](docs/testing-strategy.md) — integration tests + the aetna UI lint pipeline
+- [`docs/testing-strategy.md`](docs/testing-strategy.md) — integration tests + the damascene UI lint pipeline
 - [`docs/v2-architecture.md`](docs/v2-architecture.md) — *historical* platform-abstraction design
 
 ## Repository layout
@@ -101,7 +101,7 @@ references:
 | `rumble-desktop` | Native desktop `Platform` impl: quinn, cpal, opus, ed25519 |
 | `rumble-desktop-shell` | Settings store, encrypted identity files, ssh-agent, global hotkeys |
 | `rumble-audio` | Pluggable audio-processor framework (denoise, VAD, gain) |
-| `rumble-aetna` | The desktop GUI client |
+| `rumble-damascene` | The desktop GUI client |
 | `rumble-video` | Thin libmpv wrapper for the video lightbox |
 | `server` | Server binary: rooms, members, ACL, voice/chat relay, sled persistence |
 | `mumble-bridge` | Bidirectional Mumble ↔ Rumble proxy |
@@ -118,7 +118,7 @@ UI changes are validated headlessly with the `dump_bundles` tool, which renders 
 scenes through the real app event path and emits SVG/lint artifacts:
 
 ```bash
-cargo run -p rumble-aetna --bin dump_bundles
+cargo run -p rumble-damascene --bin dump_bundles
 ```
 
 See [`docs/testing-strategy.md`](docs/testing-strategy.md) for details.

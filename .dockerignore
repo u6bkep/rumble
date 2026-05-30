@@ -13,7 +13,7 @@ reference/
 .git/
 .github/
 .claude/
-crates/rumble-aetna/out/
+crates/rumble-damascene/out/
 
 # Editor/OS junk
 *.swp

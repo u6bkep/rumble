@@ -267,7 +267,7 @@ Lighter than "refactor the relay" — most targets are callable as-is:
 
 ## Subsystem 3 — GUI render (30 FPS full-tree rebuild)
 
-**Hot path:** `crates/rumble-aetna/src/app.rs`. `main.rs:75` pins a **33ms
+**Hot path:** `crates/rumble-damascene/src/app.rs`. `main.rs:75` pins a **33ms
 redraw interval**, so `build()` (app.rs:400-651) runs ~30×/sec **even when idle**.
 Each call clones the full `State` (app.rs:402), clones the transfer list
 (app.rs:405-407), and rebuilds the entire `El` tree from scratch — O(messages) +
@@ -275,14 +275,14 @@ O(rooms+users) + overlays — with no diffing, plus per-message `format!` and
 markdown parsing.
 
 Note: the continuous redraw is a *known workaround* — main.rs comments that
-aetna "doesn't expose an event-loop wakeup hook today," so the 33ms poll stands
+damascene "doesn't expose an event-loop wakeup hook today," so the 33ms poll stands
 in for event-driven repaint. Any "redraw only on change" optimization is
-therefore partly an upstream-aetna conversation (see the aetna-relationship
+therefore partly an upstream-damascene conversation (see the damascene-relationship
 note), not purely a rumble change.
 
 ### Benchmarks (criterion, headless)
 
-The existing `dump_bundles` path (`crates/rumble-aetna/src/bin/dump_bundles.rs`)
+The existing `dump_bundles` path (`crates/rumble-damascene/src/bin/dump_bundles.rs`)
 already drives the **real** `App::build` against a `MockBackend` with canned
 `State`, headlessly, no GPU/window. A bench reuses that exact harness:
 

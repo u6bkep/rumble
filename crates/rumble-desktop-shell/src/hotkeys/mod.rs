@@ -421,7 +421,7 @@ impl HotkeyManager {
         if !self.is_wayland {
             return;
         }
-        // Test/headless escape hatch — `crates/rumble-aetna/src/bin/dump_bundles.rs`
+        // Test/headless escape hatch — `crates/rumble-damascene/src/bin/dump_bundles.rs`
         // builds many RumbleApp instances back-to-back, and each portal
         // session leaves a D-Bus listener task behind that backs up
         // xdg-desktop-portal until the dump hangs mid-run. Setting this

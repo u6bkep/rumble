@@ -70,7 +70,7 @@ use uuid::Uuid;
 /// Severity level for a [`BackendEvent::Toast`] notification.
 ///
 /// Neutral type defined here so `rumble-client` doesn't depend on the
-/// aetna UI library. Callers (aetna, tests) map this to their own
+/// damascene UI library. Callers (damascene, tests) map this to their own
 /// `ToastLevel` / colour token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NotificationLevel {
@@ -82,7 +82,7 @@ pub enum NotificationLevel {
 /// One-way events that background tasks push to the UI.
 ///
 /// Produced by internal client code via [`BackendHandle::push_event`];
-/// consumed by the UI layer (aetna) by draining
+/// consumed by the UI layer (damascene) by draining
 /// [`BackendHandle::take_event_receiver`] once at startup and polling
 /// it each frame.
 #[derive(Debug, Clone)]

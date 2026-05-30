@@ -363,7 +363,7 @@ impl PortalHotkeyBackend {
 /// configuration — the portal spec doesn't give us a programmatic way to
 /// re-show the dialog there, so we hand control over to the DE.
 ///
-/// Spawned children are detached: closing aetna doesn't take them down.
+/// Spawned children are detached: closing damascene doesn't take them down.
 /// `XDG_CURRENT_DESKTOP` is colon-separated on some setups; lowercase
 /// substring match is sufficient.
 fn spawn_system_shortcut_settings() {

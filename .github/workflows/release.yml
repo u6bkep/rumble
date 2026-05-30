@@ -68,19 +68,19 @@ jobs:
           cargo build --release \
             -p server \
             -p mumble-bridge \
-            -p rumble-aetna
+            -p rumble-damascene
 
       - name: Build Windows client (cross-compile)
         run: |
           cargo build --release \
             --target "$WIN_TARGET" \
-            -p rumble-aetna
+            -p rumble-damascene
 
       - name: Strip Linux binaries
         run: |
           strip target/release/server
           strip target/release/mumble-bridge
-          strip target/release/rumble-aetna
+          strip target/release/rumble-damascene
 
       - name: Package release archives
         id: package
@@ -104,7 +104,7 @@ jobs:
 
           pack_linux server
           pack_linux mumble-bridge
-          pack_linux rumble-aetna
+          pack_linux rumble-damascene
 
           # Windows client: bin + the libmpv-2.dll that build.rs fetched and copied
           # next to the artifact (see crates/rumble-video/build.rs).
@@ -113,10 +113,10 @@ jobs:
             echo "expected $WIN_DIR/libmpv-2.dll to exist (rumble-video build.rs)" >&2
             exit 1
           fi
-          win_archive="$OUT/rumble-aetna-${VERSION}-windows-x86_64.zip"
-          win_stage="$(mktemp -d)/rumble-aetna-${VERSION}-windows-x86_64"
+          win_archive="$OUT/rumble-damascene-${VERSION}-windows-x86_64.zip"
+          win_stage="$(mktemp -d)/rumble-damascene-${VERSION}-windows-x86_64"
           mkdir -p "$win_stage"
-          cp "$WIN_DIR/rumble-aetna.exe" "$win_stage/"
+          cp "$WIN_DIR/rumble-damascene.exe" "$win_stage/"
           cp "$WIN_DIR/libmpv-2.dll"     "$win_stage/"
           cp README.md LICENSE* "$win_stage/" 2>/dev/null || true
           (cd "$(dirname "$win_stage")" && zip -r "$win_archive" "$(basename "$win_stage")")

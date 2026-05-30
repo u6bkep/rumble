@@ -11,18 +11,18 @@ Rumble is a voice chat application (similar to Discord/Mumble) written in Rust. 
 ```bash
 cargo build                    # Build all crates
 cargo run --bin server         # Run the server
-cargo run -p rumble-aetna      # Run the GUI client
+cargo run -p rumble-damascene      # Run the GUI client
 cargo test                     # Run all tests
 cargo +nightly fmt             # Format code
-RUST_LOG=debug cargo run -p rumble-aetna  # Run with debug logging
+RUST_LOG=debug cargo run -p rumble-damascene  # Run with debug logging
 ```
 
 ## Crate Architecture
 
 ```
             ┌─────────────────────────┐
-            │   rumble-aetna (GUI)    │
-            │  aetna-core / winit-wgpu│
+            │   rumble-damascene (GUI)    │
+            │  damascene-core / winit-wgpu│
             └───────────┬─────────────┘
                         │
                         ▼
@@ -71,8 +71,8 @@ RUST_LOG=debug cargo run -p rumble-aetna  # Run with debug logging
 - **rumble-desktop**: Native desktop Platform implementation (quinn, cpal, opus, ed25519)
 - **rumble-desktop-shell**: Shared shell-level concerns for the desktop client — persistent settings store, identity-file management (encrypted-at-rest via Argon2 + ChaCha20Poly1305), ssh-agent identity, cross-platform global hotkeys, XDG GlobalShortcuts portal.
 - **rumble-audio**: Pluggable audio processor framework (denoise, VAD, gain control)
-- **rumble-aetna**: GUI client. Built on aetna-core + aetna-winit-wgpu (vendored at `vendor/aetna/`, uses winit + wgpu directly). `App` impl projects `(state, ui_state) → El` tree per frame; `UiBackend` adapter wraps `BackendHandle`. Native SVG/icon support and color emoji.
-- **rumble-video**: Thin safe wrapper over libmpv (player + software-render APIs) used by aetna's video lightbox.
+- **rumble-damascene**: GUI client. Built on damascene-core + damascene-winit-wgpu (vendored at `vendor/damascene/`, uses winit + wgpu directly). `App` impl projects `(state, ui_state) → El` tree per frame; `UiBackend` adapter wraps `BackendHandle`. Native SVG/icon support and color emoji.
+- **rumble-video**: Thin safe wrapper over libmpv (player + software-render APIs) used by damascene's video lightbox.
 - **server**: Server binary — room management, user auth, message relay, persistence (sled), ACL system
 - **mumble-bridge**: Bidirectional bridge between Mumble and Rumble servers, proxying voice and chat
 
@@ -84,7 +84,7 @@ Authoritative subsystem docs live in `docs/`. Start with the overview, then dril
 - **`docs/quic-protocol.md`** — the wire protocol: QUIC transport, protobuf `Envelope` framing, the Ed25519 auth handshake, state sync, and voice datagrams.
 - **`docs/acl-system.md`** — permission bitflags, groups (incl. the implicit username-as-group), per-room ACLs, and the root→target evaluation algorithm.
 - **`docs/audio-subsystem.md`** — Opus codec, the audio task, jitter buffers, the processor pipeline, and the per-peer decoder-lifetime invariant (see also below).
-- **`docs/testing-strategy.md`** — server integration tests and the aetna `dump_bundles` lint/snapshot pipeline.
+- **`docs/testing-strategy.md`** — server integration tests and the damascene `dump_bundles` lint/snapshot pipeline.
 - **`docs/v2-architecture.md`** — *historical* design doc for the platform-trait decoupling; kept for rationale, not as a current API reference.
 
 ## Key Architecture Patterns
@@ -121,26 +121,26 @@ Each remote peer must have a **long-lived Opus decoder instance** that persists 
 
 Uses `imports_granularity = "Crate"` in rustfmt.toml — group imports by crate.
 
-## GUI Testing (rumble-aetna)
+## GUI Testing (rumble-damascene)
 
-aetna has its own bundle/lint pipeline that replaces the old egui screenshot harness. The `dump_bundles` binary in `rumble-aetna` runs the real `App::on_event` path against a `MockBackend` returning canned `State`, then writes per-scene artifacts to `crates/rumble-aetna/out/` (gitignored):
+damascene has its own bundle/lint pipeline that replaces the old egui screenshot harness. The `dump_bundles` binary in `rumble-damascene` runs the real `App::on_event` path against a `MockBackend` returning canned `State`, then writes per-scene artifacts to `crates/rumble-damascene/out/` (gitignored):
 
 ```bash
-cargo run -p rumble-aetna --bin dump_bundles                       # dump every scene
-cargo run -p rumble-aetna --bin dump_bundles -- connected cert_pending  # specific scenes
-cargo run -p rumble-aetna --bin dump_bundles -- --check             # diff vs checked-in goldens (exit 1 on drift)
-cargo run -p rumble-aetna --bin dump_bundles -- --bless             # re-bless goldens after an intended UI change
+cargo run -p rumble-damascene --bin dump_bundles                       # dump every scene
+cargo run -p rumble-damascene --bin dump_bundles -- connected cert_pending  # specific scenes
+cargo run -p rumble-damascene --bin dump_bundles -- --check             # diff vs checked-in goldens (exit 1 on drift)
+cargo run -p rumble-damascene --bin dump_bundles -- --bless             # re-bless goldens after an intended UI change
 ```
 
 Each scene produces `rumble_<scene>.{svg,tree.txt,draw_ops.txt,lint.txt,shader_manifest.txt}`. The SVG fallback renders the same draw-op stream as the wgpu Runner, so layout regressions are visible without spinning up a window or device. Lint findings (raw colors, overflow, weak focus, scrollbar overlap, etc.) land in `lint.txt` — review them before declaring a UI change done.
 
-**Golden regression check.** `--check` re-renders every scene and diffs the deterministic subset (`draw_ops.txt` + `lint.txt`) against the checked-in goldens in `crates/rumble-aetna/goldens/` (tracked, unlike `out/`); it exits non-zero on any drift. Run it after touching UI code. When a change is intentional, run `--bless`, then review `git diff crates/rumble-aetna/goldens/` to confirm only the expected scenes moved. Goldens are pinned to the current git-pinned aetna rev — re-bless after an aetna bump. For new fixtures, keep them deterministic (no wall-clock or random keys): each scene renders against its own freshly-wiped config dir, and identity hooks install a fixed key.
+**Golden regression check.** `--check` re-renders every scene and diffs the deterministic subset (`draw_ops.txt` + `lint.txt`) against the checked-in goldens in `crates/rumble-damascene/goldens/` (tracked, unlike `out/`); it exits non-zero on any drift. Run it after touching UI code. When a change is intentional, run `--bless`, then review `git diff crates/rumble-damascene/goldens/` to confirm only the expected scenes moved. Goldens are pinned to the current git-pinned damascene rev — re-bless after an damascene bump. For new fixtures, keep them deterministic (no wall-clock or random keys): each scene renders against its own freshly-wiped config dir, and identity hooks install a fixed key.
 
-To add a new scene, extend the `Scene` enum and `drive_setup` in `crates/rumble-aetna/src/bin/dump_bundles.rs`, then `--bless` to capture its goldens.
+To add a new scene, extend the `Scene` enum and `drive_setup` in `crates/rumble-damascene/src/bin/dump_bundles.rs`, then `--bless` to capture its goldens.
 
 ## External Dependencies (git-pinned)
 
 Cargo consumes these from upstream GitHub at a pinned rev rather than crates.io. The `vendor/` directory is gitignored and holds local working copies for easy reference; Cargo does not consult it for builds.
 
-- **aetna** — UI library powering `rumble-aetna`. Pinned in the root `Cargo.toml` `[workspace.dependencies]` block to a rev of `https://github.com/computer-whisperer/aetna`; consumers (`rumble-aetna`, `rumble-video`) inherit via `{ workspace = true }`, so bumping the rev is a single-line change. To iterate locally against `vendor/aetna` without touching tracked files, run cargo through `scripts/aetna-local.sh` (e.g. `scripts/aetna-local.sh build -p rumble-aetna`). It applies the gitignored `.cargo/local-aetna.toml` overlay as a `--config` patch and restores `Cargo.lock` afterwards, so CI and other machines stay on the git pin.
+- **damascene** — UI library powering `rumble-damascene`. Pinned in the root `Cargo.toml` `[workspace.dependencies]` block to a rev of `https://github.com/computer-whisperer/damascene`; consumers (`rumble-damascene`, `rumble-video`) inherit via `{ workspace = true }`, so bumping the rev is a single-line change. To iterate locally against `vendor/damascene` without touching tracked files, run cargo through `scripts/damascene-local.sh` (e.g. `scripts/damascene-local.sh build -p rumble-damascene`). It applies the gitignored `.cargo/local-damascene.toml` overlay as a `--config` patch and restores `Cargo.lock` afterwards, so CI and other machines stay on the git pin.
 - **opus-rs** — Opus audio codec bindings, pinned via `opus = { git = "...", rev = "..." }` in `crates/rumble-desktop/Cargo.toml`.

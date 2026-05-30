@@ -1,17 +1,17 @@
 //! Thin safe wrapper over libmpv's player + software-render APIs.
 //!
-//! Phase 1 of rumble-aetna's video support. Just enough surface to:
+//! Phase 1 of rumble-damascene's video support. Just enough surface to:
 //! load a file, wait for the first frame, render that frame into a
 //! caller-supplied RGBA buffer, and tear down cleanly. Future phases
 //! grow play/pause/seek + the GPU-mirror pattern from
-//! `rumble-aetna::animated_gpu`; the API here is shaped so those slot
+//! `rumble-damascene::animated_gpu`; the API here is shaped so those slot
 //! in without revisiting the FFI layer.
 //!
 //! Software render output is `"rgb0"` — bytes laid out R, G, B,
 //! garbage. Callers wanting an alpha-correct buffer should overwrite
 //! every fourth byte with `0xff` post-render. This matches the
 //! pixel-format requirements of `wgpu::TextureFormat::Rgba8UnormSrgb`
-//! used elsewhere in rumble-aetna.
+//! used elsewhere in rumble-damascene.
 //!
 //! ## Platform support
 //!

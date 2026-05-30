@@ -506,7 +506,7 @@ async fn do_fetch(
 }
 
 /// Reverse-DNS namespace for this plugin's chat attachments. Public so
-/// the aetna renderer can match against it without depending on the
+/// the damascene renderer can match against it without depending on the
 /// concrete plugin type.
 pub const NAMESPACE: &str = "rumble.file_transfer.relay";
 

@@ -13,7 +13,7 @@
 //! `state`. The connection and audio tasks emit typed events; this
 //! task applies them. `BackendHandle::state_mut()` exists as a
 //! public escape hatch for the deprecated egui clients to clear
-//! one-shot fields, but the active aetna path does not call it.
+//! one-shot fields, but the active damascene path does not call it.
 //!
 //! ## Why a separate task instead of folding into the connection task
 //!

@@ -2,7 +2,7 @@
 
 Rumble is a Mumble/Discord-like voice + text chat application written in Rust. Users join a
 hierarchical tree of rooms and talk over voice (Opus) and text chat. The stack is a QUIC
-client/server split: a GUI client (`rumble-aetna`) drives a platform-agnostic client engine
+client/server split: a GUI client (`rumble-damascene`) drives a platform-agnostic client engine
 (`rumble-client`), which speaks a protobuf-over-QUIC wire protocol (`rumble-protocol`) to the
 `server` (rooms, members, ACL, sled persistence). `mumble-bridge` connects a real Mumble server
 to a Rumble server as a *controller*. This document is the top-level map; subsystem depth is
@@ -20,8 +20,8 @@ deferred to the sibling docs listed at the end. Source lives under `crates/`.
 | `rumble-desktop` | Native desktop `Platform` implementation: quinn (QUIC), cpal (audio I/O), opus, ed25519. |
 | `rumble-desktop-shell` | Desktop shell concerns: persistent settings store, encrypted-at-rest identity files (Argon2 + ChaCha20Poly1305), ssh-agent identity, cross-platform + XDG-portal global hotkeys. |
 | `rumble-audio` | Pluggable audio-processor framework (denoise, VAD, gain control). |
-| `rumble-aetna` | The GUI client, built on the aetna UI library; projects `(State, ui_state) → El` tree per frame, wraps `BackendHandle` via a `UiBackend` adapter. |
-| `rumble-video` | Thin safe wrapper over libmpv (player + software-render) for aetna's video lightbox. |
+| `rumble-damascene` | The GUI client, built on the damascene UI library; projects `(State, ui_state) → El` tree per frame, wraps `BackendHandle` via a `UiBackend` adapter. |
+| `rumble-video` | Thin safe wrapper over libmpv (player + software-render) for damascene's video lightbox. |
 | `server` | Server binary: room tree, member/identity roster, ACL evaluation, voice/chat relay, sled persistence. |
 | `mumble-bridge` | Bidirectional Mumble↔Rumble proxy; registers Mumble clients as participants on the Rumble server via the controller protocol. |
 
@@ -30,7 +30,7 @@ deferred to the sibling docs listed at the end. Source lives under `crates/`.
 ## End-to-End Data Flow
 
 ```
-  rumble-aetna (GUI)
+  rumble-damascene (GUI)
     │   reads State each frame, sends Command (fire-and-forget)
     ▼
   rumble-client  ── BackendHandle: Arc<RwLock<State>> + command_tx
@@ -131,5 +131,5 @@ register Mumble clients as first-class participants over the controller protocol
 - `docs/quic-protocol.md` — wire protocol details: QUIC transport, protobuf envelopes/framing, auth handshake, message catalog.
 - `docs/acl-system.md` — permission groups, per-room grant/deny ACLs, evaluation order, superuser/controller bootstrap.
 - `docs/audio-subsystem.md` — Opus codec, datagram voice format, jitter buffers, audio-processor pipeline.
-- `docs/testing-strategy.md` — test layout and the aetna `dump_bundles` UI lint/snapshot pipeline.
+- `docs/testing-strategy.md` — test layout and the damascene `dump_bundles` UI lint/snapshot pipeline.
 - `docs/v2-architecture.md` — *historical* platform-abstraction design doc (how the client was decoupled from `rumble-desktop` behind `rumble-client-traits`); kept for design rationale, not current API reference.

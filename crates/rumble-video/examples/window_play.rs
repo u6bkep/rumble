@@ -1,6 +1,6 @@
 //! Phase-2 integration test: open a video file, run libmpv on its
 //! own decode worker, mirror frames into a wgpu texture, composite
-//! through aetna's `surface()` widget into a real winit window.
+//! through damascene's `surface()` widget into a real winit window.
 //!
 //! Run with `cargo run -p rumble-video --example window_play -- input.mp4`.
 //! The window opens at the video's natural aspect, plays in a loop
@@ -9,8 +9,8 @@
 
 use std::{path::PathBuf, time::Duration};
 
-use aetna_core::{App, BuildCx, Rect, prelude::*};
-use aetna_winit_wgpu::{HostConfig, WinitWgpuApp, run_host_app_with_config};
+use damascene_core::{App, BuildCx, Rect, prelude::*};
+use damascene_winit_wgpu::{HostConfig, WinitWgpuApp, run_host_app_with_config};
 use rumble_video::{VideoGpu, VideoStream};
 
 struct VideoApp {
@@ -30,7 +30,7 @@ impl App for VideoApp {
         // `redraw_within` keeps the host loop ticking while the
         // worker is producing frames; it goes away naturally if
         // the window is hidden (off-screen surfaces drop out of
-        // aetna's redraw aggregator).
+        // damascene's redraw aggregator).
         match self.video_gpu.as_ref() {
             Some(gpu) => surface(gpu.app_texture().clone())
                 .surface_alpha(SurfaceAlpha::Opaque)

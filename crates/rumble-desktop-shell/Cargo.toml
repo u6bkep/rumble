@@ -16,7 +16,7 @@ path = "src/lib.rs"
 # `ssh-agent` stays on by default because its underlying crates
 # (ssh-agent-lib, ssh-key, service-binding) compile on every platform
 # and the API surface — `SshAgentClient`, `connect_and_list_keys`,
-# `select_agent_key` — is referenced unconditionally by `rumble-aetna`.
+# `select_agent_key` — is referenced unconditionally by `rumble-damascene`.
 # Cfg-gating those call sites would be a much larger change.
 default = ["encrypted-keys", "ssh-agent", "global-hotkeys"]
 # Enables Argon2 + ChaCha20Poly1305 encrypted-at-rest identity files.

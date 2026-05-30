@@ -4,9 +4,9 @@ How rumble is tested today. This replaces the old `docs/test-harness.md` (which
 described a GUI screenshot harness that no longer exists). There are two
 substantive test pillars on top of `cargo test`:
 
-1. **rumble-aetna bundle/lint pipeline** — a headless renderer that drives the
+1. **rumble-damascene bundle/lint pipeline** — a headless renderer that drives the
    real GUI `App` against a mock backend and dumps per-scene artifacts
-   (`crates/rumble-aetna/src/bin/dump_bundles.rs`).
+   (`crates/rumble-damascene/src/bin/dump_bundles.rs`).
 2. **Server integration tests** — spin up a real QUIC server process plus a real
    client and assert on observed state/audio (`crates/server/tests/`).
 
@@ -30,9 +30,9 @@ back both pillars.
 
 ---
 
-## Pillar 1 — rumble-aetna bundle/lint pipeline
+## Pillar 1 — rumble-damascene bundle/lint pipeline
 
-`dump_bundles` (`crates/rumble-aetna/src/bin/dump_bundles.rs`) is the GUI's
+`dump_bundles` (`crates/rumble-damascene/src/bin/dump_bundles.rs`) is the GUI's
 regression harness. It renders every canonical UI scene **without a GPU or
 window**, so layout/visual regressions are visible in CI-friendly text + SVG.
 
@@ -43,7 +43,7 @@ For each `Scene` it:
 1. Builds a `MockBackend` (`dump_bundles.rs`) that returns a canned
    `rumble_client::State` from `state()` and discards every `Command` from
    `send()`. It also serves canned `meter()`, `stats()`, and `transfers()`
-   snapshots. It implements the real `rumble_aetna::backend::UiBackend` trait, so
+   snapshots. It implements the real `rumble_damascene::backend::UiBackend` trait, so
    the app sees exactly the surface the production client exposes.
 2. Constructs a real `RumbleApp::new(...)` over that backend.
 3. Drives any per-scene local UI state through the **real `App` event path** via
@@ -53,7 +53,7 @@ For each `Scene` it:
    production code can drift away from.
 4. Calls `app.build(&cx)` to produce the element tree, then
    `render_bundle(&mut tree, viewport)` (viewport is fixed at 1280×800 to match
-   the real window) and `write_bundle(...)` from the aetna-core prelude.
+   the real window) and `write_bundle(...)` from the damascene-core prelude.
 
 Portal init is disabled (`RUMBLE_DISABLE_PORTAL=1`, set in `main` before any
 thread spawns) so repeated `RumbleApp` construction doesn't hang on the XDG
@@ -62,7 +62,7 @@ freshly-wiped temp scratch dir (see the golden-check section on determinism).
 
 ### Artifacts
 
-Output lands in `crates/rumble-aetna/out/` (gitignored), one set per scene named
+Output lands in `crates/rumble-damascene/out/` (gitignored), one set per scene named
 `rumble_<scene>.<ext>`:
 
 | File                  | Contents                                                        |
@@ -84,7 +84,7 @@ declaring a UI change done.**
 
 `dump_bundles` doubles as a snapshot regression net. `--bless` writes the
 deterministic subset of artifacts — `draw_ops.txt` (the flat paint IR: geometry,
-colors, fonts, layering) and `lint.txt` — to the **tracked** `crates/rumble-aetna/goldens/`
+colors, fonts, layering) and `lint.txt` — to the **tracked** `crates/rumble-damascene/goldens/`
 dir. `--check` re-renders every scene and diffs against those goldens, exiting
 non-zero (with a first-divergence report per artifact) on any drift. We pin only
 those two artifacts: `tree.txt` carries `source=app.rs:NNN` line references that
@@ -99,25 +99,25 @@ scene can't bleed into another or across runs), and identity fixtures install a
 avoid wall-clock-absolute timestamps (anchor them now-relative) and random key
 material.
 
-Goldens are pinned to the current git-pinned aetna rev; re-bless after an aetna
+Goldens are pinned to the current git-pinned damascene rev; re-bless after an damascene
 bump. CI runs fmt + clippy only, so `--check` is a local/pre-commit gate — run it
 after any UI change.
 
 ### Commands
 
 ```bash
-cargo run -p rumble-aetna --bin dump_bundles                       # dump every scene
-cargo run -p rumble-aetna --bin dump_bundles -- connected cert_pending  # specific scenes by slug
-cargo run -p rumble-aetna --bin dump_bundles -- --check             # diff vs goldens (exit 1 on drift)
-cargo run -p rumble-aetna --bin dump_bundles -- --bless             # re-bless goldens after an intended change
+cargo run -p rumble-damascene --bin dump_bundles                       # dump every scene
+cargo run -p rumble-damascene --bin dump_bundles -- connected cert_pending  # specific scenes by slug
+cargo run -p rumble-damascene --bin dump_bundles -- --check             # diff vs goldens (exit 1 on drift)
+cargo run -p rumble-damascene --bin dump_bundles -- --bless             # re-bless goldens after an intended change
 ```
 
 Scene names are matched case-insensitively against each `Scene::slug()` (e.g.
 `connected`, `cert_pending`, `settings_admin`, `image_lightbox_zoomed`). An
 unknown name panics with `unknown scene \`...\``.
 
-> Iterating against `vendor/aetna`: run through `scripts/aetna-local.sh` instead
-> of bare `cargo` so the local aetna overlay is applied (see project CLAUDE.md).
+> Iterating against `vendor/damascene`: run through `scripts/damascene-local.sh` instead
+> of bare `cargo` so the local damascene overlay is applied (see project CLAUDE.md).
 
 ### Adding a scene
 
