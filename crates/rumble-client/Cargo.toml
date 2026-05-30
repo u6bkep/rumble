@@ -4,6 +4,11 @@ description = "Rumble client backend library"
 version = "0.1.0"
 edition = "2024"
 
+# Disable the default libtest bench harness so `cargo bench -p rumble-client`
+# dispatches only to the criterion bench (libtest rejects --save-baseline etc).
+[lib]
+bench = false
+
 [dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "io-util", "net", "sync", "fs"] }
 anyhow = { workspace = true }
@@ -24,3 +29,8 @@ rand = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+criterion = { workspace = true }
+
+[[bench]]
+name = "audio_pipeline"
+harness = false

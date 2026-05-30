@@ -4,6 +4,11 @@ description = "Native desktop Platform implementation for rumble-client-traits"
 version = "0.1.0"
 edition = "2024"
 
+# Disable the default libtest bench harness so `cargo bench -p rumble-desktop`
+# dispatches only to the criterion bench (libtest rejects --save-baseline etc).
+[lib]
+bench = false
+
 [features]
 # Cross-platform defaults only. `pulse` is Linux-only — consumers
 # opt in via a `[target.'cfg(target_os = "linux")'.dependencies]`
@@ -67,3 +72,9 @@ libpulse-simple-binding = { version = "2.29", optional = true }
 [dev-dependencies]
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+criterion = { workspace = true }
+
+# Requires the default `codec` feature (NativeOpusCodec).
+[[bench]]
+name = "opus_codec"
+harness = false
