@@ -181,7 +181,13 @@ impl std::fmt::Debug for AudioCommand {
 ///
 /// The jitter buffer stores incoming Opus packets by sequence number,
 /// allowing reordering and providing a delay to absorb network jitter.
-struct UserAudioState<D: VoiceDecoderTrait> {
+///
+/// Exposed (`#[doc(hidden)]`) so the `jitter_buffer`/`rx_mix` benches and tests
+/// can drive it directly — not a stable public API. Fields stay private;
+/// construct via [`UserAudioState::new`] and feed it with
+/// [`UserAudioState::insert_packet`].
+#[doc(hidden)]
+pub struct UserAudioState<D: VoiceDecoderTrait> {
     /// Opus decoder for this user (platform-specific via VoiceCodec trait).
     decoder: D,
     /// Jitter buffer: maps sequence number to Opus packet data.
@@ -233,7 +239,7 @@ enum CaptureMessage {
 }
 
 impl<D: VoiceDecoderTrait> UserAudioState<D> {
-    fn new(decoder: D, jitter_buffer_delay: u32) -> Self {
+    pub fn new(decoder: D, jitter_buffer_delay: u32) -> Self {
         Self {
             decoder,
             jitter_buffer: BTreeMap::new(),
@@ -265,7 +271,7 @@ impl<D: VoiceDecoderTrait> UserAudioState<D> {
     }
 
     /// Insert a packet into the jitter buffer.
-    fn insert_packet(&mut self, sequence: u32, opus_data: Vec<u8>) {
+    pub fn insert_packet(&mut self, sequence: u32, opus_data: Vec<u8>) {
         self.last_received = Instant::now();
         self.packets_received += 1;
         self.bytes_received += opus_data.len() as u64;
@@ -353,7 +359,7 @@ impl<D: VoiceDecoderTrait> UserAudioState<D> {
     /// FEC (Forward Error Correction) recovery works by using data embedded in the
     /// *next* packet to reconstruct a lost packet. This provides better quality than
     /// pure PLC (Packet Loss Concealment) which just interpolates/generates comfort noise.
-    fn get_next_frame(&mut self) -> Option<Vec<f32>> {
+    pub fn get_next_frame(&mut self) -> Option<Vec<f32>> {
         if !self.ready_to_play() {
             return None;
         }
@@ -1690,14 +1696,23 @@ fn handle_voice_datagram<C: VoiceCodec>(
     }
 }
 
-/// Mix audio from all users' jitter buffers and queue for playback.
-fn mix_and_play_audio<D: VoiceDecoderTrait>(
+/// Decode, RX-process, volume-adjust, and sum one 20 ms frame from every peer
+/// that is ready to play. Returns the mixed frame, or `None` when no peer
+/// contributed audio this tick.
+///
+/// This is the decode+mix core of [`mix_and_play_audio`], split out from the
+/// sfx queue and the cpal playback sink so it can be unit-tested and
+/// benchmarked on its own (it touches only the peer states + the dumper). The
+/// `audio_dumper` receives each peer's decoded frame *before* its RX pipeline;
+/// it is a no-op when dumping is disabled.
+///
+/// Exposed (`#[doc(hidden)]`) for the `rx_mix`/`jitter_buffer` benches and tests
+/// — not a stable public API.
+#[doc(hidden)]
+pub fn mix_peer_frames<D: VoiceDecoderTrait>(
     user_audio: &mut HashMap<u64, UserAudioState<D>>,
-    sfx_queue: &mut VecDeque<f32>,
-    playback_buffer: &Arc<Mutex<VecDeque<f32>>>,
     audio_dumper: &AudioDumper,
-) {
-    // Collect decoded frames from all users who are ready
+) -> Option<[f32; OPUS_FRAME_SIZE]> {
     let mut mixed_buffer = [0.0f32; OPUS_FRAME_SIZE];
     let mut has_audio = false;
 
@@ -1733,6 +1748,20 @@ fn mix_and_play_audio<D: VoiceDecoderTrait>(
             }
         }
     }
+
+    has_audio.then_some(mixed_buffer)
+}
+
+/// Mix audio from all users' jitter buffers + the sfx queue and queue for playback.
+fn mix_and_play_audio<D: VoiceDecoderTrait>(
+    user_audio: &mut HashMap<u64, UserAudioState<D>>,
+    sfx_queue: &mut VecDeque<f32>,
+    playback_buffer: &Arc<Mutex<VecDeque<f32>>>,
+    audio_dumper: &AudioDumper,
+) {
+    let peer_mix = mix_peer_frames(user_audio, audio_dumper);
+    let mut has_audio = peer_mix.is_some();
+    let mut mixed_buffer = peer_mix.unwrap_or([0.0f32; OPUS_FRAME_SIZE]);
 
     // Mix in sound effects from the sfx queue
     if !sfx_queue.is_empty() {
@@ -1945,6 +1974,35 @@ mod tests {
         state.insert_packet(2, packet(2));
         assert!(state.ready_to_play(), "should be ready once 3 packets are buffered");
         assert_eq!(drain_tags(&mut state, 3), vec![Some(0.0), Some(1.0), Some(2.0)]);
+    }
+
+    #[test]
+    fn mix_returns_none_when_no_peer_is_ready() {
+        let mut peers: HashMap<u64, UserAudioState<MarkerDecoder>> = HashMap::new();
+        // No peers at all.
+        assert_eq!(mix_peer_frames(&mut peers, &AudioDumper::disabled()), None);
+
+        // One peer still buffering (delay 3, only 1 packet) — not ready, so the
+        // tick produces silence (None), not a partial frame.
+        let mut s = make_state(3);
+        s.insert_packet(0, packet(1));
+        peers.insert(1, s);
+        assert_eq!(mix_peer_frames(&mut peers, &AudioDumper::disabled()), None);
+    }
+
+    #[test]
+    fn mix_sums_ready_peers_and_clamps_to_output_range() {
+        let mut peers: HashMap<u64, UserAudioState<MarkerDecoder>> = HashMap::new();
+        let mut a = make_state(1);
+        a.insert_packet(0, packet(1)); // MarkerDecoder decodes every sample to 1.0
+        let mut b = make_state(1);
+        b.insert_packet(0, packet(1));
+        peers.insert(1, a);
+        peers.insert(2, b);
+
+        let mixed = mix_peer_frames(&mut peers, &AudioDumper::disabled()).expect("two ready peers produce audio");
+        // 1.0 + 1.0 summed, then clamped into the [-1.0, 1.0] output range.
+        assert!(mixed.iter().all(|&s| s == 1.0), "mixed output must be clamped to 1.0");
     }
 
     #[test]

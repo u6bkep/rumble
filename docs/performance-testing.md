@@ -113,22 +113,32 @@ Locations: `crates/rumble-desktop/benches/opus_codec.rs` (Opus, needs the
 | `denoise_frame` | RNNoise inference alone | — (isolates the dominant TX cost) | **done** |
 | `opus_encode` | Encode one 960-sample frame | VBR+FEC / CBR no-FEC | **done** |
 | `opus_decode` | Decode + FEC + PLC paths | normal / FEC-recovery / PLC | **done** |
-| `rx_mix_n_speakers` | Full RX decode+pipeline+mix tick | **N = 1, 5, 20** concurrent speakers | **TODO — needs extraction** |
-| `jitter_buffer` | insert + get_next_frame | in-order / reordered / 10% loss | **TODO — needs extraction** |
+| `rx_mix_n_speakers` | decode+pipeline+volume+mix tick (`mix_peer_frames`) | **N = 1, 5, 20** concurrent speakers | **done** |
+| `jitter_buffer` | `insert_packet` + `get_next_frame` | in-order / reordered / 10% loss | **done** |
 
-First numbers (release, this machine): RNNoise `denoise_frame` ≈ **88 µs/frame**
-— the dominant TX cost by ~3 orders of magnitude over gain (115 ns) and VAD
-(870 ns), so `tx_pipeline/full` is essentially denoise. `opus_encode` ≈ 136 µs;
-`opus_decode` normal/FEC ≈ 20 µs, PLC ≈ 67 ns. Both encode and denoise sit well
-inside the 20 ms (20 000 µs) frame budget but are the clear hotspots.
+The RX benches live in `crates/rumble-client/benches/rx_audio.rs`. The seam
+extraction: `mix_and_play_audio` was split into a pure `mix_peer_frames`
+(decode → RX pipeline → volume → clamped sum, returning the mixed frame or
+`None`) plus the leftover sfx-mix + cpal-sink shell. `UserAudioState` and
+`mix_peer_frames` are now `#[doc(hidden)] pub` (rumble-client is a
+workspace-internal crate, so the bench/test surface is exposed rather than
+mirrored). A trivial `BenchDecoder` stands in for Opus so the RX benches isolate
+buffer bookkeeping, the per-frame `vec![0.0; 960]` allocation, and mix-loop
+scaling — real decode (~20 µs/frame) is the separate `opus_decode` bench.
 
-`rx_mix_n_speakers` (the would-be headline bench — it measures whether the
-per-frame `vec![0.0f32; 960]` allocations matter and how mixing scales with room
-size) and `jitter_buffer` are **not yet written**: the jitter buffer struct and
-the mix tick are private inside `audio_task.rs` (`jitter_buffer: BTreeMap<u32,
-Vec<u8>>` + `get_next_frame`). Benching them needs the same kind of seam
-extraction the relay path got — pull the per-peer playback state and the mix
-tick into callable units. Deferred to its own pass.
+First numbers (release, this machine):
+- TX: RNNoise `denoise_frame` ≈ **88 µs/frame** — the dominant TX cost by ~3
+  orders of magnitude over gain (115 ns) and VAD (870 ns), so `tx_pipeline/full`
+  is essentially denoise. `opus_encode` ≈ 136 µs.
+- RX: `opus_decode` normal/FEC ≈ 20 µs, PLC ≈ 67 ns. `jitter_buffer` ≈ 0.34
+  µs/packet (all three patterns). `rx_mix_n_speakers` scales linearly at ≈ 0.86
+  µs/peer/tick (1 → 20 speakers: 1.0 → 17.3 µs) — that is the per-peer
+  `vec![0.0; 960]` alloc + cheap-decode + clamped-sum, *excluding* the ~20 µs
+  real Opus decode each peer would add.
+
+All sit well inside the 20 ms (20 000 µs) frame budget; RNNoise denoise and Opus
+encode are the clear hotspots, with the per-peer RX allocation the thing to watch
+as room size grows.
 
 ### Characterization safety nets
 
