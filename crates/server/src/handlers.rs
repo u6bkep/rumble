@@ -1972,6 +1972,7 @@ pub async fn relay_voice_as(
     sender_id: u64,
     opus_data: Vec<u8>,
     sequence: u32,
+    timestamp_us: u64,
     end_of_stream: bool,
 ) {
     let room_memberships = state.snapshot_room_memberships().await;
@@ -1985,7 +1986,7 @@ pub async fn relay_voice_as(
     let dgram = VoiceDatagram {
         opus_data: opus_data.clone(),
         sequence,
-        timestamp_us: 0,
+        timestamp_us,
         end_of_stream,
         sender_id: Some(sender_id),
         room_id: Some(room.as_bytes().to_vec()),
@@ -2009,7 +2010,7 @@ pub async fn relay_voice_as(
             sender_id,
             opus_data,
             sequence,
-            timestamp_us: 0,
+            timestamp_us,
             end_of_stream,
         },
     );

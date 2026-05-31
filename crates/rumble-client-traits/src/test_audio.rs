@@ -71,16 +71,33 @@ impl MockAudio {
         self.capture_active.load(Ordering::Relaxed)
     }
 
-    /// Pull `n` mixed playback samples from the engine. Internally calls the
-    /// engine's `fill_buffer` callback once with an `n`-sized buffer (the same
-    /// way cpal would in production). Returns silence (zeros) if no playback
+    /// Pull `n` mixed playback samples from the engine. Calls the engine's
+    /// `fill_buffer` callback in 20 ms device-sized blocks, yielding briefly
+    /// between blocks — the way a real output device pulls incrementally at its
+    /// clock rate, giving the engine's device-paced producer time to refill the
+    /// playback ring between callbacks. (Pulling all `n` at once would outrun the
+    /// producer and read mostly silence.) Returns silence (zeros) if no playback
     /// stream has been opened yet.
     pub fn pump_playback(&self, n: usize) -> Vec<f32> {
+        const BLOCK: usize = 960; // 20 ms at 48 kHz
         let mut buf = vec![0.0; n];
-        if let Ok(mut guard) = self.playback.lock()
-            && let Some(fill) = guard.as_mut()
-        {
-            fill(&mut buf);
+        let mut off = 0;
+        while off < n {
+            let end = (off + BLOCK).min(n);
+            // Re-acquire the lock per block and release it before sleeping, so the
+            // engine can (re)open/close the playback stream between blocks instead
+            // of blocking on this lock for the whole pump. If the stream is gone,
+            // stop filling — the remainder stays silence.
+            {
+                let Ok(mut guard) = self.playback.lock() else { break };
+                let Some(fill) = guard.as_mut() else { break };
+                fill(&mut buf[off..end]);
+            }
+            off = end;
+            if off < n {
+                // Let the producer's ~10 ms refill tick run before the next block.
+                std::thread::sleep(Duration::from_millis(12));
+            }
         }
         buf
     }

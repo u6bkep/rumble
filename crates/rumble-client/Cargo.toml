@@ -21,6 +21,11 @@ prost = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 nnnoiseless = { version = "0.5.2", default-features = false }
+# Lock-free SPSC ring for the playback hand-off: the audio-task thread is the
+# sole producer (mix tick), the device callback the sole consumer. Keeps the
+# real-time output callback off a general-purpose Mutex. Its only dependency,
+# crossbeam-utils, is already in the tree.
+rtrb = "0.3"
 serde = { workspace = true }
 serde_json = { workspace = true }
 hex = { workspace = true }

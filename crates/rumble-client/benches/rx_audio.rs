@@ -55,21 +55,23 @@ fn payload() -> Vec<u8> {
 /// draining a frame after each insert. `gap` marks every Nth sequence dropped
 /// (0 = no loss). When `reorder` is set, adjacent packets arrive swapped.
 fn run_stream(n: u32, gap: u32, reorder: bool) {
+    // Contiguous media clock: frame index == sequence, 20 ms (20_000 µs) apart.
+    let ts = |seq: u32| seq as u64 * 20_000;
     let mut state = UserAudioState::new(BenchDecoder, 2);
     let mut frame = [0.0f32; OPUS_FRAME_SIZE];
     let mut seq = 0u32;
     while seq < n {
         if reorder && seq + 1 < n {
             // Adjacent pair arrives out of order.
-            state.insert_packet(seq + 1, payload());
-            state.insert_packet(seq, payload());
+            state.insert_packet(seq + 1, ts(seq + 1), payload());
+            state.insert_packet(seq, ts(seq), payload());
             black_box(state.decode_next_into(&mut frame));
             black_box(state.decode_next_into(&mut frame));
             seq += 2;
         } else {
             // Drop every `gap`-th packet to exercise the FEC/PLC paths.
             if gap == 0 || !seq.is_multiple_of(gap) {
-                state.insert_packet(seq, payload());
+                state.insert_packet(seq, ts(seq), payload());
             }
             black_box(state.decode_next_into(&mut frame));
             seq += 1;
@@ -91,20 +93,22 @@ fn bench_rx_mix(c: &mut Criterion) {
     let dumper = AudioDumper::disabled();
     let mut group = c.benchmark_group("rx_mix_n_speakers");
     for &n in &[1u64, 5, 20] {
-        // n peers, each pre-seeded so they're ready on the first tick.
+        // n peers, each pre-seeded with two frames so they're ready on the
+        // first tick (the adaptive buffer's minimum playout depth).
         let mut peers: HashMap<u64, UserAudioState<BenchDecoder>> = HashMap::new();
         for uid in 0..n {
-            let mut s = UserAudioState::new(BenchDecoder, 1);
-            s.insert_packet(0, payload());
+            let mut s = UserAudioState::new(BenchDecoder, 2);
+            s.insert_packet(0, 0, payload());
+            s.insert_packet(1, 20_000, payload());
             peers.insert(uid, s);
         }
-        let mut seq = 1u32;
+        let mut seq = 2u32;
         group.throughput(Throughput::Elements(n));
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
             b.iter(|| {
                 // Steady state: one packet arrives per peer, then one mix tick.
                 for s in peers.values_mut() {
-                    s.insert_packet(seq, payload());
+                    s.insert_packet(seq, seq as u64 * 20_000, payload());
                 }
                 seq = seq.wrapping_add(1);
                 black_box(mix_peer_frames(&mut peers, &dumper))

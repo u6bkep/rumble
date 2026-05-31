@@ -254,10 +254,14 @@ pub async fn run_bridge(
                     // but Rumble's jitter buffer expects consecutive per-packet sequences.
                     let seq = mumble_to_rumble_seq.entry(session).or_insert(0);
                     *seq = seq.wrapping_add(1);
+                    // Media timestamp on the Rumble clock: the bridge relays a
+                    // contiguous stream (one 20 ms frame per packet), so frame
+                    // index == bridge sequence and the timestamp is seq * 20 ms.
+                    // The Rumble receiver uses this to tell silence from loss.
                     let datagram = proto::VoiceDatagram {
                         opus_data: voice.opus_data,
                         sequence: *seq,
-                        timestamp_us: 0,
+                        timestamp_us: *seq as u64 * 20_000,
                         end_of_stream: voice.is_last,
                         sender_id: Some(virtual_user_id),
                         room_id: None,

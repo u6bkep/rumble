@@ -173,7 +173,7 @@ async fn echo_loop(handle: ParticipantHandle, mut sub: AudioSubscription, summon
             continue;
         }
         handle
-            .send_voice(frame.opus_data, frame.sequence, frame.end_of_stream)
+            .send_voice(frame.opus_data, frame.sequence, frame.timestamp_us, frame.end_of_stream)
             .await;
     }
 }

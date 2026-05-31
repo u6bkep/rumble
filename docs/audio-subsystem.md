@@ -8,7 +8,7 @@ Reference for rumble's voice path: capture → encode → send, and receive → 
 
 - **48 kHz, mono, 20 ms frames = 960 samples.** Constants in `rumble-client-traits/src/codec.rs`: `OPUS_SAMPLE_RATE = 48000`, `OPUS_FRAME_SIZE = 960`, `OPUS_MAX_PACKET_SIZE = 4000`, `OPUS_DEFAULT_BITRATE = 64000`. Mono is fixed in the codec impl (`codec.rs`: `OPUS_CHANNELS = Channels::Mono`).
 - **Encode** happens in the capture callback (`audio_task.rs` `start_transmission`, the closure passed to `open_input`), one Opus packet per processed 960-sample frame.
-- **Decode** happens per remote peer in `UserAudioState::get_next_frame` (`audio_task.rs`), driven by the 20 ms mix timer.
+- **Decode** happens per remote peer in `UserAudioState::decode_next_into` (`audio_task.rs`), driven by the playback producer as it tops up the device ring (see Playback path).
 - Encoder application is `Voip`, VBR + DTX + inband-FEC enabled (`NativeOpusEncoder::configure`). 50 frames/sec → stats compute bitrate as `avg_frame_bytes * 50 * 8`.
 
 ---
@@ -20,7 +20,7 @@ Spawned by `spawn_audio_task::<P>()` (`audio_task.rs`, called from `handle.rs:30
 - `command_rx` — `AudioCommand`s from `BackendHandle` (device/mute/PTT/room/settings).
 - `encoded_rx` — `CaptureMessage` (`EncodedFrame` / `EndOfStream`) produced by the capture callback; the loop wraps each into a `VoiceDatagram` and sends it.
 - `recv_datagram()` — incoming voice datagrams (only polled when a connection exists).
-- `mix_interval` (20 ms) — pull one frame per ready peer, mix, push to playback buffer.
+- `produce_interval` (10 ms) — top the playback ring back up to its target depth: decode/mix/limit one frame per ready peer at a time until the ring is at `PLAYBACK_TARGET_SAMPLES` (consumer-paced; see Playback path).
 - `cleanup_interval` (500 ms) — expire `talking_users` UI state (does **not** drop decoders).
 - `stats_interval` (500 ms) — roll up `AudioStats` into the stats snapshot.
 
@@ -33,10 +33,10 @@ Spawned by `spawn_audio_task::<P>()` (`audio_task.rs`, called from `handle.rs:30
    QUIC datagram (recv) ───────────┘
         │
         ▼ handle_voice_datagram
-   per-peer jitter buffer (BTreeMap<seq, opus>)
-        │ mix_interval (20ms) → get_next_frame → RX pipeline → volume
+   per-peer jitter buffer (BTreeMap<media-frame, packet>)
+        │ produce_interval (10ms) → fill_playback_ring → decode_next_into → RX pipeline → volume → soft-limit mix
         ▼
-   playback_buffer (VecDeque<f32>) ──fill cb──> cpal/pulse output
+   playback ring (rtrb SPSC f32) ──fill cb──> cpal/pulse output
 ```
 
 ### TX path
@@ -44,11 +44,19 @@ Spawned by `spawn_audio_task::<P>()` (`audio_task.rs`, called from `handle.rs:30
 - The **input stream is connection-scoped**: created once on `ConnectionEstablished`, destroyed on disconnect / device / settings / TX-pipeline change. Mute, server-mute, and PTT do **not** recreate it — they toggle `AudioCaptureStream::set_active()` via the `sync_transmission!` macro. This avoids ALSA device re-enumeration on every PTT cycle.
 - The **encoder is also connection-scoped** (`Arc<Mutex<Option<Enc<P>>>>`), created on `ConnectionEstablished`, persisting across all talk spurts so Opus keeps its DTX/VBR state. Settings changes call `apply_settings` in place rather than rebuilding.
 - Capture callback per frame: discard first 3 frames (stale hardware ringbuffer); measure pre-pipeline RMS; run the TX `AudioPipeline`; measure post-pipeline RMS; if `suppress` → emit `EndOfStream` (on the active→suppressed edge) and return; else encode and send `EncodedFrame`.
-- Outgoing `VoiceDatagram` (proto `api.proto`) carries `sender_id`, a **client-owned `sequence`** (`send_sequence`, incremented per sent packet including DTX frames), `opus_data`, and `end_of_stream`. `room_id`/`timestamp_us` are left unset (server infers room; receiver uses arrival time).
+- Outgoing `VoiceDatagram` (proto `api.proto`) carries `sender_id`, a **client-owned `sequence`** (`send_sequence`, incremented per sent packet including DTX frames), `opus_data`, `end_of_stream`, and a **media `timestamp_us`**. The timestamp is a continuous media clock (`capture_frame_index` × `FRAME_US`) that advances per captured frame *including silence* — VAD-suppressed frames advance it, and a mute/PTT gap fast-forwards it to real elapsed time on the next activation. So a silence gap shows up as a timestamp jump, which is what lets the receiver tell silence from loss. `room_id` is left unset (server infers room). The Mumble bridge and the server's plugin/echo relay also stamp a media timestamp, so every producer emits one.
 
 ### RX path
 
-`handle_voice_datagram::<P::Codec>` (`audio_task.rs`): drops own/locally-muted senders, lazily creates a `UserAudioState` if none exists, then `insert_packet(seq, opus)` into that peer's jitter buffer. `end_of_stream` datagrams mark `stream_ended` and set the final `next_play_seq`. The 20 ms `mix_and_play_audio` then decodes one frame per ready peer, runs the per-peer RX pipeline, applies per-user volume (dB), sums with clamp to `[-1.0, 1.0]`, mixes in any queued SFX, and appends to the shared `playback_buffer` (capped at `MAX_PLAYBACK_BUFFER_SAMPLES = 9600`).
+`handle_voice_datagram::<P::Codec>` (`audio_task.rs`): drops own/locally-muted senders, lazily creates a `UserAudioState` if none exists, then `insert_packet(seq, timestamp_us, opus)` into that peer's jitter buffer (keyed by media frame index). `end_of_stream` datagrams call `mark_end_of_stream` (advisory). The 10 ms `produce_interval` then runs `fill_playback_ring`, which for each ready peer decodes one frame (`decode_next_into`), runs the per-peer RX pipeline, applies per-user volume (dB), and sums into the mix; the summed peers + any queued SFX are passed through a soft-knee limiter (`soft_clip`) rather than a hard clamp, and pushed to the per-stream `rtrb` playback ring (capacity `MAX_PLAYBACK_BUFFER_SAMPLES = 9600`, filled only to `PLAYBACK_TARGET_SAMPLES`).
+
+### Playback path (device-clocked ring)
+
+The hand-off from the audio task to the output device is a **lock-free SPSC ring** (`rtrb`): the audio task holds the `Producer`, the device callback owns the `Consumer` (inside `PlaybackFiller`). The real-time callback only does a wait-free read — no `Mutex`, no allocation.
+
+- **Consumer-paced production.** There is no free-running mix timer feeding the ring. `produce_interval` (10 ms) is a poll; on each tick `fill_playback_ring` produces frames only until the ring is back at `PLAYBACK_TARGET_SAMPLES`. Because it fills to a fixed depth, the number of frames produced equals what the device drained — so production rate tracks the device's audio clock, not wall-clock, which is what eliminated the buffer-underrun drift. With no output stream open (deafened / device failed), the producer is `None` and nothing is produced.
+- **`PlaybackFiller`** primes a small cushion (`PLAYBACK_PRIME_SAMPLES`) before playout and re-primes on a starvation that occurs *while a stream is live* (`producer_active`), so the device callback never clicks on a thin buffer and the underrun stat stays honest (a cushion drain after a spurt ends is not counted).
+- The producer/stream pair is created and torn down together per output stream (`open_playback!`), since each ring has exactly one producer and one consumer.
 
 ---
 
@@ -63,28 +71,28 @@ A decoder is **only** dropped when the peer genuinely goes away:
 
 It is created proactively on `UserJoinedRoom` / `RoomChanged`, or lazily on first datagram (`handle_voice_datagram`) via `P::Codec::create_decoder()`.
 
-**It must NOT be re-created per packet, per talk spurt, or on silence/EOS.** `insert_packet` explicitly preserves the decoder across:
-- end-of-stream → new stream (resets jitter buffer state only; sets `needs_plc_prime`),
-- detected sender restart (sequence jump backward),
-- the 60 ms stale-stream timeout.
+**It must NOT be re-created per packet, per talk spurt, or on silence/EOS.** The buffer explicitly preserves the decoder across:
+- silence → new spurt (re-anchors playout; primes via `needs_prime` — a discarded PLC frame),
+- detected sender restart (media-clock jump backward),
+- the stale-stream timeout.
 
 `cleanup_stale_users` clears only the `talking_users` UI set, never the decoder map. Re-initializing decoders per packet/talkspurt produces `native codec: decoder initialized` log spam (emitted by `NativeOpusDecoder::new` in `codec.rs`) and audible crackle/pop at speech onset, because the decoder loses its internal continuity state. Treat any per-spurt decoder construction as a bug.
 
 ---
 
-## Jitter Buffer
+## Jitter Buffer (timestamp-driven)
 
-Per-peer, in `UserAudioState` (`audio_task.rs`):
+Per-peer, in `UserAudioState` (`audio_task.rs`). Keyed by the sender's **media clock**, not by sequence — see `docs/audio-playback-redesign.md` for the rationale.
 
-- `jitter_buffer: BTreeMap<u32, Vec<u8>>` keyed by sequence (kept ordered).
-- **Startup delay:** playback begins once `buffered_since_stream_start >= jitter_buffer_delay` packets. `jitter_buffer_delay` comes from `AudioSettings::jitter_buffer_delay_packets` (default **3** = 60 ms; `events.rs`). The counter resets at each new stream start so each talk spurt re-buffers before playout.
-- **Cap:** `JITTER_BUFFER_MAX_PACKETS = 20`; oldest packets are dropped beyond that, advancing `next_play_seq` past any discarded unplayed packet.
-- **Loss handling in `get_next_frame`:** if the expected `seq` is present → decode; if missing → try **FEC** recovery using the *next* packet (`decode_fec`), else **PLC** (`decode_plc`). Decode errors also fall back to PLC. Stats track `packets_lost`, `packets_recovered_fec`, `frames_concealed`.
-- **PLC priming:** at each new stream start a discarded PLC frame warms the decoder (`needs_plc_prime`) to avoid onset clicks.
-- **Stale-stream guard:** if no packet for 60 ms (`STREAM_STALE_THRESHOLD`) and no explicit EOS, the stream is treated as ended so PLC doesn't run forever.
-- Sender restart (sequence jumps backward by `< u32::MAX/2`) resets buffer state but **not** the decoder.
+- `jitter_buffer: BTreeMap<u64, BufferedPacket>` keyed by media frame index (`timestamp_us / FRAME_US`); each `BufferedPacket` keeps the sender `seq` alongside the Opus payload. `next_play_frame` is the playout cursor on that clock.
+- **Adaptive startup depth:** playback begins once the buffered depth reaches `target_frames`, which adapts to an RFC 3550 interarrival-jitter estimate (`update_jitter`), clamped to `[MIN_TARGET_FRAMES (2), MAX_TARGET_FRAMES (12)]`. The floor is `AudioSettings::jitter_buffer_delay_packets` (default 3). `started` clears on re-anchor so each new spurt re-buffers.
+- **Loss vs silence classification (`decode_next_into`):** if the frame at the cursor is present → decode. If missing, look at the next buffered frame `(seq_n, frame_n)`: if the sequence advanced as many steps as the media clock (`seq_span == media_span`) the gap is **loss** — recover from the immediate successor's in-band **FEC** (`decode_fec`), else **PLC** (`decode_plc`); if the media clock jumped further (`seq_span < media_span`) the sender was **silent** → **re-anchor** to `frame_n` (re-buffer + prime), not concealed. A trailing gap with nothing buffered ahead is concealed but not counted as confirmed loss. Stats: `packets_lost`, `packets_recovered_fec`, `frames_concealed`.
+- **Drift handling:** sender-faster clock drift is mostly absorbed for free at spurt re-anchors; sustained drift in long continuous speech is bounded by dropping the oldest unplayed frame once depth exceeds `target_frames + DRIFT_DROP_SLACK`. Hard cap `JITTER_BUFFER_MAX_PACKETS = 20` is the backstop.
+- **PLC priming:** on re-anchor a discarded PLC frame warms the decoder (`needs_prime`) to avoid onset clicks — this now fires on a missed EOS too, since the timestamp jump alone triggers the re-anchor.
+- **Stale-stream guard:** if no packet for `STREAM_STALE_THRESHOLD` (200 ms) and no EOS, the stream is treated as ended so PLC doesn't run forever.
+- **Sender restart:** a media-clock jump backward by more than `RESTART_BACKWARD_FRAMES` clears the buffer and re-anchors (reconnect / new capture epoch), preserving the decoder.
 
-DTX note: the TX side sends DTX silence frames as-is (not skipped) so sequence numbers stay consecutive at one-per-20 ms and the receiver never sees a phantom gap; long silences are handled by the `EndOfStream` marker when the gate closes.
+EOS is **advisory**: `mark_end_of_stream` stops PLC promptly once the buffer drains, but a lost EOS is covered by both the stale guard and the silence classification. (DTX silence frames are still sent as-is today; the timestamp would also permit skipping them — a future TX optimization.)
 
 ---
 

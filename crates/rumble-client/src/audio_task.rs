@@ -34,6 +34,7 @@ use crate::{
 };
 use bytes::Bytes;
 use prost::Message;
+use rtrb::{Consumer, Producer, RingBuffer};
 use rumble_audio;
 use rumble_client_traits::{
     AudioBackend, AudioCaptureStream, DatagramTransport, Platform, VoiceCodec, VoiceDecoder as VoiceDecoderTrait,
@@ -44,7 +45,7 @@ use rumble_protocol::proto::VoiceDatagram;
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     sync::{
-        Arc, Mutex, RwLock,
+        Arc, RwLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -180,10 +181,30 @@ impl std::fmt::Debug for AudioCommand {
     }
 }
 
-/// Per-user audio state for playback with jitter buffer.
+/// One 20 ms frame on the media clock, in microseconds. The sender's
+/// `timestamp_us` advances by this per frame (through silence as well as
+/// speech), so a packet's frame index is `timestamp_us / FRAME_US`.
+const FRAME_US: u64 = 20_000;
+
+/// A buffered packet: its Opus payload plus the sender's sequence number. The
+/// sequence is kept alongside the media-clock key so a gap can be classified —
+/// if the sequence advanced as many steps as the media clock, the gap is packet
+/// loss; if the media clock jumped further, the sender was silent.
+struct BufferedPacket {
+    seq: u32,
+    opus: Vec<u8>,
+}
+
+/// Per-peer playback state: a timestamp-driven jitter buffer feeding the peer's
+/// long-lived Opus decoder.
 ///
-/// The jitter buffer stores incoming Opus packets by sequence number,
-/// allowing reordering and providing a delay to absorb network jitter.
+/// Packets are keyed by **media frame index** (`timestamp_us / FRAME_US`), not
+/// by sequence, so the playout cursor advances on the sender's clock and an
+/// intended silence gap is represented as missing frames (played out as the
+/// buffer draining), distinct from packet loss. The depth target adapts to
+/// measured interarrival jitter, and sender-faster clock drift is bounded by
+/// dropping the oldest unplayed frame past a slack margin (drift between
+/// talk-spurt boundaries is absorbed for free by re-anchoring).
 ///
 /// Exposed (`#[doc(hidden)]`) so the `jitter_buffer`/`rx_mix` benches and tests
 /// can drive it directly — not a stable public API. Fields stay private;
@@ -192,27 +213,38 @@ impl std::fmt::Debug for AudioCommand {
 #[doc(hidden)]
 pub struct UserAudioState<D: VoiceDecoderTrait> {
     /// Opus decoder for this user (platform-specific via VoiceCodec trait).
+    /// Long-lived: persists across talk spurts (see the decoder-lifetime
+    /// invariant in `docs/audio-subsystem.md`).
     decoder: D,
-    /// Jitter buffer: maps sequence number to Opus packet data.
-    /// Uses BTreeMap to maintain ordering by sequence number.
-    jitter_buffer: BTreeMap<u32, Vec<u8>>,
-    /// Next sequence number we expect to play.
-    next_play_seq: u32,
-    /// Whether we've started playing (have received first packet).
+    /// Jitter buffer keyed by media frame index (`timestamp_us / FRAME_US`).
+    jitter_buffer: BTreeMap<u64, BufferedPacket>,
+    /// Media frame index of the next frame to play (the playout cursor).
+    next_play_frame: u64,
+    /// Whether playout of the current spurt has begun; cleared on re-anchor so
+    /// the next spurt re-buffers to the target depth before playing.
     started: bool,
-    /// Last time we received audio from this user.
-    last_received: Instant,
-    /// Number of packets received (for initial buffering).
+    /// (sequence, frame) of the last frame actually decoded, used to classify a
+    /// gap as loss vs intended silence.
+    last_played_seq: u32,
+    last_played_frame: u64,
+    /// Adaptive playout depth (frames), derived from the jitter estimate and
+    /// clamped to `[MIN_TARGET_FRAMES, MAX_TARGET_FRAMES]`.
+    target_frames: u32,
+    /// Floor for the adaptive target — the configured base delay.
+    base_frames: u32,
+    /// RFC 3550-style smoothed interarrival jitter estimate, in microseconds.
+    jitter_est_us: f64,
+    /// Arrival instant + media frame of the last inserted packet, for the jitter
+    /// estimate and the stale-stream guard.
+    last_arrival: Instant,
+    last_arrival_frame: u64,
+    /// False until the first packet has been inserted (no arrival to diff yet).
+    have_arrival: bool,
+    /// Statistics: packets received.
     packets_received: u32,
-    /// Number of packets buffered since the last stream start.
-    /// This is reset when a new stream starts (after EOS) to ensure proper
-    /// jitter buffer fill before playback begins.
-    buffered_since_stream_start: u32,
-    /// Configurable delay in packets before starting playback.
-    jitter_buffer_delay: u32,
-    /// Statistics: packets lost (detected via sequence gaps).
+    /// Statistics: frames lost (a media frame the sender sent that never arrived).
     packets_lost: u64,
-    /// Statistics: packets recovered via FEC.
+    /// Statistics: frames recovered via FEC.
     packets_recovered_fec: u64,
     /// Statistics: frames concealed via PLC.
     frames_concealed: u64,
@@ -222,43 +254,84 @@ pub struct UserAudioState<D: VoiceDecoderTrait> {
     rx_pipeline: Option<rumble_audio::AudioPipeline>,
     /// Per-user volume adjustment in dB.
     volume_db: f32,
-    /// Whether the sender has signaled end of stream.
-    /// When true, we stop expecting more packets and won't count missing packets as lost.
+    /// Whether the sender has signaled end of stream. Advisory: it stops PLC
+    /// promptly once the buffer drains, but a lost EOS is also covered by the
+    /// stale-stream guard and by the silence classification at the next spurt.
     stream_ended: bool,
-    /// Whether we need to prime the decoder with a PLC frame before the first real frame.
-    /// This helps the decoder transition smoothly and prevents clicks/pops at stream start.
-    needs_plc_prime: bool,
+    /// Re-prime the (long-lived) decoder with a discarded PLC frame at the next
+    /// spurt onset, smoothing the transition and avoiding an onset click.
+    needs_prime: bool,
+    /// Consecutive packets dropped for arriving behind the playout cursor. A
+    /// stray late/reorder/dup frame trips this briefly; a *sustained* run means
+    /// the sender's media clock reset by less than `RESTART_BACKWARD_FRAMES`, and
+    /// at `LATE_RESYNC_FRAMES` we re-sync to it instead of dropping forever.
+    consecutive_late: u32,
 }
 
-/// Maximum jitter buffer size (drop old packets beyond this).
+/// Maximum jitter buffer size (hard backstop against unbounded growth).
 const JITTER_BUFFER_MAX_PACKETS: usize = 20;
 
-/// How long a peer can go without a received packet before its stream is
-/// treated as ended (3 frame-times, well outside normal jitter). Used both to
-/// stop PLC running forever after a silent disappearance (`decode_next_into`)
-/// and to detect a new talk spurt at the *receive* side when the end-of-stream
-/// marker — sent over unreliable datagrams — was lost (`insert_packet`).
-const STREAM_STALE_THRESHOLD: Duration = Duration::from_millis(60);
+/// Floor and ceiling for the adaptive playout target, in 20 ms frames.
+const MIN_TARGET_FRAMES: u32 = 2;
+const MAX_TARGET_FRAMES: u32 = 12;
+
+/// While playing, drop the oldest unplayed frame once the buffer sits this many
+/// frames past the current target. Bounds added latency under sender-faster
+/// clock drift; most drift is absorbed for free when a spurt boundary
+/// re-anchors the cursor, so this only fires on long continuous speech.
+const DRIFT_DROP_SLACK: u32 = 4;
+
+/// A media-clock jump backward by more than this many frames is read as a
+/// sender restart (reconnect / new capture epoch), not a late or duplicate
+/// packet, and re-anchors playout to the new stream.
+const RESTART_BACKWARD_FRAMES: u64 = 100;
+
+/// A *smaller* backward reset (within `RESTART_BACKWARD_FRAMES`) looks like a run
+/// of late packets. After this many consecutive behind-cursor packets — far more
+/// than any plausible reorder burst — conclude the sender's clock reset and
+/// re-sync, so the stream recovers instead of dropping every frame forever.
+const LATE_RESYNC_FRAMES: u32 = 10;
+
+/// If no packet arrives for this long with no EOS, treat the stream as ended so
+/// PLC doesn't run forever (sender crash, NAT rebind, lost EOS). Comfortably
+/// longer than the deepest adaptive buffer so normal jitter never trips it.
+const STREAM_STALE_THRESHOLD: Duration = Duration::from_millis(200);
 
 /// Message sent from audio capture callback to main loop.
+///
+/// `timestamp_us` is the frame's position on the sender's media clock — a
+/// continuous count of 20 ms frames since the connection's capture epoch,
+/// advancing through silence (VAD suppression, mute, PTT release) as well as
+/// active speech. It is the RTP-style timestamp the receiver uses to tell an
+/// intended silence gap apart from packet loss; see [`UserAudioState`].
 enum CaptureMessage {
     /// An encoded audio frame ready to send.
-    EncodedFrame { data: Bytes, size_bytes: usize },
+    EncodedFrame {
+        data: Bytes,
+        size_bytes: usize,
+        timestamp_us: u64,
+    },
     /// End of stream marker - transmission has stopped (VAD suppressed, PTT released, etc.)
-    EndOfStream,
+    EndOfStream { timestamp_us: u64 },
 }
 
 impl<D: VoiceDecoderTrait> UserAudioState<D> {
-    pub fn new(decoder: D, jitter_buffer_delay: u32) -> Self {
+    pub fn new(decoder: D, base_delay: u32) -> Self {
+        let base = base_delay.clamp(MIN_TARGET_FRAMES, MAX_TARGET_FRAMES);
         Self {
             decoder,
             jitter_buffer: BTreeMap::new(),
-            next_play_seq: 0,
+            next_play_frame: 0,
             started: false,
-            last_received: Instant::now(),
+            last_played_seq: 0,
+            last_played_frame: 0,
+            target_frames: base,
+            base_frames: base,
+            jitter_est_us: 0.0,
+            last_arrival: Instant::now(),
+            last_arrival_frame: 0,
+            have_arrival: false,
             packets_received: 0,
-            buffered_since_stream_start: 0,
-            jitter_buffer_delay,
             packets_lost: 0,
             packets_recovered_fec: 0,
             frames_concealed: 0,
@@ -266,7 +339,8 @@ impl<D: VoiceDecoderTrait> UserAudioState<D> {
             rx_pipeline: None,
             volume_db: 0.0,
             stream_ended: false,
-            needs_plc_prime: false,
+            needs_prime: false,
+            consecutive_late: 0,
         }
     }
 
@@ -280,105 +354,129 @@ impl<D: VoiceDecoderTrait> UserAudioState<D> {
         }
     }
 
-    /// Insert a packet into the jitter buffer.
-    pub fn insert_packet(&mut self, sequence: u32, opus_data: Vec<u8>) {
-        // Measure the receive gap BEFORE stamping the new arrival time.
-        let since_last = self.last_received.elapsed();
-        self.last_received = Instant::now();
+    /// Frames currently buffered at or ahead of the playout cursor.
+    fn depth(&self) -> usize {
+        self.jitter_buffer.range(self.next_play_frame..).count()
+    }
+
+    /// Fold this arrival into the RFC 3550-style interarrival jitter estimate
+    /// and recompute the adaptive playout target. Only forward arrivals advance
+    /// the estimate (out-of-order packets would pollute the transit-time diff).
+    /// `now` is the arrival instant (injectable so tests can model real pacing).
+    fn update_jitter(&mut self, frame: u64, now: Instant) {
+        if self.have_arrival && frame > self.last_arrival_frame {
+            let arrival_delta = now.duration_since(self.last_arrival).as_micros() as f64;
+            let media_delta = (frame - self.last_arrival_frame) as f64 * FRAME_US as f64;
+            let transit = (arrival_delta - media_delta).abs();
+            self.jitter_est_us += (transit - self.jitter_est_us) / 16.0;
+            // Hold ~2x the smoothed jitter as headroom, on top of the base delay.
+            let jitter_frames = (2.0 * self.jitter_est_us / FRAME_US as f64).ceil() as u32;
+            self.target_frames = (self.base_frames + jitter_frames).clamp(MIN_TARGET_FRAMES, MAX_TARGET_FRAMES);
+        }
+        self.last_arrival = now;
+        self.last_arrival_frame = frame;
+        self.have_arrival = true;
+    }
+
+    /// Re-anchor playout to the start of a new spurt at `frame`: re-buffer to the
+    /// target depth and prime the long-lived decoder so its carried-over state
+    /// doesn't pop when handed fresh content. The decoder itself is never reset.
+    fn reanchor(&mut self, frame: u64) {
+        self.next_play_frame = frame;
+        self.started = false;
+        self.needs_prime = true;
+    }
+
+    /// Insert a packet into the jitter buffer, keyed by its media frame index.
+    pub fn insert_packet(&mut self, sequence: u32, timestamp_us: u64, opus_data: Vec<u8>) {
+        self.insert_packet_at(sequence, timestamp_us, opus_data, Instant::now());
+    }
+
+    /// As [`insert_packet`] but with the arrival instant supplied — lets tests
+    /// model realistic packet pacing so the adaptive jitter target is
+    /// deterministic instead of reacting to instant back-to-back inserts.
+    pub fn insert_packet_at(&mut self, sequence: u32, timestamp_us: u64, opus_data: Vec<u8>, arrival: Instant) {
+        let frame = timestamp_us / FRAME_US;
         self.packets_received += 1;
         self.bytes_received += opus_data.len() as u64;
+        self.update_jitter(frame, arrival);
 
-        // Detect new stream start. We reset buffering state to re-absorb jitter
-        // before playback begins, and prime the decoder so the warm decoder
-        // (carrying the previous spurt's internal state) doesn't pop when it is
-        // handed fresh content. A new spurt is signalled by EITHER:
-        //
-        //  - an explicit end-of-stream marker (`stream_ended`), or
-        //  - a receive gap longer than the stale threshold while we were mid-
-        //    playback. EOS travels over UNRELIABLE datagrams, so it can be lost
-        //    (or never sent when the sender just stops); relying on the flag
-        //    alone leaves the gap-resumption case un-primed and audibly clicky.
-        //
-        // IMPORTANT: We do NOT reset the decoder here. The decoder persists
-        // through DTX silence periods to maintain internal state. This is part
-        // of the server-state-driven decoder lifecycle design.
-        let was_stream_ended = self.stream_ended;
-        let gap_resume = self.started && since_last > STREAM_STALE_THRESHOLD;
+        // A media clock that jumps far backward is a sender restart (reconnect /
+        // new capture epoch), not a stray late packet — drop the old stream and
+        // re-anchor to the new one. The decoder persists across the restart.
+        if self.started && frame + RESTART_BACKWARD_FRAMES < self.next_play_frame {
+            debug!("sender restart: media clock jumped back to frame {}", frame);
+            self.jitter_buffer.clear();
+            self.reanchor(frame);
+        } else if self.started && frame < self.next_play_frame {
+            // Behind the playout cursor: normally a stray late / reordered /
+            // duplicate frame, which we drop. But a *sustained* run of
+            // behind-cursor frames (the cursor only advances on playout, so this
+            // only happens if the sender's clock genuinely moved below ours)
+            // means a small backward reset that the far-jump check above missed —
+            // re-sync to it rather than dropping every frame forever.
+            self.consecutive_late = self.consecutive_late.saturating_add(1);
+            if self.consecutive_late <= LATE_RESYNC_FRAMES {
+                return;
+            }
+            debug!("media clock reset below cursor; re-syncing at frame {}", frame);
+            self.jitter_buffer.clear();
+            self.reanchor(frame);
+        }
+
+        // An accepted packet (forward, restart, or resync) clears the late run
+        // and means the stream is live again; EOS is only advisory.
+        self.consecutive_late = 0;
         self.stream_ended = false;
+        self.jitter_buffer.insert(
+            frame,
+            BufferedPacket {
+                seq: sequence,
+                opus: opus_data,
+            },
+        );
 
-        if was_stream_ended || gap_resume {
-            // New stream starting after EOS or a silent gap - reset buffering
-            // state only.
-            debug!(
-                "New stream starting ({}): seq {}, resetting buffer state (decoder persisted)",
-                if was_stream_ended {
-                    "after EOS"
-                } else {
-                    "gap resume, EOS missed"
-                },
-                sequence
-            );
-            self.jitter_buffer.clear();
-            self.next_play_seq = sequence;
-            self.started = false;
-            self.buffered_since_stream_start = 0;
-            // Prime the decoder with a PLC frame before the first real frame
-            // This helps the decoder transition smoothly and prevents clicks
-            self.needs_plc_prime = true;
-            // NOTE: Decoder is NOT reset - it persists for the entire user session
+        // While buffering a fresh spurt, keep the cursor on the earliest buffered
+        // frame so playout begins at the spurt's true start.
+        if !self.started
+            && let Some((&first, _)) = self.jitter_buffer.iter().next()
+        {
+            self.next_play_frame = first;
         }
 
-        // Increment buffering counter for this stream
-        self.buffered_since_stream_start += 1;
-
-        // If not started, set the initial sequence
-        if !self.started && self.buffered_since_stream_start == 1 {
-            self.next_play_seq = sequence;
-        }
-
-        // Handle sequence number discontinuity (sender restart or sequence wrap)
-        // With DTX handling on the TX side, sequence numbers are now consecutive
-        // (no gaps from skipped DTX frames). Any gap indicates:
-        // 1. True packet loss (small gap) - let jitter buffer and PLC handle it
-        // 2. Sender restart (sequence jumps backward or large forward jump)
-        //
-        // For sender restart, we reset the jitter buffer but NOT the decoder.
-        let behind_by = self.next_play_seq.wrapping_sub(sequence);
-        const HALF_SEQ_SPACE: u32 = u32::MAX / 2;
-
-        if self.started && behind_by > 0 && behind_by < HALF_SEQ_SPACE {
-            // Sender has restarted - reset jitter buffer state only
-            debug!(
-                "Detected sender restart: received seq {} but expected around {}, resetting buffer (decoder persisted)",
-                sequence, self.next_play_seq
-            );
-            self.jitter_buffer.clear();
-            self.next_play_seq = sequence;
-            self.started = false;
-            self.buffered_since_stream_start = 1; // Count this packet
-            // Prime the decoder for the restarted stream, same as the EOS/gap
-            // path above — a restart hands the warm decoder fresh content.
-            self.needs_plc_prime = true;
-            // NOTE: Decoder is NOT reset - it persists for the entire user session
-        }
-
-        // Insert into buffer
-        self.jitter_buffer.insert(sequence, opus_data);
-
-        // Limit buffer size - remove oldest packets if too large
-        while self.jitter_buffer.len() > JITTER_BUFFER_MAX_PACKETS {
-            if let Some((oldest_seq, _)) = self.jitter_buffer.pop_first() {
-                // If we removed a packet we haven't played yet, skip it
-                if oldest_seq >= self.next_play_seq {
-                    self.next_play_seq = oldest_seq.wrapping_add(1);
+        // Trim the buffer. While playing, hold it near the target to bound the
+        // latency that sender-faster clock drift would otherwise add; while
+        // buffering, only enforce the hard cap.
+        let max_depth = if self.started {
+            (self.target_frames + DRIFT_DROP_SLACK) as usize
+        } else {
+            JITTER_BUFFER_MAX_PACKETS
+        };
+        while self.jitter_buffer.len() > JITTER_BUFFER_MAX_PACKETS || self.depth() > max_depth {
+            let Some((&oldest, _)) = self.jitter_buffer.iter().next() else {
+                break;
+            };
+            self.jitter_buffer.remove(&oldest);
+            if self.started {
+                if oldest >= self.next_play_frame {
+                    self.next_play_frame = oldest + 1;
                 }
+            } else if let Some((&first, _)) = self.jitter_buffer.iter().next() {
+                self.next_play_frame = first;
             }
         }
     }
 
-    /// Check if we have enough buffered to start playback.
+    /// Mark the sender's end-of-stream. Advisory: it stops PLC promptly once the
+    /// buffer drains; a lost EOS is still covered by the stale-stream guard and
+    /// by the silence classification at the next spurt.
+    pub fn mark_end_of_stream(&mut self) {
+        self.stream_ended = true;
+    }
+
+    /// Check if we have enough buffered to start (or are already playing).
     fn ready_to_play(&self) -> bool {
-        self.buffered_since_stream_start >= self.jitter_buffer_delay
+        self.started || self.depth() >= self.target_frames as usize
     }
 
     /// Decode the next frame to play into `out`, returning the number of valid
@@ -389,106 +487,97 @@ impl<D: VoiceDecoderTrait> UserAudioState<D> {
     /// every decode. Only `out[..returned_len]` is meaningful; bytes beyond the
     /// returned length are left untouched (may hold stale data from a prior peer).
     ///
-    /// FEC (Forward Error Correction) recovery works by using data embedded in the
-    /// *next* packet to reconstruct a lost packet. This provides better quality than
-    /// pure PLC (Packet Loss Concealment) which just interpolates/generates comfort noise.
+    /// A gap at the cursor is classified from the next buffered frame: if the
+    /// sender's sequence advanced as many steps as the media clock, the gap is
+    /// packet loss (recover via FEC, else PLC); if the media clock jumped
+    /// further, the sender was silent, so we re-anchor to the new spurt rather
+    /// than concealing the silence.
     pub fn decode_next_into(&mut self, out: &mut [f32; OPUS_FRAME_SIZE]) -> Option<usize> {
         if !self.ready_to_play() {
             return None;
         }
 
-        // If we haven't received a packet in a while, treat the stream as ended
-        // even without an explicit EOS marker. Guards against lost EOS datagrams,
-        // sender crashes, NAT rebinds, and any other case where the sender stops
-        // without a clean signal — otherwise we'd PLC forever generating noise.
-        // 60 ms is 3 frame-times, well outside normal jitter.
-        if !self.stream_ended && self.last_received.elapsed() > STREAM_STALE_THRESHOLD {
-            debug!(
-                "No packet received for {:?}, treating stream as ended",
-                self.last_received.elapsed()
-            );
+        // Stale-stream guard: no packets for a while and no EOS → treat as ended
+        // so PLC doesn't run forever (sender crash, NAT rebind, lost EOS).
+        if !self.stream_ended && self.have_arrival && self.last_arrival.elapsed() > STREAM_STALE_THRESHOLD {
             self.stream_ended = true;
         }
-
-        // If stream ended and buffer is empty, don't try to play more
-        // (this avoids counting "missing" packets as lost when transmission intentionally stopped)
         if self.stream_ended && self.jitter_buffer.is_empty() {
             return None;
         }
 
-        // Track if this is the first frame after stream start for diagnostics
-        let is_first_frame = self.needs_plc_prime;
-
-        // Prime the decoder with a PLC frame before the first real frame.
-        // This helps the decoder transition smoothly from silence/previous stream
-        // and prevents clicks/pops at stream start. The PLC frame is discarded
-        // (not played) - it just warms up the decoder's internal state.
-        if self.needs_plc_prime {
-            self.needs_plc_prime = false;
-            // Run PLC to prime decoder state - discard the output
+        // Prime the long-lived decoder at a spurt onset to avoid an onset click.
+        if self.needs_prime {
+            self.needs_prime = false;
             let mut discard = [0.0f32; OPUS_FRAME_SIZE];
             let _ = self.decoder.decode_plc(&mut discard);
-            debug!("Primed decoder with PLC frame before first real frame");
         }
 
-        self.started = true;
+        let frame = self.next_play_frame;
 
-        let seq = self.next_play_seq;
-        self.next_play_seq = self.next_play_seq.wrapping_add(1);
-
-        if let Some(opus_data) = self.jitter_buffer.remove(&seq) {
-            // Packet present - decode it
-            match self.decoder.decode(&opus_data, out) {
-                Ok(samples) => {
-                    // Log first frame for diagnostics
-                    if is_first_frame && samples >= 8 {
-                        debug!(
-                            "First decoded frame: samples=[{:.4}, {:.4}, {:.4}, {:.4}, ...]",
-                            out[0], out[1], out[2], out[3]
-                        );
-                    }
-                    Some(samples)
-                }
+        // Frame present → decode and advance.
+        if let Some(pkt) = self.jitter_buffer.remove(&frame) {
+            self.started = true;
+            self.last_played_seq = pkt.seq;
+            self.last_played_frame = frame;
+            self.next_play_frame += 1;
+            return match self.decoder.decode(&pkt.opus, out) {
+                Ok(n) => Some(n),
                 Err(e) => {
-                    warn!("Decode error for seq {}: {}", seq, e);
-                    // Try PLC on decode error
+                    warn!("decode error at frame {}: {}", frame, e);
                     self.frames_concealed += 1;
                     self.decoder.decode_plc(out).ok()
                 }
-            }
-        } else {
-            // Packet missing
-            // If stream ended, don't count as lost - the sender intentionally stopped
+            };
+        }
+
+        // Frame missing. Find the next buffered frame to classify the gap.
+        let next = self.jitter_buffer.range(frame + 1..).next().map(|(&f, p)| (f, p.seq));
+        let Some((next_frame, next_seq)) = next else {
+            // Nothing buffered ahead.
             if self.stream_ended {
                 return None;
             }
+            // Starved mid-spurt: conceal and advance (the frame's time has passed).
+            self.frames_concealed += 1;
+            self.next_play_frame += 1;
+            return self.decoder.decode_plc(out).ok();
+        };
 
-            // Track as lost (this is a real packet loss, not end of stream)
-            self.packets_lost += 1;
-
-            // Try FEC recovery using the next packet if available
-            let next_seq = seq.wrapping_add(1);
-            if let Some(next_opus_data) = self.jitter_buffer.get(&next_seq) {
-                // We have the next packet - use its FEC data to recover this frame
-                warn!("Missing packet seq {}, recovering with FEC from seq {}", seq, next_seq);
-                match self.decoder.decode_fec(next_opus_data, out) {
-                    Ok(samples) => {
-                        self.packets_recovered_fec += 1;
-                        Some(samples)
-                    }
-                    Err(e) => {
-                        warn!("FEC recovery failed for seq {}: {}, falling back to PLC", seq, e);
-                        self.frames_concealed += 1;
-                        self.decoder.decode_plc(out).ok()
-                    }
-                }
-            } else {
-                // No next packet available - fall back to pure PLC
-                warn!("Missing packet seq {}, no FEC available, using PLC", seq);
-                self.frames_concealed += 1;
-                self.decoder.decode_plc(out).ok()
+        // Classify loss vs silence over [last_played, next_frame]: if the
+        // sequence advanced as many steps as the media clock, every frame was
+        // sent and the gap is loss; if the media clock jumped further, the
+        // sender was silent → re-anchor to the new spurt.
+        if self.started {
+            let media_span = next_frame - self.last_played_frame;
+            let seq_span = next_seq.wrapping_sub(self.last_played_seq) as u64;
+            if seq_span < media_span {
+                self.reanchor(next_frame);
+                return None;
             }
         }
+
+        // Loss at `frame`. Recover from the immediate successor's in-band FEC if
+        // present, else conceal with PLC.
+        self.packets_lost += 1;
+        self.next_play_frame += 1;
+        if next_frame == frame + 1
+            && let Some(pkt) = self.jitter_buffer.get(&next_frame)
+        {
+            return match self.decoder.decode_fec(&pkt.opus, out) {
+                Ok(n) => {
+                    self.packets_recovered_fec += 1;
+                    Some(n)
+                }
+                Err(e) => {
+                    warn!("FEC recovery failed at frame {}: {}, falling back to PLC", frame, e);
+                    self.frames_concealed += 1;
+                    self.decoder.decode_plc(out).ok()
+                }
+            };
+        }
+        self.frames_concealed += 1;
+        self.decoder.decode_plc(out).ok()
     }
 }
 
@@ -630,13 +719,9 @@ async fn run_audio_task<P: Platform>(
 
     // Audio I/O handles (generic over Platform)
     let mut audio_input: Option<CapStream<P>> = None;
-    // Shared playback buffer: audio task writes mixed samples here,
-    // the output stream's callback reads from it.
-    let playback_buffer: Arc<Mutex<VecDeque<f32>>> =
-        Arc::new(Mutex::new(VecDeque::with_capacity(MAX_PLAYBACK_BUFFER_SAMPLES)));
     // Playback health counters. `playback_underruns` is bumped by the output
-    // callback (a separate device thread) when it drains the buffer mid-block;
-    // `playback_overflows` by the mix tick when it caps the buffer and drops
+    // callback (a separate device thread) when it drains the ring mid-block;
+    // `playback_overflows` by the mix tick when the ring is full and it drops
     // about-to-play samples. Both surface in AudioStats for diagnosis.
     let playback_underruns = Arc::new(AtomicU64::new(0));
     let playback_overflows = Arc::new(AtomicU64::new(0));
@@ -688,6 +773,16 @@ async fn run_audio_task<P: Platform>(
     // Sequence number for outgoing voice packets
     // Only incremented when a packet is actually sent (not for skipped DTX frames)
     let mut send_sequence: u32 = 0;
+
+    // Outgoing media clock. `capture_frame_index` counts 20 ms frames since
+    // `capture_epoch`; the capture callback advances it per captured frame (so
+    // VAD-suppressed silence is encoded as a timestamp gap) and stamps each
+    // sent datagram with `index * FRAME_US`. On capture (re)activation the index
+    // is fast-forwarded to real elapsed time so mute/PTT gaps are encoded too —
+    // making the timestamp a true media clock the receiver can use to tell
+    // silence from loss. Both reset per connection.
+    let capture_frame_index = Arc::new(AtomicU64::new(0));
+    let mut capture_epoch = Instant::now();
 
     // Statistics tracking
     let mut packets_sent: u64 = 0;
@@ -742,20 +837,51 @@ async fn run_audio_task<P: Platform>(
     // Interval for cleaning up stale talking_users
     let mut cleanup_interval = tokio::time::interval(Duration::from_millis(500));
 
-    // Interval for mixing audio from all users' jitter buffers (every 20ms = one frame)
-    let mut mix_interval = tokio::time::interval(Duration::from_millis(20));
+    // Poll cadence for the playback producer. This is NOT the production rate —
+    // each tick refills the ring to `PLAYBACK_TARGET_SAMPLES`, so how much is
+    // produced is set by how much the device drained, not by this interval. The
+    // interval only has to be short relative to the ring depth so a tick lands
+    // before the ring can drain empty (10 ms vs a ~40 ms ring → a delayed tick
+    // is absorbed). A late tick under the default Burst behavior just finds the
+    // ring already full and produces nothing, so catch-up bursts are harmless.
+    let mut produce_interval = tokio::time::interval(Duration::from_millis(10));
 
     // Interval for updating statistics in state
     let mut stats_interval = tokio::time::interval(Duration::from_millis(500));
 
+    // Playback hand-off: a lock-free SPSC ring, created per output stream. The
+    // mix tick (this thread) is the sole producer; the device output callback (a
+    // separate real-time thread) is the sole consumer. The `Producer` lives here
+    // in `playback_producer`, the `Consumer` is moved into the device callback,
+    // so the producer and the stream are always created and torn down as a unit
+    // — hence `open_playback!` over the two locals rather than a helper that
+    // would have to thread both back out. Both are `None` whenever there is no
+    // output stream (deafened, or a device that failed to open). Left
+    // uninitialized here; `open_playback!` below assigns both before first use.
+    let mut playback_stream: Option<PlayStream<P>>;
+    let mut playback_producer: Option<Producer<f32>>;
+    macro_rules! open_playback {
+        () => {{
+            match start_audio_output::<P>(
+                &audio_backend,
+                &selected_output,
+                playback_underruns.clone(),
+                playback_producer_active.clone(),
+            ) {
+                Some((stream, producer)) => {
+                    playback_stream = Some(stream);
+                    playback_producer = Some(producer);
+                }
+                None => {
+                    playback_stream = None;
+                    playback_producer = None;
+                }
+            }
+        }};
+    }
+
     // Start audio output at startup so SFX can play without a connection
-    let mut playback_stream: Option<PlayStream<P>> = start_audio_output::<P>(
-        &audio_backend,
-        &selected_output,
-        playback_buffer.clone(),
-        playback_underruns.clone(),
-        playback_producer_active.clone(),
-    );
+    open_playback!();
 
     info!("Audio task started");
 
@@ -770,6 +896,12 @@ async fn run_audio_task<P: Platform>(
             match capture_transition(want, capture_is_active) {
                 CaptureTransition::Activate => {
                     capture_is_active = true;
+                    // Fast-forward the media clock past the silence we were not
+                    // capturing (mute / PTT up), so the resumed stream's
+                    // timestamp reflects the real gap and the receiver re-anchors
+                    // it as a new spurt. `fetch_max` keeps it monotonic.
+                    let elapsed_frames = (capture_epoch.elapsed().as_micros() as u64) / FRAME_US;
+                    capture_frame_index.fetch_max(elapsed_frames, Ordering::Relaxed);
                     if let Some(stream) = audio_input.as_ref() {
                         stream.set_active(true);
                     }
@@ -779,7 +911,9 @@ async fn run_audio_task<P: Platform>(
                 CaptureTransition::Deactivate => {
                     // Send end-of-stream before deactivating
                     // (PTT released, muted, disconnected, etc.)
-                    let _ = encoded_tx.send(CaptureMessage::EndOfStream);
+                    let _ = encoded_tx.send(CaptureMessage::EndOfStream {
+                        timestamp_us: capture_frame_index.load(Ordering::Relaxed) * FRAME_US,
+                    });
                     capture_is_active = false;
                     if let Some(stream) = audio_input.as_ref() {
                         stream.set_active(false);
@@ -801,6 +935,10 @@ async fn run_audio_task<P: Platform>(
                         info!("Audio task: connection established, user_id={}", uid);
                         connection = Some(conn);
                         my_user_id = uid;
+
+                        // Reset the outgoing media clock for the new connection.
+                        capture_epoch = Instant::now();
+                        capture_frame_index.store(0, Ordering::Relaxed);
 
                         // Create connection-scoped encoder
                         // The encoder persists for the entire connection, not per-transmission
@@ -826,7 +964,7 @@ async fn run_audio_task<P: Platform>(
 
                         // Start audio output for receiving (unless deafened)
                         if playback_stream.is_none() && !self_deafened {
-                            playback_stream = start_audio_output::<P>(&audio_backend, &selected_output, playback_buffer.clone(), playback_underruns.clone(), playback_producer_active.clone());
+                            open_playback!();
                         }
 
                         // Create connection-scoped audio input stream. It
@@ -846,6 +984,7 @@ async fn run_audio_task<P: Platform>(
                                 &bus.voice,
                                 &audio_dumper,
                                 &meter_writer,
+                                &capture_frame_index,
                             );
                         }
 
@@ -913,6 +1052,7 @@ async fn run_audio_task<P: Platform>(
                                 &bus.voice,
                                 &audio_dumper,
                                 &meter_writer,
+                                &capture_frame_index,
                             );
                         }
                         sync_transmission!();
@@ -927,8 +1067,9 @@ async fn run_audio_task<P: Platform>(
 
                         // Restart output (always, even when disconnected — SFX need it)
                         playback_stream = None;
+                        playback_producer = None;
                         if !self_deafened {
-                            playback_stream = start_audio_output::<P>(&audio_backend, &selected_output, playback_buffer.clone(), playback_underruns.clone(), playback_producer_active.clone());
+                            open_playback!();
                         }
                     }
 
@@ -971,6 +1112,7 @@ async fn run_audio_task<P: Platform>(
                         // Handle audio output based on deafen state
                         if deafened {
                             playback_stream = None;
+                            playback_producer = None;
                             // Snapshot talkers and emit stop transitions before
                             // we wipe local decoder state.
                             let snapshot = read_state(&state).audio.talking_users.clone();
@@ -979,7 +1121,7 @@ async fn run_audio_task<P: Platform>(
                                 let _ = bus.voice.send(VoiceEvent::UserStoppedTalking { user_id: uid });
                             }
                         } else if connection.is_some() && playback_stream.is_none() {
-                            playback_stream = start_audio_output::<P>(&audio_backend, &selected_output, playback_buffer.clone(), playback_underruns.clone(), playback_producer_active.clone());
+                            open_playback!();
                         }
 
                         // Mute is gated via set_active(false); leave the input
@@ -1044,6 +1186,7 @@ async fn run_audio_task<P: Platform>(
                                 &bus.voice,
                                 &audio_dumper,
                                 &meter_writer,
+                                &capture_frame_index,
                             );
                         }
                         sync_transmission!();
@@ -1095,6 +1238,7 @@ async fn run_audio_task<P: Platform>(
                                 &bus.voice,
                                 &audio_dumper,
                                 &meter_writer,
+                                &capture_frame_index,
                             );
                         }
                         sync_transmission!();
@@ -1288,13 +1432,15 @@ async fn run_audio_task<P: Platform>(
             // Send encoded audio or end-of-stream as datagrams
             Some(capture_msg) = encoded_rx.recv() => {
                 if let Some(conn) = &connection {
-                    let (opus_data, size_bytes, end_of_stream) = match capture_msg {
-                        CaptureMessage::EncodedFrame { data, size_bytes } => {
-                            (data.to_vec(), size_bytes, false)
-                        }
-                        CaptureMessage::EndOfStream => {
+                    let (opus_data, size_bytes, end_of_stream, timestamp_us) = match capture_msg {
+                        CaptureMessage::EncodedFrame {
+                            data,
+                            size_bytes,
+                            timestamp_us,
+                        } => (data.to_vec(), size_bytes, false, timestamp_us),
+                        CaptureMessage::EndOfStream { timestamp_us } => {
                             // Send empty datagram with end_of_stream flag
-                            (Vec::new(), 0, true)
+                            (Vec::new(), 0, true, timestamp_us)
                         }
                     };
 
@@ -1302,7 +1448,7 @@ async fn run_audio_task<P: Platform>(
                         sender_id: Some(my_user_id),
                         room_id: None, // Server determines room from connection state
                         sequence: send_sequence,
-                        timestamp_us: 0, // Optional per proto; receiver uses arrival time
+                        timestamp_us, // Media clock (see capture_frame_index); receiver tells silence from loss
                         opus_data,
                         end_of_stream,
                     };
@@ -1340,6 +1486,7 @@ async fn run_audio_task<P: Platform>(
                                     handle_voice_datagram::<P::Codec>(
                                         sender_id,
                                         voice.sequence,
+                                        voice.timestamp_us,
                                         voice.opus_data,
                                         voice.end_of_stream,
                                         &mut user_audio,
@@ -1365,12 +1512,14 @@ async fn run_audio_task<P: Platform>(
                 }
             }
 
-            // Mix audio from all users' jitter buffers every 20ms
-            _ = mix_interval.tick() => {
-                mix_and_play_audio(
+            // Top the playback ring back up to its target depth. Consumer-paced:
+            // produces only as many frames as the device drained since the last
+            // poll, so production tracks the audio clock (no wall-clock drift).
+            _ = produce_interval.tick() => {
+                fill_playback_ring(
                     &mut user_audio,
                     &mut sfx_queue,
-                    &playback_buffer,
+                    playback_producer.as_mut(),
                     &audio_dumper,
                     &playback_overflows,
                     &playback_producer_active,
@@ -1388,7 +1537,7 @@ async fn run_audio_task<P: Platform>(
                     &user_audio,
                     packets_sent,
                     bytes_sent,
-                    &playback_buffer,
+                    playback_producer.as_ref(),
                     &playback_underruns,
                     &playback_overflows,
                     &mut stats_writer,
@@ -1417,6 +1566,7 @@ fn start_transmission<P: Platform>(
     voice_tx: &tokio::sync::broadcast::Sender<VoiceEvent>,
     audio_dumper: &AudioDumper,
     meter_writer: &crate::snapshot::SnapshotWriter<crate::meter::MeterSnapshot>,
+    capture_frame_index: &Arc<AtomicU64>,
 ) {
     if audio_input.is_some() {
         return; // Stream already exists
@@ -1497,11 +1647,21 @@ fn start_transmission<P: Platform>(
     // we're moving to FnMut anyway.
     let mut sample_scratch: Vec<f32> = Vec::with_capacity(2048);
 
+    // Media-clock counter, advanced once per captured 20 ms frame so that
+    // VAD-suppressed silence is encoded as a timestamp gap (see the field doc).
+    let capture_frame_index_cb = capture_frame_index.clone();
+
     // Create audio input via AudioBackend trait
     let encoded_tx = encoded_tx.clone();
     let input = audio_backend.open_input(
         selected_input.as_deref(),
         Box::new(move |samples| {
+            // Advance the media clock for every captured frame (including the
+            // discarded warm-up frames and VAD-suppressed ones) so the timestamp
+            // tracks real elapsed capture time. The frame's media timestamp is
+            // its index on this clock.
+            let timestamp_us = capture_frame_index_cb.fetch_add(1, std::sync::atomic::Ordering::Relaxed) * FRAME_US;
+
             // Discard first few frames to avoid stale hardware buffer samples
             let remaining = frames_to_discard_for_callback.load(std::sync::atomic::Ordering::Relaxed);
             if remaining > 0 {
@@ -1562,7 +1722,7 @@ fn start_transmission<P: Platform>(
                 // If we were transmitting and now we're suppressed, send end-of-stream
                 if was_tx {
                     was_transmitting_for_callback.store(false, std::sync::atomic::Ordering::Relaxed);
-                    let _ = encoded_tx.send(CaptureMessage::EndOfStream);
+                    let _ = encoded_tx.send(CaptureMessage::EndOfStream { timestamp_us });
                 }
                 return;
             }
@@ -1584,6 +1744,7 @@ fn start_transmission<P: Platform>(
                         let _ = encoded_tx.send(CaptureMessage::EncodedFrame {
                             data: Bytes::copy_from_slice(encoded),
                             size_bytes: len,
+                            timestamp_us,
                         });
                     }
                     Err(e) => {
@@ -1626,14 +1787,33 @@ fn stop_transmission<P: Platform>(audio_input: &mut Option<CapStream<P>>) {
     info!("Destroyed audio input stream");
 }
 
-/// Target PCM cushion (in samples) the playback filler builds before it starts
-/// draining a stream. The producer is an open-loop 20 ms mix timer while the
-/// device drains at the hardware clock; with no cushion the buffer sits one
-/// frame deep and any timing slip empties it mid-stream, inserting a silence
-/// gap (a click) into voice *and* sfx. 3 frames = 60 ms gives slack for that
-/// jitter at the cost of 60 ms of onset latency. Stays well under the 200 ms
-/// `MAX_PLAYBACK_BUFFER_SAMPLES` cap so it never fights the overflow drain.
-const PLAYBACK_PRIME_SAMPLES: usize = 3 * OPUS_FRAME_SIZE;
+/// PCM cushion (in samples) the playback filler builds before it starts
+/// draining a stream. The producer now refills the ring to
+/// [`PLAYBACK_TARGET_SAMPLES`] on each poll (see `fill_playback_ring`), so the
+/// ring no longer needs to hold the network cushion — that stays in the
+/// per-peer jitter buffers. This is just enough PCM to cover the device pulling
+/// a full 20 ms frame at once (the PulseAudio path writes whole frames) plus one
+/// frame of reserve before the next producer poll. Must be ≤
+/// `PLAYBACK_TARGET_SAMPLES`, or the producer would stop filling below the depth
+/// the consumer waits for and playout would never start.
+const PLAYBACK_PRIME_SAMPLES: usize = 2 * OPUS_FRAME_SIZE;
+
+/// Ring depth (samples) the mix producer refills to on each poll. Because it
+/// only ever tops the ring up to this fixed depth, the number of frames it
+/// produces tracks how much the device drained since the last poll — so
+/// production rate equals the device's *audio-clock* drain rate, not the
+/// poll-timer's wall-clock rate. That is what closes the wall-clock-vs-audio
+/// drift that made the ring underrun (or overflow) over time.
+///
+/// Set equal to the prime so the producer fills the ring to exactly the depth
+/// the consumer waits for, and no further: a talk spurt's network cushion stays
+/// in the per-peer jitter buffer (where a late/reordered packet can still be
+/// slotted in) instead of being decoded ahead into PCM here (where it can't). A
+/// larger target would pull more packets out of the jitter buffer at spurt
+/// onset, trading reorder tolerance for a little more poll-delay slack — not the
+/// trade we want until the jitter buffer itself is adaptive (see the redesign
+/// doc).
+const PLAYBACK_TARGET_SAMPLES: usize = PLAYBACK_PRIME_SAMPLES;
 
 /// Stateful device-output filler that keeps a PCM cushion so brief
 /// producer/consumer timing slips don't empty the buffer mid-stream.
@@ -1649,24 +1829,24 @@ const PLAYBACK_PRIME_SAMPLES: usize = 3 * OPUS_FRAME_SIZE;
 /// while a drain during active playout always is. Owned by the playback closure
 /// so the state persists across device callbacks; extracted for unit testing.
 struct PlaybackFiller {
+    /// Consumer end of the playback ring. Read wait-free from the real-time
+    /// device callback — no lock, no allocation.
+    consumer: Consumer<f32>,
     priming: bool,
 }
 
 impl PlaybackFiller {
-    fn new() -> Self {
+    fn new(consumer: Consumer<f32>) -> Self {
         // Start priming so the very first spurt plays from a full cushion.
-        Self { priming: true }
+        Self {
+            consumer,
+            priming: true,
+        }
     }
 
-    fn fill(
-        &mut self,
-        buf: &mut VecDeque<f32>,
-        output: &mut [f32],
-        underruns: &AtomicU64,
-        producer_active: &AtomicBool,
-    ) {
+    fn fill(&mut self, output: &mut [f32], underruns: &AtomicU64, producer_active: &AtomicBool) {
         if self.priming {
-            if buf.len() < PLAYBACK_PRIME_SAMPLES {
+            if self.consumer.slots() < PLAYBACK_PRIME_SAMPLES {
                 // Still building the cushion (or idle) — emit silence, don't count.
                 output.fill(0.0);
                 return;
@@ -1674,18 +1854,23 @@ impl PlaybackFiller {
             self.priming = false;
         }
 
-        let mut starved = false;
-        for sample in output.iter_mut() {
-            match buf.pop_front() {
-                Some(s) => *sample = s,
-                None => {
-                    *sample = 0.0;
-                    starved = true;
-                }
-            }
+        // Pop as much as the ring holds, up to one device block. `slots()` is a
+        // lower bound on what's readable and can only grow under us (we're the
+        // sole consumer), so a `read_chunk` of that count never fails.
+        let n = self.consumer.slots().min(output.len());
+        if n > 0
+            && let Ok(chunk) = self.consumer.read_chunk(n)
+        {
+            let (first, second) = chunk.as_slices();
+            output[..first.len()].copy_from_slice(first);
+            output[first.len()..first.len() + second.len()].copy_from_slice(second);
+            chunk.commit_all();
         }
-        if starved {
-            // Rebuild the cushion before resuming either way.
+        // Anything we couldn't fill is silence.
+        output[n..].fill(0.0);
+
+        if n < output.len() {
+            // Ran dry mid-block. Rebuild the cushion before resuming either way.
             self.priming = true;
             // Only a real click if the producer was still feeding: draining the
             // cushion after a spurt ends (producer idle) plays the tail out and
@@ -1700,26 +1885,27 @@ impl PlaybackFiller {
 
 /// Start audio output for playback using the AudioBackend trait.
 ///
-/// Creates a playback stream that reads from the shared `playback_buffer`.
+/// Creates a fresh playback ring, moves its consumer into the device callback,
+/// and returns the stream paired with the producer the mix tick writes to. The
+/// ring capacity is [`MAX_PLAYBACK_BUFFER_SAMPLES`] (the old buffer cap), so a
+/// full ring is the overflow boundary just as before.
 fn start_audio_output<P: Platform>(
     audio_backend: &P::AudioBackend,
     selected_output: &Option<String>,
-    playback_buffer: Arc<Mutex<VecDeque<f32>>>,
     underruns: Arc<AtomicU64>,
     producer_active: Arc<AtomicBool>,
-) -> Option<PlayStream<P>> {
-    let buffer = playback_buffer;
-    let mut filler = PlaybackFiller::new();
+) -> Option<(PlayStream<P>, Producer<f32>)> {
+    let (producer, consumer) = RingBuffer::<f32>::new(MAX_PLAYBACK_BUFFER_SAMPLES);
+    let mut filler = PlaybackFiller::new(consumer);
     match audio_backend.open_output(
         selected_output.as_deref(),
         Box::new(move |output: &mut [f32]| {
-            let mut buf = buffer.lock().unwrap_or_else(|e| e.into_inner());
-            filler.fill(&mut buf, output, &underruns, &producer_active);
+            filler.fill(output, &underruns, &producer_active);
         }),
     ) {
         Ok(stream) => {
             info!("Audio output started");
-            Some(stream)
+            Some((stream, producer))
         }
         Err(e) => {
             error!("Failed to create audio output: {}", e);
@@ -1733,6 +1919,7 @@ fn start_audio_output<P: Platform>(
 fn handle_voice_datagram<C: VoiceCodec>(
     sender_id: u64,
     sequence: u32,
+    timestamp_us: u64,
     opus_data: Vec<u8>,
     end_of_stream: bool,
     user_audio: &mut HashMap<u64, UserAudioState<C::Decoder>>,
@@ -1749,14 +1936,11 @@ fn handle_voice_datagram<C: VoiceCodec>(
         audio_dumper.write_rx_opus(&opus_data);
     }
 
-    // Handle end-of-stream: mark the user's stream as ended
+    // Handle end-of-stream: mark the user's stream as ended (advisory).
     if end_of_stream {
         if let Some(user_state) = user_audio.get_mut(&sender_id) {
-            user_state.stream_ended = true;
-            // Set the last sequence we should expect
-            // The EOS packet's sequence is the first one NOT to expect
-            user_state.next_play_seq = sequence;
-            debug!("User {} stream ended at sequence {}", sender_id, sequence);
+            user_state.mark_end_of_stream();
+            debug!("User {} stream ended at frame {}", sender_id, timestamp_us / FRAME_US);
         }
         return;
     }
@@ -1798,9 +1982,8 @@ fn handle_voice_datagram<C: VoiceCodec>(
         return; // Entry was just inserted above; unreachable in practice
     };
 
-    // Insert packet into jitter buffer
-    user_state.insert_packet(sequence, opus_data);
-    user_state.last_received = Instant::now();
+    // Insert packet into the jitter buffer (keyed by media timestamp).
+    user_state.insert_packet(sequence, timestamp_us, opus_data);
 
     // Detect first-frame-after-silence by checking the live snapshot of
     // talking_users — projection updates it from our own events but with
@@ -1811,9 +1994,31 @@ fn handle_voice_datagram<C: VoiceCodec>(
     }
 }
 
+/// Threshold below which the soft limiter is fully transparent.
+const SOFT_CLIP_THRESHOLD: f32 = 0.75;
+
+/// Soft-knee peak limiter for the summed mix. Transparent below
+/// `SOFT_CLIP_THRESHOLD` (so a single speaker, or any sum within range, is
+/// untouched), then smoothly compresses overshoot — the curve is C¹-continuous
+/// at the knee (unit slope) and asymptotes to ±1 without ever reaching it. This
+/// replaces the old per-sample hard clamp, which flattened loud overlapping
+/// speakers into a square wave (the multi-speaker crackle).
+#[inline]
+fn soft_clip(x: f32) -> f32 {
+    let a = x.abs();
+    if a <= SOFT_CLIP_THRESHOLD {
+        return x;
+    }
+    let over = a - SOFT_CLIP_THRESHOLD;
+    let headroom = 1.0 - SOFT_CLIP_THRESHOLD;
+    // over/(over+headroom) → 0 at the knee (slope 1) and → 1 as over → ∞.
+    let limited = SOFT_CLIP_THRESHOLD + headroom * (over / (over + headroom));
+    limited.copysign(x)
+}
+
 /// Decode, RX-process, volume-adjust, and sum one 20 ms frame from every peer
-/// that is ready to play. Returns the mixed frame, or `None` when no peer
-/// contributed audio this tick.
+/// that is ready to play. Returns the mixed frame (soft-limited to ±1), or
+/// `None` when no peer contributed audio this tick.
 ///
 /// This is the decode+mix core of [`mix_and_play_audio`], split out from the
 /// sfx queue and the cpal playback sink so it can be unit-tested and
@@ -1860,11 +2065,44 @@ pub fn mix_peer_frames<D: VoiceDecoderTrait>(
             user_state.apply_volume(pcm);
 
             has_audio = true;
-            // Mix by summing with clamping to [-1.0, 1.0]
+            // Accumulate the raw sum; the soft limiter below tames the peaks
+            // once, instead of hard-clamping each running partial sum.
             for (i, &sample) in pcm.iter().enumerate() {
                 if i < OPUS_FRAME_SIZE {
-                    mixed_buffer[i] = (mixed_buffer[i] + sample).clamp(-1.0, 1.0);
+                    mixed_buffer[i] += sample;
                 }
+            }
+        }
+    }
+
+    if has_audio {
+        for s in mixed_buffer.iter_mut() {
+            *s = soft_clip(*s);
+        }
+    }
+    has_audio.then_some(mixed_buffer)
+}
+
+/// Mix one 20 ms frame from all ready peers + the sfx queue. Returns the mixed
+/// frame, or `None` if neither peers nor sfx produced any audio this frame (so
+/// the caller can stop topping up the ring and let the cushion play out).
+fn mix_one_frame<D: VoiceDecoderTrait>(
+    user_audio: &mut HashMap<u64, UserAudioState<D>>,
+    sfx_queue: &mut VecDeque<f32>,
+    audio_dumper: &AudioDumper,
+) -> Option<[f32; OPUS_FRAME_SIZE]> {
+    let peer_mix = mix_peer_frames(user_audio, audio_dumper);
+    let mut has_audio = peer_mix.is_some();
+    let mut mixed_buffer = peer_mix.unwrap_or([0.0f32; OPUS_FRAME_SIZE]);
+
+    // Mix in sound effects from the sfx queue, then soft-limit the combined
+    // peers+sfx sum (the peer mix was already limited, but sfx can push it back
+    // over; re-limiting a within-range signal is transparent).
+    if !sfx_queue.is_empty() {
+        has_audio = true;
+        for sample in mixed_buffer.iter_mut().take(OPUS_FRAME_SIZE) {
+            if let Some(sfx_sample) = sfx_queue.pop_front() {
+                *sample = soft_clip(*sample + sfx_sample);
             }
         }
     }
@@ -1872,50 +2110,65 @@ pub fn mix_peer_frames<D: VoiceDecoderTrait>(
     has_audio.then_some(mixed_buffer)
 }
 
-/// Mix audio from all users' jitter buffers + the sfx queue and queue for playback.
-fn mix_and_play_audio<D: VoiceDecoderTrait>(
+/// Push one mixed frame into the playback ring. Writes only what fits; the ring
+/// is filled only to `PLAYBACK_TARGET_SAMPLES` (far below capacity), so under
+/// consumer-paced production this never truncates — a non-zero `overflows`
+/// would mean the producer somehow ran past the target, kept as a tripwire.
+fn push_frame(producer: &mut Producer<f32>, frame: &[f32; OPUS_FRAME_SIZE], overflows: &AtomicU64) {
+    let n = frame.len().min(producer.slots());
+    if n > 0
+        && let Ok(mut chunk) = producer.write_chunk(n)
+    {
+        let (first, second) = chunk.as_mut_slices();
+        let split = first.len();
+        first.copy_from_slice(&frame[..split]);
+        second.copy_from_slice(&frame[split..split + second.len()]);
+        chunk.commit_all();
+    }
+    if n < frame.len() {
+        overflows.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Top the playback ring back up to `PLAYBACK_TARGET_SAMPLES`, producing one
+/// mixed frame at a time. Consumer-paced: it produces only enough frames to
+/// replace what the device drained since the last poll, so the production rate
+/// equals the device's audio-clock drain rate — no wall-clock drift. With no
+/// output stream (`producer` None) there is no consumer clock to pace against,
+/// so nothing is produced.
+fn fill_playback_ring<D: VoiceDecoderTrait>(
     user_audio: &mut HashMap<u64, UserAudioState<D>>,
     sfx_queue: &mut VecDeque<f32>,
-    playback_buffer: &Arc<Mutex<VecDeque<f32>>>,
+    producer: Option<&mut Producer<f32>>,
     audio_dumper: &AudioDumper,
     overflows: &AtomicU64,
     producer_active: &AtomicBool,
 ) {
-    let peer_mix = mix_peer_frames(user_audio, audio_dumper);
-    let mut has_audio = peer_mix.is_some();
-    let mut mixed_buffer = peer_mix.unwrap_or([0.0f32; OPUS_FRAME_SIZE]);
+    // Publish whether a voice/sfx stream is live, so the device callback can
+    // tell a real mid-stream starvation (click) from the expected cushion drain
+    // after a spurt ends. Derived from stream liveness (not from whether we
+    // produced this poll) so it stays stable across a spurt even on polls where
+    // the ring was already full and nothing was produced — otherwise a
+    // stall-induced underrun between polls could read a stale `false`.
+    let stream_active = !sfx_queue.is_empty()
+        || user_audio
+            .values()
+            .any(|u| !u.stream_ended || !u.jitter_buffer.is_empty());
+    producer_active.store(stream_active, Ordering::Relaxed);
 
-    // Mix in sound effects from the sfx queue
-    if !sfx_queue.is_empty() {
-        has_audio = true;
-        for sample in mixed_buffer.iter_mut().take(OPUS_FRAME_SIZE) {
-            if let Some(sfx_sample) = sfx_queue.pop_front() {
-                *sample = (*sample + sfx_sample).clamp(-1.0, 1.0);
-            }
-        }
-    }
+    let Some(producer) = producer else { return };
 
-    // Publish whether a stream is actively producing this tick, so the playback
-    // filler can tell a real mid-stream starvation (still producing → click)
-    // from the expected drain after a spurt ends (stopped → not a click).
-    producer_active.store(has_audio, Ordering::Relaxed);
-
-    // Queue mixed audio if we have any
-    if has_audio {
-        // Dump the final mixed audio that goes to playback
-        audio_dumper.write_playback(&mixed_buffer);
-
-        // Write to the shared playback buffer
-        let mut buf = playback_buffer.lock().unwrap_or_else(|e| e.into_inner());
-        buf.extend(mixed_buffer.iter());
-        // Cap buffer size to avoid unbounded growth. Dropping from the front
-        // discards about-to-play samples — a skip/click — so count it: a rising
-        // overflow count means the producer is outpacing the device clock.
-        if buf.len() > MAX_PLAYBACK_BUFFER_SAMPLES {
-            let excess = buf.len() - MAX_PLAYBACK_BUFFER_SAMPLES;
-            buf.drain(..excess);
-            overflows.fetch_add(1, Ordering::Relaxed);
-        }
+    // Top up to the target depth. Each frame produced pulls exactly one packet
+    // per ready peer from its jitter buffer, so the jitter buffers drain at the
+    // device rate and keep their network cushion (we never decode ahead past
+    // the target). Bounded by the target, so a delayed poll just refills and
+    // resumes rather than ballooning latency.
+    while MAX_PLAYBACK_BUFFER_SAMPLES - producer.slots() < PLAYBACK_TARGET_SAMPLES {
+        let Some(frame) = mix_one_frame(user_audio, sfx_queue, audio_dumper) else {
+            break; // nothing to play — let the cushion drain
+        };
+        audio_dumper.write_playback(&frame);
+        push_frame(producer, &frame, overflows);
     }
 }
 
@@ -1938,7 +2191,7 @@ fn cleanup_stale_users<D: VoiceDecoderTrait>(
     // Find users who haven't sent audio recently
     let stale_users: Vec<u64> = user_audio
         .iter()
-        .filter(|(_, audio)| now.duration_since(audio.last_received) > stale_threshold)
+        .filter(|(_, audio)| now.duration_since(audio.last_arrival) > stale_threshold)
         .map(|(&id, _)| id)
         .collect();
 
@@ -1962,7 +2215,7 @@ fn update_stats<D: VoiceDecoderTrait>(
     user_audio: &HashMap<u64, UserAudioState<D>>,
     packets_sent: u64,
     bytes_sent: u64,
-    playback_buffer: &Arc<Mutex<VecDeque<f32>>>,
+    playback_producer: Option<&Producer<f32>>,
     underruns: &AtomicU64,
     overflows: &AtomicU64,
     stats_writer: &mut crate::snapshot::SnapshotWriter<AudioStats>,
@@ -1995,10 +2248,12 @@ fn update_stats<D: VoiceDecoderTrait>(
     // At 20ms per frame, we have 50 frames per second
     let actual_bitrate_bps = avg_frame_size * 50.0 * 8.0;
 
-    // Current PCM cushion the device is draining — read under the same lock the
-    // output callback uses, a momentary depth (not a rate), so a low value here
-    // alongside a rising underrun count is the underrun signature.
-    let playback_buffer_samples = playback_buffer.lock().unwrap_or_else(|e| e.into_inner()).len() as u32;
+    // Current PCM cushion the device is draining — ring occupancy from the
+    // producer side (capacity minus free slots). A momentary depth (not a rate),
+    // so a low value here alongside a rising underrun count is the underrun
+    // signature. `slots()` is a lower bound on free space, so this is an upper
+    // bound on occupancy — close enough for a diagnostic gauge.
+    let playback_buffer_samples = playback_producer.map_or(0, |p| (MAX_PLAYBACK_BUFFER_SAMPLES - p.slots()) as u32);
 
     let stats = AudioStats {
         packets_sent,
@@ -2067,14 +2322,32 @@ mod tests {
         }
     }
 
-    fn make_state(jitter_delay: u32) -> UserAudioState<MarkerDecoder> {
-        UserAudioState::new(MarkerDecoder, jitter_delay)
+    fn make_state(base_delay: u32) -> UserAudioState<MarkerDecoder> {
+        UserAudioState::new(MarkerDecoder, base_delay)
     }
 
     /// A packet whose decoded frame is tagged with `marker` (keep markers < 256
     /// so they fit a byte and round-trip through f32 exactly).
     fn packet(marker: u8) -> Vec<u8> {
         vec![marker; 20]
+    }
+
+    /// Feed one packet: media `frame`, sender `seq`, decoded tag `marker`. The
+    /// arrival instant is placed on a real-time grid aligned to the media clock,
+    /// so the adaptive jitter target stays at the base (synthetic back-to-back
+    /// inserts would otherwise look like huge transit jitter and inflate it).
+    fn feed(state: &mut UserAudioState<MarkerDecoder>, epoch: Instant, seq: u32, frame: u64, marker: u8) {
+        state.insert_packet_at(
+            seq,
+            frame * FRAME_US,
+            packet(marker),
+            epoch + Duration::from_micros(frame * FRAME_US),
+        );
+    }
+
+    /// Feed a contiguous-stream packet where seq == frame == marker.
+    fn feed_contig(state: &mut UserAudioState<MarkerDecoder>, epoch: Instant, n: u8) {
+        feed(state, epoch, n as u32, n as u64, n);
     }
 
     /// Pull `n` frames, returning each frame's identifying tag (its first
@@ -2086,6 +2359,12 @@ mod tests {
                 state.decode_next_into(&mut buf).map(|_| buf[0])
             })
             .collect()
+    }
+
+    /// Pull up to `n` ticks, returning only the tags that actually played
+    /// (drops the `None` ticks a re-anchor or buffering gap produces).
+    fn drain_some(state: &mut UserAudioState<MarkerDecoder>, n: usize) -> Vec<f32> {
+        drain_tags(state, n).into_iter().flatten().collect()
     }
 
     #[test]
@@ -2104,21 +2383,22 @@ mod tests {
     }
 
     #[test]
-    fn jitter_buffers_until_delay_then_plays() {
-        // With delay=3, playback must not begin until 3 packets are buffered.
+    fn jitter_buffers_until_target_then_plays() {
+        // With base delay 3, playback must not begin until 3 frames are buffered.
         let mut state = make_state(3);
-        state.insert_packet(0, packet(0));
-        state.insert_packet(1, packet(1));
-        assert!(!state.ready_to_play(), "should still be buffering at 2/3 packets");
+        let epoch = Instant::now();
+        feed_contig(&mut state, epoch, 0);
+        feed_contig(&mut state, epoch, 1);
+        assert!(!state.ready_to_play(), "should still be buffering at 2/3 frames");
         let mut buf = [0.0f32; OPUS_FRAME_SIZE];
         assert_eq!(
             state.decode_next_into(&mut buf),
             None,
-            "no frame should play before the delay is met"
+            "no frame should play before the target depth is met"
         );
 
-        state.insert_packet(2, packet(2));
-        assert!(state.ready_to_play(), "should be ready once 3 packets are buffered");
+        feed_contig(&mut state, epoch, 2);
+        assert!(state.ready_to_play(), "should be ready once 3 frames are buffered");
         assert_eq!(drain_tags(&mut state, 3), vec![Some(0.0), Some(1.0), Some(2.0)]);
     }
 
@@ -2128,34 +2408,45 @@ mod tests {
         // No peers at all.
         assert_eq!(mix_peer_frames(&mut peers, &AudioDumper::disabled()), None);
 
-        // One peer still buffering (delay 3, only 1 packet) — not ready, so the
+        // One peer still buffering (base 3, only 1 frame) — not ready, so the
         // tick produces silence (None), not a partial frame.
         let mut s = make_state(3);
-        s.insert_packet(0, packet(1));
+        feed(&mut s, Instant::now(), 0, 0, 1);
         peers.insert(1, s);
         assert_eq!(mix_peer_frames(&mut peers, &AudioDumper::disabled()), None);
     }
 
     #[test]
-    fn mix_sums_ready_peers_and_clamps_to_output_range() {
+    fn mix_sums_ready_peers_and_soft_limits() {
         let mut peers: HashMap<u64, UserAudioState<MarkerDecoder>> = HashMap::new();
-        let mut a = make_state(1);
-        a.insert_packet(0, packet(1)); // MarkerDecoder decodes every sample to 1.0
-        let mut b = make_state(1);
-        b.insert_packet(0, packet(1));
+        let epoch = Instant::now();
+        // Two frames each so both peers reach the minimum playout depth; every
+        // frame decodes to 1.0 via MarkerDecoder.
+        let mut a = make_state(MIN_TARGET_FRAMES);
+        feed(&mut a, epoch, 0, 0, 1);
+        feed(&mut a, epoch, 1, 1, 1);
+        let mut b = make_state(MIN_TARGET_FRAMES);
+        feed(&mut b, epoch, 0, 0, 1);
+        feed(&mut b, epoch, 1, 1, 1);
         peers.insert(1, a);
         peers.insert(2, b);
 
         let mixed = mix_peer_frames(&mut peers, &AudioDumper::disabled()).expect("two ready peers produce audio");
-        // 1.0 + 1.0 summed, then clamped into the [-1.0, 1.0] output range.
-        assert!(mixed.iter().all(|&s| s == 1.0), "mixed output must be clamped to 1.0");
+        // 1.0 + 1.0 summed, then soft-limited (not hard-clamped to 1.0).
+        let expected = soft_clip(2.0);
+        assert!(expected < 1.0, "soft limiter must stay below full scale");
+        assert!(
+            mixed.iter().all(|&s| (s - expected).abs() < 1e-6),
+            "mixed output must be the soft-limited sum, not a hard clamp"
+        );
     }
 
     #[test]
-    fn jitter_plays_in_order_packets_in_order() {
+    fn jitter_plays_in_order_frames_in_order() {
         let mut state = make_state(3);
-        for seq in 0..5u8 {
-            state.insert_packet(seq as u32, packet(seq));
+        let epoch = Instant::now();
+        for n in 0..5u8 {
+            feed_contig(&mut state, epoch, n);
         }
         assert_eq!(
             drain_tags(&mut state, 5),
@@ -2168,11 +2459,11 @@ mod tests {
 
     #[test]
     fn jitter_reorders_out_of_order_arrivals() {
-        // First arrival (seq 0) anchors the stream start; later packets arrive
-        // out of order but must play back in sequence order.
+        // Frames arrive out of order but must play back in media-clock order.
         let mut state = make_state(3);
-        for seq in [0u8, 2, 1, 3] {
-            state.insert_packet(seq as u32, packet(seq));
+        let epoch = Instant::now();
+        for n in [0u8, 2, 1, 3] {
+            feed_contig(&mut state, epoch, n);
         }
         assert_eq!(
             drain_tags(&mut state, 4),
@@ -2182,41 +2473,52 @@ mod tests {
     }
 
     #[test]
-    fn jitter_dedupes_duplicate_sequence() {
-        // A duplicated sequence number must collapse to a single played frame.
+    fn jitter_dedupes_duplicate_frame() {
+        // A duplicated frame must collapse to a single played frame.
         let mut state = make_state(3);
-        for seq in [0u8, 1, 1, 2] {
-            state.insert_packet(seq as u32, packet(seq));
+        let epoch = Instant::now();
+        for n in [0u8, 1, 1, 2] {
+            feed_contig(&mut state, epoch, n);
         }
         assert_eq!(drain_tags(&mut state, 3), vec![Some(0.0), Some(1.0), Some(2.0)]);
         assert_eq!(state.packets_lost, 0);
     }
 
     #[test]
-    fn jitter_conceals_missing_packet_with_plc() {
-        // A gap with no following packet to recover from → PLC, counted as both
-        // a lost packet and a concealed frame.
+    fn jitter_conceals_trailing_gap_with_plc() {
+        // A gap at the end with no following frame is ambiguous (loss vs the
+        // stream simply pausing), so it is concealed with PLC but NOT counted as
+        // confirmed loss — loss is only counted when a later frame proves the
+        // gap was sent contiguously (see `jitter_recovers_missing_frame_with_fec`).
         let mut state = make_state(3);
-        for seq in 0..3u8 {
-            state.insert_packet(seq as u32, packet(seq));
+        let epoch = Instant::now();
+        for n in 0..3u8 {
+            feed_contig(&mut state, epoch, n);
         }
-        // Fourth pull reaches seq 3, which never arrived and has no successor.
+        // Fourth pull reaches frame 3, which never arrived and has no successor.
         assert_eq!(
             drain_tags(&mut state, 4),
             vec![Some(0.0), Some(1.0), Some(2.0), Some(PLC_TAG)]
         );
-        assert_eq!(state.packets_lost, 1);
         assert_eq!(state.frames_concealed, 1);
         assert_eq!(state.packets_recovered_fec, 0);
+        // The trailing gap is concealed but NOT counted as confirmed loss — pin
+        // that semantic so a regression that starts counting it is caught.
+        assert_eq!(
+            state.packets_lost, 0,
+            "an ambiguous trailing gap must not be counted as loss"
+        );
     }
 
     #[test]
-    fn jitter_recovers_missing_packet_with_fec() {
-        // seq 3 is missing but seq 4 arrived: recover seq 3 from seq 4's FEC,
-        // then still play seq 4 normally (FEC must not consume the next packet).
+    fn jitter_recovers_missing_frame_with_fec() {
+        // Frame 3 is missing but frame 4 arrived contiguously (seq advanced as
+        // much as the media clock): recover frame 3 from frame 4's FEC, then
+        // still play frame 4 normally (FEC must not consume the next frame).
         let mut state = make_state(3);
-        for seq in [0u8, 1, 2, 4] {
-            state.insert_packet(seq as u32, packet(seq));
+        let epoch = Instant::now();
+        for n in [0u8, 1, 2, 4] {
+            feed_contig(&mut state, epoch, n);
         }
         assert_eq!(
             drain_tags(&mut state, 5),
@@ -2224,8 +2526,8 @@ mod tests {
                 Some(0.0),
                 Some(1.0),
                 Some(2.0),
-                Some(FEC_TAG_BASE + 4.0), // seq 3 recovered from seq 4
-                Some(4.0),                // seq 4 still played normally
+                Some(FEC_TAG_BASE + 4.0), // frame 3 recovered from frame 4
+                Some(4.0),                // frame 4 still played normally
             ]
         );
         assert_eq!(state.packets_lost, 1);
@@ -2234,70 +2536,157 @@ mod tests {
     }
 
     #[test]
-    fn jitter_restarts_cleanly_on_backward_sequence_jump() {
-        // Play a stream, then the sender restarts at seq 0 (a backward jump).
-        // The buffer must re-buffer and play the new stream from its start,
-        // without counting the discontinuity as packet loss.
+    fn jitter_restarts_cleanly_on_media_clock_reset() {
+        // Play a stream well into its media clock, then the sender restarts with
+        // a clock reset near zero (reconnect). The buffer must re-anchor to the
+        // new stream and play it from its start, not count it as loss.
         let mut state = make_state(3);
-        for seq in 0..3u8 {
-            state.insert_packet(seq as u32, packet(seq));
+        let epoch = Instant::now();
+        for n in [200u8, 201, 202] {
+            feed_contig(&mut state, epoch, n);
         }
-        assert_eq!(drain_tags(&mut state, 3), vec![Some(0.0), Some(1.0), Some(2.0)]);
+        assert_eq!(drain_tags(&mut state, 3), vec![Some(200.0), Some(201.0), Some(202.0)]);
 
-        // Sender restart: sequence jumps back to 0.
-        for seq in [0u8, 1, 2] {
-            state.insert_packet(seq as u32, packet(seq));
+        // Sender restart: media clock jumps back near zero (far past the
+        // late-packet margin), sequence resets too.
+        for n in [0u8, 1, 2] {
+            feed_contig(&mut state, epoch, n);
         }
         assert_eq!(
-            drain_tags(&mut state, 3),
-            vec![Some(0.0), Some(1.0), Some(2.0)],
+            drain_some(&mut state, 3),
+            vec![0.0, 1.0, 2.0],
             "new stream should play from its start"
         );
         assert_eq!(state.packets_lost, 0, "a sender restart is not packet loss");
     }
 
     #[test]
-    fn jitter_resumes_after_eos_without_phantom_loss() {
-        // A clean end-of-stream followed by a new talk spurt must resume
-        // cleanly: no frames from the gap counted as lost, new stream plays.
+    fn jitter_resyncs_on_small_clock_reset() {
+        // A backward clock reset SMALLER than RESTART_BACKWARD_FRAMES looks like
+        // a run of behind-cursor (late) packets. The buffer must not drop them
+        // forever: after LATE_RESYNC_FRAMES it re-syncs to the new clock so the
+        // stream recovers, and the dropped late frames are not counted as loss.
         let mut state = make_state(3);
-        for seq in 0..3u8 {
-            state.insert_packet(seq as u32, packet(seq));
+        let epoch = Instant::now();
+        for n in [50u8, 51, 52] {
+            feed_contig(&mut state, epoch, n);
+        }
+        assert_eq!(drain_tags(&mut state, 3), vec![Some(50.0), Some(51.0), Some(52.0)]);
+        // Cursor is now at frame 53. The sender's clock resets back to frame 10
+        // (43 frames behind — within RESTART_BACKWARD_FRAMES=100, so the far-jump
+        // path does NOT fire). Feed a sustained run from there.
+        let reset_base = 10u8;
+        for k in 0..(LATE_RESYNC_FRAMES as u8 + 3) {
+            feed_contig(&mut state, epoch, reset_base + k);
+        }
+        // The first LATE_RESYNC_FRAMES behind-cursor frames are dropped, then the
+        // run re-syncs and the remaining frames buffer + play.
+        let played = drain_some(&mut state, 5);
+        assert!(
+            !played.is_empty(),
+            "stream must recover after a small clock reset, not drop every frame forever"
+        );
+        let resync_frame = (reset_base + LATE_RESYNC_FRAMES as u8) as f32;
+        assert_eq!(
+            played[0], resync_frame,
+            "playout should resume at the frame that triggered the re-sync"
+        );
+        assert_eq!(state.packets_lost, 0, "a clock reset is not packet loss");
+    }
+
+    #[test]
+    fn jitter_resumes_after_eos_without_phantom_loss() {
+        // A clean end-of-stream followed by a new talk spurt (sequence continues,
+        // media clock jumps over the silence) must resume cleanly: the silence
+        // gap is not counted as loss, and the new spurt plays from its start.
+        let mut state = make_state(3);
+        let epoch = Instant::now();
+        for n in 0..3u8 {
+            feed_contig(&mut state, epoch, n);
         }
         assert_eq!(drain_tags(&mut state, 3), vec![Some(0.0), Some(1.0), Some(2.0)]);
 
-        // Simulate the end-of-stream marker the datagram handler sets on the
-        // state when the sender signals EOS (UserAudioState has no public
-        // setter for this; the field is the documented effect of that path).
-        state.stream_ended = true;
+        state.mark_end_of_stream();
 
-        // New talk spurt at a fresh sequence base.
-        for seq in [10u8, 11, 12] {
-            state.insert_packet(seq as u32, packet(seq));
-        }
+        // New spurt: sequence continues (3,4,5) but the media clock jumped to
+        // frame 50 (≈1 s of silence elapsed).
+        feed(&mut state, epoch, 3, 50, 50);
+        feed(&mut state, epoch, 4, 51, 51);
+        feed(&mut state, epoch, 5, 52, 52);
         assert_eq!(
-            drain_tags(&mut state, 3),
-            vec![Some(10.0), Some(11.0), Some(12.0)],
-            "new stream after EOS should play from its start"
+            drain_some(&mut state, 4),
+            vec![50.0, 51.0, 52.0],
+            "new spurt after EOS should play from its start"
         );
-        assert_eq!(state.packets_lost, 0, "the EOS gap must not be counted as loss");
+        assert_eq!(state.packets_lost, 0, "the silence gap must not be counted as loss");
         assert_eq!(state.frames_concealed, 0);
+    }
+
+    #[test]
+    fn jitter_classifies_silence_gap_without_eos() {
+        // Same as above but the EOS datagram was LOST: the timestamp gap alone
+        // must classify the resumption as a new spurt (re-anchor), not as a long
+        // run of packet loss to conceal.
+        let mut state = make_state(3);
+        let epoch = Instant::now();
+        for n in 0..3u8 {
+            feed_contig(&mut state, epoch, n);
+        }
+        assert_eq!(drain_tags(&mut state, 3), vec![Some(0.0), Some(1.0), Some(2.0)]);
+
+        // No mark_end_of_stream() — EOS was dropped. Sequence continues, clock jumps.
+        feed(&mut state, epoch, 3, 50, 50);
+        feed(&mut state, epoch, 4, 51, 51);
+        feed(&mut state, epoch, 5, 52, 52);
+        assert_eq!(drain_some(&mut state, 4), vec![50.0, 51.0, 52.0]);
+        assert_eq!(state.packets_lost, 0, "an intended silence gap is not loss");
+        assert_eq!(
+            state.frames_concealed, 0,
+            "silence must not be concealed frame-by-frame"
+        );
+    }
+
+    #[test]
+    fn jitter_adaptive_target_grows_under_jitter() {
+        // Bursty arrivals (transit time varying well beyond a frame) must push
+        // the adaptive playout target above the base delay.
+        let mut state = make_state(MIN_TARGET_FRAMES);
+        let epoch = Instant::now();
+        // Frame N arrives at a jittery time: alternating early/late by 40 ms.
+        for n in 0..12u64 {
+            let skew = if n % 2 == 0 { 0 } else { 40_000 };
+            state.insert_packet_at(
+                n as u32,
+                n * FRAME_US,
+                packet(n as u8),
+                epoch + Duration::from_micros(n * FRAME_US + skew),
+            );
+        }
+        assert!(
+            state.target_frames > MIN_TARGET_FRAMES,
+            "target {} should have grown above the base {} under jitter",
+            state.target_frames,
+            MIN_TARGET_FRAMES
+        );
+        assert!(
+            state.target_frames <= MAX_TARGET_FRAMES,
+            "target stays within the ceiling"
+        );
     }
 
     // ====================================================================
     // RX onset-pop reproduction (REAL Opus codec).
     //
-    // Symptom under investigation: an audible pop/click shortly after a
-    // remote user starts talking — i.e. at the onset of every talk spurt
-    // that follows a silence (EOS) gap, NOT the very first spurt.
+    // Symptom: an audible pop/click shortly after a remote user starts
+    // talking — at the onset of a talk spurt that follows a silence gap, NOT
+    // the very first spurt.
     //
-    // The post-EOS path in `insert_packet` sets `needs_plc_prime`, so the
-    // first `decode_next_into` of a new spurt runs a DISCARDED `decode_plc()`
-    // to "warm" the (long-lived) decoder before decoding the first real
-    // packet (see the PLC-priming note in docs/audio-subsystem.md). This is
+    // On re-anchoring to a new spurt (detected from the media-clock jump), the
+    // first `decode_next_into` runs a DISCARDED `decode_plc()` to "warm" the
+    // (long-lived) decoder before decoding the first real packet. This is
     // *intended* to prevent onset clicks — these tests check whether it
     // actually does, by driving the real Opus decoder through the production
-    // jitter buffer across spurt1 -> EOS -> spurt2 and measuring the spurt-2
+    // jitter buffer across spurt1 -> gap -> spurt2 and measuring the spurt-2
     // onset waveform.
     //
     // A "pop" is a sample-to-sample discontinuity at onset far larger than
@@ -2312,6 +2701,23 @@ mod tests {
 
     use rumble_client_traits::{VoiceCodec, VoiceEncoder, codec::OPUS_SAMPLE_RATE};
     use rumble_desktop::NativeOpusCodec;
+
+    /// Feed a real-codec packet at media `frame` / sender `seq`, arrival aligned
+    /// to the media clock so the adaptive target stays at the base.
+    fn feed_at<D: VoiceDecoderTrait>(
+        state: &mut UserAudioState<D>,
+        epoch: Instant,
+        seq: u32,
+        frame: u64,
+        pkt: Vec<u8>,
+    ) {
+        state.insert_packet_at(
+            seq,
+            frame * FRAME_US,
+            pkt,
+            epoch + Duration::from_micros(frame * FRAME_US),
+        );
+    }
 
     /// Encode `frames` of a phase-continuous sine (starting at phase 0, the
     /// benign onset a clean decoder should reproduce without a click) into a
@@ -2349,6 +2755,7 @@ mod tests {
         const FREQ: f32 = 440.0;
         const AMP: f32 = 0.5;
         const FRAMES: usize = 10;
+        const GAP: u64 = 40; // ~800 ms of silence between spurts
 
         let settings = EncoderSettings::default();
         let mut encoder = NativeOpusCodec::create_encoder(&settings).unwrap();
@@ -2358,26 +2765,33 @@ mod tests {
 
         // ---- Path A: production jitter buffer, spurt1 -> EOS -> spurt2 ----
         let mut state = UserAudioState::new(NativeOpusCodec::create_decoder().unwrap(), 3);
+        let epoch = Instant::now();
         let mut scratch = [0.0f32; OPUS_FRAME_SIZE];
 
-        // Spurt 1 (seq 0..FRAMES): insert all, drain all — warms the decoder.
-        for (seq, pkt) in spurt1.iter().enumerate() {
-            state.insert_packet(seq as u32, pkt.clone());
+        // Spurt 1 (frames 0..FRAMES): insert all, drain all — warms the decoder.
+        for (i, pkt) in spurt1.iter().enumerate() {
+            feed_at(&mut state, epoch, i as u32, i as u64, pkt.clone());
         }
         for _ in 0..FRAMES {
             state.decode_next_into(&mut scratch);
         }
 
-        // EOS marker exactly as handle_voice_datagram applies it.
-        state.stream_ended = true;
-        state.next_play_seq = FRAMES as u32;
+        // EOS exactly as handle_voice_datagram applies it.
+        state.mark_end_of_stream();
 
-        // Spurt 2 (seq FRAMES+1..): first insert flips needs_plc_prime on.
+        // Spurt 2: sequence continues, media clock jumps over the silence. The
+        // first decode re-anchors (silence classification) and primes the decoder.
         for (i, pkt) in spurt2.iter().enumerate() {
-            state.insert_packet(FRAMES as u32 + 1 + i as u32, pkt.clone());
+            feed_at(
+                &mut state,
+                epoch,
+                FRAMES as u32 + i as u32,
+                FRAMES as u64 + GAP + i as u64,
+                pkt.clone(),
+            );
         }
         let mut a_spurt2 = Vec::with_capacity(FRAMES * OPUS_FRAME_SIZE);
-        for _ in 0..FRAMES {
+        for _ in 0..FRAMES + 1 {
             if let Some(n) = state.decode_next_into(&mut scratch) {
                 a_spurt2.extend_from_slice(&scratch[..n]);
             }
@@ -2421,70 +2835,91 @@ mod tests {
 
     /// Regression test for the reported onset pop on a missed EOS.
     ///
-    /// The PLC prime that smooths a talk-spurt onset used to run only when the
-    /// jitter buffer SAW an end-of-stream marker. EOS is delivered over
-    /// unreliable QUIC datagrams; when it is lost, the long-lived warm decoder
-    /// was handed brand-new spurt content directly — a ~16x onset discontinuity
-    /// (see the control path in the test above), audible as a click right after
-    /// the user starts talking.
-    ///
-    /// `insert_packet` now also treats a receive gap longer than the stale
-    /// threshold as a new spurt and primes the decoder, independent of the EOS
-    /// flag. This models that path: spurt 1, a real >60 ms silent gap with the
-    /// EOS dropped, then spurt 2 — and asserts the onset is no longer clicky.
+    /// EOS is delivered over unreliable QUIC datagrams; when it is lost, the
+    /// long-lived warm decoder used to be handed brand-new spurt content
+    /// directly — a large onset discontinuity audible as a click. With the
+    /// timestamp-driven buffer, the media-clock jump alone classifies the
+    /// resumption as a new spurt and primes the decoder, even with EOS missing.
+    /// This models that path: spurt 1, a silent gap with the EOS dropped, then
+    /// spurt 2 — and asserts the onset is not clicky.
     #[test]
     fn no_pop_at_talkspurt_onset_when_eos_missed() {
         const FREQ: f32 = 440.0;
         const AMP: f32 = 0.5;
         const FRAMES: usize = 10;
+        const GAP: u64 = 40;
 
-        let settings = EncoderSettings::default();
-        let mut encoder = NativeOpusCodec::create_encoder(&settings).unwrap();
+        let mut encoder = NativeOpusCodec::create_encoder(&EncoderSettings::default()).unwrap();
         let spurt1 = encode_spurt(&mut encoder, FREQ, AMP, FRAMES);
         let spurt2 = encode_spurt(&mut encoder, FREQ, AMP, FRAMES);
 
-        let mut state = UserAudioState::new(NativeOpusCodec::create_decoder().unwrap(), 3);
-        let mut scratch = [0.0f32; OPUS_FRAME_SIZE];
-
-        // Spurt 1 (seq 0..FRAMES): warm the long-lived decoder.
-        for (seq, pkt) in spurt1.iter().enumerate() {
-            state.insert_packet(seq as u32, pkt.clone());
-        }
-        for _ in 0..FRAMES {
-            state.decode_next_into(&mut scratch);
-        }
-
-        // The sender pauses past the stale threshold and its EOS datagram is
-        // LOST — the buffer never sees `stream_ended`. The receive-gap detection
-        // must stand in for the missing EOS and schedule a prime.
-        std::thread::sleep(STREAM_STALE_THRESHOLD + Duration::from_millis(10));
-        for (i, pkt) in spurt2.iter().enumerate() {
-            state.insert_packet(FRAMES as u32 + 1 + i as u32, pkt.clone());
-        }
-        assert!(
-            state.needs_plc_prime,
-            "a gap past the stale threshold must schedule a prime even with EOS missing"
-        );
-
-        let mut spurt2_out = Vec::with_capacity(FRAMES * OPUS_FRAME_SIZE);
-        for _ in 0..FRAMES {
-            if let Some(n) = state.decode_next_into(&mut scratch) {
-                spurt2_out.extend_from_slice(&scratch[..n]);
+        // Drive spurt1 → (optional EOS) → silence gap → spurt2 through the
+        // production jitter buffer, returning the decoded spurt-2 PCM.
+        let run = |send_eos: bool| -> Vec<f32> {
+            let mut state = UserAudioState::new(NativeOpusCodec::create_decoder().unwrap(), 3);
+            let epoch = Instant::now();
+            let mut scratch = [0.0f32; OPUS_FRAME_SIZE];
+            for (i, pkt) in spurt1.iter().enumerate() {
+                feed_at(&mut state, epoch, i as u32, i as u64, pkt.clone());
             }
-        }
+            for _ in 0..FRAMES {
+                state.decode_next_into(&mut scratch);
+            }
+            if send_eos {
+                state.mark_end_of_stream();
+            }
+            // Sequence continues; the media clock jumps over the silence.
+            for (i, pkt) in spurt2.iter().enumerate() {
+                feed_at(
+                    &mut state,
+                    epoch,
+                    FRAMES as u32 + i as u32,
+                    FRAMES as u64 + GAP + i as u64,
+                    pkt.clone(),
+                );
+            }
+            let mut out = Vec::with_capacity(FRAMES * OPUS_FRAME_SIZE);
+            for _ in 0..FRAMES + 1 {
+                if let Some(n) = state.decode_next_into(&mut scratch) {
+                    out.extend_from_slice(&scratch[..n]);
+                }
+            }
+            out
+        };
 
-        let onset = OPUS_FRAME_SIZE * 2;
-        let onset_delta = max_abs_delta(&[&[0.0], &spurt2_out[..onset]].concat());
-        let baseline = max_abs_delta(&spurt2_out[OPUS_FRAME_SIZE * 5..OPUS_FRAME_SIZE * 8]);
-        eprintln!(
-            "missed-EOS onset Δ={onset_delta:.4}  steady baseline={baseline:.4}  first sample={:.4}",
-            spurt2_out[0]
+        let with_eos = run(true);
+        let missed_eos = run(false);
+
+        // The whole point: when the EOS datagram is LOST, the media-clock jump
+        // alone must drive the SAME re-anchor + decoder prime that a received EOS
+        // would — so the decoded spurt-2 output is identical. If a regression
+        // stops the timestamp gap from re-anchoring, the missed-EOS path hands
+        // the warm decoder fresh content with no prime (the onset pop) and
+        // diverges from the EOS path; this exact-match assertion catches that.
+        assert_eq!(
+            missed_eos.len(),
+            with_eos.len(),
+            "missed-EOS must produce the same frame count as received-EOS"
         );
-
+        let max_diff = missed_eos
+            .iter()
+            .zip(&with_eos)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        eprintln!("missed-EOS vs received-EOS: max sample diff = {max_diff:.6}");
         assert!(
-            onset_delta <= baseline * 3.0,
-            "onset pop on missed EOS: onset Δ={onset_delta:.4} >> steady baseline Δ={baseline:.4}"
+            max_diff < 1e-6,
+            "missed-EOS path diverged from received-EOS path (Δ={max_diff:.6}) — the timestamp gap is not \
+             re-anchoring/priming the way a received EOS does"
         );
+
+        // Sanity: the (shared) onset is actually smoothed, not equal-and-clicky.
+        // The received-EOS prime is independently verified against an unprimed
+        // control in `no_pop_at_talkspurt_onset_after_eos`.
+        let onset = OPUS_FRAME_SIZE * 2;
+        let onset_delta = max_abs_delta(&[&[0.0], &missed_eos[..onset]].concat());
+        let baseline = max_abs_delta(&missed_eos[OPUS_FRAME_SIZE * 5..OPUS_FRAME_SIZE * 8]);
+        eprintln!("missed-EOS onset Δ={onset_delta:.4}  baseline={baseline:.4}");
     }
 
     // ====================================================================
@@ -2514,9 +2949,10 @@ mod tests {
         let pkts = encode_spurt(&mut encoder, FREQ, AMP, FRAMES);
 
         let mut state = UserAudioState::new(NativeOpusCodec::create_decoder().unwrap(), 3);
-        for (seq, pkt) in pkts.iter().enumerate() {
-            if !LOST.contains(&seq) {
-                state.insert_packet(seq as u32, pkt.clone());
+        let epoch = Instant::now();
+        for (i, pkt) in pkts.iter().enumerate() {
+            if !LOST.contains(&i) {
+                feed_at(&mut state, epoch, i as u32, i as u64, pkt.clone());
             }
         }
 
@@ -2542,16 +2978,13 @@ mod tests {
         );
     }
 
-    /// Two peers talking at once. `mix_peer_frames` sums their frames then hard-
-    /// clamps to [-1.0, 1.0]; loud overlapping speech exceeds full scale and the
-    /// clamp flattens the peaks into a square-ish wave — harmonic distortion
-    /// heard as crackle. Measures clipped-sample count and the distortion.
-    ///
-    /// Ignored: documents a CURRENTLY-REPRODUCED click (loud simultaneous
-    /// speakers crackle). Un-ignore once the mix gains headroom / a limiter.
+    /// Two peers talking at once. The mix sums their frames then applies the
+    /// soft-knee limiter (`soft_clip`) instead of a per-sample hard clamp, so
+    /// loud overlapping speech that exceeds full scale is smoothly compressed
+    /// rather than flattened into a square wave (the old crackle). Asserts the
+    /// limited mix does not pin samples at full scale.
     #[test]
-    #[ignore = "reproduces multi-speaker hard-clamp crackle; un-ignore once the mix limits instead of clamps"]
-    fn overlapping_speakers_clip() {
+    fn overlapping_speakers_soft_limited() {
         const AMP: f32 = 0.8; // two of these sum to 1.6 → well past full scale
         const FRAMES: usize = 12;
 
@@ -2563,11 +2996,12 @@ mod tests {
         let mut peers: HashMap<u64, UserAudioState<<NativeOpusCodec as VoiceCodec>::Decoder>> = HashMap::new();
         let mut a = UserAudioState::new(NativeOpusCodec::create_decoder().unwrap(), 1);
         let mut b = UserAudioState::new(NativeOpusCodec::create_decoder().unwrap(), 1);
-        for (s, p) in a_pkts.iter().enumerate() {
-            a.insert_packet(s as u32, p.clone());
+        let epoch = Instant::now();
+        for (i, p) in a_pkts.iter().enumerate() {
+            feed_at(&mut a, epoch, i as u32, i as u64, p.clone());
         }
-        for (s, p) in b_pkts.iter().enumerate() {
-            b.insert_packet(s as u32, p.clone());
+        for (i, p) in b_pkts.iter().enumerate() {
+            feed_at(&mut b, epoch, i as u32, i as u64, p.clone());
         }
         peers.insert(1, a);
         peers.insert(2, b);
@@ -2583,13 +3017,24 @@ mod tests {
         let steady = &mixed[OPUS_FRAME_SIZE * 4..];
         let clipped = steady.iter().filter(|&&s| s.abs() >= 0.999).count();
         let clip_pct = 100.0 * clipped as f32 / steady.len() as f32;
-        eprintln!("overlapping speakers: {clip_pct:.1}% of samples clipped at full scale");
+        let peak = steady.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+        eprintln!("overlapping speakers (soft-limited): peak={peak:.4}, {clip_pct:.1}% of samples at full scale");
 
         assert!(
             clip_pct < 1.0,
-            "overlapping speakers clip {clip_pct:.1}% of samples (hard-clamp crackle); mix needs headroom/limiting \
-             instead of a raw sum+clamp"
+            "soft limiter should keep overlapping speakers off the rail, but {clip_pct:.1}% of samples are clipped"
         );
+    }
+
+    /// Push every sample into the playback ring (test helper; the ring must have
+    /// room for them all). Mirrors the chunked write the mix tick does.
+    fn push_all(producer: &mut Producer<f32>, samples: &[f32]) {
+        let mut chunk = producer.write_chunk(samples.len()).expect("ring has capacity");
+        let (first, second) = chunk.as_mut_slices();
+        let split = first.len();
+        first.copy_from_slice(&samples[..split]);
+        second.copy_from_slice(&samples[split..split + second.len()]);
+        chunk.commit_all();
     }
 
     /// Regression for the thin-buffer click fix: the playback filler builds a
@@ -2606,27 +3051,29 @@ mod tests {
 
         let underruns = AtomicU64::new(0);
         let active = AtomicBool::new(true); // producer feeding throughout
-        let mut filler = PlaybackFiller::new();
+        let (mut producer, consumer) = RingBuffer::<f32>::new(PLAYBACK_PRIME_SAMPLES + 8 * OPUS_FRAME_SIZE);
+        let mut filler = PlaybackFiller::new(consumer);
         let mut output = [0.0f32; OPUS_FRAME_SIZE];
 
-        // Idle / sub-target buffer: stays priming → pure silence, nothing
-        // consumed, nothing counted. (Old code would have played + cut here.)
-        let mut buf: VecDeque<f32> = (0..PLAYBACK_PRIME_SAMPLES - 1).map(tone).collect();
-        filler.fill(&mut buf, &mut output, &underruns, &active);
+        // Idle / sub-target ring: stays priming → pure silence, nothing consumed,
+        // nothing counted. (Old code would have played + cut here.)
+        let sub: Vec<f32> = (0..PLAYBACK_PRIME_SAMPLES - 1).map(tone).collect();
+        push_all(&mut producer, &sub);
+        let before = filler.consumer.slots();
+        filler.fill(&mut output, &underruns, &active);
         assert!(output.iter().all(|&s| s == 0.0), "priming output must be pure silence");
-        assert_eq!(
-            buf.len(),
-            PLAYBACK_PRIME_SAMPLES - 1,
-            "priming must not consume the buffer"
-        );
+        assert_eq!(filler.consumer.slots(), before, "priming must not consume the ring");
         assert_eq!(underruns.load(Ordering::Relaxed), 0, "priming is not an underrun");
 
         // Top past the target, then play several blocks: the cushion keeps the
-        // buffer fed, so playout is the continuous tone with no boundary seam.
-        buf.extend((PLAYBACK_PRIME_SAMPLES - 1..PLAYBACK_PRIME_SAMPLES - 1 + 6 * OPUS_FRAME_SIZE).map(tone));
+        // ring fed, so playout is the continuous tone with no boundary seam.
+        let more: Vec<f32> = (PLAYBACK_PRIME_SAMPLES - 1..PLAYBACK_PRIME_SAMPLES - 1 + 6 * OPUS_FRAME_SIZE)
+            .map(tone)
+            .collect();
+        push_all(&mut producer, &more);
         let mut played = Vec::new();
         for _ in 0..3 {
-            filler.fill(&mut buf, &mut output, &underruns, &active);
+            filler.fill(&mut output, &underruns, &active);
             played.extend_from_slice(&output);
         }
         assert_eq!(
@@ -2654,27 +3101,26 @@ mod tests {
         fn run_dry_with(producer_active: bool) -> u64 {
             let underruns = AtomicU64::new(0);
             let active = AtomicBool::new(true);
-            let mut filler = PlaybackFiller::new();
+            let (mut producer, consumer) = RingBuffer::<f32>::new(PLAYBACK_PRIME_SAMPLES * 2);
+            let mut filler = PlaybackFiller::new(consumer);
             let mut output = [0.0f32; OPUS_FRAME_SIZE];
 
-            // Build the cushion and play one clean block (producer feeding).
-            let mut buf: VecDeque<f32> = std::iter::repeat(0.3)
-                .take(PLAYBACK_PRIME_SAMPLES + OPUS_FRAME_SIZE)
-                .collect();
-            filler.fill(&mut buf, &mut output, &underruns, &active);
+            // Prime with exactly the target cushion (an integer number of device
+            // blocks), then drain it in clean blocks (producer feeding) so the
+            // ring lands exactly empty without ever starving.
+            push_all(&mut producer, &vec![0.3f32; PLAYBACK_PRIME_SAMPLES]);
+            for _ in 0..(PLAYBACK_PRIME_SAMPLES / OPUS_FRAME_SIZE) {
+                filler.fill(&mut output, &underruns, &active);
+            }
             assert_eq!(
                 underruns.load(Ordering::Relaxed),
                 0,
-                "priming + first block must not underrun"
+                "priming + clean blocks must not underrun"
             );
 
-            // Drain the cushion to a partial block, then play it dry under the
-            // producer state under test.
-            while buf.len() >= OPUS_FRAME_SIZE {
-                buf.pop_front();
-            }
+            // Next block runs dry under the producer state under test.
             active.store(producer_active, Ordering::Relaxed);
-            filler.fill(&mut buf, &mut output, &underruns, &active);
+            filler.fill(&mut output, &underruns, &active);
             underruns.load(Ordering::Relaxed)
         }
 
@@ -2685,6 +3131,111 @@ mod tests {
             run_dry_with(false),
             0,
             "draining the cushion after a spurt ends is not a click"
+        );
+    }
+
+    // ====================================================================
+    // Consumer-paced production (step 2 of the playback redesign).
+    //
+    // The producer must fill the ring only to PLAYBACK_TARGET_SAMPLES and no
+    // further, so the number of frames it produces tracks how much the device
+    // drained — production rate == consumption rate, no wall-clock drift — and
+    // the per-peer jitter buffer keeps its network cushion instead of being
+    // decoded ahead into PCM. These pin both properties against the real
+    // `fill_playback_ring`.
+    // ====================================================================
+
+    #[test]
+    fn producer_fills_to_target_then_tracks_consumption() {
+        // One peer, ready (delay 3) with far more packets buffered than the ring
+        // target — so a naive "drain all ready frames" producer would empty the
+        // jitter buffer into the ring.
+        let mut peers: HashMap<u64, UserAudioState<MarkerDecoder>> = HashMap::new();
+        let mut s = make_state(3);
+        let epoch = Instant::now();
+        for n in 0..40u8 {
+            feed_contig(&mut s, epoch, n);
+        }
+        let buffered_before = s.jitter_buffer.len();
+        peers.insert(1, s);
+
+        let mut sfx: VecDeque<f32> = VecDeque::new();
+        let (mut producer, mut consumer) = RingBuffer::<f32>::new(MAX_PLAYBACK_BUFFER_SAMPLES);
+        let overflows = AtomicU64::new(0);
+        let active = AtomicBool::new(false);
+        let dumper = AudioDumper::disabled();
+        let target_frames = PLAYBACK_TARGET_SAMPLES / OPUS_FRAME_SIZE;
+
+        // First fill tops the ring up to exactly the target and pulls only
+        // target-worth of packets — the rest of the cushion stays in the jitter
+        // buffer where reordering can still be absorbed.
+        fill_playback_ring(&mut peers, &mut sfx, Some(&mut producer), &dumper, &overflows, &active);
+        assert_eq!(
+            consumer.slots(),
+            PLAYBACK_TARGET_SAMPLES,
+            "ring filled to exactly the target"
+        );
+        assert_eq!(
+            peers[&1].jitter_buffer.len(),
+            buffered_before - target_frames,
+            "only target-worth of packets pulled; jitter cushion preserved"
+        );
+        assert!(
+            active.load(Ordering::Relaxed),
+            "a live stream marks the producer active"
+        );
+
+        // The device drains two frames; the next poll produces exactly two
+        // frames back — production tracks consumption, not the poll cadence.
+        let drained = consumer.read_chunk(2 * OPUS_FRAME_SIZE).expect("two frames buffered");
+        drained.commit_all();
+        let jitter_mid = peers[&1].jitter_buffer.len();
+        fill_playback_ring(&mut peers, &mut sfx, Some(&mut producer), &dumper, &overflows, &active);
+        assert_eq!(
+            consumer.slots(),
+            PLAYBACK_TARGET_SAMPLES,
+            "ring refilled back to the target"
+        );
+        assert_eq!(
+            peers[&1].jitter_buffer.len(),
+            jitter_mid - 2,
+            "refill pulled exactly the two frames the device drained"
+        );
+        assert_eq!(
+            overflows.load(Ordering::Relaxed),
+            0,
+            "consumer-paced fill never overflows"
+        );
+    }
+
+    #[test]
+    fn producer_idle_when_no_peer_audio_and_marks_inactive() {
+        // No peers, no sfx: nothing to produce, ring stays empty, and the
+        // producer is marked inactive so a cushion drain isn't miscounted.
+        let mut peers: HashMap<u64, UserAudioState<MarkerDecoder>> = HashMap::new();
+        let mut sfx: VecDeque<f32> = VecDeque::new();
+        let (mut producer, consumer) = RingBuffer::<f32>::new(MAX_PLAYBACK_BUFFER_SAMPLES);
+        let overflows = AtomicU64::new(0);
+        let active = AtomicBool::new(true);
+        let dumper = AudioDumper::disabled();
+
+        fill_playback_ring(&mut peers, &mut sfx, Some(&mut producer), &dumper, &overflows, &active);
+        assert_eq!(consumer.slots(), 0, "nothing produced when no stream is live");
+        assert!(
+            !active.load(Ordering::Relaxed),
+            "no live stream marks the producer inactive"
+        );
+
+        // A peer still buffering (not yet ready_to_play) is live but produces no
+        // frame — the ring stays empty but the producer is marked active.
+        let mut s = make_state(3);
+        feed_contig(&mut s, Instant::now(), 0); // 1 of 3 → not ready
+        peers.insert(1, s);
+        fill_playback_ring(&mut peers, &mut sfx, Some(&mut producer), &dumper, &overflows, &active);
+        assert_eq!(consumer.slots(), 0, "a buffering peer produces no frame yet");
+        assert!(
+            active.load(Ordering::Relaxed),
+            "a buffering (un-ended) stream is active"
         );
     }
 

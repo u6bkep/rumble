@@ -84,6 +84,7 @@ Authoritative subsystem docs live in `docs/`. Start with the overview, then dril
 - **`docs/quic-protocol.md`** — the wire protocol: QUIC transport, protobuf `Envelope` framing, the Ed25519 auth handshake, state sync, and voice datagrams.
 - **`docs/acl-system.md`** — permission bitflags, groups (incl. the implicit username-as-group), per-room ACLs, and the root→target evaluation algorithm.
 - **`docs/audio-subsystem.md`** — Opus codec, the audio task, jitter buffers, the processor pipeline, and the per-peer decoder-lifetime invariant (see also below).
+- **`docs/audio-playback-redesign.md`** — *design note*: why the playback path underruns (wall-clock-timer producer vs hardware-clock consumer), what to keep, and the device-pulls / SPSC-ring / timestamp-driven rebuild shape. Rationale, not current API.
 - **`docs/testing-strategy.md`** — server integration tests and the damascene `dump_bundles` lint/snapshot pipeline.
 - **`docs/v2-architecture.md`** — *historical* design doc for the platform-trait decoupling; kept for rationale, not as a current API reference.
 

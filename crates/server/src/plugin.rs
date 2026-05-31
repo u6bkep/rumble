@@ -354,8 +354,16 @@ impl ParticipantHandle {
     /// Emit one Opus voice frame as this participant into its current room,
     /// relayed to every other member and to in-process audio subscribers exactly
     /// like a client's voice. No-op if the participant is not in a room.
-    pub async fn send_voice(&self, opus_data: Vec<u8>, sequence: u32, end_of_stream: bool) {
-        handlers::relay_voice_as(&self.state, self.user_id, opus_data, sequence, end_of_stream).await;
+    pub async fn send_voice(&self, opus_data: Vec<u8>, sequence: u32, timestamp_us: u64, end_of_stream: bool) {
+        handlers::relay_voice_as(
+            &self.state,
+            self.user_id,
+            opus_data,
+            sequence,
+            timestamp_us,
+            end_of_stream,
+        )
+        .await;
     }
 }
 
