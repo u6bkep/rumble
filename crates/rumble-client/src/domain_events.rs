@@ -305,6 +305,19 @@ pub enum RoomEvent {
     SelfMovedToRoom {
         room_id: Uuid,
     },
+
+    /// Post-`StateUpdate` hash checkpoint. The connection task emits
+    /// this on the room channel immediately after the delta event(s)
+    /// it gates, carrying the server's BLAKE3 `expected_hash` of the
+    /// post-apply `ServerState`. Because broadcast ordering is
+    /// preserved within a channel, the projection has already applied
+    /// the preceding delta by the time it dequeues this; it then
+    /// reconstructs a canonical `ServerState` from `State`, hashes it,
+    /// and on mismatch requests a full resync. Carries no state
+    /// mutation of its own.
+    StateHashCheckpoint {
+        expected_hash: Vec<u8>,
+    },
 }
 
 // =============================================================================
