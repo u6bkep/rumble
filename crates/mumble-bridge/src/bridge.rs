@@ -64,6 +64,11 @@ pub enum BridgeEvent {
     RumbleEnvelope(proto::Envelope),
     /// Received a Rumble voice datagram.
     RumbleVoice(proto::VoiceDatagram),
+    /// The Rumble receiver task has exited (connection error or stream closed).
+    ///
+    /// This signals `run_bridge` to break and trigger reconnect logic, because
+    /// inbound Rumble events are no longer flowing.
+    RumbleReceiverDied,
 }
 
 /// Per-client sender handle.
@@ -471,6 +476,13 @@ pub async fn run_bridge(
 
             BridgeEvent::RumbleVoice(datagram) => {
                 handle_rumble_voice(datagram, &bridge_state, client_senders, rumble_outbound_seq);
+            }
+
+            BridgeEvent::RumbleReceiverDied => {
+                // The Rumble receiver task exited (connection error or stream EOF).
+                // Break so the outer reconnect loop can tear down and retry.
+                warn!("Rumble receiver task died — inbound events halted, triggering reconnect");
+                break;
             }
         }
     }

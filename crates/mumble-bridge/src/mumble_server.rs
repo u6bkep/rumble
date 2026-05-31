@@ -92,8 +92,12 @@ async fn handle_mumble_client(
         sender: out_tx,
     })?;
 
-    // Spawn writer task
-    let writer_handle = tokio::spawn(async move {
+    // Spawn writer task.
+    // If the write half fails (e.g. client TCP reset), the task exits.  We
+    // detect that exit below via `tokio::select!` so the message loop and
+    // cleanup path both run promptly rather than hanging until the reader
+    // also notices the dead connection.
+    let mut writer_handle = tokio::spawn(async move {
         while let Some(msg) = out_rx.recv().await {
             let result = match msg {
                 MumbleOutbound::Protobuf { msg_type, payload } => {
@@ -102,16 +106,24 @@ async fn handle_mumble_client(
                 MumbleOutbound::Voice(data) => write_udp_tunnel(&mut writer, &data).await,
             };
             if let Err(e) = result {
-                warn!(error = %e, "Error writing to Mumble client");
+                warn!(error = %e, "Error writing to Mumble client; writer task exiting");
                 break;
             }
         }
     });
 
-    // Phase 2: Message loop
-    let result = mumble_message_loop(&mut reader, session, &bridge_tx).await;
+    // Phase 2: Message loop — race reader against writer so that a writer
+    // crash also breaks out here and falls through to cleanup.
+    let result = tokio::select! {
+        r = mumble_message_loop(&mut reader, session, &bridge_tx) => r,
+        _ = &mut writer_handle => {
+            // Writer task exited first (write error or channel closed).
+            // Return an error so the caller logs it; cleanup runs below.
+            Err(anyhow::anyhow!("writer task exited unexpectedly for session {}", session))
+        }
+    };
 
-    // Cleanup
+    // Cleanup — runs regardless of which half exited first.
     writer_handle.abort();
     bridge_tx.send(BridgeEvent::MumbleClientLeft { session })?;
 
