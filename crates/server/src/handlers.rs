@@ -435,8 +435,22 @@ async fn handle_authenticate(
         return send_auth_failed(&sender, "Invalid signature").await;
     }
 
-    // 4b. Check BANNED permission via ACL evaluation
+    // 4b. Check BANNED permission via ACL evaluation, honouring ban expiry.
     if let Some(persist) = &persistence {
+        // If a timed ban record exists and has expired, lift it proactively so
+        // the group check below sees a clean state.
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if let Some(ban_record) = persist.get_ban(&pending.public_key) {
+            if ban_record.is_expired(now_secs) {
+                info!("ban expired at auth time, lifting ban");
+                let _ = persist.remove_ban(&pending.public_key);
+                let _ = persist.remove_user_from_group(&pending.public_key, "banned");
+            }
+        }
+
         // Load user's groups to check for BANNED flag
         let mut check_groups = vec!["default".to_string()];
         let user_groups = persist.get_user_groups(&pending.public_key);
@@ -2137,10 +2151,25 @@ async fn handle_ban_user(
         let _ = persist.create_group("banned", Permissions::BANNED.bits());
     }
 
-    // Add target to "banned" group
+    // Add target to "banned" group and persist a timed ban record.
     let target_key = state.get_user_public_key(target_user_id);
     if let Some(key) = target_key {
         let _ = persist.add_user_to_group(&key, "banned");
+
+        // Record the ban with a creation timestamp so expiry can be computed.
+        let banned_at_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let ban_record = crate::persistence::PersistedBan {
+            banned_at_secs: Some(banned_at_secs),
+            duration_seconds: bu.duration_seconds,
+            reason: bu.reason.clone(),
+            banned_by: sender.get_username().await,
+        };
+        if let Err(e) = persist.set_ban(&key, &ban_record) {
+            warn!("Failed to persist ban record: {e}");
+        }
     } else {
         return send_command_result(&sender, "BanUser", false, "Cannot resolve user's public key").await;
     }

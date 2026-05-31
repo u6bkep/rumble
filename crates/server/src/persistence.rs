@@ -16,6 +16,41 @@ use sled::Db;
 use std::path::Path;
 use tracing::info;
 
+/// A persisted ban record, keyed by the banned user's public key (32 bytes).
+///
+/// `banned_at_secs` is wall-clock seconds since UNIX epoch at the moment the
+/// ban was issued. `duration_seconds == 0` means permanent. Missing
+/// `banned_at_secs` in old records is handled gracefully: if we cannot compute
+/// an expiry we treat the ban as permanent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedBan {
+    /// Unix timestamp (seconds) when the ban was issued. `None` in records
+    /// written before this field was added — treat as permanent.
+    pub banned_at_secs: Option<u64>,
+    /// Duration in seconds; 0 means permanent.
+    pub duration_seconds: u64,
+    /// Human-readable reason (may be empty).
+    pub reason: String,
+    /// Display name of the issuing admin (informational).
+    pub banned_by: String,
+}
+
+impl PersistedBan {
+    /// Returns `true` if this ban has expired as of `now_secs` (seconds since
+    /// UNIX epoch). Permanent bans (`duration_seconds == 0`) or bans with no
+    /// recorded timestamp never expire.
+    pub fn is_expired(&self, now_secs: u64) -> bool {
+        if self.duration_seconds == 0 {
+            return false;
+        }
+        match self.banned_at_secs {
+            Some(at) => now_secs >= at.saturating_add(self.duration_seconds),
+            // Unknown issue time → treat as permanent, do not expire
+            None => false,
+        }
+    }
+}
+
 /// User registration data stored in the database.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisteredUser {
@@ -84,6 +119,10 @@ pub struct Persistence {
     /// controller's own group assignment (which carries MANAGE_PARTICIPANTS),
     /// so anonymous participants never inherit the controller's authority.
     participant_defaults: sled::Tree,
+    /// Tree for timed ban metadata: public_key (32 bytes) → PersistedBan.
+    /// A record here coexists with the user being in the "banned" group.
+    /// When a ban expires, both the group membership and this record are removed.
+    pub bans: sled::Tree,
 }
 
 impl Persistence {
@@ -98,6 +137,7 @@ impl Persistence {
         let room_acls = db.open_tree("room_acls")?;
         let sudo_password = db.open_tree("sudo_password")?;
         let participant_defaults = db.open_tree("participant_defaults")?;
+        let bans = db.open_tree("bans")?;
 
         Ok(Self {
             db,
@@ -109,6 +149,7 @@ impl Persistence {
             room_acls,
             sudo_password,
             participant_defaults,
+            bans,
         })
     }
 
@@ -123,6 +164,7 @@ impl Persistence {
         let room_acls = db.open_tree("room_acls")?;
         let sudo_password = db.open_tree("sudo_password")?;
         let participant_defaults = db.open_tree("participant_defaults")?;
+        let bans = db.open_tree("bans")?;
 
         Ok(Self {
             db,
@@ -134,6 +176,7 @@ impl Persistence {
             room_acls,
             sudo_password,
             participant_defaults,
+            bans,
         })
     }
 
@@ -466,6 +509,58 @@ impl Persistence {
     pub fn delete_room_acl(&self, room_uuid: &[u8; 16]) -> Result<()> {
         self.room_acls.remove(room_uuid)?;
         Ok(())
+    }
+
+    // =========================================================================
+    // Bans
+    // =========================================================================
+
+    /// Persist a ban record for a user's public key.
+    pub fn set_ban(&self, public_key: &[u8; 32], ban: &PersistedBan) -> Result<()> {
+        let data = bincode::serialize(ban)?;
+        self.bans.insert(public_key, data)?;
+        Ok(())
+    }
+
+    /// Retrieve the ban record for a user's public key, if one exists.
+    pub fn get_ban(&self, public_key: &[u8; 32]) -> Option<PersistedBan> {
+        self.bans
+            .get(public_key)
+            .ok()
+            .flatten()
+            .and_then(|data| bincode::deserialize(&data).ok())
+    }
+
+    /// Remove the ban record for a user's public key.
+    pub fn remove_ban(&self, public_key: &[u8; 32]) -> Result<()> {
+        self.bans.remove(public_key)?;
+        Ok(())
+    }
+
+    /// Iterate all ban records and remove any that have expired as of `now_secs`
+    /// (seconds since UNIX epoch). For each expired ban, the user is also removed
+    /// from the "banned" group.
+    ///
+    /// Returns the number of bans swept.
+    pub fn sweep_expired_bans(&self, now_secs: u64) -> usize {
+        let mut swept = 0usize;
+        let expired_keys: Vec<[u8; 32]> = self
+            .bans
+            .iter()
+            .filter_map(|entry| {
+                let (key, value) = entry.ok()?;
+                let ban: PersistedBan = bincode::deserialize(&value).ok()?;
+                let key_arr: [u8; 32] = key.as_ref().try_into().ok()?;
+                if ban.is_expired(now_secs) { Some(key_arr) } else { None }
+            })
+            .collect();
+
+        for key in &expired_keys {
+            let _ = self.bans.remove(key);
+            let _ = self.remove_user_from_group(key, "banned");
+            swept += 1;
+        }
+        swept
     }
 
     // =========================================================================
@@ -853,5 +948,188 @@ mod tests {
 
         persistence.set_sudo_password("$2b$12$somehash").unwrap();
         assert_eq!(persistence.get_sudo_password().unwrap(), "$2b$12$somehash");
+    }
+
+    // =========================================================================
+    // Ban expiry unit tests
+    // =========================================================================
+
+    #[test]
+    fn test_persisted_ban_permanent_never_expires() {
+        let ban = PersistedBan {
+            banned_at_secs: Some(1_000),
+            duration_seconds: 0, // permanent
+            reason: String::new(),
+            banned_by: String::new(),
+        };
+        assert!(!ban.is_expired(1_000));
+        assert!(!ban.is_expired(u64::MAX));
+    }
+
+    #[test]
+    fn test_persisted_ban_timed_expires() {
+        let ban = PersistedBan {
+            banned_at_secs: Some(1_000),
+            duration_seconds: 3_600, // 1 hour
+            reason: String::new(),
+            banned_by: String::new(),
+        };
+        // Not yet expired
+        assert!(!ban.is_expired(1_000));
+        assert!(!ban.is_expired(4_599));
+        // Exactly at expiry
+        assert!(ban.is_expired(4_600));
+        // Well past expiry
+        assert!(ban.is_expired(u64::MAX));
+    }
+
+    #[test]
+    fn test_persisted_ban_missing_timestamp_treated_as_permanent() {
+        // Old records without a timestamp should never expire (treated as permanent).
+        let ban = PersistedBan {
+            banned_at_secs: None,
+            duration_seconds: 60,
+            reason: String::new(),
+            banned_by: String::new(),
+        };
+        assert!(!ban.is_expired(u64::MAX));
+    }
+
+    #[test]
+    fn test_ban_crud() {
+        let persistence = Persistence::in_memory().unwrap();
+        let key = [42u8; 32];
+
+        assert!(persistence.get_ban(&key).is_none());
+
+        let ban = PersistedBan {
+            banned_at_secs: Some(500),
+            duration_seconds: 3_600,
+            reason: "test".to_string(),
+            banned_by: "admin".to_string(),
+        };
+        persistence.set_ban(&key, &ban).unwrap();
+
+        let retrieved = persistence.get_ban(&key).unwrap();
+        assert_eq!(retrieved.banned_at_secs, Some(500));
+        assert_eq!(retrieved.duration_seconds, 3_600);
+        assert_eq!(retrieved.reason, "test");
+
+        persistence.remove_ban(&key).unwrap();
+        assert!(persistence.get_ban(&key).is_none());
+    }
+
+    #[test]
+    fn test_sweep_expired_bans_removes_expired_and_group() {
+        let persistence = Persistence::in_memory().unwrap();
+        persistence.ensure_default_groups().unwrap();
+        let _ = persistence.create_group("banned", 0x400000); // BANNED flag
+
+        let key_expired = [1u8; 32];
+        let key_permanent = [2u8; 32];
+        let key_not_yet = [3u8; 32];
+
+        // Timed ban that has expired
+        persistence.add_user_to_group(&key_expired, "banned").unwrap();
+        persistence
+            .set_ban(
+                &key_expired,
+                &PersistedBan {
+                    banned_at_secs: Some(100),
+                    duration_seconds: 60, // expires at 160
+                    reason: String::new(),
+                    banned_by: String::new(),
+                },
+            )
+            .unwrap();
+
+        // Permanent ban — must survive sweep
+        persistence.add_user_to_group(&key_permanent, "banned").unwrap();
+        persistence
+            .set_ban(
+                &key_permanent,
+                &PersistedBan {
+                    banned_at_secs: Some(100),
+                    duration_seconds: 0,
+                    reason: String::new(),
+                    banned_by: String::new(),
+                },
+            )
+            .unwrap();
+
+        // Timed ban not yet expired
+        persistence.add_user_to_group(&key_not_yet, "banned").unwrap();
+        persistence
+            .set_ban(
+                &key_not_yet,
+                &PersistedBan {
+                    banned_at_secs: Some(100),
+                    duration_seconds: 1_000, // expires at 1100
+                    reason: String::new(),
+                    banned_by: String::new(),
+                },
+            )
+            .unwrap();
+
+        let swept = persistence.sweep_expired_bans(200); // now = 200 → key_expired expired
+        assert_eq!(swept, 1);
+
+        // Expired ban removed from both the bans tree and the banned group
+        assert!(persistence.get_ban(&key_expired).is_none());
+        assert!(
+            !persistence
+                .get_user_groups(&key_expired)
+                .contains(&"banned".to_string())
+        );
+
+        // Permanent and not-yet-expired bans must still be there
+        assert!(persistence.get_ban(&key_permanent).is_some());
+        assert!(
+            persistence
+                .get_user_groups(&key_permanent)
+                .contains(&"banned".to_string())
+        );
+        assert!(persistence.get_ban(&key_not_yet).is_some());
+        assert!(
+            persistence
+                .get_user_groups(&key_not_yet)
+                .contains(&"banned".to_string())
+        );
+    }
+
+    #[test]
+    fn test_auth_time_expired_ban_lifts_cleanly() {
+        // Simulate what happens at auth time: if the ban record is expired,
+        // we remove the group membership. Afterwards the user is no longer
+        // in the "banned" group.
+        let persistence = Persistence::in_memory().unwrap();
+        persistence.ensure_default_groups().unwrap();
+        let _ = persistence.create_group("banned", 0x400000);
+
+        let key = [7u8; 32];
+        persistence.add_user_to_group(&key, "banned").unwrap();
+        persistence
+            .set_ban(
+                &key,
+                &PersistedBan {
+                    banned_at_secs: Some(0),
+                    duration_seconds: 10, // expired at t=10
+                    reason: String::new(),
+                    banned_by: String::new(),
+                },
+            )
+            .unwrap();
+
+        let now_secs: u64 = 9999;
+        let ban_record = persistence.get_ban(&key).unwrap();
+        assert!(ban_record.is_expired(now_secs));
+
+        // Lift the ban (as the auth handler does)
+        persistence.remove_ban(&key).unwrap();
+        persistence.remove_user_from_group(&key, "banned").unwrap();
+
+        // Verify clean state
+        assert!(persistence.get_ban(&key).is_none());
+        assert!(!persistence.get_user_groups(&key).contains(&"banned".to_string()));
     }
 }
