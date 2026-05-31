@@ -289,6 +289,7 @@ impl<P: Platform> BackendHandle<P> {
             permission_denied: None,
             kicked: None,
             group_definitions: vec![],
+            slash_commands: vec![],
         };
 
         let state = Arc::new(RwLock::new(state));
@@ -857,7 +858,7 @@ async fn run_connection_task<P: Platform>(
 
                         // Attempt connection with Ed25519 auth
                         match connect_to_server::<P::Transport>(&addr, &name, &public_key, key_signer.as_ref(), password.as_deref(), &config, captured_cert.clone()).await {
-                            Ok((mut new_transport, user_id, rooms, users, groups, session_info)) => {
+                            Ok((mut new_transport, user_id, rooms, users, groups, slash_commands, session_info)) => {
                                 // Connection-identity transition via the projection.
                                 let _ = bus.connection.send(crate::ConnectionEvent::Connected {
                                     server_name: "Rumble Server".to_string(),
@@ -886,6 +887,7 @@ async fn run_connection_task<P: Platform>(
                                     rooms,
                                     users,
                                     groups,
+                                    slash_commands,
                                     per_room_permissions,
                                 });
                                 let _ = bus.room.send(crate::RoomEvent::SelfMovedToRoom { room_id: my_room_uuid });
@@ -1018,7 +1020,7 @@ async fn run_connection_task<P: Platform>(
                                 &new_config,
                                 captured_cert,
                             ).await {
-                                Ok((mut new_transport, user_id, rooms, users, groups, session_info)) => {
+                                Ok((mut new_transport, user_id, rooms, users, groups, slash_commands, session_info)) => {
                                     let _ = bus.connection.send(crate::ConnectionEvent::Connected {
                                         server_name: "Rumble Server".to_string(),
                                         user_id,
@@ -1040,6 +1042,7 @@ async fn run_connection_task<P: Platform>(
                                         rooms,
                                         users,
                                         groups,
+                                        slash_commands,
                                         per_room_permissions,
                                     });
                                     let _ = bus.room.send(crate::RoomEvent::SelfMovedToRoom { room_id: my_room_uuid });
@@ -1139,6 +1142,7 @@ async fn run_connection_task<P: Platform>(
                             rooms: Vec::new(),
                             users: Vec::new(),
                             groups: Vec::new(),
+                            slash_commands: Vec::new(),
                             per_room_permissions: HashMap::new(),
                         });
                         let _ = bus.connection.send(crate::ConnectionEvent::Disconnected);
@@ -1801,6 +1805,7 @@ async fn connect_to_server<T: Transport>(
     Vec<proto::RoomInfo>,
     Vec<proto::User>,
     Vec<proto::GroupInfo>,
+    Vec<proto::SlashCommand>,
     SessionIdentity,
 )> {
     info!(server_addr = %addr, client_name, "Connecting to server");
@@ -1906,7 +1911,7 @@ async fn connect_to_server<T: Transport>(
     debug!("Sent Authenticate");
 
     // Step 8: Wait for ServerState or AuthFailed
-    let (rooms, users, groups) = wait_for_auth_result(&mut transport).await?;
+    let (rooms, users, groups, slash_commands) = wait_for_auth_result(&mut transport).await?;
 
     let session_identity = SessionIdentity {
         signing_key: session_signing,
@@ -1916,7 +1921,15 @@ async fn connect_to_server<T: Transport>(
         _expires_ms: expires_ms,
     };
 
-    Ok((transport, user_id, rooms, users, groups, session_identity))
+    Ok((
+        transport,
+        user_id,
+        rooms,
+        users,
+        groups,
+        slash_commands,
+        session_identity,
+    ))
 }
 
 /// Background task that receives reliable messages from the server.
@@ -1974,6 +1987,7 @@ async fn run_receiver_task(
             rooms: Vec::new(),
             users: Vec::new(),
             groups: Vec::new(),
+            slash_commands: Vec::new(),
             per_room_permissions: HashMap::new(),
         });
     }
@@ -2148,6 +2162,7 @@ fn handle_server_message(
                             rooms: ss.rooms,
                             users: ss.users,
                             groups: ss.groups,
+                            slash_commands: ss.slash_commands,
                             per_room_permissions,
                         });
                     }

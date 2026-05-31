@@ -42,9 +42,64 @@ pub type TransferMap = HashMap<String, TransferStatus>;
 
 /// Routed-key constants for the composer's auxiliary buttons.
 pub const KEY_INPUT: &str = "chat:input";
+/// Stable key for the row wrapping the text input. Without it the row's
+/// `computed_id` is position-based, so inserting the slash-command suggestion
+/// column above it shifts the row's index and changes the input's full-path
+/// `computed_id` — which the focus reconciler reads as "node removed", clearing
+/// focus the instant a `/` is typed or deleted. A key pins the id regardless of
+/// siblings.
+pub const KEY_INPUT_ROW: &str = "chat:input-row";
 pub const KEY_SHARE_FILE: &str = "chat:share-file";
 pub const KEY_PASTE_IMAGE: &str = "chat:paste-image";
 pub const KEY_SYNC_HISTORY: &str = "chat:sync";
+
+/// Key prefix for a slash-command suggestion row; the command name follows
+/// (e.g. `chat:cmd:echo`). See [`command_from_key`] and [`command_suggestions`].
+pub const KEY_CMD_PREFIX: &str = "chat:cmd:";
+
+/// Client-side slash commands handled locally by the composer (see
+/// `App::parse_and_send_chat`). Merged with the server-advertised commands in
+/// the suggestion list so the user sees every available command in one place.
+const BUILTIN_COMMANDS: &[(&str, &str)] = &[
+    ("msg", "Private message — /msg <user> <text>"),
+    ("tree", "Message this room and all sub-rooms — /tree <text>"),
+];
+
+/// Extract the command name from a suggestion-row key, if it is one.
+pub fn command_from_key(key: &str) -> Option<&str> {
+    key.strip_prefix(KEY_CMD_PREFIX)
+}
+
+/// Slash-command suggestions for the current composer line: client built-ins
+/// merged with the server-advertised commands ([`State::slash_commands`]),
+/// filtered by the fragment typed after `/` and sorted by name.
+///
+/// Returns empty unless `input` is an in-progress command — it starts with `/`
+/// and has no whitespace yet (once a command and a space are typed the user is
+/// entering arguments, so the list hides).
+pub fn command_suggestions(input: &str, state: &State) -> Vec<(String, String)> {
+    let Some(frag) = input.strip_prefix('/') else {
+        return Vec::new();
+    };
+    if frag.contains(char::is_whitespace) {
+        return Vec::new();
+    }
+    let frag = frag.to_ascii_lowercase();
+    let mut out: Vec<(String, String)> = BUILTIN_COMMANDS
+        .iter()
+        .map(|(n, d)| ((*n).to_string(), (*d).to_string()))
+        .chain(
+            state
+                .slash_commands
+                .iter()
+                .map(|c| (c.name.clone(), c.description.clone())),
+        )
+        .filter(|(name, _)| name.to_ascii_lowercase().starts_with(&frag))
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out.dedup_by(|a, b| a.0.eq_ignore_ascii_case(&b.0));
+    out
+}
 
 /// Routed keys for the file card context menu.
 pub const KEY_FILE_CTX_DISMISS: &str = "chat:file_ctx:dismiss";
@@ -171,6 +226,7 @@ pub fn render(
     pending_cancel_confirm: &HashMap<String, Instant>,
     chat_input: &str,
     selection: &Selection,
+    cmd_selected: Option<usize>,
     my_user_id: Option<u64>,
     own_username: &str,
 ) -> El {
@@ -189,7 +245,7 @@ pub fn render(
             own_username,
         ),
         divider(),
-        composer(state, chat_input, selection),
+        composer(state, chat_input, selection, cmd_selected),
     ])
     .height(Size::Fill(1.0))
     .fill(tokens::CARD)
@@ -502,7 +558,7 @@ fn render_attachment_view(
     }
 }
 
-fn composer(state: &State, chat_input: &str, selection: &Selection) -> El {
+fn composer(state: &State, chat_input: &str, selection: &Selection, cmd_selected: Option<usize>) -> El {
     let connected = state.connection.is_connected();
     let can_chat = Permissions::from_bits_truncate(state.effective_permissions).contains(Permissions::TEXT_MESSAGE);
 
@@ -541,10 +597,63 @@ fn composer(state: &State, chat_input: &str, selection: &Selection) -> El {
         sync = sync.disabled();
     }
 
-    column([
+    // Slash-command autocomplete: a list shown above the input while the user
+    // is typing a `/command`. Clicking a row (or pressing Tab — see the App's
+    // KEY_INPUT handler) completes it.
+    let suggestions = if connected && can_chat {
+        command_suggestions(chat_input, state)
+    } else {
+        Vec::new()
+    };
+
+    let mut children: Vec<El> = Vec::new();
+    if !suggestions.is_empty() {
+        let rows: Vec<El> = suggestions
+            .iter()
+            .enumerate()
+            .map(|(i, (name, desc))| {
+                // The arrow-key-highlighted row gets the accent fill so the
+                // keyboard selection is visible; clamping to `len` happens in
+                // the App, so any `Some(i)` here is in range.
+                let mut r = row([
+                    text(format!("/{name}")).semibold().width(Size::Fixed(120.0)),
+                    text(desc.clone())
+                        .muted()
+                        .font_size(tokens::TEXT_XS.size)
+                        .ellipsis()
+                        .width(Size::Fill(1.0)),
+                ])
+                .key(format!("{KEY_CMD_PREFIX}{name}"))
+                .focusable()
+                // Dense flush rows (gap 0): draw the focus ring just inside the
+                // row so a highlighted neighbor's fill can't occlude it.
+                .focus_ring_inside()
+                .cursor(Cursor::Pointer)
+                .gap(tokens::SPACE_3)
+                .padding(Sides::xy(tokens::SPACE_3, tokens::SPACE_1))
+                .align(Align::Center)
+                .width(Size::Fill(1.0));
+                if cmd_selected == Some(i) {
+                    r = r.fill(tokens::ACCENT);
+                }
+                r
+            })
+            .collect();
+        children.push(
+            column(rows)
+                .fill(tokens::POPOVER)
+                .gap(0.0)
+                .width(Size::Fill(1.0))
+                .padding(Sides::xy(tokens::SPACE_4, tokens::SPACE_1)),
+        );
+    }
+    children.push(
         row([input])
+            .key(KEY_INPUT_ROW)
             .padding(Sides::xy(tokens::SPACE_4, tokens::SPACE_2))
             .width(Size::Fill(1.0)),
+    );
+    children.push(
         row([share, paste, sync, spacer()])
             .gap(tokens::SPACE_1)
             .padding(Sides {
@@ -555,8 +664,9 @@ fn composer(state: &State, chat_input: &str, selection: &Selection) -> El {
             })
             .width(Size::Fill(1.0))
             .align(Align::Center),
-    ])
-    .width(Size::Fill(1.0))
+    );
+
+    column(children).width(Size::Fill(1.0))
 }
 
 /// Format a byte size as a human-readable string (B / KB / MB / GB).
@@ -655,4 +765,54 @@ fn plain_with_links(input: &str, msg_key: u128) -> El {
         .height(Size::Hug)
         .key(key)
         .selectable()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state_with(cmds: &[(&str, &str)]) -> State {
+        let mut s = State::default();
+        s.slash_commands = cmds
+            .iter()
+            .map(|(n, d)| rumble_protocol::proto::SlashCommand {
+                name: (*n).to_string(),
+                description: (*d).to_string(),
+            })
+            .collect();
+        s
+    }
+
+    #[test]
+    fn suggestions_merge_builtins_and_server_sorted_and_filtered() {
+        let s = state_with(&[("echo", "Echo bot"), ("ping", "Ping")]);
+
+        // "/" alone matches everything: 2 builtins (msg, tree) + 2 server, sorted.
+        let all = command_suggestions("/", &s);
+        let names: Vec<&str> = all.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["echo", "msg", "ping", "tree"]);
+
+        // Prefix narrows to the server command.
+        let ec = command_suggestions("/ec", &s);
+        let e: Vec<&str> = ec.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(e, ["echo"]);
+    }
+
+    #[test]
+    fn no_suggestions_for_plain_text_or_completed_command() {
+        let s = state_with(&[]);
+        assert!(command_suggestions("hello", &s).is_empty());
+        assert!(command_suggestions("", &s).is_empty());
+        // Once a space follows the command the user is typing args — hide the list.
+        assert!(command_suggestions("/msg ", &s).is_empty());
+    }
+
+    #[test]
+    fn server_command_does_not_duplicate_builtin_of_same_name() {
+        // A server command colliding with a builtin name collapses to one row.
+        let s = state_with(&[("msg", "server msg")]);
+        let result = command_suggestions("/msg", &s);
+        let msgs: Vec<&str> = result.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(msgs, ["msg"]);
+    }
 }

@@ -16,7 +16,7 @@ use crate::{
     plugin::{ServerCtx, ServerPlugin},
     state::{
         Binding, ClientHandle, Identity, Member, OwnerId, PendingAuth, ServerState, SessionEntry, UserStatus,
-        compute_server_state_hash,
+        VoiceFrame, compute_server_state_hash,
     },
 };
 use anyhow::Result;
@@ -41,6 +41,22 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
+}
+
+/// Parse a chat line into a `(command, args)` pair if it is a slash command.
+///
+/// Returns the lowercased command keyword (no leading slash) and the trimmed
+/// remainder of the line. `None` for plain text, a bare `/`, or `/ ...`.
+fn parse_slash_command(text: &str) -> Option<(String, &str)> {
+    let rest = text.trim_start().strip_prefix('/')?;
+    let (cmd, args) = match rest.split_once(char::is_whitespace) {
+        Some((c, a)) => (c, a.trim()),
+        None => (rest, ""),
+    };
+    if cmd.is_empty() {
+        return None;
+    }
+    Some((cmd.to_ascii_lowercase(), args))
 }
 
 /// Handle a decoded envelope from a client.
@@ -68,6 +84,23 @@ pub async fn handle_envelope(
     plugins: &[Arc<dyn ServerPlugin>],
     ctx: &ServerCtx,
 ) -> Result<()> {
+    // Slash-command dispatch: a chat line beginning with `/<cmd>` whose command
+    // is declared by a plugin is routed to that plugin's `on_command` and
+    // consumed (never broadcast as chat). Only authenticated native chat is
+    // eligible. Checked before `on_message` so command lines aren't also
+    // observed as ordinary chat.
+    if let Some(Payload::ChatMessage(msg)) = &env.payload
+        && sender.authenticated.load(Ordering::SeqCst)
+        && let Some((cmd, args)) = parse_slash_command(&msg.text)
+    {
+        for plugin in plugins.iter() {
+            if plugin.commands().iter().any(|c| c.name.eq_ignore_ascii_case(&cmd)) {
+                plugin.on_command(&cmd, args, &sender, ctx).await?;
+                return Ok(());
+            }
+        }
+    }
+
     // Try plugins first
     for plugin in plugins.iter() {
         if plugin.on_message(&env, &sender, ctx).await? {
@@ -1555,6 +1588,7 @@ async fn send_server_state_to_client(
         rooms: rooms.clone(),
         users: users.clone(),
         groups: groups.clone(),
+        slash_commands: vec![], // excluded from the hash anyway
     };
 
     // Compute the state hash BEFORE setting per-client effective_permissions
@@ -1568,8 +1602,14 @@ async fn send_server_state_to_client(
         }
     }
 
-    // Build the actual message with effective_permissions set
-    let server_state = ProtoServerState { rooms, users, groups };
+    // Build the actual message with effective_permissions set. Slash commands
+    // ride along so clients can discover them for autocomplete.
+    let server_state = ProtoServerState {
+        rooms,
+        users,
+        groups,
+        slash_commands: state.slash_commands(),
+    };
 
     let env = proto::Envelope {
         state_hash,
@@ -1616,6 +1656,7 @@ pub async fn broadcast_state_update(state: &Arc<ServerState>, update: proto::sta
         rooms,
         users,
         groups: vec![],
+        slash_commands: vec![],
     };
     let expected_hash = compute_server_state_hash(&server_state);
 
@@ -1714,6 +1755,12 @@ pub struct RelayPacket {
     /// Member user_ids in the sender's room, excluding the sender. These are
     /// roster member ids, *not* yet resolved to delivery connections.
     pub recipients: Vec<u64>,
+    /// The room the frame was sent in, used to fan out to in-process audio
+    /// subscribers (plugins) alongside the QUIC recipients.
+    pub room: Uuid,
+    /// The frame in decoded form for in-process delivery via
+    /// [`ServerState::fanout_audio`]. Carries the server-authoritative sender.
+    pub frame: VoiceFrame,
 }
 
 /// Route an inbound voice datagram: validate the sender (incl. controller
@@ -1808,6 +1855,13 @@ pub async fn build_relay_packet(
     // Stamp server-authoritative sender/room, then re-encode.
     voice_dgram.sender_id = Some(effective_sender);
     voice_dgram.room_id = Some(actual_room.as_bytes().to_vec());
+    let frame = VoiceFrame {
+        sender_id: effective_sender,
+        opus_data: voice_dgram.opus_data.clone(),
+        sequence: voice_dgram.sequence,
+        timestamp_us: voice_dgram.timestamp_us,
+        end_of_stream: voice_dgram.end_of_stream,
+    };
     let bytes = voice_dgram.encode_to_vec();
 
     let recipients = room_memberships
@@ -1815,7 +1869,12 @@ pub async fn build_relay_packet(
         .map(|members| members.iter().copied().filter(|&id| id != effective_sender).collect())
         .unwrap_or_default();
 
-    Some(RelayPacket { bytes, recipients })
+    Some(RelayPacket {
+        bytes,
+        recipients,
+        room: actual_room,
+        frame,
+    })
 }
 
 /// Resolve room members to their delivery connections and deduplicate, so a
@@ -1879,6 +1938,10 @@ pub async fn handle_datagrams(conn: quinn::Connection, state: Arc<ServerState>, 
                                 );
                             }
                         }
+
+                        // Deliver to in-process audio subscribers (plugins) for
+                        // this room, alongside the QUIC recipients above.
+                        state.fanout_audio(packet.room, &packet.frame);
                     }
                     Err(e) => {
                         debug!(error = ?e, "server: failed to decode voice datagram");
@@ -1892,6 +1955,64 @@ pub async fn handle_datagrams(conn: quinn::Connection, state: Arc<ServerState>, 
             }
         }
     }
+}
+
+/// Emit a voice frame *as* a participant (a member with no QUIC connection of
+/// its own), relaying it into the participant's current room exactly as the
+/// datagram path relays a client's voice: to every other room member's delivery
+/// connection and to in-process audio subscribers.
+///
+/// This is the egress counterpart to [`ServerState::subscribe_audio`]; together
+/// they let an in-process plugin both hear and speak in a room. The frame's
+/// `sender_id` is forced to `sender_id` (the participant) so loopback-skip in
+/// [`ServerState::fanout_audio`] keeps a bot from hearing its own output. No-op
+/// if the participant is not currently in a room.
+pub async fn relay_voice_as(
+    state: &Arc<ServerState>,
+    sender_id: u64,
+    opus_data: Vec<u8>,
+    sequence: u32,
+    end_of_stream: bool,
+) {
+    let room_memberships = state.snapshot_room_memberships().await;
+    let Some(room) = room_memberships
+        .iter()
+        .find_map(|(rid, users)| users.contains(&sender_id).then_some(*rid))
+    else {
+        return;
+    };
+
+    let dgram = VoiceDatagram {
+        opus_data: opus_data.clone(),
+        sequence,
+        timestamp_us: 0,
+        end_of_stream,
+        sender_id: Some(sender_id),
+        room_id: Some(room.as_bytes().to_vec()),
+    };
+    let bytes = dgram.encode_to_vec();
+
+    let recipients: Vec<u64> = room_memberships
+        .get(&room)
+        .map(|members| members.iter().copied().filter(|&id| id != sender_id).collect())
+        .unwrap_or_default();
+    let targets = dedup_delivery_targets(&recipients, |id| state.delivery_client(id).map(|c| c.user_id));
+    for delivery_id in targets {
+        if let Some(client) = state.get_client(delivery_id) {
+            let _ = client.conn.send_datagram(bytes.clone().into());
+        }
+    }
+
+    state.fanout_audio(
+        room,
+        &VoiceFrame {
+            sender_id,
+            opus_data,
+            sequence,
+            timestamp_us: 0,
+            end_of_stream,
+        },
+    );
 }
 
 // =============================================================================
@@ -2600,6 +2721,15 @@ async fn handle_set_room_acl(
 
 /// Mint a participant member owned by `owner`, place it in the root room, and
 /// broadcast its arrival. Returns the assigned user_id.
+///
+/// `present` controls roster visibility. A *present* participant is placed in
+/// the Root room and announced via `UserJoined`, so it shows in clients' room
+/// trees (bridged users, the echo bot once it joins a room). A *hidden*
+/// participant gets only a [`Member`] entry — identity, ACL, and the ability to
+/// author chat via [`broadcast_chat_in_room`] — but no room membership and no
+/// broadcast, so it never appears in the tree (text-only bots like the link
+/// cleaner). A hidden participant becomes present the first time it is moved
+/// into a room; see [`move_participant_to_room`].
 pub(crate) async fn create_participant(
     state: &Arc<ServerState>,
     owner: OwnerId,
@@ -2607,6 +2737,7 @@ pub(crate) async fn create_participant(
     label: Option<String>,
     verified_username: Option<String>,
     groups: Vec<String>,
+    present: bool,
 ) -> Result<u64> {
     let user_id = state.allocate_user_id();
     let identity = Arc::new(Identity::participant(
@@ -2620,43 +2751,57 @@ pub(crate) async fn create_participant(
         identity,
         binding: Binding::Owned { owner },
     }));
-    state.set_user_room(user_id, ROOT_ROOM_UUID).await;
 
-    broadcast_state_update(
-        state,
-        proto::state_update::Update::UserJoined(proto::UserJoined {
-            user: Some(proto::User {
-                user_id: Some(proto::UserId { value: user_id }),
-                username,
-                current_room: Some(room_id_from_uuid(ROOT_ROOM_UUID)),
-                is_muted: false,
-                is_deafened: false,
-                server_muted: false,
-                is_elevated: false,
-                groups,
-                label,
+    if present {
+        state.set_user_room(user_id, ROOT_ROOM_UUID).await;
+        broadcast_state_update(
+            state,
+            proto::state_update::Update::UserJoined(proto::UserJoined {
+                user: Some(proto::User {
+                    user_id: Some(proto::UserId { value: user_id }),
+                    username,
+                    current_room: Some(room_id_from_uuid(ROOT_ROOM_UUID)),
+                    is_muted: false,
+                    is_deafened: false,
+                    server_muted: false,
+                    is_elevated: false,
+                    groups,
+                    label,
+                }),
             }),
-        }),
-    )
-    .await?;
+        )
+        .await?;
+    }
 
     Ok(user_id)
 }
 
 /// Remove a participant member and broadcast its departure.
+///
+/// `UserLeft` is only broadcast for a participant that was *present* (had a room
+/// membership); a hidden participant clients never learned about needs no
+/// departure notice.
 pub(crate) async fn remove_participant(state: &Arc<ServerState>, user_id: u64) -> Result<()> {
+    let was_present = state.get_user_room(user_id).await.is_some();
     state.remove_client(user_id);
     state.remove_user_membership(user_id).await;
-    broadcast_state_update(
-        state,
-        proto::state_update::Update::UserLeft(proto::UserLeft {
-            user_id: Some(proto::UserId { value: user_id }),
-        }),
-    )
-    .await
+    if was_present {
+        broadcast_state_update(
+            state,
+            proto::state_update::Update::UserLeft(proto::UserLeft {
+                user_id: Some(proto::UserId { value: user_id }),
+            }),
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 /// Move a participant to a room. Returns false if the room does not exist.
+///
+/// A participant moving for the first time (a hidden participant with no
+/// membership yet) is announced with `UserJoined` so clients learn it exists;
+/// an already-present participant emits `UserMoved`.
 pub(crate) async fn move_participant_to_room(state: &Arc<ServerState>, user_id: u64, room_uuid: Uuid) -> Result<bool> {
     let rooms = state.get_rooms().await;
     if !rooms
@@ -2665,15 +2810,40 @@ pub(crate) async fn move_participant_to_room(state: &Arc<ServerState>, user_id: 
     {
         return Ok(false);
     }
+    let was_present = state.get_user_room(user_id).await.is_some();
     state.set_user_room(user_id, room_uuid).await;
-    broadcast_state_update(
-        state,
-        proto::state_update::Update::UserMoved(proto::UserMoved {
-            user_id: Some(proto::UserId { value: user_id }),
-            to_room_id: Some(room_id_from_uuid(room_uuid)),
-        }),
-    )
-    .await?;
+
+    if was_present {
+        broadcast_state_update(
+            state,
+            proto::state_update::Update::UserMoved(proto::UserMoved {
+                user_id: Some(proto::UserId { value: user_id }),
+                to_room_id: Some(room_id_from_uuid(room_uuid)),
+            }),
+        )
+        .await?;
+    } else if let Some(member) = state.get_member(user_id) {
+        // First appearance: the hidden→present transition. Emit UserJoined so
+        // clients render the participant in its new room.
+        let status = state.get_user_status(user_id).await;
+        broadcast_state_update(
+            state,
+            proto::state_update::Update::UserJoined(proto::UserJoined {
+                user: Some(proto::User {
+                    user_id: Some(proto::UserId { value: user_id }),
+                    username: member.identity.display_name().await,
+                    current_room: Some(room_id_from_uuid(room_uuid)),
+                    is_muted: status.is_muted,
+                    is_deafened: status.is_deafened,
+                    server_muted: status.server_muted,
+                    is_elevated: status.is_elevated,
+                    groups: member.identity.groups().await,
+                    label: member.identity.label.clone(),
+                }),
+            }),
+        )
+        .await?;
+    }
     Ok(true)
 }
 
@@ -2785,7 +2955,8 @@ async fn handle_register_participant(
         }
     };
 
-    let user_id = create_participant(&state, owner, rp.username.clone(), rp.label.clone(), None, groups).await?;
+    // Bridged users are present in the roster from the moment they register.
+    let user_id = create_participant(&state, owner, rp.username.clone(), rp.label.clone(), None, groups, true).await?;
 
     info!(
         controller_id = sender.user_id,
@@ -2892,6 +3063,141 @@ mod tests {
             sequence: seq,
             ..Default::default()
         }
+    }
+
+    // ---- parse_slash_command -----------------------------------------------
+
+    #[test]
+    fn slash_command_parses_name_and_args() {
+        assert_eq!(parse_slash_command("/echo stop"), Some(("echo".to_string(), "stop")));
+        assert_eq!(parse_slash_command("/echo"), Some(("echo".to_string(), "")));
+        // Leading whitespace is tolerated; the command is lowercased; args trimmed.
+        assert_eq!(
+            parse_slash_command("  /ECHO   hello world  "),
+            Some(("echo".to_string(), "hello world"))
+        );
+    }
+
+    #[test]
+    fn slash_command_rejects_non_commands() {
+        assert_eq!(parse_slash_command("hello"), None);
+        assert_eq!(parse_slash_command(""), None);
+        assert_eq!(parse_slash_command("/"), None);
+        assert_eq!(parse_slash_command("/   "), None);
+        // A URL in chat is not a command (it has no leading slash).
+        assert_eq!(parse_slash_command("https://example.com"), None);
+    }
+
+    // ---- audio subscription fan-out ----------------------------------------
+
+    /// A relayed frame reaches a room's audio subscriber, but never the sink
+    /// owned by the frame's own sender (loopback-skip), and never a sink for a
+    /// different room. Mirrors how `handle_datagrams` fans `build_relay_packet`
+    /// output out to plugins.
+    #[tokio::test]
+    async fn fanout_delivers_to_room_subscribers_and_skips_self() {
+        let state = ServerState::new();
+        let room_a = state.create_room("A".to_string()).await;
+        let room_b = state.create_room("B".to_string()).await;
+
+        // Listener (owner 2) subscribes to A; speaker is owner 1; a B subscriber
+        // (owner 9) must not hear A's audio.
+        let (tx_listener, mut rx_listener) = tokio::sync::mpsc::channel(8);
+        let (tx_self, mut rx_self) = tokio::sync::mpsc::channel(8);
+        let (tx_other_room, mut rx_other_room) = tokio::sync::mpsc::channel(8);
+        state.subscribe_audio(room_a, 2, tx_listener);
+        state.subscribe_audio(room_a, 1, tx_self); // owned by the sender → skipped
+        state.subscribe_audio(room_b, 9, tx_other_room);
+
+        let frame = VoiceFrame {
+            sender_id: 1,
+            opus_data: vec![0xAB; 8],
+            sequence: 42,
+            timestamp_us: 0,
+            end_of_stream: false,
+        };
+        state.fanout_audio(room_a, &frame);
+
+        let got = rx_listener.try_recv().expect("listener should receive the frame");
+        assert_eq!(got.sender_id, 1);
+        assert_eq!(got.sequence, 42);
+        assert!(rx_self.try_recv().is_err(), "sender must not hear its own frame");
+        assert!(rx_other_room.try_recv().is_err(), "other-room sink must not hear it");
+    }
+
+    /// Dropping a subscription (here simulated via explicit unsubscribe) stops
+    /// further delivery — the RAII guard relies on this.
+    #[tokio::test]
+    async fn unsubscribe_stops_delivery() {
+        let state = ServerState::new();
+        let room = state.create_room("R".to_string()).await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let sub_id = state.subscribe_audio(room, 2, tx);
+
+        state.unsubscribe_audio(room, sub_id);
+        state.fanout_audio(
+            room,
+            &VoiceFrame {
+                sender_id: 1,
+                opus_data: vec![],
+                sequence: 0,
+                timestamp_us: 0,
+                end_of_stream: true,
+            },
+        );
+        assert!(rx.try_recv().is_err(), "no frame after unsubscribe");
+    }
+
+    // ---- participant presence ----------------------------------------------
+
+    /// A hidden participant (the link-cleaner case) gets a roster member but no
+    /// room presence, and only gains one — its first appearance — when moved.
+    #[tokio::test]
+    async fn hidden_participant_has_no_presence_until_moved() {
+        let state = Arc::new(ServerState::new());
+        let room = state.create_room("R".to_string()).await;
+
+        let id = create_participant(
+            &state,
+            OwnerId::Plugin(1),
+            "bot".into(),
+            Some("bot".into()),
+            None,
+            vec![],
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(state.get_member(id).is_some(), "hidden participant still has a member");
+        assert!(
+            state.get_user_room(id).await.is_none(),
+            "hidden participant has no room presence"
+        );
+
+        assert!(move_participant_to_room(&state, id, room).await.unwrap());
+        assert_eq!(
+            state.get_user_room(id).await,
+            Some(room),
+            "moving makes the hidden participant present"
+        );
+    }
+
+    /// A present participant (the bridge case) starts visible in Root.
+    #[tokio::test]
+    async fn present_participant_starts_in_root() {
+        let state = Arc::new(ServerState::new());
+        let id = create_participant(
+            &state,
+            OwnerId::Connection(1),
+            "bridged".into(),
+            Some("Mumble".into()),
+            None,
+            vec![],
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(state.get_user_room(id).await, Some(ROOT_ROOM_UUID));
     }
 
     // ---- build_relay_packet: routing ---------------------------------------

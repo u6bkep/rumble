@@ -20,7 +20,8 @@
 
 use anyhow::Result;
 use server::{
-    Config, FileTransferRelayFactory, LinkCleanerFactory, Persistence, Server, ServerConfig, plugin::PluginFactory,
+    Config, EchoBotFactory, FileTransferRelayFactory, LinkCleanerFactory, Persistence, Server, ServerConfig,
+    plugin::PluginFactory,
 };
 use tracing::{info, warn};
 
@@ -188,7 +189,11 @@ async fn main() -> Result<()> {
     }
 
     // Construct plugins via factories, passing config sections from TOML
-    let factories: Vec<Box<dyn PluginFactory>> = vec![Box::new(FileTransferRelayFactory), Box::new(LinkCleanerFactory)];
+    let factories: Vec<Box<dyn PluginFactory>> = vec![
+        Box::new(FileTransferRelayFactory),
+        Box::new(LinkCleanerFactory),
+        Box::new(EchoBotFactory),
+    ];
 
     let mut plugins: Vec<Box<dyn server::ServerPlugin>> = Vec::new();
     for factory in &factories {

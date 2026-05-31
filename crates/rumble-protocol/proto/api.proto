@@ -63,6 +63,18 @@ message ServerState {
   repeated User users = 2;
   // All permission group definitions (for client-side evaluation).
   repeated GroupInfo groups = 3;
+  // Slash commands the server's plugins expose, for client-side
+  // discovery/autocomplete. Static for a connection; excluded from the
+  // state hash (see compute_server_state_hash).
+  repeated SlashCommand slash_commands = 4;
+}
+
+// A slash command advertised by the server (aggregated across plugins).
+message SlashCommand {
+  // Command keyword without the leading slash (e.g. "echo").
+  string name = 1;
+  // One-line human-readable help text.
+  string description = 2;
 }
 
 // =============================================================================

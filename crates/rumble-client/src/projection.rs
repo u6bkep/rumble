@@ -433,12 +433,14 @@ fn apply_room(
             rooms,
             users,
             groups,
+            slash_commands,
             per_room_permissions,
         } => {
             s.per_room_permissions = per_room_permissions;
             s.rooms = rooms;
             s.users = users;
             s.group_definitions = groups;
+            s.slash_commands = slash_commands;
             s.rebuild_room_tree();
 
             if let Some(my_room) = s.my_room_id

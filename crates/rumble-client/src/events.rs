@@ -1072,6 +1072,9 @@ pub struct State {
     pub kicked: Option<String>,
     /// Server-defined permission group definitions (synced from ServerState).
     pub group_definitions: Vec<rumble_protocol::proto::GroupInfo>,
+    /// Slash commands the server advertises (synced from ServerState), for
+    /// composer autocomplete. Static for a connection; cleared on disconnect.
+    pub slash_commands: Vec<rumble_protocol::proto::SlashCommand>,
 }
 
 impl State {
@@ -1609,6 +1612,7 @@ mod tests {
             permission_denied: None,
             kicked: None,
             group_definitions: vec![],
+            slash_commands: vec![],
         };
 
         let users_in_room1 = state.users_in_room(room1_uuid);

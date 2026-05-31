@@ -52,6 +52,7 @@
 
 pub mod acl;
 pub mod config;
+pub mod echo_bot;
 pub mod handlers;
 pub mod link_cleaner;
 pub mod persistence;
@@ -62,9 +63,12 @@ pub mod state;
 
 // Re-export main types for convenience
 pub use config::{ServerConfig, generate_self_signed_cert, load_pem_certificates};
+pub use echo_bot::{EchoBotFactory, EchoBotPlugin};
 pub use link_cleaner::{LinkCleanerFactory, LinkCleanerPlugin};
 pub use persistence::{PersistedGroup, PersistedRoom, PersistedRoomAcl, Persistence, RegisteredUser};
-pub use plugin::{ParticipantHandle, PluginFactory, ServerCtx, ServerPlugin, StreamHeader};
+pub use plugin::{
+    AudioSubscription, CommandSpec, ParticipantHandle, PluginFactory, ServerCtx, ServerPlugin, StreamHeader,
+};
 pub use relay_plugin::{FileTransferRelayFactory, FileTransferRelayPlugin};
 pub use server::{Config, Server};
-pub use state::{Binding, ClientHandle, Identity, Member, OwnerId, ServerState, StateData};
+pub use state::{Binding, ClientHandle, Identity, Member, OwnerId, ServerState, StateData, VoiceFrame};

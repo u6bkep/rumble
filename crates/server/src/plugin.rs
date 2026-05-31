@@ -7,13 +7,14 @@
 use crate::{
     handlers,
     persistence::Persistence,
-    state::{ClientHandle, OwnerId, ServerState},
+    state::{ClientHandle, OwnerId, ServerState, VoiceFrame},
 };
 use anyhow::Result;
 use prost::Message;
 use quinn::{RecvStream, SendStream};
 use rumble_protocol::proto::{self, Envelope};
 use std::sync::Arc;
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
 /// Maximum length-prefixed plugin frame the server will accept on a plugin
@@ -262,9 +263,17 @@ impl ServerCtx {
         .await
     }
 
-    /// Mint a participant driven by this plugin — a roster member with no
-    /// connection of its own (e.g. a bot). The returned [`ParticipantHandle`]
-    /// drives the participant and removes it when dropped.
+    /// Mint a *hidden* participant driven by this plugin — a roster member with
+    /// no connection of its own (e.g. a bot) and **no room presence**. The
+    /// returned [`ParticipantHandle`] drives the participant and removes it when
+    /// dropped.
+    ///
+    /// A hidden participant can author chat (via [`Self::post_chat_as`] /
+    /// [`ParticipantHandle::post_chat`]) and holds ACL groups, but it does not
+    /// appear in any room's tree — ideal for text-only bots like the link
+    /// cleaner. To give the bot a visible voice presence, call
+    /// [`ParticipantHandle::move_to_room`], which announces it in the target
+    /// room; that is how the echo bot "sits" in a room to listen.
     ///
     /// `groups` are the participant's ACL groups; participants are subject to
     /// the same permission machinery as humans. They carry no verified identity,
@@ -278,7 +287,7 @@ impl ServerCtx {
         // Each plugin participant gets a unique owner token so its lifetime is
         // independent; cleanup is handled by the returned handle on drop.
         let owner = OwnerId::Plugin(self.state.allocate_user_id());
-        let user_id = handlers::create_participant(&self.state, owner, username, label, None, groups).await?;
+        let user_id = handlers::create_participant(&self.state, owner, username, label, None, groups, false).await?;
         Ok(ParticipantHandle {
             user_id,
             state: self.state.clone(),
@@ -321,6 +330,61 @@ impl ParticipantHandle {
             .unwrap_or(0);
         handlers::broadcast_chat_as(&self.state, &self.persistence, self.user_id, text, false, id, ts, None).await
     }
+
+    /// Subscribe to the voice of `room`, receiving each relayed [`VoiceFrame`]
+    /// in-process. The participant's own frames are excluded, so a bot that both
+    /// listens and speaks never hears itself. `capacity` bounds the channel;
+    /// when full, frames are dropped rather than stalling the relay.
+    ///
+    /// The returned [`AudioSubscription`] unsubscribes automatically on drop.
+    /// Pair with [`Self::send_voice`] for a full duplex (e.g. the echo bot). The
+    /// participant must be present in `room` (see [`Self::move_to_room`]) to
+    /// receive its members' audio.
+    pub fn subscribe_room_audio(&self, room: Uuid, capacity: usize) -> AudioSubscription {
+        let (tx, rx) = mpsc::channel(capacity);
+        let sub_id = self.state.subscribe_audio(room, self.user_id, tx);
+        AudioSubscription {
+            rx,
+            room,
+            sub_id,
+            state: self.state.clone(),
+        }
+    }
+
+    /// Emit one Opus voice frame as this participant into its current room,
+    /// relayed to every other member and to in-process audio subscribers exactly
+    /// like a client's voice. No-op if the participant is not in a room.
+    pub async fn send_voice(&self, opus_data: Vec<u8>, sequence: u32, end_of_stream: bool) {
+        handlers::relay_voice_as(&self.state, self.user_id, opus_data, sequence, end_of_stream).await;
+    }
+}
+
+/// An in-process subscription to a room's voice, handed to a plugin by
+/// [`ParticipantHandle::subscribe_room_audio`]. Receives [`VoiceFrame`]s until
+/// dropped, at which point it unregisters itself from the relay.
+pub struct AudioSubscription {
+    rx: mpsc::Receiver<VoiceFrame>,
+    room: Uuid,
+    sub_id: u64,
+    state: Arc<ServerState>,
+}
+
+impl AudioSubscription {
+    /// Await the next voice frame, or `None` if the relay side closed.
+    pub async fn recv(&mut self) -> Option<VoiceFrame> {
+        self.rx.recv().await
+    }
+
+    /// The room this subscription is bound to.
+    pub fn room(&self) -> Uuid {
+        self.room
+    }
+}
+
+impl Drop for AudioSubscription {
+    fn drop(&mut self) {
+        self.state.unsubscribe_audio(self.room, self.sub_id);
+    }
 }
 
 impl Drop for ParticipantHandle {
@@ -350,6 +414,28 @@ pub trait PluginFactory: Send + Sync {
     fn create(&self, config: Option<toml::Value>) -> anyhow::Result<Box<dyn ServerPlugin>>;
 }
 
+/// Declaration of a slash command a plugin handles. Returned from
+/// [`ServerPlugin::commands`]; the server routes a chat line `/<name> …` to the
+/// declaring plugin's [`ServerPlugin::on_command`].
+#[derive(Debug, Clone)]
+pub struct CommandSpec {
+    /// Command keyword without the leading slash (e.g. `"echo"`), matched
+    /// case-insensitively against the first token of a chat line.
+    pub name: String,
+    /// One-line help text (reserved for a future `/help`).
+    pub description: String,
+}
+
+impl CommandSpec {
+    /// Convenience constructor.
+    pub fn new(name: impl Into<String>, description: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+        }
+    }
+}
+
 /// A server plugin that can handle messages and streams.
 ///
 /// Plugins are registered at server startup and receive callbacks
@@ -358,6 +444,21 @@ pub trait PluginFactory: Send + Sync {
 pub trait ServerPlugin: Send + Sync + 'static {
     /// Plugin name for logging and stream routing.
     fn name(&self) -> &str;
+
+    /// Slash commands this plugin handles. The server intercepts matching
+    /// `/<name> …` chat lines before broadcast and routes them to
+    /// [`Self::on_command`] instead. Default: none.
+    fn commands(&self) -> Vec<CommandSpec> {
+        Vec::new()
+    }
+
+    /// Handle a slash command declared in [`Self::commands`]. `cmd` is the
+    /// command keyword (no slash, lowercased); `args` is the trimmed remainder
+    /// of the line. The triggering chat line is consumed (not broadcast).
+    async fn on_command(&self, cmd: &str, args: &str, sender: &Arc<ClientHandle>, ctx: &ServerCtx) -> Result<()> {
+        let _ = (cmd, args, sender, ctx);
+        Ok(())
+    }
 
     /// Handle a proto envelope on the control stream.
     /// Return `Ok(true)` if handled, `Ok(false)` to pass to next handler.

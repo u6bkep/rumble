@@ -32,7 +32,7 @@ use rumble_audio::{PipelineConfig, UserRxConfig};
 use rumble_client_traits::file_transfer::{TransferDirection, TransferId, TransferStage};
 use rumble_protocol::{
     Uuid,
-    proto::{GroupInfo, RoomAclEntry, RoomInfo, User},
+    proto::{GroupInfo, RoomAclEntry, RoomInfo, SlashCommand, User},
 };
 
 use crate::events::{AudioDeviceInfo, AudioSettings, ChatMessage, PendingCertificate, VoiceMode};
@@ -239,6 +239,9 @@ pub enum RoomEvent {
         rooms: Vec<RoomInfo>,
         users: Vec<User>,
         groups: Vec<GroupInfo>,
+        /// Slash-command catalog reported by the server. Empty on the
+        /// disconnect/reset variants, which clear it.
+        slash_commands: Vec<SlashCommand>,
         per_room_permissions: HashMap<Uuid, u32>,
     },
 

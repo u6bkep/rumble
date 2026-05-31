@@ -85,6 +85,18 @@ impl Server {
         let plugin_ctx = Arc::new(ServerCtx::new(state.clone(), persistence.clone()));
         let plugins: Vec<Arc<dyn ServerPlugin>> = config.plugins.into_iter().map(Arc::from).collect();
 
+        // Aggregate the plugins' slash commands once; reported to clients in the
+        // full ServerState snapshot for autocomplete.
+        let slash_commands: Vec<proto::SlashCommand> = plugins
+            .iter()
+            .flat_map(|p| p.commands())
+            .map(|c| proto::SlashCommand {
+                name: c.name,
+                description: c.description,
+            })
+            .collect();
+        state.set_slash_commands(slash_commands);
+
         Ok(Self {
             endpoint,
             state,

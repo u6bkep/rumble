@@ -98,6 +98,12 @@ enum Scene {
     /// exercises the self-talking room-tree indicator path that
     /// doesn't go through `talking_users` (which is remote-only).
     ConnectedSelfTalking,
+    /// Live session with the chat composer holding `/`, showing the
+    /// slash-command suggestion list (builtins + server-advertised).
+    ConnectedSlashCommands,
+    /// Same as [`Scene::ConnectedSlashCommands`] but with a suggestion row
+    /// arrow-key-highlighted, capturing the accent-fill keyboard selection.
+    ConnectedSlashCommandHighlighted,
     /// Live session with a completed image transfer rendered as an
     /// inline preview in the chat sidebar.
     ConnectedImagePreview,
@@ -187,6 +193,8 @@ impl Scene {
         Scene::Connecting,
         Scene::Connected,
         Scene::ConnectedSelfTalking,
+        Scene::ConnectedSlashCommands,
+        Scene::ConnectedSlashCommandHighlighted,
         Scene::ConnectedImagePreview,
         Scene::ImageLightbox,
         Scene::ImageLightboxZoomed,
@@ -228,6 +236,8 @@ impl Scene {
             Scene::Connecting => "connecting",
             Scene::Connected => "connected",
             Scene::ConnectedSelfTalking => "connected_self_talking",
+            Scene::ConnectedSlashCommands => "connected_slash_commands",
+            Scene::ConnectedSlashCommandHighlighted => "connected_slash_command_highlighted",
             Scene::ConnectedImagePreview => "connected_image_preview",
             Scene::ImageLightbox => "image_lightbox",
             Scene::ImageLightboxZoomed => "image_lightbox_zoomed",
@@ -278,6 +288,22 @@ impl Scene {
             Scene::ConnectedSelfTalking => {
                 let mut s = connected_state();
                 s.audio.is_transmitting = true;
+                s
+            }
+            Scene::ConnectedSlashCommands | Scene::ConnectedSlashCommandHighlighted => {
+                let mut s = connected_state();
+                // Server-advertised commands; merged with the client builtins
+                // (/msg, /tree) in the suggestion list.
+                s.slash_commands = vec![
+                    rumble_protocol::proto::SlashCommand {
+                        name: "echo".into(),
+                        description: "Summon an echo bot that plays your audio back".into(),
+                    },
+                    rumble_protocol::proto::SlashCommand {
+                        name: "link-cleaner".into(),
+                        description: "Strip tracking params from posted links".into(),
+                    },
+                ];
                 s
             }
             Scene::ConnectionLost => State {
@@ -472,6 +498,13 @@ impl Scene {
             }
             Scene::SettingsConnection => app.open_settings_for_test(SettingsTab::Connection),
             Scene::ToolbarVoiceModeOpen => app.set_voice_mode_menu_open_for_test(true),
+            Scene::ConnectedSlashCommands => app.set_chat_input_for_test("/"),
+            Scene::ConnectedSlashCommandHighlighted => {
+                app.set_chat_input_for_test("/");
+                // Sorted list is echo, link-cleaner, msg, tree; highlight a
+                // non-top row so the accent fill is unmistakable in the golden.
+                app.set_chat_command_selected_for_test(Some(1));
+            }
             Scene::SettingsDevices => {
                 app.open_settings_for_test(SettingsTab::Devices);
                 app.open_settings_dropdown_for_test(SettingsOpenSelect::InputDevice);

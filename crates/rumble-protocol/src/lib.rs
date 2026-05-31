@@ -158,6 +158,11 @@ pub fn compute_server_state_hash(server_state: &proto::ServerState) -> Vec<u8> {
     // Create a canonicalized copy with sorted rooms and users for determinism
     let mut canonical = server_state.clone();
 
+    // Slash commands are static connection metadata, not mutable state — they
+    // ride along in the full snapshot but must not influence the hash (which
+    // gates incremental-update verification).
+    canonical.slash_commands.clear();
+
     // Sort rooms by UUID bytes for deterministic ordering
     canonical.rooms.sort_by(|a, b| {
         let a_id = a.id.as_ref().map(|r| r.uuid.as_slice()).unwrap_or(&[]);
@@ -359,6 +364,7 @@ mod state_hash_tests {
             rooms: rooms.clone(),
             users: users.clone(),
             groups: vec![],
+            slash_commands: vec![],
         };
 
         let mut rooms_rev = rooms;
@@ -369,6 +375,7 @@ mod state_hash_tests {
             rooms: rooms_rev,
             users: users_rev,
             groups: vec![],
+            slash_commands: vec![],
         };
 
         assert_eq!(
@@ -384,6 +391,7 @@ mod state_hash_tests {
             rooms: vec![room(1, "Root")],
             users: vec![user(1, "alice")],
             groups: vec![],
+            slash_commands: vec![],
         };
 
         // Golden value: update ONLY when the ServerState wire encoding changes

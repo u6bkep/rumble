@@ -105,8 +105,8 @@ pub async fn connect(addr: &str, username: &str, signing_key: &SigningKey) -> Re
     send_envelope(&mut transport, &auth).await?;
     debug!("Sent Authenticate");
 
-    // Wait for ServerState
-    let (rooms, users, groups) = wait_for_auth_result(&mut transport).await?;
+    // Wait for ServerState (slash commands are irrelevant to the bridge).
+    let (rooms, users, groups, _slash_commands) = wait_for_auth_result(&mut transport).await?;
     info!(
         rooms = rooms.len(),
         users = users.len(),

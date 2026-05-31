@@ -137,6 +137,7 @@ fn bench_state_sync(c: &mut Criterion) {
                 rooms: state.build_room_list(&None).await,
                 users: state.build_user_list().await,
                 groups: vec![],
+                slash_commands: vec![],
             }
         });
         let id = format!("{users}u_{rooms}r");

@@ -48,7 +48,12 @@ pub async fn wait_for_server_hello<T: Transport>(transport: &mut T) -> anyhow::R
 /// Returns `(rooms, users, groups)` from the initial server state.
 pub async fn wait_for_auth_result<T: Transport>(
     transport: &mut T,
-) -> anyhow::Result<(Vec<proto::RoomInfo>, Vec<proto::User>, Vec<proto::GroupInfo>)> {
+) -> anyhow::Result<(
+    Vec<proto::RoomInfo>,
+    Vec<proto::User>,
+    Vec<proto::GroupInfo>,
+    Vec<proto::SlashCommand>,
+)> {
     loop {
         match transport.recv().await? {
             Some(frame) => {
@@ -59,7 +64,7 @@ pub async fn wait_for_auth_result<T: Transport>(
                         }
                         Some(Payload::ServerEvent(se)) => {
                             if let Some(proto::server_event::Kind::ServerState(ss)) = se.kind {
-                                return Ok((ss.rooms, ss.users, ss.groups));
+                                return Ok((ss.rooms, ss.users, ss.groups, ss.slash_commands));
                             }
                         }
                         _ => {}

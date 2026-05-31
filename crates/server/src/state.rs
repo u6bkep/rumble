@@ -24,10 +24,10 @@ use rumble_protocol::{
     room_id_from_uuid, root_room_id, uuid_from_room_id,
 };
 use std::sync::{
-    Arc,
+    Arc, OnceLock,
     atomic::{AtomicU64, Ordering},
 };
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, mpsc};
 use uuid::Uuid;
 
 use std::{sync::atomic::AtomicBool, time::Instant};
@@ -157,6 +157,36 @@ pub enum Binding {
     Client(Arc<ClientHandle>),
     /// A participant with no connection of its own, driven by a controller.
     Owned { owner: OwnerId },
+}
+
+/// One Opus voice frame flowing through the relay. Delivered to in-process
+/// audio subscribers (plugins) in addition to QUIC clients; the payload mirrors
+/// the relayed [`rumble_protocol::proto::VoiceDatagram`] minus the wire framing.
+#[derive(Debug, Clone)]
+pub struct VoiceFrame {
+    /// Server-authoritative sender (a client or participant user_id).
+    pub sender_id: u64,
+    /// Opus-encoded audio (empty when `end_of_stream`).
+    pub opus_data: Vec<u8>,
+    /// Sender's per-talkspurt sequence number.
+    pub sequence: u32,
+    /// Sender's capture timestamp in microseconds (0 if unset).
+    pub timestamp_us: u64,
+    /// True on the final frame of a talkspurt.
+    pub end_of_stream: bool,
+}
+
+/// An in-process subscriber to a room's voice. A plugin registers one to
+/// receive [`VoiceFrame`]s without holding a QUIC connection.
+struct AudioSink {
+    /// Owning participant; its own frames are never delivered back to it, so a
+    /// participant that both speaks and listens (the echo bot) never loops.
+    owner_id: u64,
+    /// Unique token used to unsubscribe this exact sink.
+    sub_id: u64,
+    /// Lossy delivery channel — a full/closed channel drops the frame rather
+    /// than stalling the relay hot path.
+    tx: mpsc::Sender<VoiceFrame>,
 }
 
 /// A roster member: identity plus binding. Covers humans and participants
@@ -394,6 +424,15 @@ pub struct ServerState {
     voice_rate_limits: DashMap<u64, VoiceRateLimit>,
     /// Welcome message (MOTD) sent to clients after authentication.
     welcome_message: Option<String>,
+    /// In-process voice subscribers, keyed by room. Populated by plugins via
+    /// [`ServerState::subscribe_audio`]; the relay fans each frame out here in
+    /// addition to the QUIC recipients.
+    audio_sinks: DashMap<Uuid, Vec<AudioSink>>,
+    /// Counter for unique audio-subscription tokens.
+    next_sub_id: AtomicU64,
+    /// Slash commands aggregated from plugins, set once at startup and reported
+    /// to clients in the full [`rumble_protocol::proto::ServerState`] snapshot.
+    slash_commands: OnceLock<Vec<rumble_protocol::proto::SlashCommand>>,
 }
 
 impl ServerState {
@@ -409,6 +448,9 @@ impl ServerState {
             server_cert_der: Vec::new(),
             voice_rate_limits: DashMap::new(),
             welcome_message: None,
+            audio_sinks: DashMap::new(),
+            next_sub_id: AtomicU64::new(1),
+            slash_commands: OnceLock::new(),
         }
     }
 
@@ -424,6 +466,9 @@ impl ServerState {
             server_cert_der: cert_der,
             voice_rate_limits: DashMap::new(),
             welcome_message: None,
+            audio_sinks: DashMap::new(),
+            next_sub_id: AtomicU64::new(1),
+            slash_commands: OnceLock::new(),
         }
     }
 
@@ -588,6 +633,55 @@ impl ServerState {
             Binding::Owned {
                 owner: OwnerId::Plugin(_),
             } => None,
+        }
+    }
+
+    /// Record the slash-command catalog (aggregated from plugins) once at
+    /// startup. Subsequent calls are ignored.
+    pub fn set_slash_commands(&self, commands: Vec<rumble_protocol::proto::SlashCommand>) {
+        let _ = self.slash_commands.set(commands);
+    }
+
+    /// The slash-command catalog reported to clients (empty until set).
+    pub fn slash_commands(&self) -> Vec<rumble_protocol::proto::SlashCommand> {
+        self.slash_commands.get().cloned().unwrap_or_default()
+    }
+
+    /// Register an in-process audio subscriber for `room`. Frames whose sender
+    /// is `owner_id` are never delivered to this sink (no self-hear). Returns a
+    /// token to pass to [`Self::unsubscribe_audio`]. Prefer the RAII
+    /// `subscribe_room_audio` helpers on the plugin API over calling this
+    /// directly.
+    pub fn subscribe_audio(&self, room: Uuid, owner_id: u64, tx: mpsc::Sender<VoiceFrame>) -> u64 {
+        let sub_id = self.next_sub_id.fetch_add(1, Ordering::Relaxed);
+        self.audio_sinks
+            .entry(room)
+            .or_default()
+            .push(AudioSink { owner_id, sub_id, tx });
+        sub_id
+    }
+
+    /// Remove the audio subscriber identified by `sub_id` from `room`.
+    pub fn unsubscribe_audio(&self, room: Uuid, sub_id: u64) {
+        if let Some(mut sinks) = self.audio_sinks.get_mut(&room) {
+            sinks.retain(|s| s.sub_id != sub_id);
+        }
+    }
+
+    /// Fan a relayed frame out to every audio subscriber of `room`, skipping the
+    /// sink owned by the frame's sender so a participant never hears itself.
+    ///
+    /// Delivery is lossy and non-blocking: a sink whose channel is full or
+    /// closed simply misses the frame; the relay never stalls on a slow plugin.
+    pub fn fanout_audio(&self, room: Uuid, frame: &VoiceFrame) {
+        let Some(sinks) = self.audio_sinks.get(&room) else {
+            return;
+        };
+        for sink in sinks.iter() {
+            if sink.owner_id == frame.sender_id {
+                continue;
+            }
+            let _ = sink.tx.try_send(frame.clone());
         }
     }
 
@@ -1271,6 +1365,7 @@ mod tests {
                 rooms,
                 users,
                 groups: vec![],
+                slash_commands: vec![],
             })
         };
 
