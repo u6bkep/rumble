@@ -29,7 +29,7 @@ use damascene_core::prelude::*;
 
 use rumble_client::{
     AudioDeviceInfo, AudioState, AudioStats, ChatMessage, ChatMessageKind, ChatMessageVisibility, Command,
-    ConnectionState, PendingCertificate, State, VoiceMode,
+    ConnectionState, DeviceFault, PendingCertificate, State, VoiceMode,
 };
 use rumble_damascene::{
     ElevateState, Identity, RumbleApp, SettingsOpenSelect, SettingsTab, UnlockState, WizardState,
@@ -98,6 +98,11 @@ enum Scene {
     /// exercises the self-talking room-tree indicator path that
     /// doesn't go through `talking_users` (which is remote-only).
     ConnectedSelfTalking,
+    /// Live session that *looks* connected but whose audio devices have
+    /// faulted: a hard input (microphone) failure plus a recovering
+    /// output (speaker) loss. Exercises the under-toolbar fault banner
+    /// (`fault_banner`) in both its destructive and warning treatments.
+    ConnectedAudioFault,
     /// Live session with the chat composer holding `/`, showing the
     /// slash-command suggestion list (builtins + server-advertised).
     ConnectedSlashCommands,
@@ -193,6 +198,7 @@ impl Scene {
         Scene::Connecting,
         Scene::Connected,
         Scene::ConnectedSelfTalking,
+        Scene::ConnectedAudioFault,
         Scene::ConnectedSlashCommands,
         Scene::ConnectedSlashCommandHighlighted,
         Scene::ConnectedImagePreview,
@@ -236,6 +242,7 @@ impl Scene {
             Scene::Connecting => "connecting",
             Scene::Connected => "connected",
             Scene::ConnectedSelfTalking => "connected_self_talking",
+            Scene::ConnectedAudioFault => "connected_audio_fault",
             Scene::ConnectedSlashCommands => "connected_slash_commands",
             Scene::ConnectedSlashCommandHighlighted => "connected_slash_command_highlighted",
             Scene::ConnectedImagePreview => "connected_image_preview",
@@ -288,6 +295,22 @@ impl Scene {
             Scene::ConnectedSelfTalking => {
                 let mut s = connected_state();
                 s.audio.is_transmitting = true;
+                s
+            }
+            Scene::ConnectedAudioFault => {
+                // Session is "connected" but both audio devices have
+                // faulted: a hard mic failure (destructive badge) and a
+                // mid-session speaker loss the task is retrying (warning
+                // badge). Drives the under-toolbar fault banner.
+                let mut s = connected_state();
+                s.audio.input_fault = Some(DeviceFault {
+                    message: "Default input device unavailable".into(),
+                    recovering: false,
+                });
+                s.audio.output_fault = Some(DeviceFault {
+                    message: "USB headset disconnected".into(),
+                    recovering: true,
+                });
                 s
             }
             Scene::ConnectedSlashCommands | Scene::ConnectedSlashCommandHighlighted => {
