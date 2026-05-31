@@ -47,11 +47,28 @@ pub trait AudioCaptureStream {
     /// Enable or disable capture. When inactive, the stream should produce
     /// silence (or simply not invoke the callback).
     fn set_active(&self, active: bool);
+
+    /// Whether the stream's underlying device/IO is still alive.
+    ///
+    /// Returns `false` once the platform has observed the device vanish
+    /// (unplug, sound-server crash) or its IO thread/callback die. The audio
+    /// task polls this so it can tear the stream down, tell the UI, and try
+    /// to re-open the device — backends with no liveness signal keep the
+    /// default `true`.
+    fn is_healthy(&self) -> bool {
+        true
+    }
 }
 
 /// A live audio playback stream. See `AudioCaptureStream` for why
 /// this trait doesn't require `Send`.
-pub trait AudioPlaybackStream {}
+pub trait AudioPlaybackStream {
+    /// Whether the stream's underlying device/IO is still alive. See
+    /// [`AudioCaptureStream::is_healthy`].
+    fn is_healthy(&self) -> bool {
+        true
+    }
+}
 
 /// Platform audio I/O: device enumeration, capture, and playback.
 ///

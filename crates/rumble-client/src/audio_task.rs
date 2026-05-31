@@ -37,8 +37,8 @@ use prost::Message;
 use rtrb::{Consumer, Producer, RingBuffer};
 use rumble_audio;
 use rumble_client_traits::{
-    AudioBackend, AudioCaptureStream, DatagramTransport, Platform, VoiceCodec, VoiceDecoder as VoiceDecoderTrait,
-    VoiceEncoder as VoiceEncoderTrait,
+    AudioBackend, AudioCaptureStream, AudioPlaybackStream, DatagramTransport, Platform, VoiceCodec,
+    VoiceDecoder as VoiceDecoderTrait, VoiceEncoder as VoiceEncoderTrait,
     codec::{EncoderSettings, OPUS_MAX_PACKET_SIZE},
 };
 use rumble_protocol::proto::VoiceDatagram;
@@ -858,6 +858,12 @@ async fn run_audio_task<P: Platform>(
     // Interval for updating statistics in state
     let mut stats_interval = tokio::time::interval(Duration::from_millis(500));
 
+    // Interval for checking that the live capture/playback devices are still
+    // alive and, if not, tearing them down and retrying a re-open. Slow enough
+    // (1 s) that a persistently-missing device isn't hammered with re-open
+    // attempts, but fast enough that recovery after a replug feels immediate.
+    let mut device_health_interval = tokio::time::interval(Duration::from_secs(1));
+
     // Playback hand-off: a lock-free SPSC ring, created per output stream. The
     // mix tick (this thread) is the sole producer; the device output callback (a
     // separate real-time thread) is the sole consumer. The `Producer` lives here
@@ -988,8 +994,8 @@ async fn run_audio_task<P: Platform>(
                         // stays alive for the whole connection regardless of
                         // mute/server-mute/PTT — those gate via the
                         // capture_active flag, not stream lifetime.
-                        if audio_input.is_none() {
-                            start_transmission::<P>(
+                        if audio_input.is_none()
+                            && let Err(e) = start_transmission::<P>(
                                 &audio_backend,
                                 &selected_input,
                                 &encoded_tx,
@@ -1003,7 +1009,13 @@ async fn run_audio_task<P: Platform>(
                                 &meter_writer,
                                 &capture_frame_index,
                                 &was_transmitting,
-                            );
+                            )
+                        {
+                            capture_is_active = false;
+                            let _ = bus.voice.send(VoiceEvent::DeviceUnavailable {
+                                kind: DeviceKind::Input,
+                                message: e.to_string(),
+                            });
                         }
 
                         // Sync transmission state (toggles capture_active flag)
@@ -1047,18 +1059,22 @@ async fn run_audio_task<P: Platform>(
 
                     AudioCommand::SetInputDevice { device_id } => {
                         selected_input = device_id.clone();
-                        let _ = bus.voice.send(VoiceEvent::SelectedDeviceChanged {
-                            kind: DeviceKind::Input,
-                            id: device_id,
-                        });
 
-                        // Restart input stream if connected (need to use new device)
+                        // Tear down the current stream so we always re-open
+                        // against the new device.
                         if audio_input.is_some() {
                             stop_transmission::<P>(&mut audio_input);
                             capture_is_active = false;
                         }
+
                         if connection.is_some() {
-                            start_transmission::<P>(
+                            // Only confirm the selection once the device
+                            // actually opens — otherwise the UI would show a
+                            // dead mic as "selected" while we silently capture
+                            // nothing. On failure, capture stays off
+                            // (audio_input is None ⇒ set_active is a no-op) and
+                            // we surface a DeviceUnavailable instead.
+                            match start_transmission::<P>(
                                 &audio_backend,
                                 &selected_input,
                                 &encoded_tx,
@@ -1072,23 +1088,65 @@ async fn run_audio_task<P: Platform>(
                                 &meter_writer,
                                 &capture_frame_index,
                                 &was_transmitting,
-                            );
+                            ) {
+                                Ok(()) => {
+                                    let _ = bus.voice.send(VoiceEvent::SelectedDeviceChanged {
+                                        kind: DeviceKind::Input,
+                                        id: device_id,
+                                    });
+                                }
+                                Err(e) => {
+                                    capture_is_active = false;
+                                    let _ = bus.voice.send(VoiceEvent::DeviceUnavailable {
+                                        kind: DeviceKind::Input,
+                                        message: e.to_string(),
+                                    });
+                                }
+                            }
+                        } else {
+                            // Disconnected: nothing to open against yet, so the
+                            // selection can't fail here. Record it; it'll be
+                            // validated when the next connection opens the stream.
+                            let _ = bus.voice.send(VoiceEvent::SelectedDeviceChanged {
+                                kind: DeviceKind::Input,
+                                id: device_id,
+                            });
                         }
                         sync_transmission!();
                     }
 
                     AudioCommand::SetOutputDevice { device_id } => {
                         selected_output = device_id.clone();
-                        let _ = bus.voice.send(VoiceEvent::SelectedDeviceChanged {
-                            kind: DeviceKind::Output,
-                            id: device_id,
-                        });
 
                         // Restart output (always, even when disconnected — SFX need it)
                         playback_stream = None;
                         playback_producer = None;
                         if !self_deafened {
                             open_playback!();
+                            // Confirm the selection only if playback actually
+                            // opened; otherwise surface the failure so the UI
+                            // doesn't show a dead sink as selected.
+                            if playback_stream.is_some() {
+                                let _ = bus.voice.send(VoiceEvent::SelectedDeviceChanged {
+                                    kind: DeviceKind::Output,
+                                    id: device_id,
+                                });
+                            } else {
+                                let _ = bus.voice.send(VoiceEvent::DeviceUnavailable {
+                                    kind: DeviceKind::Output,
+                                    message: format!(
+                                        "failed to open output device {:?}",
+                                        selected_output.as_deref().unwrap_or("default")
+                                    ),
+                                });
+                            }
+                        } else {
+                            // Deafened: output isn't opened, so the selection
+                            // can't be validated yet. Record it for when we undeafen.
+                            let _ = bus.voice.send(VoiceEvent::SelectedDeviceChanged {
+                                kind: DeviceKind::Output,
+                                id: device_id,
+                            });
                         }
                     }
 
@@ -1192,8 +1250,8 @@ async fn run_audio_task<P: Platform>(
                             stop_transmission::<P>(&mut audio_input);
                             capture_is_active = false;
                         }
-                        if connection.is_some() {
-                            start_transmission::<P>(
+                        if connection.is_some()
+                            && let Err(e) = start_transmission::<P>(
                                 &audio_backend,
                                 &selected_input,
                                 &encoded_tx,
@@ -1207,7 +1265,13 @@ async fn run_audio_task<P: Platform>(
                                 &meter_writer,
                                 &capture_frame_index,
                                 &was_transmitting,
-                            );
+                            )
+                        {
+                            capture_is_active = false;
+                            let _ = bus.voice.send(VoiceEvent::DeviceUnavailable {
+                                kind: DeviceKind::Input,
+                                message: e.to_string(),
+                            });
                         }
                         sync_transmission!();
                     }
@@ -1245,8 +1309,8 @@ async fn run_audio_task<P: Platform>(
                             stop_transmission::<P>(&mut audio_input);
                             capture_is_active = false;
                         }
-                        if connection.is_some() {
-                            start_transmission::<P>(
+                        if connection.is_some()
+                            && let Err(e) = start_transmission::<P>(
                                 &audio_backend,
                                 &selected_input,
                                 &encoded_tx,
@@ -1260,7 +1324,13 @@ async fn run_audio_task<P: Platform>(
                                 &meter_writer,
                                 &capture_frame_index,
                                 &was_transmitting,
-                            );
+                            )
+                        {
+                            capture_is_active = false;
+                            let _ = bus.voice.send(VoiceEvent::DeviceUnavailable {
+                                kind: DeviceKind::Input,
+                                message: e.to_string(),
+                            });
                         }
                         sync_transmission!();
                     }
@@ -1552,6 +1622,106 @@ async fn run_audio_task<P: Platform>(
                 cleanup_stale_users(&user_audio, &state, &bus.voice);
             }
 
+            // Detect a capture/playback device that died mid-session (unplug,
+            // sound-server crash) and try to recover it. Without this the IO
+            // thread/callback just stops and the UI keeps showing "connected"
+            // with no audio.
+            _ = device_health_interval.tick() => {
+                // --- Capture (input) ---
+                if let Some(stream) = audio_input.as_ref()
+                    && !stream.is_healthy()
+                {
+                    warn!("audio: capture device died, attempting re-open");
+                    stop_transmission::<P>(&mut audio_input);
+                    capture_is_active = false;
+                    // Capture is connection-scoped — only meaningful to re-open
+                    // while connected. (If disconnected, ConnectionEstablished
+                    // re-opens it.)
+                    if connection.is_some() {
+                        match start_transmission::<P>(
+                            &audio_backend,
+                            &selected_input,
+                            &encoded_tx,
+                            &audio_settings,
+                            &tx_pipeline_config,
+                            &processor_registry,
+                            &encoder,
+                            &mut audio_input,
+                            &bus.voice,
+                            &audio_dumper,
+                            &meter_writer,
+                            &capture_frame_index,
+                            &was_transmitting,
+                        ) {
+                            Ok(()) => {
+                                info!("audio: capture device re-opened");
+                                // Re-confirm the now-working selection; the
+                                // projection clears the input fault on this.
+                                let _ = bus.voice.send(VoiceEvent::SelectedDeviceChanged {
+                                    kind: DeviceKind::Input,
+                                    id: selected_input.clone(),
+                                });
+                                // Re-arm capture if the state machine wants it.
+                                sync_transmission!();
+                            }
+                            Err(e) => {
+                                // Still gone — report we're recovering and retry
+                                // next tick (audio_input stays None).
+                                let _ = bus.voice.send(VoiceEvent::DeviceError {
+                                    kind: DeviceKind::Input,
+                                    message: e.to_string(),
+                                    recovering: true,
+                                });
+                            }
+                        }
+                    } else {
+                        let _ = bus.voice.send(VoiceEvent::DeviceError {
+                            kind: DeviceKind::Input,
+                            message: "capture device lost".to_string(),
+                            recovering: false,
+                        });
+                    }
+                }
+
+                // --- Playback (output) ---
+                // Output runs even while disconnected (SFX), so recover whenever
+                // it's not intentionally torn down (deafened).
+                if let Some(stream) = playback_stream.as_ref()
+                    && !stream.is_healthy()
+                {
+                    warn!("audio: playback device died, attempting re-open");
+                    playback_stream = None;
+                    playback_producer = None;
+                    if !self_deafened {
+                        open_playback!();
+                        if playback_stream.is_some() {
+                            info!("audio: playback device re-opened");
+                            // Re-confirm the now-working selection; the
+                            // projection clears the output fault on this.
+                            let _ = bus.voice.send(VoiceEvent::SelectedDeviceChanged {
+                                kind: DeviceKind::Output,
+                                id: selected_output.clone(),
+                            });
+                        } else {
+                            let _ = bus.voice.send(VoiceEvent::DeviceError {
+                                kind: DeviceKind::Output,
+                                message: format!(
+                                    "failed to re-open output device {:?}",
+                                    selected_output.as_deref().unwrap_or("default")
+                                ),
+                                recovering: true,
+                            });
+                        }
+                    } else {
+                        let _ = bus.voice.send(VoiceEvent::DeviceError {
+                            kind: DeviceKind::Output,
+                            message: "playback device lost".to_string(),
+                            recovering: false,
+                        });
+                    }
+                }
+            }
+
             // Periodic stats update
             _ = stats_interval.tick() => {
                 update_stats(
@@ -1589,9 +1759,9 @@ fn start_transmission<P: Platform>(
     meter_writer: &crate::snapshot::SnapshotWriter<crate::meter::MeterSnapshot>,
     capture_frame_index: &Arc<AtomicU64>,
     was_transmitting: &Arc<AtomicBool>,
-) {
+) -> anyhow::Result<()> {
     if audio_input.is_some() {
-        return; // Stream already exists
+        return Ok(()); // Stream already exists
     }
 
     // Use the connection-scoped encoder (already created on ConnectionEstablished)
@@ -1610,7 +1780,7 @@ fn start_transmission<P: Platform>(
             if guard.is_none() {
                 // Encoder not created yet (shouldn't happen if connected)
                 error!("Connection-scoped encoder not available");
-                return;
+                anyhow::bail!("connection-scoped encoder not available");
             }
             // Update settings if they've changed
             if let Some(enc) = guard.as_mut()
@@ -1620,7 +1790,7 @@ fn start_transmission<P: Platform>(
             }
         } else {
             error!("Failed to lock encoder");
-            return;
+            anyhow::bail!("failed to lock encoder");
         }
     }
 
@@ -1789,9 +1959,14 @@ fn start_transmission<P: Platform>(
                 "Started connection-scoped audio input stream with pipeline ({} processors)",
                 tx_pipeline_config.processors.len()
             );
+            Ok(())
         }
         Err(e) => {
             error!("Failed to start audio input: {}", e);
+            // Leave `audio_input` as None so the caller knows capture isn't
+            // running and can surface a DeviceUnavailable to the UI rather
+            // than reporting a phantom-working selection.
+            Err(e)
         }
     }
 }

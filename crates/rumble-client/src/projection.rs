@@ -308,9 +308,38 @@ fn apply_voice(state: &Arc<RwLock<State>>, ev: VoiceEvent, repaint: &Arc<dyn Fn(
             s.audio.output_devices = output;
         }
         VoiceEvent::SelectedDeviceChanged { kind, id } => match kind {
-            crate::domain_events::DeviceKind::Input => s.audio.selected_input = id,
-            crate::domain_events::DeviceKind::Output => s.audio.selected_output = id,
+            // A successful selection (emitted only after the stream actually
+            // opened) clears any prior fault for that side.
+            crate::domain_events::DeviceKind::Input => {
+                s.audio.selected_input = id;
+                s.audio.input_fault = None;
+            }
+            crate::domain_events::DeviceKind::Output => {
+                s.audio.selected_output = id;
+                s.audio.output_fault = None;
+            }
         },
+        VoiceEvent::DeviceUnavailable { kind, message } => {
+            let fault = crate::events::DeviceFault {
+                message,
+                recovering: false,
+            };
+            match kind {
+                crate::domain_events::DeviceKind::Input => s.audio.input_fault = Some(fault),
+                crate::domain_events::DeviceKind::Output => s.audio.output_fault = Some(fault),
+            }
+        }
+        VoiceEvent::DeviceError {
+            kind,
+            message,
+            recovering,
+        } => {
+            let fault = crate::events::DeviceFault { message, recovering };
+            match kind {
+                crate::domain_events::DeviceKind::Input => s.audio.input_fault = Some(fault),
+                crate::domain_events::DeviceKind::Output => s.audio.output_fault = Some(fault),
+            }
+        }
         VoiceEvent::VoiceModeChanged { mode } => {
             s.audio.voice_mode = mode;
         }

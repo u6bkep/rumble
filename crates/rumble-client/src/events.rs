@@ -558,6 +558,21 @@ pub use rumble_client_traits::audio::AudioDeviceInfo;
 // Audio State
 // =============================================================================
 
+/// A current audio device fault, surfaced so the UI can warn the user that
+/// audio isn't working even though the session looks "connected".
+///
+/// Set when a selected device fails to open ([`recovering`] = `false`) or a
+/// live device dies mid-session while the task retries re-opening
+/// ([`recovering`] = `true`). Cleared once a stream for that side opens again.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DeviceFault {
+    /// Human-readable failure reason (backend error string).
+    pub message: String,
+    /// True while the audio task is retrying device re-open; false for a
+    /// failed user selection or after recovery is abandoned.
+    pub recovering: bool,
+}
+
 /// Audio subsystem state.
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct AudioState {
@@ -591,6 +606,12 @@ pub struct AudioState {
     pub rx_pipeline_defaults: PipelineConfig,
     /// Per-user RX configuration overrides.
     pub per_user_rx: HashMap<u64, UserRxConfig>,
+
+    /// Current input-device fault, if any (failed selection or mid-session
+    /// loss). `None` when capture is healthy. See [`DeviceFault`].
+    pub input_fault: Option<DeviceFault>,
+    /// Current output-device fault, if any. `None` when playback is healthy.
+    pub output_fault: Option<DeviceFault>,
     // Sampled signals — per-frame input levels ([`crate::meter`]) and the
     // periodic stats roll-up ([`AudioStats`]) — live on `snapshot`
     // channels read via `BackendHandle::meter()` / `stats()`, not here.

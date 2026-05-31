@@ -281,6 +281,8 @@ impl<P: Platform> BackendHandle<P> {
                 tx_pipeline: Default::default(),
                 rx_pipeline_defaults: Default::default(),
                 per_user_rx: Default::default(),
+                input_fault: None,
+                output_fault: None,
             },
             chat_messages: Vec::new(),
             room_tree: Default::default(),

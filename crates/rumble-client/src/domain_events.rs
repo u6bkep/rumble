@@ -142,7 +142,28 @@ pub enum VoiceEvent {
 
     /// User-selected input/output device changed. `None` means
     /// "system default."
+    ///
+    /// Emitted only *after* the underlying stream actually opens, so the UI
+    /// never shows a selection that isn't really capturing/playing. A failed
+    /// selection emits [`VoiceEvent::DeviceUnavailable`] instead.
     SelectedDeviceChanged { kind: DeviceKind, id: Option<String> },
+
+    /// Opening the selected input/output device failed (it's gone, busy, or
+    /// the backend rejected it). The selection was *not* applied — capture or
+    /// playback is not running. The UI should surface this and prompt the user
+    /// to pick another device.
+    DeviceUnavailable { kind: DeviceKind, message: String },
+
+    /// A live capture/playback device died mid-session (unplug, sound-server
+    /// crash). The audio task has torn the stream down; `recovering` is true
+    /// while it retries re-opening on its poll tick and false once it gives up
+    /// (e.g. nothing to re-open against). Surfaced to the UI so "connected"
+    /// doesn't keep implying working audio.
+    DeviceError {
+        kind: DeviceKind,
+        message: String,
+        recovering: bool,
+    },
 
     /// Voice activation mode toggled between PushToTalk and Continuous.
     VoiceModeChanged { mode: VoiceMode },
