@@ -19,6 +19,7 @@ use rumble_protocol::{
 use std::{
     net::SocketAddr,
     sync::{Arc, atomic::AtomicBool},
+    time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::RwLock;
 use tracing::{debug, error, info};
@@ -154,6 +155,24 @@ impl Server {
     pub async fn run(&self) -> Result<()> {
         // Load persisted rooms before accepting connections
         self.load_persisted_rooms().await;
+
+        // Spawn background task to sweep expired timed bans every 60 seconds.
+        if let Some(persist) = self.persistence.clone() {
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+                loop {
+                    interval.tick().await;
+                    let now_secs = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    let swept = persist.sweep_expired_bans(now_secs);
+                    if swept > 0 {
+                        info!(count = swept, "swept expired bans");
+                    }
+                }
+            });
+        }
 
         // Start plugins before accepting connections
         for plugin in &self.plugins {
