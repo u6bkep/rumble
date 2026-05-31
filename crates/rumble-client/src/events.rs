@@ -1327,6 +1327,27 @@ pub enum Command {
     #[doc(hidden)]
     ShareChatHistory,
 
+    /// Internal: Send a liveness probe (empty envelope) to the server.
+    /// Emitted by the receiver task when the reliable stream has been
+    /// silent past the recv timeout. The connection task sends it via
+    /// the tracked-send path, so a dead connection surfaces as
+    /// `ConnectionLost` while a healthy-but-idle one is simply kept warm
+    /// (and refreshes the server's mirror-image read timeout).
+    #[doc(hidden)]
+    PingServer,
+
+    /// Internal: Request a full state resync from the server.
+    /// Emitted by the projection task when it detects a `StateUpdate`
+    /// hash mismatch or a broadcast-channel lag (either of which means
+    /// the local `State` may have diverged from the server's view).
+    /// `expected_hash` / `actual_hash` are carried for server-side
+    /// logging only; the server replies with a full `ServerState`.
+    #[doc(hidden)]
+    RequestStateSync {
+        expected_hash: Vec<u8>,
+        actual_hash: Vec<u8>,
+    },
+
     // ACL Commands
     /// Kick a user from the server.
     KickUser {
@@ -1487,6 +1508,8 @@ impl std::fmt::Debug for Command {
                 .finish(),
             Command::RequestChatHistory => write!(f, "RequestChatHistory"),
             Command::ShareChatHistory => write!(f, "ShareChatHistory"),
+            Command::PingServer => write!(f, "PingServer"),
+            Command::RequestStateSync { .. } => write!(f, "RequestStateSync {{ .. }}"),
             Command::KickUser { target_user_id, reason } => f
                 .debug_struct("KickUser")
                 .field("target_user_id", target_user_id)

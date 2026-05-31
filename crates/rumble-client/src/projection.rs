@@ -23,14 +23,20 @@
 //! and makes the single-writer invariant for `State` *structural*
 //! rather than aspirational.
 //!
-//! ## Resync-on-lag (TODO)
+//! ## Resync-on-lag / hash-mismatch
 //!
 //! `tokio::broadcast` returns `RecvError::Lagged(n)` when a consumer
-//! falls behind the ring. Today the projection logs and continues —
-//! at which point `state` is divergent from the event log and may
-//! never recover. The eventual fix is to request a fresh `ServerState`
-//! from the server and reset the snapshot. Capacity is 1024 which
-//! should be ample; if it ever lags in practice, that's a real bug.
+//! falls behind the ring; at that point `state` is divergent from the
+//! event log. The projection also verifies each `StateUpdate` against
+//! the server's `expected_hash` (carried as a
+//! [`RoomEvent::StateHashCheckpoint`]). On either a lag or a hash
+//! mismatch it sends [`Command::RequestStateSync`] back through the
+//! connection task, which asks the server for a fresh `ServerState`.
+//! The server's reply arrives as a `FullStateReplaced` event that
+//! atomically rebuilds the snapshot from a known-good baseline.
+//! Capacity is 1024, which should be ample; a lag in practice is a
+//! real bug, but the resync keeps us correct rather than silently
+//! divergent.
 //!
 //! [CQRS]: https://martinfowler.com/bliki/CQRS.html
 
@@ -40,14 +46,17 @@ use std::{
 };
 
 use rumble_client_traits::FileTransferPlugin;
-use tokio::sync::broadcast::{self, error::RecvError};
-use tracing::{debug, error};
+use tokio::sync::{
+    broadcast::{self, error::RecvError},
+    mpsc,
+};
+use tracing::{debug, error, warn};
 use uuid::Uuid;
 
 use crate::{
     audio_task::{AudioCommand, AudioTaskHandle},
     domain_events::{ChatEvent, ConnectionEvent, RoomEvent, TransferEvent, VoiceEvent},
-    events::State,
+    events::{Command, State},
 };
 
 /// Bundle of broadcast `Sender`s passed to the connection and audio
@@ -96,6 +105,13 @@ pub fn spawn_projection_task(
     bus: &EventBus,
     audio_task: AudioTaskHandle,
     file_transfer: Arc<RwLock<Option<Arc<dyn FileTransferPlugin>>>>,
+    // Command channel back into the connection task, used to request a
+    // full ServerState resync when the projection detects divergence
+    // (a `StateUpdate` hash mismatch or a broadcast-channel lag). This
+    // doesn't violate the sole-writer invariant: the projection still
+    // never writes `State` itself for the resync — it asks the server,
+    // whose reply arrives as a `FullStateReplaced` event applied here.
+    command_tx: mpsc::UnboundedSender<Command>,
 ) -> tokio::task::JoinHandle<()> {
     let mut chat_rx = bus.chat.subscribe();
     let mut voice_rx = bus.voice.subscribe();
@@ -113,7 +129,7 @@ pub fn spawn_projection_task(
                 // cycles). `Lagged` is a hard fault — see module docs.
                 chat = chat_rx.recv() => match chat {
                     Ok(ev) => apply_chat(&state, ev, &repaint),
-                    Err(RecvError::Lagged(skipped)) => on_lag("chat", skipped),
+                    Err(RecvError::Lagged(skipped)) => on_lag("chat", skipped, &command_tx),
                     Err(RecvError::Closed) => {
                         debug!("projection: chat channel closed");
                         if all_closed(&chat_rx, &voice_rx, &conn_rx, &room_rx, &transfer_rx) {
@@ -123,7 +139,7 @@ pub fn spawn_projection_task(
                 },
                 voice = voice_rx.recv() => match voice {
                     Ok(ev) => apply_voice(&state, ev, &repaint),
-                    Err(RecvError::Lagged(skipped)) => on_lag("voice", skipped),
+                    Err(RecvError::Lagged(skipped)) => on_lag("voice", skipped, &command_tx),
                     Err(RecvError::Closed) => {
                         debug!("projection: voice channel closed");
                         if all_closed(&chat_rx, &voice_rx, &conn_rx, &room_rx, &transfer_rx) {
@@ -133,7 +149,7 @@ pub fn spawn_projection_task(
                 },
                 conn = conn_rx.recv() => match conn {
                     Ok(ev) => apply_connection(&state, ev, &repaint),
-                    Err(RecvError::Lagged(skipped)) => on_lag("connection", skipped),
+                    Err(RecvError::Lagged(skipped)) => on_lag("connection", skipped, &command_tx),
                     Err(RecvError::Closed) => {
                         debug!("projection: connection channel closed");
                         if all_closed(&chat_rx, &voice_rx, &conn_rx, &room_rx, &transfer_rx) {
@@ -142,8 +158,8 @@ pub fn spawn_projection_task(
                     }
                 },
                 room = room_rx.recv() => match room {
-                    Ok(ev) => apply_room(&state, ev, &repaint, &audio_task, &file_transfer),
-                    Err(RecvError::Lagged(skipped)) => on_lag("room", skipped),
+                    Ok(ev) => apply_room(&state, ev, &repaint, &audio_task, &file_transfer, &command_tx),
+                    Err(RecvError::Lagged(skipped)) => on_lag("room", skipped, &command_tx),
                     Err(RecvError::Closed) => {
                         debug!("projection: room channel closed");
                         if all_closed(&chat_rx, &voice_rx, &conn_rx, &room_rx, &transfer_rx) {
@@ -153,7 +169,7 @@ pub fn spawn_projection_task(
                 },
                 transfer = transfer_rx.recv() => match transfer {
                     Ok(ev) => apply_transfer(&state, ev, &repaint),
-                    Err(RecvError::Lagged(skipped)) => on_lag("transfer", skipped),
+                    Err(RecvError::Lagged(skipped)) => on_lag("transfer", skipped, &command_tx),
                     Err(RecvError::Closed) => {
                         debug!("projection: transfer channel closed");
                         if all_closed(&chat_rx, &voice_rx, &conn_rx, &room_rx, &transfer_rx) {
@@ -167,12 +183,100 @@ pub fn spawn_projection_task(
     })
 }
 
-fn on_lag(domain: &'static str, skipped: u64) {
-    // TODO: trigger a server resync (`ServerState` re-request) so the
-    // projection rebuilds from a known-good baseline. Until then, the
-    // `state` snapshot is divergent from the event log and won't catch
-    // up on its own. See module docs.
-    error!("projection: {domain} channel lagged, skipped {skipped} events");
+fn on_lag(domain: &'static str, skipped: u64, command_tx: &mpsc::UnboundedSender<Command>) {
+    // A lag means we dropped `skipped` events and `state` is now
+    // divergent from the event log. Request a fresh ServerState so the
+    // connection task's reply rebuilds the snapshot from a known-good
+    // baseline (FullStateReplaced). The empty hashes mark this as a
+    // lag-triggered resync rather than a hash mismatch.
+    error!("projection: {domain} channel lagged, skipped {skipped} events; requesting resync");
+    request_resync(command_tx, Vec::new(), Vec::new());
+}
+
+/// Ask the connection task to request a full ServerState from the
+/// server. Fire-and-forget: if the channel is closed the connection is
+/// already tearing down and a resync is moot.
+fn request_resync(command_tx: &mpsc::UnboundedSender<Command>, expected_hash: Vec<u8>, actual_hash: Vec<u8>) {
+    if command_tx
+        .send(Command::RequestStateSync {
+            expected_hash,
+            actual_hash,
+        })
+        .is_err()
+    {
+        debug!("projection: resync requested but command channel closed");
+    }
+}
+
+/// Verify the just-applied state against the server's expected hash.
+///
+/// Reconstructs the canonical `proto::ServerState` that the server hashes
+/// in `broadcast_state_update` and re-hashes it with the shared helper
+/// [`rumble_protocol::compute_server_state_hash`]. To match the server's
+/// `StateUpdate.expected_hash` byte-for-byte we must mirror exactly what
+/// the server feeds the hasher there, which is **not** the same as the
+/// wire `ServerState` we received:
+///
+/// - `effective_permissions` is per-client and set on the wire copy
+///   *after* hashing; the server hashes rooms with it left at `0`. Our
+///   `State.rooms` carry the non-zero per-client value, so we must zero
+///   it per room before hashing or we'd mismatch on every update.
+/// - `groups` is excluded (`vec![]`) from the incremental-update hash.
+/// - `slash_commands` is excluded (the helper clears it regardless).
+///
+/// ACL entries and all other room/user fields are included and must match.
+/// A mismatch means our incremental apply diverged from the server's
+/// view — request a full resync so the next `FullStateReplaced` rebuilds
+/// us from a known-good baseline.
+fn verify_state_hash(state: &Arc<RwLock<State>>, expected_hash: &[u8], command_tx: &mpsc::UnboundedSender<Command>) {
+    let server_state = {
+        let s = match state.read() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        state_hash_input(&s)
+    };
+
+    let actual_hash = rumble_protocol::compute_server_state_hash(&server_state);
+    if actual_hash != expected_hash {
+        warn!(
+            expected = %hex_prefix(expected_hash),
+            actual = %hex_prefix(&actual_hash),
+            "projection: state hash mismatch after StateUpdate; requesting resync"
+        );
+        request_resync(command_tx, expected_hash.to_vec(), actual_hash);
+    }
+}
+
+/// Build the canonical `ServerState` the server hashes for a
+/// `StateUpdate.expected_hash`, from the client's local snapshot.
+///
+/// Must mirror `server::handlers::broadcast_state_update` exactly:
+/// rooms with `effective_permissions` zeroed (it's per-client and set on
+/// the wire copy after hashing), and empty `groups` / `slash_commands`
+/// (both excluded from the incremental-update hash). See
+/// [`verify_state_hash`] for the full rationale.
+fn state_hash_input(s: &State) -> rumble_protocol::proto::ServerState {
+    let rooms = s
+        .rooms
+        .iter()
+        .map(|r| rumble_protocol::proto::RoomInfo {
+            effective_permissions: 0,
+            ..r.clone()
+        })
+        .collect();
+    rumble_protocol::proto::ServerState {
+        rooms,
+        users: s.users.clone(),
+        groups: Vec::new(),
+        slash_commands: Vec::new(),
+    }
+}
+
+/// Short hex prefix of a hash for log readability (full 32-byte hashes
+/// are noise in logs; the first few bytes are enough to correlate).
+fn hex_prefix(bytes: &[u8]) -> String {
+    bytes.iter().take(4).map(|b| format!("{b:02x}")).collect()
 }
 
 /// True iff every domain receiver has seen its channel closed (all
@@ -443,7 +547,16 @@ fn apply_room(
     repaint: &Arc<dyn Fn() + Send + Sync>,
     audio_task: &AudioTaskHandle,
     file_transfer: &Arc<RwLock<Option<Arc<dyn FileTransferPlugin>>>>,
+    command_tx: &mpsc::UnboundedSender<Command>,
 ) {
+    // Hash-checkpoint events carry no state mutation: they verify that
+    // the delta(s) we just applied left us at the server's expected
+    // hash, and request a resync on divergence. Handled up front so the
+    // rest of this function can assume a real mutation.
+    if let RoomEvent::StateHashCheckpoint { expected_hash } = &ev {
+        verify_state_hash(state, expected_hash, command_tx);
+        return;
+    }
     // Collect side effects (AudioCommand dispatches, plugin
     // room-id updates) under the write lock, then drop the lock
     // before issuing them — the audio task uses an unbounded mpsc so
@@ -685,6 +798,11 @@ fn apply_room(
             audio_cmds.push(AudioCommand::RoomChanged { user_ids_in_room });
             recompute_perms = true;
         }
+        RoomEvent::StateHashCheckpoint { .. } => {
+            // Handled by the early return above; the match is only
+            // reached for state-mutating events.
+            unreachable!("StateHashCheckpoint is handled before the mutation match");
+        }
     }
     drop(s);
 
@@ -850,4 +968,101 @@ fn apply_transfer(_state: &Arc<RwLock<State>>, ev: TransferEvent, _repaint: &Arc
     // subscribers (chat card, media cache, auto-download) that want
     // the typed stream alongside the existing mpsc UX path.
     tracing::trace!(target: "rumble_client::projection", "transfer event: {:?}", ev);
+}
+
+#[cfg(test)]
+mod tests {
+    use rumble_protocol::{
+        compute_server_state_hash,
+        proto::{RoomId, RoomInfo, ServerState, User, UserId},
+    };
+
+    use super::*;
+
+    fn room(uuid: u128, name: &str, effective: u32) -> RoomInfo {
+        RoomInfo {
+            id: Some(RoomId {
+                uuid: uuid.to_be_bytes().to_vec(),
+            }),
+            name: name.to_string(),
+            parent_id: None,
+            description: None,
+            inherit_acl: true,
+            acls: vec![],
+            effective_permissions: effective,
+        }
+    }
+
+    fn user(id: u64, name: &str) -> User {
+        User {
+            user_id: Some(UserId { value: id }),
+            username: name.to_string(),
+            current_room: None,
+            is_muted: false,
+            is_deafened: false,
+            server_muted: false,
+            is_elevated: false,
+            groups: vec![],
+            label: None,
+        }
+    }
+
+    /// The whole point of `state_hash_input`: a client snapshot whose
+    /// rooms carry the per-client `effective_permissions` (non-zero, as
+    /// received on the wire) must still hash to the same value the server
+    /// fed its hasher in `broadcast_state_update` — which uses rooms with
+    /// `effective_permissions: 0`, empty groups, and empty slash commands.
+    /// If this drifts, every StateUpdate would spuriously trigger a resync.
+    #[test]
+    fn state_hash_input_matches_server_broadcast_update_input() {
+        let mut s = State::default();
+        // Client rooms carry non-zero per-client effective permissions and
+        // group definitions, neither of which the server hashes for a
+        // StateUpdate.
+        s.rooms = vec![room(1, "Root", 0x1ff), room(2, "Lobby", 0x42)];
+        s.users = vec![user(1, "alice"), user(2, "bob")];
+        s.group_definitions = vec![rumble_protocol::proto::GroupInfo {
+            name: "admin".to_string(),
+            permissions: 0xffff_ffff,
+            is_builtin: true,
+        }];
+
+        // Server's broadcast_state_update hash input: same rooms but with
+        // effective_permissions zeroed, groups + slash_commands empty.
+        let server_input = ServerState {
+            rooms: vec![room(1, "Root", 0), room(2, "Lobby", 0)],
+            users: s.users.clone(),
+            groups: vec![],
+            slash_commands: vec![],
+        };
+
+        assert_eq!(
+            compute_server_state_hash(&state_hash_input(&s)),
+            compute_server_state_hash(&server_input),
+            "client-side hash input must match the server's StateUpdate hash input"
+        );
+    }
+
+    /// A divergent local state (an extra user the server doesn't have)
+    /// must produce a different hash, so `verify_state_hash` actually
+    /// catches drift rather than silently matching.
+    #[test]
+    fn state_hash_input_detects_divergence() {
+        let mut s = State::default();
+        s.rooms = vec![room(1, "Root", 0)];
+        s.users = vec![user(1, "alice")];
+
+        let server_input = ServerState {
+            rooms: vec![room(1, "Root", 0)],
+            users: vec![user(1, "alice"), user(2, "ghost")],
+            groups: vec![],
+            slash_commands: vec![],
+        };
+
+        assert_ne!(
+            compute_server_state_hash(&state_hash_input(&s)),
+            compute_server_state_hash(&server_input),
+            "a missing user must change the hash"
+        );
+    }
 }

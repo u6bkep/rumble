@@ -332,6 +332,9 @@ impl<P: Platform> BackendHandle<P> {
         let repaint_for_projection = repaint_callback.clone();
         let audio_task_for_projection = audio_task.clone();
         let file_transfer_for_projection = file_transfer.clone();
+        // The projection sends Command::RequestStateSync back through the
+        // connection task when it detects a hash mismatch or a lag.
+        let command_tx_for_projection = command_tx.clone();
 
         // Spawn background thread with tokio runtime for connection task.
         // The projection task is spawned on this same runtime so it
@@ -349,6 +352,7 @@ impl<P: Platform> BackendHandle<P> {
                     &bus_for_projection,
                     audio_task_for_projection,
                     file_transfer_for_projection,
+                    command_tx_for_projection,
                 );
                 run_connection_task::<P>(
                     command_rx,
@@ -709,6 +713,78 @@ async fn send_disconnect_envelope<T: rumble_client_traits::transport::Transport>
     }
 }
 
+/// How long to wait for the connect/auth handshake before giving up.
+/// A hung handshake (TCP/QUIC connect that never completes, or a server
+/// that accepts the connection but never answers ServerHello/auth) would
+/// otherwise leave the UI stuck on "Connecting…" until the QUIC idle
+/// timeout. On timeout we fall back to Disconnected so the user can retry.
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long the receiver task waits on a single reliable-stream `recv`
+/// before actively probing connection liveness.
+///
+/// A healthy connection can be legitimately quiet: the server only pushes
+/// reliable-stream frames on state changes (there is no periodic
+/// app-level keepalive *to* the client), and QUIC's own keepalive lives
+/// at the transport layer and never surfaces as a `recv()` frame. So a
+/// silent `recv` does **not** by itself mean the peer is gone — declaring
+/// loss on bare silence would falsely disconnect an idle-but-healthy
+/// client. On elapse we instead send a liveness probe and only treat a
+/// *probe send failure* as connection loss (see the receiver loop). This
+/// mirrors the server, which sends us an empty frame on its own 30s read
+/// silence; kept below that so our probe also refreshes the server timer.
+const RECV_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Send an envelope over the (possibly-absent) transport, treating any
+/// failure — or an already-gone transport — as connection loss.
+///
+/// This is the single chokepoint that makes degraded-connection send
+/// errors *visible* (Blocker 1): previously each call site logged the
+/// error and continued while the UI still showed "Connected." On failure
+/// we tear down the transport, notify the audio task, and emit
+/// `ConnectionLost` + a state wipe through the projection — the same
+/// shape the receiver task uses when the read side drops — so the UI
+/// transitions to ConnectionLost and the user can reconnect.
+///
+/// Returns `true` if the send succeeded, `false` if the connection was
+/// lost (transport now `None`). Most callers ignore the bool: the next
+/// command they handle will see `transport` is `None` and no-op.
+async fn send_tracked<T: rumble_client_traits::transport::Transport>(
+    transport: &mut Option<T>,
+    env: &proto::Envelope,
+    bus: &crate::projection::EventBus,
+    audio_task: &AudioTaskHandle,
+) -> bool {
+    let Some(t) = transport.as_mut() else {
+        // No live connection — nothing to send. Not itself a new loss
+        // event (we already transitioned when the transport went away).
+        return false;
+    };
+    match send_envelope(t, env).await {
+        Ok(()) => true,
+        Err(e) => {
+            warn!("send failed, treating connection as lost: {}", e);
+            // Drop the dead transport so subsequent commands no-op
+            // instead of repeatedly hitting the broken stream.
+            *transport = None;
+            audio_task.send(AudioCommand::ConnectionClosed);
+            let _ = bus.connection.send(crate::ConnectionEvent::ConnectionLost {
+                error: format!("Send failed: {e}"),
+            });
+            // Wipe room/user state via the projection so the UI clears
+            // rooms/users/membership atomically (mirrors run_receiver_task).
+            let _ = bus.room.send(crate::RoomEvent::FullStateReplaced {
+                rooms: Vec::new(),
+                users: Vec::new(),
+                groups: Vec::new(),
+                slash_commands: Vec::new(),
+                per_room_permissions: HashMap::new(),
+            });
+            false
+        }
+    }
+}
+
 /// The main connection task that handles QUIC communication (reliable streams only).
 ///
 /// This task manages:
@@ -858,8 +934,25 @@ async fn run_connection_task<P: Platform>(
                         // Create a captured cert holder for the verifier to store self-signed certs
                         let captured_cert = new_captured_cert();
 
-                        // Attempt connection with Ed25519 auth
-                        match connect_to_server::<P::Transport>(&addr, &name, &public_key, key_signer.as_ref(), password.as_deref(), &config, captured_cert.clone()).await {
+                        // Attempt connection with Ed25519 auth, bounded by a
+                        // handshake timeout so a hung connect/auth falls back
+                        // to Disconnected (retryable) instead of pinning the
+                        // UI on "Connecting…" until the QUIC idle timeout.
+                        let connect_result = match tokio::time::timeout(
+                            HANDSHAKE_TIMEOUT,
+                            connect_to_server::<P::Transport>(&addr, &name, &public_key, key_signer.as_ref(), password.as_deref(), &config, captured_cert.clone()),
+                        ).await {
+                            Ok(r) => r,
+                            Err(_elapsed) => {
+                                warn!(timeout_s = HANDSHAKE_TIMEOUT.as_secs(), "Handshake timed out");
+                                let _ = bus.connection.send(crate::ConnectionEvent::Disconnected);
+                                let _ = bus.chat.send(crate::ChatEvent::SystemNotice {
+                                    text: format!("Connection to {addr} timed out"),
+                                });
+                                continue;
+                            }
+                        };
+                        match connect_result {
                             Ok((mut new_transport, user_id, rooms, users, groups, slash_commands, session_info)) => {
                                 // Connection-identity transition via the projection.
                                 let _ = bus.connection.send(crate::ConnectionEvent::Connected {
@@ -1012,16 +1105,32 @@ async fn run_connection_task<P: Platform>(
                             // Create a new captured cert holder (shouldn't capture again since cert is now trusted)
                             let captured_cert = new_captured_cert();
 
-                            // Retry connection with the certificate trusted
-                            match connect_to_server::<P::Transport>(
-                                &pending.server_addr,
-                                &pending.username,
-                                &pending.public_key,
-                                key_signer.as_ref(),
-                                pending.password.as_deref(),
-                                &new_config,
-                                captured_cert,
+                            // Retry connection with the certificate trusted,
+                            // bounded by the same handshake timeout as the
+                            // initial connect.
+                            let connect_result = match tokio::time::timeout(
+                                HANDSHAKE_TIMEOUT,
+                                connect_to_server::<P::Transport>(
+                                    &pending.server_addr,
+                                    &pending.username,
+                                    &pending.public_key,
+                                    key_signer.as_ref(),
+                                    pending.password.as_deref(),
+                                    &new_config,
+                                    captured_cert,
+                                ),
                             ).await {
+                                Ok(r) => r,
+                                Err(_elapsed) => {
+                                    warn!(timeout_s = HANDSHAKE_TIMEOUT.as_secs(), "Handshake timed out after certificate acceptance");
+                                    let _ = bus.connection.send(crate::ConnectionEvent::Disconnected);
+                                    let _ = bus.chat.send(crate::ChatEvent::SystemNotice {
+                                        text: format!("Connection to {} timed out", pending.server_addr),
+                                    });
+                                    continue;
+                                }
+                            };
+                            match connect_result {
                                 Ok((mut new_transport, user_id, rooms, users, groups, slash_commands, session_info)) => {
                                     let _ = bus.connection.send(crate::ConnectionEvent::Connected {
                                         server_name: "Rumble Server".to_string(),
@@ -1165,21 +1274,19 @@ async fn run_connection_task<P: Platform>(
                     }
 
                     Command::JoinRoom { room_id } => {
-                        if let Some(t) = &mut transport {
+                        if transport.is_some() {
                             let env = proto::Envelope {
                                 state_hash: Vec::new(),
                                 payload: Some(Payload::JoinRoom(proto::JoinRoom {
                                     room_id: Some(room_id_from_uuid(room_id)),
                                 })),
                             };
-                            if let Err(e) = send_envelope(t, &env).await {
-                                error!("Failed to send JoinRoom: {}", e);
-                            }
+                            send_tracked(&mut transport, &env, &bus, &audio_task).await;
                         }
                     }
 
                     Command::CreateRoom { name, parent_id } => {
-                        if let Some(t) = &mut transport {
+                        if transport.is_some() {
                             let env = proto::Envelope {
                                 state_hash: Vec::new(),
                                 payload: Some(Payload::CreateRoom(proto::CreateRoom {
@@ -1188,28 +1295,24 @@ async fn run_connection_task<P: Platform>(
                                     description: None,
                                 })),
                             };
-                            if let Err(e) = send_envelope(t, &env).await {
-                                error!("Failed to send CreateRoom: {}", e);
-                            }
+                            send_tracked(&mut transport, &env, &bus, &audio_task).await;
                         }
                     }
 
                     Command::DeleteRoom { room_id } => {
-                        if let Some(t) = &mut transport {
+                        if transport.is_some() {
                             let env = proto::Envelope {
                                 state_hash: Vec::new(),
                                 payload: Some(Payload::DeleteRoom(proto::DeleteRoom {
                                     room_id: Some(room_id_from_uuid(room_id)),
                                 })),
                             };
-                            if let Err(e) = send_envelope(t, &env).await {
-                                error!("Failed to send DeleteRoom: {}", e);
-                            }
+                            send_tracked(&mut transport, &env, &bus, &audio_task).await;
                         }
                     }
 
                     Command::RenameRoom { room_id, new_name } => {
-                        if let Some(t) = &mut transport {
+                        if transport.is_some() {
                             let env = proto::Envelope {
                                 state_hash: Vec::new(),
                                 payload: Some(Payload::RenameRoom(proto::RenameRoom {
@@ -1217,14 +1320,12 @@ async fn run_connection_task<P: Platform>(
                                     new_name,
                                 })),
                             };
-                            if let Err(e) = send_envelope(t, &env).await {
-                                error!("Failed to send RenameRoom: {}", e);
-                            }
+                            send_tracked(&mut transport, &env, &bus, &audio_task).await;
                         }
                     }
 
                     Command::MoveRoom { room_id, new_parent_id } => {
-                        if let Some(t) = &mut transport {
+                        if transport.is_some() {
                             let env = proto::Envelope {
                                 state_hash: Vec::new(),
                                 payload: Some(Payload::MoveRoom(proto::MoveRoom {
@@ -1232,14 +1333,12 @@ async fn run_connection_task<P: Platform>(
                                     new_parent_id: Some(room_id_from_uuid(new_parent_id)),
                                 })),
                             };
-                            if let Err(e) = send_envelope(t, &env).await {
-                                error!("Failed to send MoveRoom: {}", e);
-                            }
+                            send_tracked(&mut transport, &env, &bus, &audio_task).await;
                         }
                     }
 
                     Command::SetRoomDescription { room_id, description } => {
-                        if let Some(t) = &mut transport {
+                        if transport.is_some() {
                             let env = proto::Envelope {
                                 state_hash: Vec::new(),
                                 payload: Some(Payload::SetRoomDescription(proto::SetRoomDescription {
@@ -1247,14 +1346,12 @@ async fn run_connection_task<P: Platform>(
                                     description,
                                 })),
                             };
-                            if let Err(e) = send_envelope(t, &env).await {
-                                error!("Failed to send SetRoomDescription: {}", e);
-                            }
+                            send_tracked(&mut transport, &env, &bus, &audio_task).await;
                         }
                     }
 
                     Command::SendChat { text } => {
-                        if let Some(t) = &mut transport {
+                        if transport.is_some() {
                             let message_id = uuid::Uuid::new_v4().into_bytes();
                             let timestamp = std::time::SystemTime::now();
                             let timestamp_ms = timestamp
@@ -1272,9 +1369,7 @@ async fn run_connection_task<P: Platform>(
                                     attachment: None,
                                 })),
                             };
-                            if let Err(e) = send_envelope(t, &env).await {
-                                error!("Failed to send ChatMessage: {}", e);
-                            }
+                            send_tracked(&mut transport, &env, &bus, &audio_task).await;
                             // Insert locally — server no longer echoes chat
                             // back to the sender. Projection applies the push.
                             let my_uid = read_state(&state).my_user_id;
@@ -1294,7 +1389,7 @@ async fn run_connection_task<P: Platform>(
                     }
 
                     Command::SendTreeChat { text } => {
-                        if let Some(t) = &mut transport {
+                        if transport.is_some() {
                             let message_id = uuid::Uuid::new_v4().into_bytes();
                             let timestamp = std::time::SystemTime::now();
                             let timestamp_ms = timestamp
@@ -1312,9 +1407,7 @@ async fn run_connection_task<P: Platform>(
                                     attachment: None,
                                 })),
                             };
-                            if let Err(e) = send_envelope(t, &env).await {
-                                error!("Failed to send tree ChatMessage: {}", e);
-                            }
+                            send_tracked(&mut transport, &env, &bus, &audio_task).await;
                             let my_uid = read_state(&state).my_user_id;
                             let _ = bus.chat.send(crate::ChatEvent::MessageAdded {
                                 msg: crate::events::ChatMessage {
@@ -1332,7 +1425,7 @@ async fn run_connection_task<P: Platform>(
                     }
 
                     Command::SendDirectMessage { target_user_id, target_username, text } => {
-                        if let Some(t) = &mut transport {
+                        if transport.is_some() {
                             let message_id = uuid::Uuid::new_v4().into_bytes();
                             let timestamp = std::time::SystemTime::now();
                             let timestamp_ms = timestamp
@@ -1348,9 +1441,7 @@ async fn run_connection_task<P: Platform>(
                                     timestamp_ms,
                                 })),
                             };
-                            if let Err(e) = send_envelope(t, &env).await {
-                                error!("Failed to send DirectMessage: {}", e);
-                            }
+                            send_tracked(&mut transport, &env, &bus, &audio_task).await;
                             let my_uid = read_state(&state).my_user_id;
                             let _ = bus.chat.send(crate::ChatEvent::MessageAdded {
                                 msg: crate::events::ChatMessage {
@@ -1377,7 +1468,7 @@ async fn run_connection_task<P: Platform>(
                     // Audio commands are routed to audio task in BackendHandle::send()
                     Command::SetMuted { muted } => {
                         // Send status update to server
-                        if let Some(t) = &mut transport {
+                        if transport.is_some() {
                             let is_deafened = read_state(&state).audio.self_deafened;
                             let env = proto::Envelope {
                                 state_hash: Vec::new(),
@@ -1386,16 +1477,14 @@ async fn run_connection_task<P: Platform>(
                                     is_deafened,
                                 })),
                             };
-                            if let Err(e) = send_envelope(t, &env).await {
-                                error!("Failed to send SetUserStatus: {}", e);
-                            }
+                            send_tracked(&mut transport, &env, &bus, &audio_task).await;
                         }
                     }
 
                     Command::SetDeafened { deafened } => {
                         // Send status update to server
                         // Note: deafen implies mute
-                        if let Some(t) = &mut transport {
+                        if transport.is_some() {
                             let is_muted = read_state(&state).audio.self_muted || deafened;
                             let env = proto::Envelope {
                                 state_hash: Vec::new(),
@@ -1404,9 +1493,7 @@ async fn run_connection_task<P: Platform>(
                                     is_deafened: deafened,
                                 })),
                             };
-                            if let Err(e) = send_envelope(t, &env).await {
-                                error!("Failed to send SetUserStatus: {}", e);
-                            }
+                            send_tracked(&mut transport, &env, &bus, &audio_task).await;
                         }
                     }
 
@@ -1430,30 +1517,26 @@ async fn run_connection_task<P: Platform>(
                     }
 
                     Command::RegisterUser { user_id } => {
-                        if let Some(t) = &mut transport {
+                        if transport.is_some() {
                             let env = proto::Envelope {
                                 state_hash: Vec::new(),
                                 payload: Some(Payload::RegisterUser(proto::RegisterUser {
                                     user_id: Some(proto::UserId { value: user_id }),
                                 })),
                             };
-                            if let Err(e) = send_envelope(t, &env).await {
-                                error!("Failed to send RegisterUser: {}", e);
-                            }
+                            send_tracked(&mut transport, &env, &bus, &audio_task).await;
                         }
                     }
 
                     Command::UnregisterUser { user_id } => {
-                        if let Some(t) = &mut transport {
+                        if transport.is_some() {
                             let env = proto::Envelope {
                                 state_hash: Vec::new(),
                                 payload: Some(Payload::UnregisterUser(proto::UnregisterUser {
                                     user_id: Some(proto::UserId { value: user_id }),
                                 })),
                             };
-                            if let Err(e) = send_envelope(t, &env).await {
-                                error!("Failed to send UnregisterUser: {}", e);
-                            }
+                            send_tracked(&mut transport, &env, &bus, &audio_task).await;
                         }
                     }
 
@@ -1567,7 +1650,7 @@ async fn run_connection_task<P: Platform>(
 
                     Command::RequestChatHistory => {
                         // Send a chat history request to the room
-                        if let Some(t) = &mut transport {
+                        if transport.is_some() {
                             let request = crate::events::ChatHistoryRequestMessage::new();
                             let message_id = uuid::Uuid::new_v4().into_bytes().to_vec();
                             let timestamp_ms = SystemTime::now()
@@ -1586,9 +1669,7 @@ async fn run_connection_task<P: Platform>(
                                     attachment: None,
                                 })),
                             };
-                            if let Err(e) = send_envelope(t, &env).await {
-                                error!("Failed to send chat history request: {}", e);
-                            } else {
+                            if send_tracked(&mut transport, &env, &bus, &audio_task).await {
                                 info!("Sent chat history request to room");
                                 let _ = bus.chat.send(crate::ChatEvent::SystemNotice {
                                     text: "Requesting chat history from peers...".to_string(),
@@ -1598,7 +1679,7 @@ async fn run_connection_task<P: Platform>(
                     }
 
                     Command::ShareChatHistory => {
-                        if let Some(t) = &mut transport {
+                        if transport.is_some() {
                             let messages = {
                                 let s = read_state(&state);
                                 s.chat_messages.clone()
@@ -1624,18 +1705,47 @@ async fn run_connection_task<P: Platform>(
                                         attachment: None,
                                     })),
                                 };
-                                if let Err(e) = send_envelope(t, &env).await {
-                                    error!("Failed to send chat history response: {}", e);
-                                } else {
+                                if send_tracked(&mut transport, &env, &bus, &audio_task).await {
                                     debug!("Shared {} chat messages", share.content.messages.len());
                                 }
                             }
                         }
                     }
 
+                    Command::PingServer => {
+                        // Liveness probe from the receiver task after a
+                        // recv-silence window. An empty-payload envelope is
+                        // a no-op for the server (mirrors the empty frame
+                        // the server sends us on *its* read timeout) but
+                        // exercises the send path: send_tracked surfaces
+                        // ConnectionLost if the link is actually dead.
+                        if transport.is_some() {
+                            let env = proto::Envelope {
+                                state_hash: Vec::new(),
+                                payload: None,
+                            };
+                            send_tracked(&mut transport, &env, &bus, &audio_task).await;
+                        }
+                    }
+
+                    Command::RequestStateSync { expected_hash, actual_hash } => {
+                        // Projection detected a hash mismatch or a
+                        // broadcast lag. Ask the server for a full
+                        // ServerState push (it replies on the recv
+                        // stream → FullStateReplaced rebuilds cleanly).
+                        let env = proto::Envelope {
+                            state_hash: Vec::new(),
+                            payload: Some(Payload::RequestStateSync(proto::RequestStateSync {
+                                expected_hash,
+                                actual_hash,
+                            })),
+                        };
+                        send_tracked(&mut transport, &env, &bus, &audio_task).await;
+                    }
+
                     // ACL Commands
                     Command::KickUser { target_user_id, reason } => {
-                        if let Some(t) = &mut transport {
+                        if transport.is_some() {
                             let env = proto::Envelope {
                                 state_hash: vec![],
                                 payload: Some(Payload::KickUser(proto::KickUser {
@@ -1643,9 +1753,7 @@ async fn run_connection_task<P: Platform>(
                                     reason,
                                 })),
                             };
-                            if let Err(e) = send_envelope(t, &env).await {
-                                error!("Failed to send KickUser: {}", e);
-                            }
+                            send_tracked(&mut transport, &env, &bus, &audio_task).await;
                         }
                     }
                     Command::BanUser {
@@ -1653,7 +1761,7 @@ async fn run_connection_task<P: Platform>(
                         reason,
                         duration_seconds,
                     } => {
-                        if let Some(t) = &mut transport {
+                        if transport.is_some() {
                             let env = proto::Envelope {
                                 state_hash: vec![],
                                 payload: Some(Payload::BanUser(proto::BanUser {
@@ -1662,13 +1770,11 @@ async fn run_connection_task<P: Platform>(
                                     duration_seconds: duration_seconds.unwrap_or(0),
                                 })),
                             };
-                            if let Err(e) = send_envelope(t, &env).await {
-                                error!("Failed to send BanUser: {}", e);
-                            }
+                            send_tracked(&mut transport, &env, &bus, &audio_task).await;
                         }
                     }
                     Command::SetServerMute { target_user_id, muted } => {
-                        if let Some(t) = &mut transport {
+                        if transport.is_some() {
                             let env = proto::Envelope {
                                 state_hash: vec![],
                                 payload: Some(Payload::SetServerMute(proto::SetServerMute {
@@ -1676,24 +1782,20 @@ async fn run_connection_task<P: Platform>(
                                     muted,
                                 })),
                             };
-                            if let Err(e) = send_envelope(t, &env).await {
-                                error!("Failed to send SetServerMute: {}", e);
-                            }
+                            send_tracked(&mut transport, &env, &bus, &audio_task).await;
                         }
                     }
                     Command::Elevate { password } => {
-                        if let Some(t) = &mut transport {
+                        if transport.is_some() {
                             let env = proto::Envelope {
                                 state_hash: vec![],
                                 payload: Some(Payload::Elevate(proto::Elevate { password })),
                             };
-                            if let Err(e) = send_envelope(t, &env).await {
-                                error!("Failed to send Elevate: {}", e);
-                            }
+                            send_tracked(&mut transport, &env, &bus, &audio_task).await;
                         }
                     }
                     Command::CreateGroup { name, permissions } => {
-                        if let Some(t) = &mut transport {
+                        if transport.is_some() {
                             let env = proto::Envelope {
                                 state_hash: vec![],
                                 payload: Some(Payload::CreateGroup(proto::CreateGroup {
@@ -1701,24 +1803,20 @@ async fn run_connection_task<P: Platform>(
                                     permissions,
                                 })),
                             };
-                            if let Err(e) = send_envelope(t, &env).await {
-                                error!("Failed to send CreateGroup: {e}");
-                            }
+                            send_tracked(&mut transport, &env, &bus, &audio_task).await;
                         }
                     }
                     Command::DeleteGroup { name } => {
-                        if let Some(t) = &mut transport {
+                        if transport.is_some() {
                             let env = proto::Envelope {
                                 state_hash: vec![],
                                 payload: Some(Payload::DeleteGroup(proto::DeleteGroup { name })),
                             };
-                            if let Err(e) = send_envelope(t, &env).await {
-                                error!("Failed to send DeleteGroup: {e}");
-                            }
+                            send_tracked(&mut transport, &env, &bus, &audio_task).await;
                         }
                     }
                     Command::ModifyGroup { name, permissions } => {
-                        if let Some(t) = &mut transport {
+                        if transport.is_some() {
                             let env = proto::Envelope {
                                 state_hash: vec![],
                                 payload: Some(Payload::ModifyGroup(proto::ModifyGroup {
@@ -1726,9 +1824,7 @@ async fn run_connection_task<P: Platform>(
                                     permissions,
                                 })),
                             };
-                            if let Err(e) = send_envelope(t, &env).await {
-                                error!("Failed to send ModifyGroup: {e}");
-                            }
+                            send_tracked(&mut transport, &env, &bus, &audio_task).await;
                         }
                     }
                     Command::SetUserGroup {
@@ -1737,7 +1833,7 @@ async fn run_connection_task<P: Platform>(
                         add,
                         expires_at,
                     } => {
-                        if let Some(t) = &mut transport {
+                        if transport.is_some() {
                             let env = proto::Envelope {
                                 state_hash: vec![],
                                 payload: Some(Payload::SetUserGroup(proto::SetUserGroup {
@@ -1747,9 +1843,7 @@ async fn run_connection_task<P: Platform>(
                                     expires_at,
                                 })),
                             };
-                            if let Err(e) = send_envelope(t, &env).await {
-                                error!("Failed to send SetUserGroup: {e}");
-                            }
+                            send_tracked(&mut transport, &env, &bus, &audio_task).await;
                         }
                     }
                     Command::SetRoomAcl {
@@ -1757,7 +1851,7 @@ async fn run_connection_task<P: Platform>(
                         inherit_acl,
                         entries,
                     } => {
-                        if let Some(t) = &mut transport {
+                        if transport.is_some() {
                             let env = proto::Envelope {
                                 state_hash: vec![],
                                 payload: Some(Payload::SetRoomAcl(proto::SetRoomAcl {
@@ -1766,9 +1860,7 @@ async fn run_connection_task<P: Platform>(
                                     entries,
                                 })),
                             };
-                            if let Err(e) = send_envelope(t, &env).await {
-                                error!("Failed to send SetRoomAcl: {e}");
-                            }
+                            send_tracked(&mut transport, &env, &bus, &audio_task).await;
                         }
                     }
                     // PlaySfx is intercepted in BackendHandle::send() and never reaches here
@@ -1947,19 +2039,40 @@ async fn run_receiver_task(
     bus: crate::projection::EventBus,
 ) {
     loop {
-        match recv.recv().await {
-            Ok(Some(frame)) => {
+        // Bound the wait so a wedged server (alive QUIC connection, but
+        // no frames and no stream EOF/RST) is detected as connection loss
+        // instead of leaving us "Connected" until QUIC's own idle timeout.
+        match tokio::time::timeout(RECV_TIMEOUT, recv.recv()).await {
+            Ok(Ok(Some(frame))) => {
                 if let Ok(env) = proto::Envelope::decode(&*frame) {
                     handle_server_message(env, &state, &command_tx, &bus);
                 }
             }
-            Ok(None) => {
+            Ok(Ok(None)) => {
                 info!("Server closed the receive stream");
                 break;
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 warn!("Read error on receive stream: {}", e);
                 break;
+            }
+            Err(_elapsed) => {
+                // Reliable stream has been silent past the window. This is
+                // not itself proof of loss (a healthy server is quiet when
+                // nothing changes), so probe rather than disconnect: ask
+                // the connection task to send a liveness frame. Its tracked
+                // send will surface ConnectionLost if the link is dead; if
+                // it's just idle, the probe keeps us (and the server's read
+                // timer) warm and we loop to wait again.
+                debug!(
+                    timeout_s = RECV_TIMEOUT.as_secs(),
+                    "recv stream idle; sending liveness probe"
+                );
+                if command_tx.send(Command::PingServer).is_err() {
+                    // Connection task is gone — nothing left to probe with.
+                    debug!("recv idle probe: command channel closed, ending receiver");
+                    break;
+                }
             }
         }
     }
@@ -2307,6 +2420,14 @@ fn handle_server_message(
 fn apply_state_update(update: proto::StateUpdate, state: &Arc<RwLock<State>>, bus: &crate::projection::EventBus) {
     use crate::RoomEvent;
 
+    // Server's BLAKE3 hash of the post-apply ServerState. Forwarded to
+    // the projection as a checkpoint so it can verify its own apply and
+    // request a resync on divergence (the connection task only emits
+    // events; the projection is the sole writer that can compute the
+    // local hash). Empty for legacy servers that don't populate it —
+    // skip the checkpoint in that case.
+    let expected_hash = update.expected_hash.clone();
+
     let Some(u) = update.update else {
         return;
     };
@@ -2447,5 +2568,12 @@ fn apply_state_update(update: proto::StateUpdate, state: &Arc<RwLock<State>>, bu
                 });
             }
         }
+    }
+
+    // Forward the server's expected post-apply hash so the projection
+    // can verify and resync on divergence. Ordering within the room
+    // channel guarantees the projection sees this after the delta above.
+    if !expected_hash.is_empty() {
+        let _ = bus.room.send(RoomEvent::StateHashCheckpoint { expected_hash });
     }
 }
