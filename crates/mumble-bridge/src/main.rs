@@ -267,6 +267,9 @@ async fn main() -> Result<()> {
                     }
                 }
             }
+            // Signal the bridge event loop that inbound Rumble data has stopped.
+            // The bridge will break its loop and trigger the reconnect path.
+            let _ = rumble_bridge_tx.send(BridgeEvent::RumbleReceiverDied);
         });
 
         // Run the bridge event loop (blocks until shutdown or connection loss).
