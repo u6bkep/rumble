@@ -115,20 +115,42 @@ impl SfxLibrary {
             ),
         );
 
-        // Disconnect: gentle sawtooth sweep down — kept soft (lower level,
-        // eased attack) so a routine disconnect isn't jarring.
+        // Disconnect: the mirror of Connect — the same three-note sine
+        // arpeggio, but descending (E5 -> C#5 -> A4) instead of ascending.
+        // Kept a touch softer (slightly lower level, eased attack) so a
+        // routine disconnect isn't jarring.
         sounds.insert(
             SfxKind::Disconnect,
             mix_tones(
-                &[Tone {
-                    waveform: Waveform::Sawtooth,
-                    frequency: 600.0,
-                    end_frequency: Some(200.0),
-                    amplitude: 0.2,
-                    envelope: Envelope::percussive(0.02, 0.23),
-                    duration: 0.25,
-                    delay: 0.0,
-                }],
+                &[
+                    Tone {
+                        waveform: Waveform::Sine,
+                        frequency: 659.0,
+                        end_frequency: None,
+                        amplitude: 0.35,
+                        envelope: Envelope::percussive(0.008, 0.055),
+                        duration: 0.06,
+                        delay: 0.0,
+                    },
+                    Tone {
+                        waveform: Waveform::Sine,
+                        frequency: 554.0,
+                        end_frequency: None,
+                        amplitude: 0.35,
+                        envelope: Envelope::percussive(0.008, 0.055),
+                        duration: 0.06,
+                        delay: 0.07,
+                    },
+                    Tone {
+                        waveform: Waveform::Sine,
+                        frequency: 440.0,
+                        end_frequency: None,
+                        amplitude: 0.35,
+                        envelope: Envelope::percussive(0.008, 0.095),
+                        duration: 0.10,
+                        delay: 0.14,
+                    },
+                ],
                 SAMPLE_RATE,
             ),
         );

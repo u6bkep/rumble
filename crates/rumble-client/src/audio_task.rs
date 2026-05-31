@@ -834,6 +834,15 @@ async fn run_audio_task<P: Platform>(
     // to be gated, rather than checking a shared atomic flag.
     let mut capture_is_active = false;
 
+    // Edge-tracking baseline for the VAD-gated "transmitting" UI light, shared
+    // with the capture callback (which owns the per-frame on/off edges). The
+    // callback is gated off by set_active() when capture is deactivated, so it
+    // can't emit its own false edge then — `sync_transmission!` resets this to
+    // false on deactivate so the next activation re-evaluates from a clean
+    // baseline. "Capture armed" (unmute) is NOT itself "transmitting"; only the
+    // callback's VAD decision lights the indicator.
+    let was_transmitting = Arc::new(AtomicBool::new(false));
+
     // Interval for cleaning up stale talking_users
     let mut cleanup_interval = tokio::time::interval(Duration::from_millis(500));
 
@@ -905,7 +914,11 @@ async fn run_audio_task<P: Platform>(
                     if let Some(stream) = audio_input.as_ref() {
                         stream.set_active(true);
                     }
-                    let _ = bus.voice.send(VoiceEvent::TransmittingChanged { active: true });
+                    // Don't light the transmitting indicator here: arming capture
+                    // (e.g. unmuting) is not the same as transmitting. The capture
+                    // callback drives the VAD-gated edge from a clean `false`
+                    // baseline (reset on the matching deactivate), so the light
+                    // turns on only once we actually speak.
                     info!("Capture activated (samples will be processed)");
                 }
                 CaptureTransition::Deactivate => {
@@ -918,6 +931,10 @@ async fn run_audio_task<P: Platform>(
                     if let Some(stream) = audio_input.as_ref() {
                         stream.set_active(false);
                     }
+                    // The callback is now gated off and can't emit its own false
+                    // edge, so force the light off and reset the baseline for the
+                    // next activation.
+                    was_transmitting.store(false, Ordering::Relaxed);
                     let _ = bus.voice.send(VoiceEvent::TransmittingChanged { active: false });
                     info!("Capture deactivated (samples will be discarded)");
                 }
@@ -985,6 +1002,7 @@ async fn run_audio_task<P: Platform>(
                                 &audio_dumper,
                                 &meter_writer,
                                 &capture_frame_index,
+                                &was_transmitting,
                             );
                         }
 
@@ -1053,6 +1071,7 @@ async fn run_audio_task<P: Platform>(
                                 &audio_dumper,
                                 &meter_writer,
                                 &capture_frame_index,
+                                &was_transmitting,
                             );
                         }
                         sync_transmission!();
@@ -1187,6 +1206,7 @@ async fn run_audio_task<P: Platform>(
                                 &audio_dumper,
                                 &meter_writer,
                                 &capture_frame_index,
+                                &was_transmitting,
                             );
                         }
                         sync_transmission!();
@@ -1239,6 +1259,7 @@ async fn run_audio_task<P: Platform>(
                                 &audio_dumper,
                                 &meter_writer,
                                 &capture_frame_index,
+                                &was_transmitting,
                             );
                         }
                         sync_transmission!();
@@ -1567,6 +1588,7 @@ fn start_transmission<P: Platform>(
     audio_dumper: &AudioDumper,
     meter_writer: &crate::snapshot::SnapshotWriter<crate::meter::MeterSnapshot>,
     capture_frame_index: &Arc<AtomicU64>,
+    was_transmitting: &Arc<AtomicBool>,
 ) {
     if audio_input.is_some() {
         return; // Stream already exists
@@ -1627,9 +1649,10 @@ fn start_transmission<P: Platform>(
     // buffer across stores.
     let mut meter_for_callback = meter_writer.clone();
 
-    // Track whether we were transmitting (for detecting suppress transitions)
-    let was_transmitting = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let was_transmitting_for_callback = was_transmitting.clone();
+    // Track whether we were transmitting (for detecting suppress transitions).
+    // Shared with `run_audio_task`, which resets it to false when capture is
+    // deactivated so each (re)activation re-evaluates from a clean baseline.
+    let was_transmitting_for_callback = Arc::clone(was_transmitting);
 
     // Discard the first few frames to avoid stale samples from the hardware buffer.
     // When an audio stream starts, the hardware often delivers stale/garbage data
@@ -1846,8 +1869,14 @@ impl PlaybackFiller {
 
     fn fill(&mut self, output: &mut [f32], underruns: &AtomicU64, producer_active: &AtomicBool) {
         if self.priming {
-            if self.consumer.slots() < PLAYBACK_PRIME_SAMPLES {
-                // Still building the cushion (or idle) — emit silence, don't count.
+            // Hold output silent until the cushion fills — but only while the
+            // producer is still feeding. If it has gone idle with a sub-target
+            // burst already buffered (e.g. a <40 ms SFX like mute/unmute, shorter
+            // than the prime cushion), the ring will never reach the target on its
+            // own, so play out what we have rather than stranding it until the
+            // next burst tops it over the line. That stranding is what made short
+            // SFX play only every other press.
+            if self.consumer.slots() < PLAYBACK_PRIME_SAMPLES && producer_active.load(Ordering::Relaxed) {
                 output.fill(0.0);
                 return;
             }
@@ -3087,6 +3116,43 @@ mod tests {
             seam <= natural_slew * 3.0,
             "primed playout must be continuous (seam Δ={seam:.4} vs natural slew {natural_slew:.4})"
         );
+    }
+
+    /// Regression for "short SFX plays only every other press": a self-contained
+    /// burst shorter than the prime cushion (e.g. a <40 ms mute/unmute blip) must
+    /// still play out once the producer goes idle, instead of being stranded in
+    /// the ring until the next press tops it past the prime target. With the old
+    /// gate it stayed silent (priming forever) and accumulated, so only every
+    /// second press crossed the threshold and flushed both.
+    #[test]
+    fn playback_filler_flushes_sub_prime_burst_once_producer_idle() {
+        let underruns = AtomicU64::new(0);
+        // Producer already idle: the burst is complete, nothing more is coming.
+        let active = AtomicBool::new(false);
+        let (mut producer, consumer) = RingBuffer::<f32>::new(MAX_PLAYBACK_BUFFER_SAMPLES);
+        let mut filler = PlaybackFiller::new(consumer);
+        let mut output = [0.0f32; OPUS_FRAME_SIZE];
+
+        // A sub-prime burst (shorter than the cushion target) sits buffered.
+        let burst = PLAYBACK_PRIME_SAMPLES / 2;
+        assert!(burst < PLAYBACK_PRIME_SAMPLES && burst >= OPUS_FRAME_SIZE);
+        push_all(&mut producer, &vec![0.5f32; burst]);
+
+        // First fill: even though the ring never reached the prime target, the
+        // idle producer means this is all there is — it must play, not stay silent.
+        filler.fill(&mut output, &underruns, &active);
+        assert!(
+            output.iter().any(|&s| s != 0.0),
+            "a complete sub-prime burst must play out, not stay silent"
+        );
+        assert_eq!(
+            filler.consumer.slots(),
+            burst - OPUS_FRAME_SIZE,
+            "the buffered burst must be consumed, not stranded"
+        );
+        // Draining a sub-prime burst after the producer stopped is the expected
+        // tail, not a mid-stream click — it must not count as an underrun.
+        assert_eq!(underruns.load(Ordering::Relaxed), 0, "idle drain is not an underrun");
     }
 
     /// The filler counts a starvation only when it runs dry WHILE THE PRODUCER
