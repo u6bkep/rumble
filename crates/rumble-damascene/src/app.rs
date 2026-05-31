@@ -453,8 +453,13 @@ impl<B: UiBackend> App for RumbleApp<B> {
             .map(|u| u.username.as_str())
             .unwrap_or("");
 
-        let main = column([
-            top_toolbar(&state, in_flight_uploads, in_flight_downloads),
+        // Toolbar, then an optional device-fault banner (only present when
+        // a mic/speaker fault is active), then the chat + center split.
+        let mut main_children: Vec<El> = vec![top_toolbar(&state, in_flight_uploads, in_flight_downloads)];
+        if let Some(banner) = fault_banner(&state) {
+            main_children.push(banner);
+        }
+        main_children.push(
             row([
                 chat::render(
                     &state,
@@ -475,9 +480,8 @@ impl<B: UiBackend> App for RumbleApp<B> {
             .width(Size::Fill(1.0))
             .height(Size::Fill(1.0))
             .align(Align::Stretch),
-        ])
-        .fill_size()
-        .align(Align::Stretch);
+        );
+        let main = column(main_children).fill_size().align(Align::Stretch);
 
         // Wizard takes precedence over everything else — until an identity
         // is configured the rest of the UI is read-only.
@@ -3005,6 +3009,68 @@ fn top_toolbar(state: &State, in_flight_uploads: usize, in_flight_downloads: usi
         .width(Size::Fill(1.0))
         .fill(tokens::ACCENT)
         .align(Align::Center)
+}
+
+/// Thin fault banner shown directly under the toolbar whenever an audio
+/// device fault is active. The session can look "connected" while the
+/// microphone or speaker is actually dead, so we surface that prominently
+/// here rather than burying it in Settings.
+///
+/// Each side renders a leading [`IconName::AlertCircle`] plus a status
+/// badge that reuses the same `.destructive()` / `.warning()` treatment
+/// as the toolbar connection badge:
+/// - `recovering = false` (failed selection / abandoned recovery) →
+///   `.destructive()` ("Microphone error: …" / "Speaker error: …").
+/// - `recovering = true` (task is retrying the device) → `.warning()`
+///   ("Microphone disconnected — reconnecting…").
+///
+/// Returns `None` when both `input_fault` and `output_fault` are `None`,
+/// so nothing is rendered (and the column collapses) on a healthy session.
+fn fault_banner(state: &State) -> Option<El> {
+    let mut badges: Vec<El> = Vec::new();
+
+    if let Some(fault) = &state.audio.input_fault {
+        let b = if fault.recovering {
+            badge("Microphone disconnected — reconnecting…").warning()
+        } else {
+            badge(format!("Microphone error: {}", fault.message)).destructive()
+        };
+        badges.push(
+            row([icon(IconName::AlertCircle).icon_size(tokens::ICON_SM), b])
+                .key("fault:input")
+                .gap(tokens::SPACE_1)
+                .align(Align::Center),
+        );
+    }
+
+    if let Some(fault) = &state.audio.output_fault {
+        let b = if fault.recovering {
+            badge("Speaker disconnected — reconnecting…").warning()
+        } else {
+            badge(format!("Speaker error: {}", fault.message)).destructive()
+        };
+        badges.push(
+            row([icon(IconName::AlertCircle).icon_size(tokens::ICON_SM), b])
+                .key("fault:output")
+                .gap(tokens::SPACE_1)
+                .align(Align::Center),
+        );
+    }
+
+    if badges.is_empty() {
+        return None;
+    }
+
+    Some(
+        row(badges)
+            .key("fault:banner")
+            .gap(tokens::SPACE_3)
+            .padding(Sides::xy(tokens::SPACE_4, tokens::SPACE_2))
+            .width(Size::Fill(1.0))
+            .fill(tokens::SECONDARY)
+            .stroke(tokens::BORDER)
+            .align(Align::Center),
+    )
 }
 
 /// Voice-mode dropdown trigger: an icon button paired with a chevron
