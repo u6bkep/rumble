@@ -60,6 +60,14 @@ impl AudioCaptureStream for DesktopCaptureStream {
             Self::Cpal(s) => s.set_active(active),
         }
     }
+
+    fn is_healthy(&self) -> bool {
+        match self {
+            #[cfg(all(target_os = "linux", feature = "pulse"))]
+            Self::Pulse(s) => s.is_healthy(),
+            Self::Cpal(s) => s.is_healthy(),
+        }
+    }
 }
 
 /// Playback stream produced by [`DesktopAudioBackend`].
@@ -69,7 +77,15 @@ pub enum DesktopPlaybackStream {
     Cpal(CpalPlaybackStream),
 }
 
-impl AudioPlaybackStream for DesktopPlaybackStream {}
+impl AudioPlaybackStream for DesktopPlaybackStream {
+    fn is_healthy(&self) -> bool {
+        match self {
+            #[cfg(all(target_os = "linux", feature = "pulse"))]
+            Self::Pulse(s) => s.is_healthy(),
+            Self::Cpal(s) => s.is_healthy(),
+        }
+    }
+}
 
 impl AudioBackend for DesktopAudioBackend {
     type CaptureStream = DesktopCaptureStream;

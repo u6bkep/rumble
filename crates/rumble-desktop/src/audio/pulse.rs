@@ -117,12 +117,17 @@ impl AudioBackend for PulseAudioBackend {
 
         let active = Arc::new(AtomicBool::new(true));
         let stop = Arc::new(AtomicBool::new(false));
+        // Cleared by the capture thread when its read loop exits for any reason
+        // other than a requested stop (device unplug, server crash). The audio
+        // task polls `is_healthy()` to notice and attempt a re-open.
+        let alive = Arc::new(AtomicBool::new(true));
         let on_frame = Arc::new(Mutex::new(on_frame));
-        let handle = spawn_capture_thread(simple, active.clone(), stop.clone(), on_frame);
+        let handle = spawn_capture_thread(simple, active.clone(), stop.clone(), alive.clone(), on_frame);
 
         Ok(PulseCaptureStream {
             active,
             stop,
+            alive,
             handle: Some(handle),
         })
     }
@@ -149,11 +154,15 @@ impl AudioBackend for PulseAudioBackend {
         info!(sink = ?device_id, "audio: PulseAudio output opened");
 
         let stop = Arc::new(AtomicBool::new(false));
+        // See the capture path: cleared if the write loop exits on a device
+        // error so the audio task can re-open.
+        let alive = Arc::new(AtomicBool::new(true));
         let fill_buffer = Arc::new(Mutex::new(fill_buffer));
-        let handle = spawn_playback_thread(simple, stop.clone(), fill_buffer);
+        let handle = spawn_playback_thread(simple, stop.clone(), alive.clone(), fill_buffer);
 
         Ok(PulsePlaybackStream {
             stop,
+            alive,
             handle: Some(handle),
         })
     }
@@ -204,6 +213,7 @@ fn spawn_capture_thread(
     simple: Simple,
     active: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
+    alive: Arc<AtomicBool>,
     on_frame: Arc<Mutex<OnFrameFn>>,
 ) -> JoinHandle<()> {
     thread::Builder::new()
@@ -217,6 +227,9 @@ fn spawn_capture_thread(
                     unsafe { std::slice::from_raw_parts_mut(samples.as_mut_ptr().cast::<u8>(), FRAME_BYTES) };
                 if let Err(e) = simple.read(bytes) {
                     error!(error = %e, "audio: Pulse capture read failed");
+                    // Device died / server gone: flag unhealthy so the audio
+                    // task re-opens. (A requested stop never reaches here.)
+                    alive.store(false, Ordering::Relaxed);
                     break;
                 }
                 if !active.load(Ordering::Relaxed) {
@@ -234,6 +247,7 @@ fn spawn_capture_thread(
 fn spawn_playback_thread(
     simple: Simple,
     stop: Arc<AtomicBool>,
+    alive: Arc<AtomicBool>,
     fill_buffer: Arc<Mutex<FillBufferFn>>,
 ) -> JoinHandle<()> {
     thread::Builder::new()
@@ -249,6 +263,9 @@ fn spawn_playback_thread(
                 let bytes: &[u8] = unsafe { std::slice::from_raw_parts(samples.as_ptr().cast::<u8>(), FRAME_BYTES) };
                 if let Err(e) = simple.write(bytes) {
                     error!(error = %e, "audio: Pulse playback write failed");
+                    // Device died / server gone: flag unhealthy so the audio
+                    // task re-opens. (A requested stop never reaches here.)
+                    alive.store(false, Ordering::Relaxed);
                     break;
                 }
             }
@@ -266,12 +283,17 @@ fn spawn_playback_thread(
 pub struct PulseCaptureStream {
     active: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
+    alive: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
 }
 
 impl AudioCaptureStream for PulseCaptureStream {
     fn set_active(&self, active: bool) {
         self.active.store(active, Ordering::Relaxed);
+    }
+
+    fn is_healthy(&self) -> bool {
+        self.alive.load(Ordering::Relaxed)
     }
 }
 
@@ -287,10 +309,15 @@ impl Drop for PulseCaptureStream {
 
 pub struct PulsePlaybackStream {
     stop: Arc<AtomicBool>,
+    alive: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
 }
 
-impl AudioPlaybackStream for PulsePlaybackStream {}
+impl AudioPlaybackStream for PulsePlaybackStream {
+    fn is_healthy(&self) -> bool {
+        self.alive.load(Ordering::Relaxed)
+    }
+}
 
 impl Drop for PulsePlaybackStream {
     fn drop(&mut self) {

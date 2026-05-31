@@ -217,7 +217,17 @@ impl AudioBackend for CpalAudioBackend {
 
         let is_active = Arc::new(AtomicBool::new(true));
         let processor = Arc::new(Mutex::new(InputProcessor::new(FRAME_SIZE, on_frame)));
-        let err_fn = move |err| error!("audio: input stream error: {}", err);
+        // Cleared if cpal reports a stream error (e.g. device unplug →
+        // `DeviceNotAvailable`). The audio task polls `is_healthy()` to notice
+        // and re-open.
+        let alive = Arc::new(AtomicBool::new(true));
+        let err_fn = {
+            let alive = alive.clone();
+            move |err| {
+                error!("audio: input stream error: {}", err);
+                alive.store(false, Ordering::Relaxed);
+            }
+        };
 
         let stream = match sample_format {
             SampleFormat::F32 => {
@@ -236,7 +246,7 @@ impl AudioBackend for CpalAudioBackend {
                             proc.process(&samples);
                         }
                     },
-                    err_fn,
+                    err_fn.clone(),
                     None,
                 )?
             }
@@ -257,7 +267,7 @@ impl AudioBackend for CpalAudioBackend {
                             proc.process(&samples);
                         }
                     },
-                    err_fn,
+                    err_fn.clone(),
                     None,
                 )?
             }
@@ -279,7 +289,7 @@ impl AudioBackend for CpalAudioBackend {
                             proc.process(&samples);
                         }
                     },
-                    err_fn,
+                    err_fn.clone(),
                     None,
                 )?
             }
@@ -300,7 +310,7 @@ impl AudioBackend for CpalAudioBackend {
                             proc.process(&samples);
                         }
                     },
-                    err_fn,
+                    err_fn.clone(),
                     None,
                 )?
             }
@@ -321,7 +331,7 @@ impl AudioBackend for CpalAudioBackend {
                             proc.process(&samples);
                         }
                     },
-                    err_fn,
+                    err_fn.clone(),
                     None,
                 )?
             }
@@ -334,6 +344,7 @@ impl AudioBackend for CpalAudioBackend {
         Ok(CpalCaptureStream {
             _stream: stream,
             is_active,
+            alive,
         })
     }
 
@@ -366,7 +377,16 @@ impl AudioBackend for CpalAudioBackend {
         );
 
         let fill = Arc::new(Mutex::new(fill_buffer));
-        let err_fn = move |err| error!("audio: output stream error: {}", err);
+        // See `open_input`: cleared on a cpal stream error so the audio task
+        // can re-open the output device.
+        let alive = Arc::new(AtomicBool::new(true));
+        let err_fn = {
+            let alive = alive.clone();
+            move |err| {
+                error!("audio: output stream error: {}", err);
+                alive.store(false, Ordering::Relaxed);
+            }
+        };
 
         let stream = match sample_format {
             SampleFormat::F32 => {
@@ -378,7 +398,7 @@ impl AudioBackend for CpalAudioBackend {
                     move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                         write_output_f32(data, &fill, ch, rate);
                     },
-                    err_fn,
+                    err_fn.clone(),
                     None,
                 )?
             }
@@ -399,7 +419,7 @@ impl AudioBackend for CpalAudioBackend {
                             *out = (val * i16::MAX as f32) as i16;
                         }
                     },
-                    err_fn,
+                    err_fn.clone(),
                     None,
                 )?
             }
@@ -420,7 +440,7 @@ impl AudioBackend for CpalAudioBackend {
                             *out = ((val + 1.0) / 2.0 * u16::MAX as f32) as u16;
                         }
                     },
-                    err_fn,
+                    err_fn.clone(),
                     None,
                 )?
             }
@@ -441,7 +461,7 @@ impl AudioBackend for CpalAudioBackend {
                             *out = (val * i32::MAX as f32) as i32;
                         }
                     },
-                    err_fn,
+                    err_fn.clone(),
                     None,
                 )?
             }
@@ -462,7 +482,7 @@ impl AudioBackend for CpalAudioBackend {
                             *out = ((val * 128.0) + 128.0).clamp(0.0, 255.0) as u8;
                         }
                     },
-                    err_fn,
+                    err_fn.clone(),
                     None,
                 )?
             }
@@ -472,7 +492,7 @@ impl AudioBackend for CpalAudioBackend {
         stream.play()?;
         info!("audio: output stream started");
 
-        Ok(CpalPlaybackStream { _stream: stream })
+        Ok(CpalPlaybackStream { _stream: stream, alive })
     }
 }
 
@@ -546,16 +566,26 @@ fn write_output_f32(data: &mut [f32], fill: &Arc<Mutex<FillBufferFn>>, channels:
 pub struct CpalCaptureStream {
     _stream: cpal::Stream,
     is_active: Arc<AtomicBool>,
+    alive: Arc<AtomicBool>,
 }
 
 impl AudioCaptureStream for CpalCaptureStream {
     fn set_active(&self, active: bool) {
         self.is_active.store(active, Ordering::Relaxed);
     }
+
+    fn is_healthy(&self) -> bool {
+        self.alive.load(Ordering::Relaxed)
+    }
 }
 
 pub struct CpalPlaybackStream {
     _stream: cpal::Stream,
+    alive: Arc<AtomicBool>,
 }
 
-impl AudioPlaybackStream for CpalPlaybackStream {}
+impl AudioPlaybackStream for CpalPlaybackStream {
+    fn is_healthy(&self) -> bool {
+        self.alive.load(Ordering::Relaxed)
+    }
+}
