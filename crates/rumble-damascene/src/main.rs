@@ -78,9 +78,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Reverse-DNS app id (matches our `ProjectDirs` qualifier/org/app)
         // so the Wayland `xdg_toplevel.app_id` / X11 `WM_CLASS` we present
         // to the compositor and the XDG GlobalShortcuts portal is a stable
-        // "com.rumble.Rumble" instead of a generic `surface-transient`
+        // "network.gecko.Rumble" instead of a generic `surface-transient`
         // placeholder. This is what the system hotkeys UI groups us under.
-        .with_app_id("com.rumble.Rumble")
+        .with_app_id("network.gecko.Rumble")
         // Opt into the extended-range linear HDR ladder
         // ([scRGB-linear, Display-P3-linear, Display-P3, sRGB]). On a
         // genuinely HDR output the host selects an `Rgba16Float` (scRGB)
@@ -157,7 +157,7 @@ fn config_dir() -> std::path::PathBuf {
     if let Ok(override_dir) = std::env::var("RUMBLE_DAMASCENE_CONFIG_DIR") {
         return std::path::PathBuf::from(override_dir);
     }
-    if let Some(dirs) = directories::ProjectDirs::from("com", "rumble", "Rumble") {
+    if let Some(dirs) = directories::ProjectDirs::from("network", "gecko", "Rumble") {
         dirs.config_dir().to_path_buf()
     } else {
         std::path::PathBuf::from("./config")

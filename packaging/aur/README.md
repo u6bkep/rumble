@@ -2,7 +2,7 @@
 
 Source-build AUR package for the Rumble desktop client. It compiles
 `rumble-damascene` from the tagged release tarball and installs the binary plus
-the `com.rumble.Rumble.desktop` launcher entry.
+the `network.gecko.Rumble.desktop` launcher entry.
 
 Files here are the canonical copy kept in-tree. The AUR itself is a separate git
 repo (`ssh://aur@aur.archlinux.org/rumble-damascene.git`) that contains only the

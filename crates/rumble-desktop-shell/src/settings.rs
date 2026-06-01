@@ -388,7 +388,7 @@ impl Default for FileTransferSettings {
 /// a config dir; callers should treat that as "settings disabled" and
 /// run with defaults.
 pub fn default_settings_path() -> Option<PathBuf> {
-    ProjectDirs::from("com", "rumble", "Rumble").map(|dirs| dirs.config_dir().join("desktop-shell.json"))
+    ProjectDirs::from("network", "gecko", "Rumble").map(|dirs| dirs.config_dir().join("desktop-shell.json"))
 }
 
 /// Server the user has connected to before. Populated as the connect

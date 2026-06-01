@@ -43,8 +43,11 @@ package() {
     cd "$_srcdir"
     install -Dm0755 "target/release/rumble-damascene" \
         "$pkgdir/usr/bin/rumble-damascene"
-    install -Dm0644 "packaging/linux/com.rumble.Rumble.desktop" \
-        "$pkgdir/usr/share/applications/com.rumble.Rumble.desktop"
+    install -Dm0644 "packaging/linux/network.gecko.Rumble.desktop" \
+        "$pkgdir/usr/share/applications/network.gecko.Rumble.desktop"
+    # Icon name must match the .desktop `Icon=` key and the window app_id.
+    install -Dm0644 "icon/rumble.svg" \
+        "$pkgdir/usr/share/icons/hicolor/scalable/apps/network.gecko.Rumble.svg"
     install -Dm0644 "LICENSE" \
         "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }
