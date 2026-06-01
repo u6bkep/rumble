@@ -3132,7 +3132,7 @@ checksum = "1d87ecb2933e8aeadb3e3a02b828fed80a7528047e68b4f424523a0981a3a084"
 
 [[package]]
 name = "mumble-bridge"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -4793,7 +4793,7 @@ checksum = "4ade083ccbb4bf536df69d1f6432cc23deb7acccff86b183f3923a6fd56a1153"
 
 [[package]]
 name = "rumble-audio"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -4801,7 +4801,7 @@ dependencies = [
 
 [[package]]
 name = "rumble-client"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -4827,7 +4827,7 @@ dependencies = [
 
 [[package]]
 name = "rumble-client-traits"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4841,7 +4841,7 @@ dependencies = [
 
 [[package]]
 name = "rumble-damascene"
-version = "0.1.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "arboard",
@@ -4875,7 +4875,7 @@ dependencies = [
 
 [[package]]
 name = "rumble-desktop"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4907,7 +4907,7 @@ dependencies = [
 
 [[package]]
 name = "rumble-desktop-shell"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -4937,7 +4937,7 @@ dependencies = [
 
 [[package]]
 name = "rumble-protocol"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "bitflags 2.11.1",
  "blake3",
@@ -4955,7 +4955,7 @@ dependencies = [
 
 [[package]]
 name = "rumble-video"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "damascene-core",
  "damascene-wgpu",
@@ -5310,7 +5310,7 @@ dependencies = [
 
 [[package]]
 name = "server"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7463,7 +7463,7 @@ checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.3.0"
 
 [[package]]
 name = "yasna"

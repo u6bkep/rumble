@@ -1,6 +1,6 @@
 [package]
 name = "rumble-damascene"
-version = "0.1.1"
+version = "0.3.0"
 edition = "2024"
 description = "Rumble client built on the damascene UI library"
 default-run = "rumble-damascene"

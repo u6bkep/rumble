@@ -772,15 +772,16 @@ mod tests {
     use super::*;
 
     fn state_with(cmds: &[(&str, &str)]) -> State {
-        let mut s = State::default();
-        s.slash_commands = cmds
-            .iter()
-            .map(|(n, d)| rumble_protocol::proto::SlashCommand {
-                name: (*n).to_string(),
-                description: (*d).to_string(),
-            })
-            .collect();
-        s
+        State {
+            slash_commands: cmds
+                .iter()
+                .map(|(n, d)| rumble_protocol::proto::SlashCommand {
+                    name: (*n).to_string(),
+                    description: (*d).to_string(),
+                })
+                .collect(),
+            ..Default::default()
+        }
     }
 
     #[test]

@@ -3310,7 +3310,7 @@ mod tests {
 
         // A sub-prime burst (shorter than the cushion target) sits buffered.
         let burst = PLAYBACK_PRIME_SAMPLES / 2;
-        assert!(burst < PLAYBACK_PRIME_SAMPLES && burst >= OPUS_FRAME_SIZE);
+        assert!((OPUS_FRAME_SIZE..PLAYBACK_PRIME_SAMPLES).contains(&burst));
         push_all(&mut producer, &vec![0.5f32; burst]);
 
         // First fill: even though the ring never reached the prime target, the

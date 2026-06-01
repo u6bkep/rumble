@@ -1,7 +1,7 @@
 [package]
 name = "rumble-client"
 description = "Rumble client backend library"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2024"
 
 # Disable the default libtest bench harness so `cargo bench -p rumble-client`

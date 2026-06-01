@@ -1015,17 +1015,19 @@ mod tests {
     /// If this drifts, every StateUpdate would spuriously trigger a resync.
     #[test]
     fn state_hash_input_matches_server_broadcast_update_input() {
-        let mut s = State::default();
         // Client rooms carry non-zero per-client effective permissions and
         // group definitions, neither of which the server hashes for a
         // StateUpdate.
-        s.rooms = vec![room(1, "Root", 0x1ff), room(2, "Lobby", 0x42)];
-        s.users = vec![user(1, "alice"), user(2, "bob")];
-        s.group_definitions = vec![rumble_protocol::proto::GroupInfo {
-            name: "admin".to_string(),
-            permissions: 0xffff_ffff,
-            is_builtin: true,
-        }];
+        let s = State {
+            rooms: vec![room(1, "Root", 0x1ff), room(2, "Lobby", 0x42)],
+            users: vec![user(1, "alice"), user(2, "bob")],
+            group_definitions: vec![rumble_protocol::proto::GroupInfo {
+                name: "admin".to_string(),
+                permissions: 0xffff_ffff,
+                is_builtin: true,
+            }],
+            ..Default::default()
+        };
 
         // Server's broadcast_state_update hash input: same rooms but with
         // effective_permissions zeroed, groups + slash_commands empty.
@@ -1048,9 +1050,11 @@ mod tests {
     /// catches drift rather than silently matching.
     #[test]
     fn state_hash_input_detects_divergence() {
-        let mut s = State::default();
-        s.rooms = vec![room(1, "Root", 0)];
-        s.users = vec![user(1, "alice")];
+        let s = State {
+            rooms: vec![room(1, "Root", 0)],
+            users: vec![user(1, "alice")],
+            ..Default::default()
+        };
 
         let server_input = ServerState {
             rooms: vec![room(1, "Root", 0)],

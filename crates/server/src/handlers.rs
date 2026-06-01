@@ -443,12 +443,12 @@ async fn handle_authenticate(
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        if let Some(ban_record) = persist.get_ban(&pending.public_key) {
-            if ban_record.is_expired(now_secs) {
-                info!("ban expired at auth time, lifting ban");
-                let _ = persist.remove_ban(&pending.public_key);
-                let _ = persist.remove_user_from_group(&pending.public_key, "banned");
-            }
+        if let Some(ban_record) = persist.get_ban(&pending.public_key)
+            && ban_record.is_expired(now_secs)
+        {
+            info!("ban expired at auth time, lifting ban");
+            let _ = persist.remove_ban(&pending.public_key);
+            let _ = persist.remove_user_from_group(&pending.public_key, "banned");
         }
 
         // Load user's groups to check for BANNED flag
