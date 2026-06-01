@@ -125,4 +125,4 @@ See [`docs/testing-strategy.md`](docs/testing-strategy.md) for details.
 
 ## License
 
-No license has been specified for this project yet.
+Licensed under the [MIT License](LICENSE).

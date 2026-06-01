@@ -3,6 +3,7 @@ name = "rumble-client-traits"
 description = "Platform-agnostic Rumble client library"
 version = "0.3.0"
 edition = "2024"
+license = "MIT"
 
 [dependencies]
 rumble-protocol = { path = "../rumble-protocol" }

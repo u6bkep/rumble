@@ -49,7 +49,5 @@ at build time, not duplicated into the AUR repo.
 - **Vulkan ICD** — `vulkan-icd-loader` is a hard dep, but the actual driver
   (`vulkan-radeon` / `nvidia-utils` / `vulkan-intel`) depends on the user's GPU
   and is intentionally not pinned.
-- **License files** — the crates declare `MIT OR Apache-2.0` but the repo ships
-  no `LICENSE` files yet, so the package installs none. Add them at the repo
-  root and an `install -Dm644 LICENSE-* "$pkgdir/usr/share/licenses/$pkgname/"`
-  step once they exist.
+- **License** — MIT (root `LICENSE`); the package installs it to
+  `/usr/share/licenses/$pkgname/`.

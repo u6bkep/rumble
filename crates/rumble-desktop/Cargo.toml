@@ -3,6 +3,7 @@ name = "rumble-desktop"
 description = "Native desktop Platform implementation for rumble-client-traits"
 version = "0.3.0"
 edition = "2024"
+license = "MIT"
 
 # Disable the default libtest bench harness so `cargo bench -p rumble-desktop`
 # dispatches only to the criterion bench (libtest rejects --save-baseline etc).

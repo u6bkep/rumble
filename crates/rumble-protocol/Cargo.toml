@@ -2,6 +2,7 @@
 name = "rumble-protocol"
 version = "0.3.0"
 edition = "2024"
+license = "MIT"
 
 [lib]
 name = "rumble_protocol"

@@ -5,7 +5,7 @@ pkgrel=1
 pkgdesc="Voice + text chat client in the spirit of Mumble (QUIC transport, Opus audio, Ed25519 identities)"
 arch=('x86_64')
 url="https://github.com/u6bkep/rumble"
-license=('MIT' 'Apache-2.0')
+license=('MIT')
 # Runtime libraries the client links against (see `ldd` of the built binary):
 #   libpulse / libpulse-simple -> libpulse, libasound -> alsa-lib,
 #   libmpv.so.2 -> mpv, libxkbcommon, libvulkan -> vulkan-icd-loader,
@@ -45,4 +45,6 @@ package() {
         "$pkgdir/usr/bin/rumble-damascene"
     install -Dm0644 "packaging/linux/com.rumble.Rumble.desktop" \
         "$pkgdir/usr/share/applications/com.rumble.Rumble.desktop"
+    install -Dm0644 "LICENSE" \
+        "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }

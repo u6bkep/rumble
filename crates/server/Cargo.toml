@@ -2,6 +2,7 @@
 name = "server"
 version = "0.3.0"
 edition = "2024"
+license = "MIT"
 
 # Disable the default libtest bench harness on the lib and binary so
 # `cargo bench -p server` dispatches only to the criterion bench below
