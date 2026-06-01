@@ -1,7 +1,7 @@
 [package]
 name = "rumble-audio"
 version = "0.3.0"
-edition = "2021"
+edition = "2024"
 description = "Audio processing pipeline traits and registry for Rumble"
 license = "MIT OR Apache-2.0"
 
