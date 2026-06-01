@@ -1,0 +1,25 @@
+pkgbase = rumble-damascene
+	pkgdesc = Voice + text chat client in the spirit of Mumble (QUIC transport, Opus audio, Ed25519 identities)
+	pkgver = 0.3.0
+	pkgrel = 1
+	url = https://github.com/u6bkep/rumble
+	arch = x86_64
+	license = MIT
+	license = Apache-2.0
+	makedepends = rust
+	makedepends = cargo
+	makedepends = protobuf
+	makedepends = pkgconf
+	makedepends = git
+	depends = libpulse
+	depends = alsa-lib
+	depends = mpv
+	depends = libxkbcommon
+	depends = vulkan-icd-loader
+	depends = opus
+	depends = openssl
+	options = !lto
+	source = rumble-damascene-0.3.0.tar.gz::https://github.com/u6bkep/rumble/archive/refs/tags/v0.3.0.tar.gz
+	sha256sums = SKIP
+
+pkgname = rumble-damascene

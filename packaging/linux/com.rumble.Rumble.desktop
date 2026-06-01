@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=Rumble
+GenericName=Voice Chat
+Comment=Voice and text chat in the spirit of Mumble
+Exec=rumble-damascene
+Icon=audio-input-microphone
+Terminal=false
+Categories=Network;Chat;
+Keywords=voice;chat;mumble;voip;quic;
+StartupNotify=true
+# Must match the Wayland xdg_toplevel.app_id / X11 WM_CLASS set in
+# crates/rumble-damascene/src/main.rs (`.with_app_id("com.rumble.Rumble")`),
+# so the compositor associates the window with this launcher entry.
+StartupWMClass=com.rumble.Rumble
