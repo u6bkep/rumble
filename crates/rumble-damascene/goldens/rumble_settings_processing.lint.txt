@@ -1,2 +1,6 @@
+RawColor node=root.overlay.1.modal.1.group.1.scroll.1.group.0.group.0.card.2.group.1.group.8.group.0.group.0.om-track.0 <no-source> :: fill is a raw rgba(0.0070774667,0.0070774583,0.008076814,1) — use a token
+RawColor node=root.overlay.1.modal.1.group.1.scroll.1.group.0.group.0.card.2.group.1.group.8.group.0.group.0.om-zone.1 <no-source> :: fill is a raw rgba(0.1488316,0.014465327,0.014465298,1) — use a token
+RawColor node=root.overlay.1.modal.1.group.1.scroll.1.group.0.group.0.card.2.group.1.group.8.group.0.group.0.om-zone.2 <no-source> :: fill is a raw rgba(0.3193839,0.19363779,0.0039396705,1) — use a token
+RawColor node=root.overlay.1.modal.1.group.1.scroll.1.group.0.group.0.card.2.group.1.group.8.group.0.group.0.om-zone.3 <no-source> :: fill is a raw rgba(0.006100416,0.23266241,0.15172228,1) — use a token
 RawColor node=root.overlay.1.modal.1.group.1.scroll.1.group.0.group.0.card.5.group.1.group.0.group.0.group.0.vu-below-track.0 <no-source> :: fill is a raw rgba(0.06778845,0.0042860196,0.0042860056,1) — use a token
 RawColor node=root.overlay.1.modal.1.group.1.scroll.1.group.0.group.0.card.5.group.1.group.0.group.0.group.0.vu-above-track.1 <no-source> :: fill is a raw rgba(0.0018074721,0.11828821,0.06952976,1) — use a token

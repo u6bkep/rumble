@@ -49,6 +49,11 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+pub mod outputs;
+pub use outputs::{
+    Anchor, MAX_OUTPUTS, Mark, OutputEntry, OutputFrame, OutputKind, OutputLayout, OutputSink, OutputSpec, Role, Zone,
+};
+
 // =============================================================================
 // Processor Result
 // =============================================================================
@@ -147,6 +152,15 @@ pub trait AudioProcessor: Send {
     /// Disabled processors are skipped during pipeline execution but
     /// remain in the chain for potential re-enabling.
     fn set_enabled(&mut self, enabled: bool);
+
+    /// Emit this processor's live output values into `sink`, keyed by the
+    /// `key` of each [`OutputSpec`] its factory declared via
+    /// [`ProcessorFactory::outputs`].
+    ///
+    /// Called once per processed frame on the audio thread — keep it cheap
+    /// and allocation-free (read cached fields, don't recompute). Stages
+    /// with no outputs leave this as the default no-op.
+    fn write_outputs(&self, _sink: &mut OutputSink) {}
 }
 
 // =============================================================================
@@ -191,6 +205,16 @@ pub trait ProcessorFactory: Send + Sync {
     /// This can be used by UI code to generate appropriate controls.
     /// The schema should follow JSON Schema conventions.
     fn settings_schema(&self) -> serde_json::Value;
+
+    /// Describe this processor's live output meters/indicators for the UI.
+    ///
+    /// Mirror of [`settings_schema`](Self::settings_schema) for *feedback*:
+    /// the values these specs describe are emitted per frame by
+    /// [`AudioProcessor::write_outputs`]. Returns an empty vec for stages
+    /// with no live feedback (the default).
+    fn outputs(&self) -> Vec<OutputSpec> {
+        Vec::new()
+    }
 
     /// Get the default settings for this processor as JSON.
     ///
@@ -409,6 +433,12 @@ impl ProcessorRegistry {
         self.factories.get(type_id).map(|f| f.settings_schema())
     }
 
+    /// Get the output descriptors for a processor type. Empty if the type
+    /// is unregistered or declares no outputs.
+    pub fn outputs(&self, type_id: &str) -> Vec<OutputSpec> {
+        self.factories.get(type_id).map(|f| f.outputs()).unwrap_or_default()
+    }
+
     /// Get the default settings for a processor type.
     pub fn default_settings(&self, type_id: &str) -> Option<serde_json::Value> {
         self.factories.get(type_id).map(|f| f.default_settings())
@@ -478,6 +508,12 @@ pub fn backfill_settings_from_schema(value: &mut serde_json::Value, schema: &ser
 /// `suppress` (any processor can gate the frame).
 pub struct AudioPipeline {
     processors: Vec<Box<dyn AudioProcessor>>,
+    /// Output descriptors per processor, parallel to `processors` and
+    /// captured at build time from the registry. Drives `write_outputs`'s
+    /// slot assignment; kept in lock-step with [`OutputLayout::derive`].
+    /// Processors added via [`add`](Self::add) (test/builder paths) declare
+    /// no outputs.
+    output_specs: Vec<Vec<OutputSpec>>,
     frame_size: usize,
 }
 
@@ -486,6 +522,7 @@ impl AudioPipeline {
     pub fn new(frame_size: usize) -> Self {
         Self {
             processors: Vec::new(),
+            output_specs: Vec::new(),
             frame_size,
         }
     }
@@ -493,21 +530,30 @@ impl AudioPipeline {
     /// Create a pipeline from configuration.
     pub fn from_config(config: &PipelineConfig, registry: &ProcessorRegistry) -> Result<Self, String> {
         let mut processors = Vec::with_capacity(config.processors.len());
+        let mut output_specs = Vec::with_capacity(config.processors.len());
 
         for proc_config in &config.processors {
             let processor = registry.create(proc_config)?;
+            output_specs.push(registry.outputs(&proc_config.type_id));
             processors.push(processor);
         }
 
         Ok(Self {
             processors,
+            output_specs,
             frame_size: config.frame_size,
         })
     }
 
     /// Add a processor to the end of the pipeline.
+    ///
+    /// The processor is added with no output descriptors — this builder
+    /// path is for tests and manual assembly; production pipelines go
+    /// through [`from_config`](Self::from_config), which captures outputs
+    /// from the registry.
     pub fn add(&mut self, processor: Box<dyn AudioProcessor>) {
         self.processors.push(processor);
+        self.output_specs.push(Vec::new());
     }
 
     /// Process a frame of audio samples.
@@ -568,8 +614,43 @@ impl AudioPipeline {
     pub fn update_config(&mut self, config: &PipelineConfig, registry: &ProcessorRegistry) -> Result<(), String> {
         let new_pipeline = Self::from_config(config, registry)?;
         self.processors = new_pipeline.processors;
+        self.output_specs = new_pipeline.output_specs;
         self.frame_size = new_pipeline.frame_size;
         Ok(())
+    }
+
+    /// Collect every enabled processor's live outputs into `frame`.
+    ///
+    /// Walks processors in order, giving each a contiguous slot window
+    /// sized to its declared outputs. Disabled stages keep their window
+    /// (so slot indices stay stable across enable toggles) but get zeroed
+    /// rather than queried. Slot assignment mirrors [`OutputLayout::derive`]
+    /// exactly, so a reader that derived its layout from the same config
+    /// addresses the right values.
+    ///
+    /// Cheap and allocation-free — safe to call from the audio callback
+    /// right after [`process`](Self::process), while the same lock is held.
+    pub fn write_outputs(&self, frame: &mut OutputFrame) {
+        let mut offset = 0usize;
+        for (processor, specs) in self.processors.iter().zip(self.output_specs.iter()) {
+            if specs.is_empty() {
+                continue;
+            }
+            let n = specs.len();
+            if offset + n > MAX_OUTPUTS {
+                // Tail dropped — the reader's OutputLayout flags this via
+                // `truncated`; nothing useful to do here on the hot path.
+                break;
+            }
+            let slots = &mut frame.values[offset..offset + n];
+            slots.fill(0.0);
+            if processor.is_enabled() {
+                let mut sink = OutputSink::new(specs, slots);
+                processor.write_outputs(&mut sink);
+            }
+            offset += n;
+        }
+        frame.len = offset as u8;
     }
 }
 
@@ -618,6 +699,149 @@ mod tests {
     fn test_processor_result_default() {
         let result = ProcessorResult::default();
         assert!(!result.suppress);
+    }
+
+    // A processor that declares `n` outputs and emits each output's index
+    // as its value, so a test can assert exactly which slot got what.
+    struct CountingProcessor {
+        keys: Vec<String>,
+        enabled: bool,
+    }
+    impl AudioProcessor for CountingProcessor {
+        fn process(&mut self, _samples: &mut [f32], _sample_rate: u32) -> ProcessorResult {
+            ProcessorResult::pass()
+        }
+        fn name(&self) -> &'static str {
+            "counting"
+        }
+        fn config(&self) -> serde_json::Value {
+            serde_json::Value::Null
+        }
+        fn set_config(&mut self, _config: &serde_json::Value) {}
+        fn is_enabled(&self) -> bool {
+            self.enabled
+        }
+        fn set_enabled(&mut self, enabled: bool) {
+            self.enabled = enabled;
+        }
+        fn write_outputs(&self, sink: &mut OutputSink) {
+            for (i, k) in self.keys.iter().enumerate() {
+                sink.set(k, i as f32 + 1.0);
+            }
+        }
+    }
+
+    struct CountingFactory {
+        type_id: &'static str,
+        keys: Vec<&'static str>,
+    }
+    impl ProcessorFactory for CountingFactory {
+        fn type_id(&self) -> &'static str {
+            self.type_id
+        }
+        fn display_name(&self) -> &'static str {
+            "Counting"
+        }
+        fn create_default(&self) -> Box<dyn AudioProcessor> {
+            Box::new(CountingProcessor {
+                keys: self.keys.iter().map(|k| k.to_string()).collect(),
+                enabled: true,
+            })
+        }
+        fn create_from_config(&self, _config: &serde_json::Value) -> Result<Box<dyn AudioProcessor>, String> {
+            Ok(self.create_default())
+        }
+        fn settings_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        fn outputs(&self) -> Vec<OutputSpec> {
+            self.keys
+                .iter()
+                .map(|k| OutputSpec {
+                    key: k.to_string(),
+                    title: k.to_string(),
+                    kind: OutputKind::Indicator,
+                })
+                .collect()
+        }
+    }
+
+    fn counting_registry() -> ProcessorRegistry {
+        let mut reg = ProcessorRegistry::new();
+        // "silent" declares no outputs and must be skipped in slot assignment.
+        reg.register(Box::new(CountingFactory {
+            type_id: "silent",
+            keys: vec![],
+        }));
+        reg.register(Box::new(CountingFactory {
+            type_id: "two",
+            keys: vec!["a", "b"],
+        }));
+        reg.register(Box::new(CountingFactory {
+            type_id: "one",
+            keys: vec!["c"],
+        }));
+        reg
+    }
+
+    // The whole transport hinges on writer and reader agreeing on slots
+    // without a shared map. Build a pipeline, write a frame, derive the
+    // layout independently, and assert each entry reads back the value its
+    // producer wrote into that slot.
+    #[test]
+    fn write_outputs_slots_match_derived_layout() {
+        let reg = counting_registry();
+        let config = PipelineConfig {
+            processors: vec![
+                ProcessorConfig::new("silent"),
+                ProcessorConfig::new("two"),
+                ProcessorConfig::new("one"),
+            ],
+            frame_size: 960,
+        };
+
+        let pipeline = AudioPipeline::from_config(&config, &reg).unwrap();
+        let mut frame = OutputFrame::default();
+        pipeline.write_outputs(&mut frame);
+
+        let layout = OutputLayout::derive(&config, &reg);
+        assert!(!layout.truncated);
+        // silent (skipped) → two: slots 0,1 → one: slot 2.
+        assert_eq!(layout.entries.len(), 3);
+        assert_eq!(frame.len, 3);
+
+        let by_key: std::collections::HashMap<&str, &OutputEntry> =
+            layout.entries.iter().map(|e| (e.spec.key.as_str(), e)).collect();
+        // CountingProcessor wrote (output index + 1) into each slot.
+        assert_eq!(frame.get(by_key["a"].slot), Some(1.0));
+        assert_eq!(frame.get(by_key["b"].slot), Some(2.0));
+        assert_eq!(frame.get(by_key["c"].slot), Some(1.0));
+        // The skipped silent stage produced no entries.
+        assert!(layout.entries.iter().all(|e| e.type_id != "silent"));
+    }
+
+    // A disabled stage keeps its slot window (so indices stay stable across
+    // enable toggles) but its values are zeroed rather than queried.
+    #[test]
+    fn write_outputs_zeroes_disabled_stage_but_keeps_slots() {
+        let reg = counting_registry();
+        let config = PipelineConfig {
+            processors: vec![ProcessorConfig::new("two").enabled(false), ProcessorConfig::new("one")],
+            frame_size: 960,
+        };
+        let pipeline = AudioPipeline::from_config(&config, &reg).unwrap();
+        let mut frame = OutputFrame::default();
+        pipeline.write_outputs(&mut frame);
+
+        let layout = OutputLayout::derive(&config, &reg);
+        let by_key: std::collections::HashMap<&str, &OutputEntry> =
+            layout.entries.iter().map(|e| (e.spec.key.as_str(), e)).collect();
+        // Disabled "two" still occupies slots 0,1 but reads back zero...
+        assert_eq!(frame.get(by_key["a"].slot), Some(0.0));
+        assert_eq!(frame.get(by_key["b"].slot), Some(0.0));
+        // ...and the enabled "one" downstream still lands at slot 2.
+        assert_eq!(by_key["c"].slot, 2);
+        assert_eq!(frame.get(by_key["c"].slot), Some(1.0));
     }
 
     #[test]

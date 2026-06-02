@@ -13,11 +13,11 @@
 
 use std::path::PathBuf;
 
-use damascene_core::prelude::*;
+use damascene_core::{Color, prelude::*};
 
 use rumble_client::{
-    AudioSettings, AudioState, AudioStats, Level, MeterSnapshot, PipelineConfig, ProcessorConfig, ProcessorRegistry,
-    SfxKind, State,
+    AudioSettings, AudioState, AudioStats, Level, MeterSnapshot, OutputFrame, OutputKind, OutputLayout, OutputSpec,
+    PipelineConfig, ProcessorConfig, ProcessorRegistry, Role, SfxKind, State,
 };
 use rumble_desktop_shell::{
     AutoDownloadRule, HotkeyBinding, HotkeyData, HotkeyFunction, HotkeyManager, HotkeyModifiers, KeyboardSettings,
@@ -622,6 +622,7 @@ pub fn render(
     app_state: &State,
     meter: &MeterSnapshot,
     stats: &AudioStats,
+    outputs: &OutputFrame,
     identity: &Identity,
     selection: &Selection,
     processor_registry: &ProcessorRegistry,
@@ -647,7 +648,7 @@ pub fn render(
         SettingsTab::Connection => render_connection(pending, identity, app_state),
         SettingsTab::Devices => render_devices(pending, &app_state.audio, meter),
         SettingsTab::Voice => render_voice(pending),
-        SettingsTab::Processing => render_processing(pending, meter, processor_registry, selection),
+        SettingsTab::Processing => render_processing(pending, meter, outputs, processor_registry, selection),
         SettingsTab::Sounds => render_sounds(pending),
         SettingsTab::Chat => render_chat(pending),
         SettingsTab::Shortcuts => render_shortcuts(pending, state, hotkeys),
@@ -1152,11 +1153,15 @@ fn render_voice(pending: &PendingSettings) -> El {
 fn render_processing(
     pending: &PendingSettings,
     meter: &MeterSnapshot,
+    outputs: &OutputFrame,
     registry: &ProcessorRegistry,
     selection: &Selection,
 ) -> El {
     let mut cards: Vec<El> = Vec::new();
     let processor_count = pending.tx_pipeline.processors.len();
+    // Slot assignment for live stage outputs, derived from the same config
+    // the audio task derives from — so `outputs.values[slot]` lines up.
+    let output_layout = OutputLayout::derive(&pending.tx_pipeline, registry);
     // Look up display metadata once per render. `list_available` walks
     // the registry's BTreeMap and allocates a Vec, so doing it inside
     // the per-processor loop (as the previous code did) was O(n * m).
@@ -1243,6 +1248,16 @@ fn render_processing(
                     &proc_config.settings,
                     selection,
                 ));
+            }
+        }
+
+        // Live output feedback (VAD probability meter, gate lamp). Driven
+        // entirely by the stage's declared output specs — no per-processor
+        // code here. Resolved against the live `outputs` frame by slot.
+        if proc_config.enabled {
+            for entry in output_layout.for_processor(idx) {
+                let value = outputs.get(entry.slot).unwrap_or(0.0);
+                body.push(render_output(&entry.spec, value, &proc_config.settings));
             }
         }
 
@@ -1523,6 +1538,250 @@ fn threshold_bar(value_n: f32, threshold_n: f32, release_n: Option<f32>, bar_w: 
     .layout(layout)
     .width(Size::Fixed(bar_w))
     .height(Size::Fixed(bar_h))
+}
+
+/// Map an output [`Role`] onto a theme colour. Keeping this the single
+/// point of translation means output descriptors stay colour-free (and
+/// lint-clean) while the UI controls the palette.
+fn role_color(role: Role) -> Color {
+    match role {
+        Role::Neutral => tokens::MUTED,
+        Role::Inactive => tokens::DESTRUCTIVE,
+        Role::Active => tokens::SUCCESS,
+        Role::Warning => tokens::WARNING,
+        Role::Danger => tokens::DESTRUCTIVE,
+    }
+}
+
+/// Render one declared stage output (a [`OutputKind::Meter`] or
+/// [`OutputKind::Indicator`]) against its live `value`. Generic over every
+/// processor — the only stage-specific input is the descriptor and the
+/// stage's settings (used to resolve [`MarkAnchor::Setting`] marks).
+fn render_output(spec: &OutputSpec, value: f32, settings: &JsonValue) -> El {
+    match &spec.kind {
+        OutputKind::Meter {
+            min,
+            max,
+            unit,
+            zones,
+            marks,
+        } => {
+            let span = (max - min).max(f32::EPSILON);
+            let norm = |v: f32| ((v - min) / span).clamp(0.0, 1.0);
+            let value_n = norm(value);
+
+            // Resolve each anchor against the stage's live settings, so a
+            // `Setting`-anchored bound or tick reads the slider value. A
+            // missing key drops that zone/mark rather than guessing.
+            let lookup = |k: &str| settings.get(k).and_then(|v| v.as_f64()).map(|v| v as f32);
+
+            // Zones resolved to axis units once: setting-anchored edges
+            // (e.g. the VAD bands tracking trigger/release) move with the
+            // sliders. Reused for the bands, the value-fill colour, and the
+            // label strip so they can't disagree.
+            let zones_resolved: Vec<(f32, f32, Role, Option<String>)> = zones
+                .iter()
+                .filter_map(|z| {
+                    let lo = z.lo.resolve(lookup)?;
+                    let hi = z.hi.resolve(lookup)?;
+                    Some((lo, hi, z.role, z.label.clone()))
+                })
+                .collect();
+
+            // Zones → normalised bands carrying their role colour.
+            let zone_bands: Vec<(f32, f32, Color)> = zones_resolved
+                .iter()
+                .map(|(lo, hi, role, _)| (norm(*lo), norm(*hi), role_color(*role)))
+                .collect();
+
+            // Resolve marks once: `Setting` anchors read the stage's live
+            // settings so the tick tracks the slider. The raw value and
+            // label are kept for the legend below; the normalised position
+            // drives the on-bar tick.
+            let marks_resolved: Vec<(f32, Color, Option<String>)> = marks
+                .iter()
+                .filter_map(|m| {
+                    m.at.resolve(lookup)
+                        .map(|raw| (raw, role_color(m.role), m.label.clone()))
+                })
+                .collect();
+            let mark_ticks: Vec<(f32, Color)> = marks_resolved.iter().map(|(raw, c, _)| (norm(*raw), *c)).collect();
+
+            let readout = match unit {
+                Some(u) => format!("{value:.2} {u}"),
+                None => format!("{value:.2}"),
+            };
+
+            let mut col: Vec<El> = vec![
+                row([
+                    output_meter_bar(value_n, zone_bands, mark_ticks, VU_BAR_W, VU_BAR_H),
+                    text(readout).mono().font_size(tokens::TEXT_XS.size),
+                ])
+                .gap(tokens::SPACE_2)
+                .align(Align::Center),
+            ];
+
+            // Spatial zone labels, centred under their bands, directly
+            // beneath the bar (which sits at the column's left edge).
+            if let Some(strip) = zone_label_strip(&zones_resolved, *min, *max, VU_BAR_W) {
+                col.push(strip);
+            }
+
+            // Footer: the output title, then a colour-keyed legend for each
+            // labelled mark with its resolved value (e.g. "trigger 0.50").
+            // Marks can sit too close to label spatially, so the legend
+            // carries the names while the swatch colour ties back to the
+            // on-bar tick.
+            let mut footer: Vec<El> = vec![text(spec.title.clone()).muted().font_size(tokens::TEXT_XS.size)];
+            for (raw, color, label) in &marks_resolved {
+                if let Some(label) = label {
+                    footer.push(
+                        text(format!("{label} {raw:.2}"))
+                            .text_color(*color)
+                            .font_size(tokens::TEXT_XS.size),
+                    );
+                }
+            }
+            col.push(row(footer).gap(tokens::SPACE_3).align(Align::Center));
+
+            column(col).gap(tokens::SPACE_1).width(Size::Fill(1.0))
+        }
+        OutputKind::Indicator => {
+            let on = value != 0.0;
+            let (color, label) = if on {
+                (tokens::SUCCESS, "open")
+            } else {
+                (tokens::MUTED, "closed")
+            };
+            field_row(
+                spec.title.clone(),
+                row([
+                    El::new(Kind::Custom("output-indicator-dot"))
+                        .fill(color)
+                        .width(Size::Fixed(10.0))
+                        .height(Size::Fixed(10.0)),
+                    text(label).muted().font_size(tokens::TEXT_XS.size),
+                ])
+                .gap(tokens::SPACE_2)
+                .align(Align::Center),
+            )
+        }
+    }
+}
+
+/// Generic meter bar: a faint full-width track, always-visible dim zone
+/// bands, a bright per-zone "lit" overlay that the live value illuminates
+/// from the left, and point ticks — all positioned by a single layout
+/// pass. The value *lights up* the static zones rather than painting over
+/// them: each band shows in its own role colour at full brightness up to
+/// the current level and dimmed beyond it, so the coloured regions and
+/// their labels stay legible while the speaker talks.
+fn output_meter_bar(
+    value_n: f32,
+    zones: Vec<(f32, f32, Color)>,
+    marks: Vec<(f32, Color)>,
+    bar_w: f32,
+    bar_h: f32,
+) -> El {
+    const TICK_W: f32 = 2.0;
+    let value_n = value_n.clamp(0.0, 1.0);
+
+    // Positions captured for the layout closure (colours live in the El
+    // children below, in matching order). For each zone we keep both its
+    // full extent (the dim base) and the portion below the current value
+    // (the lit overlay), so the level reads as brightness within a band.
+    let zone_pos: Vec<(f32, f32)> = zones
+        .iter()
+        .map(|(lo, hi, _)| (lo.clamp(0.0, 1.0), hi.clamp(0.0, 1.0)))
+        .collect();
+    let mark_pos: Vec<f32> = marks.iter().map(|(p, _)| p.clamp(0.0, 1.0)).collect();
+
+    // Children order MUST match the rect order produced by `layout`:
+    // [track, dim-zone*, lit-zone*, mark*]. Dim bands paint first as the
+    // static base; the lit bands sit on top but only brighten their own
+    // colour, so nothing is hidden.
+    let mut children: Vec<El> = Vec::with_capacity(1 + zones.len() * 2 + marks.len());
+    children.push(El::new(Kind::Custom("om-track")).fill(tokens::MUTED.darken(0.7)));
+    for (_, _, color) in &zones {
+        // Dimmed base: always visible, regardless of the live level.
+        children.push(El::new(Kind::Custom("om-zone")).fill(color.darken(0.55)));
+    }
+    for (_, _, color) in &zones {
+        // Full-brightness overlay clipped to the lit portion of the band.
+        children.push(El::new(Kind::Custom("om-lit")).fill(*color));
+    }
+    for (_, color) in &marks {
+        children.push(El::new(Kind::Custom("om-mark")).fill(*color));
+    }
+
+    let layout = move |ctx: LayoutCtx| {
+        let r = ctx.container;
+        let mut rects: Vec<Rect> = Vec::with_capacity(1 + zone_pos.len() * 2 + mark_pos.len());
+        // Full-width background track.
+        rects.push(Rect::new(r.x, r.y, r.w, r.h));
+        // Dim zone bands across their full extent.
+        for (lo, hi) in &zone_pos {
+            let x = r.x + r.w * lo;
+            let w = (r.w * (hi - lo)).max(0.0);
+            rects.push(Rect::new(x, r.y, w, r.h));
+        }
+        // Lit overlay: each band brightened from its start up to the level.
+        for (lo, hi) in &zone_pos {
+            let lit_hi = value_n.clamp(*lo, *hi);
+            let x = r.x + r.w * lo;
+            let w = (r.w * (lit_hi - lo)).max(0.0);
+            rects.push(Rect::new(x, r.y, w, r.h));
+        }
+        // Point ticks, centred on their position and clamped in-bounds.
+        for p in &mark_pos {
+            let center = r.x + r.w * p;
+            let x = (center - TICK_W * 0.5).clamp(r.x, r.x + (r.w - TICK_W).max(0.0));
+            rects.push(Rect::new(x, r.y, TICK_W, r.h));
+        }
+        rects
+    };
+
+    stack(children)
+        .layout(layout)
+        .width(Size::Fixed(bar_w))
+        .height(Size::Fixed(bar_h))
+}
+
+/// A `bar_w`-wide strip of zone labels, each centred under its band, meant
+/// to sit directly beneath the meter bar. Uncovered ranges become fixed
+/// spacers so labels stay aligned to their zones even with gaps. Returns
+/// `None` when no zone carries a label (nothing to show).
+fn zone_label_strip(zones: &[(f32, f32, Role, Option<String>)], min: f32, max: f32, bar_w: f32) -> Option<El> {
+    if !zones.iter().any(|(_, _, _, label)| label.is_some()) {
+        return None;
+    }
+    let span = (max - min).max(f32::EPSILON);
+    let norm = |v: f32| ((v - min) / span).clamp(0.0, 1.0);
+
+    // Walk zones left-to-right, emitting a spacer for any gap before each
+    // band and a centred label cell for the band itself.
+    let mut ordered: Vec<&(f32, f32, Role, Option<String>)> = zones.iter().collect();
+    ordered.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut cells: Vec<El> = Vec::new();
+    let mut cursor = 0.0f32;
+    for (lo, hi, _, label) in ordered {
+        let lo_n = norm(*lo);
+        let hi_n = norm(*hi).max(lo_n);
+        if lo_n > cursor + f32::EPSILON {
+            cells.push(El::new(Kind::Group).width(Size::Fixed((lo_n - cursor) * bar_w)));
+        }
+        let w = (hi_n - lo_n) * bar_w;
+        let label = label.clone().unwrap_or_default();
+        cells.push(
+            row([text(label).muted().font_size(tokens::TEXT_XS.size)])
+                .width(Size::Fixed(w))
+                .justify(Justify::Center),
+        );
+        cursor = hi_n.max(cursor);
+    }
+
+    Some(row(cells).gap(0.0).width(Size::Fixed(bar_w)))
 }
 
 fn render_sounds(pending: &PendingSettings) -> El {

@@ -3,7 +3,7 @@
 //! Same shape as `rumble-next`'s `UiBackend`: the renderer reads `State`
 //! snapshots and pushes `Command`s; tests can swap a mock in.
 
-use rumble_client::{AudioStats, BackendEvent, Command, MeterSnapshot, State, handle::BackendHandle};
+use rumble_client::{AudioStats, BackendEvent, Command, MeterSnapshot, OutputFrame, State, handle::BackendHandle};
 use rumble_client_traits::file_transfer::TransferStatus;
 use tokio::sync::mpsc;
 
@@ -21,6 +21,12 @@ pub trait UiBackend: 'static {
     /// backends compile without plumbing; fixtures override it.
     fn stats(&self) -> AudioStats {
         AudioStats::default()
+    }
+    /// Live per-stage pipeline outputs (VAD probability, gate state).
+    /// Defaults to an empty frame so test/mock backends compile without
+    /// plumbing; fixtures override it to exercise the output meters.
+    fn outputs(&self) -> OutputFrame {
+        OutputFrame::default()
     }
     /// Snapshot of file-transfer state. The default returns an empty
     /// vec so test backends without a transfer plugin compile without
@@ -69,6 +75,10 @@ impl UiBackend for NativeUiBackend {
 
     fn stats(&self) -> AudioStats {
         self.inner.stats()
+    }
+
+    fn outputs(&self) -> OutputFrame {
+        self.inner.outputs()
     }
 
     fn transfers(&self) -> Vec<TransferStatus> {

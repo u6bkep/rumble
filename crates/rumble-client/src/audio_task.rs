@@ -619,6 +619,11 @@ pub struct AudioTaskConfig<P: Platform> {
     /// Writer for the periodic stats roll-up, driven from the async
     /// loop's stats timer. UI loads via `BackendHandle::stats()`.
     pub stats_writer: crate::snapshot::SnapshotWriter<crate::events::AudioStats>,
+    /// Writer for live per-stage pipeline outputs (e.g. the denoise VAD
+    /// probability meter). Same sampled-snapshot transport as the meter;
+    /// published once per capture frame, read by the UI via
+    /// `BackendHandle::outputs()`.
+    pub output_writer: crate::snapshot::SnapshotWriter<rumble_audio::OutputFrame>,
 }
 
 /// Spawn the audio task and return a handle for sending commands.
@@ -694,6 +699,7 @@ async fn run_audio_task<P: Platform>(
     let bus = config.bus;
     let meter_writer = config.meter_writer;
     let mut stats_writer = config.stats_writer;
+    let output_writer = config.output_writer;
     let audio_dumper = config.audio_dumper.unwrap_or_else(AudioDumper::disabled);
 
     // Audio backend for device access (lives on this thread)
@@ -1007,6 +1013,7 @@ async fn run_audio_task<P: Platform>(
                                 &bus.voice,
                                 &audio_dumper,
                                 &meter_writer,
+                                &output_writer,
                                 &capture_frame_index,
                                 &was_transmitting,
                             )
@@ -1086,6 +1093,7 @@ async fn run_audio_task<P: Platform>(
                                 &bus.voice,
                                 &audio_dumper,
                                 &meter_writer,
+                                &output_writer,
                                 &capture_frame_index,
                                 &was_transmitting,
                             ) {
@@ -1263,6 +1271,7 @@ async fn run_audio_task<P: Platform>(
                                 &bus.voice,
                                 &audio_dumper,
                                 &meter_writer,
+                                &output_writer,
                                 &capture_frame_index,
                                 &was_transmitting,
                             )
@@ -1322,6 +1331,7 @@ async fn run_audio_task<P: Platform>(
                                 &bus.voice,
                                 &audio_dumper,
                                 &meter_writer,
+                                &output_writer,
                                 &capture_frame_index,
                                 &was_transmitting,
                             )
@@ -1650,6 +1660,7 @@ async fn run_audio_task<P: Platform>(
                             &bus.voice,
                             &audio_dumper,
                             &meter_writer,
+                            &output_writer,
                             &capture_frame_index,
                             &was_transmitting,
                         ) {
@@ -1757,6 +1768,7 @@ fn start_transmission<P: Platform>(
     voice_tx: &tokio::sync::broadcast::Sender<VoiceEvent>,
     audio_dumper: &AudioDumper,
     meter_writer: &crate::snapshot::SnapshotWriter<crate::meter::MeterSnapshot>,
+    output_writer: &crate::snapshot::SnapshotWriter<rumble_audio::OutputFrame>,
     capture_frame_index: &Arc<AtomicU64>,
     was_transmitting: &Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
@@ -1819,6 +1831,12 @@ fn start_transmission<P: Platform>(
     // buffer across stores.
     let mut meter_for_callback = meter_writer.clone();
 
+    // Live per-stage output snapshot writer, same single-producer story as
+    // the meter. `output_frame` is reused across frames so publishing the
+    // pipeline's outputs doesn't allocate in the callback.
+    let mut output_for_callback = output_writer.clone();
+    let mut output_frame = rumble_audio::OutputFrame::default();
+
     // Track whether we were transmitting (for detecting suppress transitions).
     // Shared with `run_audio_task`, which resets it to false when capture is
     // deactivated so each (re)activation re-evaluates from a clean baseline.
@@ -1877,10 +1895,17 @@ fn start_transmission<P: Platform>(
             sample_scratch.extend_from_slice(samples);
 
             let pipeline_result = if let Ok(mut pipe) = pipeline_mutex.lock() {
-                pipe.process(&mut sample_scratch, 48000)
+                let r = pipe.process(&mut sample_scratch, 48000);
+                // Collect live stage outputs while the same lock is held,
+                // so the published values match the frame just processed.
+                pipe.write_outputs(&mut output_frame);
+                r
             } else {
                 rumble_audio::ProcessorResult::default()
             };
+            // Publish the per-stage outputs (VAD probability, gate lamp).
+            // Recycles its buffer like the meter writer — no allocation.
+            output_for_callback.store(output_frame);
 
             // RMS dB after the pipeline runs — what's actually about
             // to be encoded. Measured here (not via a processor) so the

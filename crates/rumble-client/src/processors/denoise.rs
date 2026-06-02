@@ -17,7 +17,9 @@
 //! sizes. The very first 10 ms output is muted to hide fade-in artifacts.
 
 use nnnoiseless::DenoiseState;
-use rumble_audio::{AudioProcessor, ProcessorFactory, ProcessorResult};
+use rumble_audio::{
+    Anchor, AudioProcessor, OutputKind, OutputSink, OutputSpec, ProcessorFactory, ProcessorResult, Role, Zone,
+};
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -258,6 +260,12 @@ impl AudioProcessor for DenoiseProcessor {
             self.reset();
         }
     }
+
+    fn write_outputs(&self, sink: &mut OutputSink) {
+        // Cached from the most-recent 10 ms chunk; no recomputation here.
+        sink.set("vad_probability", self.last_vad_prob);
+        sink.set("voice_active", if self.is_voice_active() { 1.0 } else { 0.0 });
+    }
 }
 
 /// Factory for creating [`DenoiseProcessor`] instances.
@@ -331,6 +339,46 @@ impl ProcessorFactory for DenoiseProcessorFactory {
                 }
             }
         })
+    }
+
+    fn outputs(&self) -> Vec<OutputSpec> {
+        vec![
+            // Live RNNoise voice probability on the same 0..1 axis the
+            // trigger/release sliders act on — the feedback that was
+            // missing when tuning the gate. The coloured bands ARE the gate
+            // thresholds: their edges track `vad_release`/`vad_trigger`, so
+            // dragging a slider grows or shrinks a zone directly. Below
+            // release the gate is closed ("silent"); between release and
+            // trigger is the hysteresis band where it holds its state
+            // ("hold"); above trigger it opens ("speech").
+            OutputSpec {
+                key: "vad_probability".to_string(),
+                title: "Voice probability".to_string(),
+                kind: OutputKind::Meter {
+                    min: 0.0,
+                    max: 1.0,
+                    unit: None,
+                    zones: vec![
+                        Zone::new(Anchor::fixed(0.0), Anchor::setting("vad_release"), Role::Inactive).label("silent"),
+                        Zone::new(
+                            Anchor::setting("vad_release"),
+                            Anchor::setting("vad_trigger"),
+                            Role::Warning,
+                        )
+                        .label("hold"),
+                        Zone::new(Anchor::setting("vad_trigger"), Anchor::fixed(1.0), Role::Active).label("speech"),
+                    ],
+                    marks: vec![],
+                },
+            },
+            // Whether the shaper currently considers the speaker active
+            // (after attack/holdoff). A lamp, not a meter.
+            OutputSpec {
+                key: "voice_active".to_string(),
+                title: "Voice gate open".to_string(),
+                kind: OutputKind::Indicator,
+            },
+        ]
     }
 
     fn description(&self) -> &'static str {

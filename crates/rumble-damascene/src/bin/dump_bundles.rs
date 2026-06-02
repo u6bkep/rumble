@@ -57,6 +57,7 @@ struct MockBackend {
     transfers: Vec<rumble_client_traits::file_transfer::TransferStatus>,
     meter: rumble_client::MeterSnapshot,
     stats: AudioStats,
+    outputs: rumble_client::OutputFrame,
 }
 
 impl UiBackend for MockBackend {
@@ -69,6 +70,9 @@ impl UiBackend for MockBackend {
     }
     fn stats(&self) -> AudioStats {
         self.stats
+    }
+    fn outputs(&self) -> rumble_client::OutputFrame {
+        self.outputs
     }
     fn transfers(&self) -> Vec<rumble_client_traits::file_transfer::TransferStatus> {
         self.transfers.clone()
@@ -403,6 +407,26 @@ impl Scene {
                 input_post: Level::Db(-22.0),
             },
             _ => MeterSnapshot::default(),
+        }
+    }
+
+    /// Live per-stage pipeline outputs the MockBackend hands to the UI on
+    /// `outputs()`. The Processing scene seeds a representative RNNoise VAD
+    /// probability (and an open gate) so the dumped meter shows a filled
+    /// bar past the trigger; other scenes use the empty frame. Slot order
+    /// matches `OutputLayout::derive` for the default pipeline: the gain
+    /// stage declares no outputs, so denoise's `vad_probability` is slot 0
+    /// and `voice_active` is slot 1.
+    fn build_outputs(self) -> rumble_client::OutputFrame {
+        match self {
+            Scene::SettingsProcessing => {
+                let mut frame = rumble_client::OutputFrame::default();
+                frame.values[0] = 0.72; // voice probability → green zone
+                frame.values[1] = 1.0; // gate open
+                frame.len = 2;
+                frame
+            }
+            _ => rumble_client::OutputFrame::default(),
         }
     }
 
@@ -1314,6 +1338,7 @@ fn render_scene(scene: Scene, scratch: &std::path::Path, viewport: Rect) -> Resu
         transfers: scene.build_transfers(),
         meter: scene.build_meter(),
         stats: scene.build_stats(),
+        outputs: scene.build_outputs(),
     };
     // Each scene gets its own freshly-wiped config dir. Identity and settings
     // persist to disk, so a shared dir would let one scene's generated key or

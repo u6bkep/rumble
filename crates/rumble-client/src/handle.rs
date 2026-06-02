@@ -149,6 +149,11 @@ pub struct BackendHandle<P: Platform> {
     /// Reader for the periodic stats roll-up. Same transport as the
     /// meter; written ~2×/s by the audio task's stats loop.
     stats: crate::snapshot::Snapshot<crate::events::AudioStats>,
+    /// Reader for live per-stage pipeline outputs (VAD probability, gate
+    /// state). Same sampled-snapshot transport as the meter; published per
+    /// capture frame. The UI maps slots to stages via
+    /// `rumble_audio::OutputLayout::derive`.
+    outputs: crate::snapshot::Snapshot<rumble_audio::OutputFrame>,
     /// Sender half of the backend-event channel. Internal client code
     /// calls `push_event` to enqueue a [`BackendEvent`]; the UI drains
     /// the receiver each frame.
@@ -307,6 +312,7 @@ impl<P: Platform> BackendHandle<P> {
         // stay on the handle for the UI. See `crate::snapshot`.
         let (meter_writer, meter) = crate::snapshot::Snapshot::new(crate::meter::MeterSnapshot::default());
         let (stats_writer, stats) = crate::snapshot::Snapshot::new(crate::events::AudioStats::default());
+        let (output_writer, outputs) = crate::snapshot::Snapshot::new(rumble_audio::OutputFrame::default());
 
         // Spawn the audio task (runs on its own thread)
         let audio_task = spawn_audio_task::<P>(AudioTaskConfig {
@@ -317,6 +323,7 @@ impl<P: Platform> BackendHandle<P> {
             audio_backend,
             meter_writer,
             stats_writer,
+            output_writer,
         });
 
         // Clone handles for the connection task
@@ -380,6 +387,7 @@ impl<P: Platform> BackendHandle<P> {
             sfx_library: crate::sfx::SfxLibrary::new(),
             meter,
             stats,
+            outputs,
             event_tx,
             event_rx: std::sync::Mutex::new(Some(event_rx)),
             _phantom: std::marker::PhantomData,
@@ -396,6 +404,15 @@ impl<P: Platform> BackendHandle<P> {
     /// transport as [`Self::meter`]; updated ~2×/s by the audio task.
     pub fn stats(&self) -> crate::events::AudioStats {
         self.stats.load()
+    }
+
+    /// Load the latest live per-stage pipeline outputs (VAD probability,
+    /// gate state). Map slots to stages with
+    /// `rumble_audio::OutputLayout::derive(config, registry)` against the
+    /// running TX pipeline config. Same cheap sampled transport as
+    /// [`Self::meter`].
+    pub fn outputs(&self) -> rumble_audio::OutputFrame {
+        self.outputs.load()
     }
 
     // -------------------------------------------------------------

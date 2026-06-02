@@ -536,6 +536,7 @@ impl<B: UiBackend> App for RumbleApp<B> {
                 &state,
                 &self.backend.meter(),
                 &self.backend.stats(),
+                &self.backend.outputs(),
                 &self.identity,
                 &self.selection,
                 &self.processor_registry,

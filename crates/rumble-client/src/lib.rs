@@ -132,8 +132,9 @@ pub use processors::{
 
 // Re-export pipeline crate types
 pub use rumble_audio::{
-    AudioPipeline, AudioProcessor, PipelineConfig, ProcessorConfig, ProcessorFactory, ProcessorRegistry,
-    ProcessorResult, UserRxConfig, calculate_peak_db, calculate_rms_db, db_to_linear, linear_to_db,
+    Anchor, AudioPipeline, AudioProcessor, Mark, OutputEntry, OutputFrame, OutputKind, OutputLayout, OutputSpec,
+    PipelineConfig, ProcessorConfig, ProcessorFactory, ProcessorRegistry, ProcessorResult, Role, UserRxConfig, Zone,
+    calculate_peak_db, calculate_rms_db, db_to_linear, linear_to_db,
 };
 
 // Re-exports from rumble-protocol crate
