@@ -476,6 +476,10 @@ enum AttachmentView<'a> {
         offer: RelayFileSharePayload,
         thumb: &'a Image,
     },
+    Model {
+        offer: RelayFileSharePayload,
+        thumb: &'a Image,
+    },
     File {
         offer: RelayFileSharePayload,
         status: Option<&'a TransferStatus>,
@@ -529,6 +533,9 @@ fn attachment_view<'a>(
     if let Some(thumb) = media_cache.video_thumb_for(&offer.transfer_id) {
         return AttachmentView::Video { offer, thumb };
     }
+    if let Some(thumb) = media_cache.model_thumb_for(&offer.transfer_id) {
+        return AttachmentView::Model { offer, thumb };
+    }
     AttachmentView::File { offer, status }
 }
 
@@ -545,6 +552,7 @@ fn render_attachment_view(
             gpu,
         } => image_preview::image_preview(&offer, cached, playback, gpu),
         AttachmentView::Video { offer, thumb } => image_preview::video_preview(&offer, thumb),
+        AttachmentView::Model { offer, thumb } => image_preview::model_preview(&offer, thumb),
         AttachmentView::File { offer, status } => {
             file_card::file_offer_card(&offer, status, is_local_sender, pending_cancel_confirm)
         }

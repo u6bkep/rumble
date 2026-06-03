@@ -122,6 +122,12 @@ enum Scene {
     /// `−` / `+` / Fit buttons + zoom-percent label in their
     /// "non-default" state and showing the zoomed paint transform.
     ImageLightboxZoomed,
+    /// Live session with a completed 3D-model transfer rendered as an
+    /// inline poster preview (the offscreen render is seeded directly).
+    ConnectedModelPreview,
+    /// Live session with the 3D-model orbit lightbox open over the
+    /// connected backdrop.
+    ModelLightbox,
     /// Connection lost with an error message in the toolbar.
     ConnectionLost,
     /// Cert acceptance modal up over the disconnected backdrop.
@@ -208,6 +214,8 @@ impl Scene {
         Scene::ConnectedImagePreview,
         Scene::ImageLightbox,
         Scene::ImageLightboxZoomed,
+        Scene::ConnectedModelPreview,
+        Scene::ModelLightbox,
         Scene::ConnectionLost,
         Scene::CertPending,
         Scene::WizardSelectMethod,
@@ -252,6 +260,8 @@ impl Scene {
             Scene::ConnectedImagePreview => "connected_image_preview",
             Scene::ImageLightbox => "image_lightbox",
             Scene::ImageLightboxZoomed => "image_lightbox_zoomed",
+            Scene::ConnectedModelPreview => "connected_model_preview",
+            Scene::ModelLightbox => "model_lightbox",
             Scene::ConnectionLost => "connection_lost",
             Scene::CertPending => "cert_pending",
             Scene::WizardSelectMethod => "wizard_select_method",
@@ -296,6 +306,7 @@ impl Scene {
             Scene::Connected | Scene::ConnectedImagePreview | Scene::ImageLightbox | Scene::ImageLightboxZoomed => {
                 connected_state()
             }
+            Scene::ConnectedModelPreview | Scene::ModelLightbox => connected_state_with_model(),
             Scene::ConnectedSelfTalking => {
                 let mut s = connected_state();
                 s.audio.is_transmitting = true;
@@ -613,6 +624,17 @@ impl Scene {
                 app.insert_image_preview_for_test("demo-offer", demo_preview_image());
                 app.open_lightbox_for_test("demo-offer", "deploy_notes.md");
                 app.set_lightbox_zoom_for_test(2.0, (40.0, 30.0));
+            }
+            Scene::ConnectedModelPreview => {
+                // Seed a poster directly (no GPU in bundle dumps) so the
+                // dispatch swaps the file card for the 3D preview card.
+                app.insert_model_thumb_for_test("demo-model", demo_preview_image());
+            }
+            Scene::ModelLightbox => {
+                // Seed parsed geometry and open the orbit lightbox. The
+                // SVG fallback renders the `chart3d` element's draw op
+                // deterministically (auto-framed from the cube's bounds).
+                app.open_model_lightbox_for_test("demo-model", "bracket.stl", demo_cube_model());
             }
             _ => {}
         }
@@ -1151,6 +1173,80 @@ fn demo_preview_image() -> Image {
         }
     }
     Image::from_rgba8(w, h, pixels)
+}
+
+/// Connected state whose shared-file message carries a 3D-model offer
+/// (`bracket.stl`) instead of the default markdown file, so the model
+/// preview / lightbox scenes dispatch through the model path.
+fn connected_state_with_model() -> State {
+    let mut state = connected_state();
+    if let Some(msg) = state.chat_messages.last_mut() {
+        let summary = "shared model: bracket.stl (48.0 KB)";
+        msg.text = summary.into();
+        msg.attachment = Some(relay_attachment(
+            RelayFileSharePayload {
+                transfer_id: "demo-model".into(),
+                name: "bracket.stl".into(),
+                size: 49_152,
+                mime: "model/stl".into(),
+                share_data: "demo".into(),
+            },
+            summary,
+        ));
+    }
+    state
+}
+
+/// A unit cube as parsed model geometry, for the lightbox scene. Flat
+/// per-face normals; deterministic, so the auto-framed `chart3d` draw op
+/// is stable across runs.
+fn demo_cube_model() -> rumble_damascene::model::LoadedModel {
+    use damascene_core::scene::{MeshData, MeshHandle, MeshVertex, glam::Vec3};
+
+    type Face = ([f32; 3], [[f32; 3]; 4]);
+    let faces: [Face; 6] = [
+        (
+            [0., 0., 1.],
+            [[-1., -1., 1.], [1., -1., 1.], [1., 1., 1.], [-1., 1., 1.]],
+        ),
+        (
+            [0., 0., -1.],
+            [[1., -1., -1.], [-1., -1., -1.], [-1., 1., -1.], [1., 1., -1.]],
+        ),
+        (
+            [1., 0., 0.],
+            [[1., -1., 1.], [1., -1., -1.], [1., 1., -1.], [1., 1., 1.]],
+        ),
+        (
+            [-1., 0., 0.],
+            [[-1., -1., -1.], [-1., -1., 1.], [-1., 1., 1.], [-1., 1., -1.]],
+        ),
+        (
+            [0., 1., 0.],
+            [[-1., 1., 1.], [1., 1., 1.], [1., 1., -1.], [-1., 1., -1.]],
+        ),
+        (
+            [0., -1., 0.],
+            [[-1., -1., -1.], [1., -1., -1.], [1., -1., 1.], [-1., -1., 1.]],
+        ),
+    ];
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+    for (normal, corners) in faces {
+        let base = vertices.len() as u32;
+        let n = Vec3::from_array(normal);
+        for c in corners {
+            vertices.push(MeshVertex {
+                position: Vec3::from_array(c),
+                normal: n,
+            });
+        }
+        indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    }
+    rumble_damascene::model::LoadedModel::Mesh(MeshHandle::new(MeshData {
+        vertices,
+        indices: Some(indices),
+    }))
 }
 
 fn demo_pending_cert() -> PendingCertificate {

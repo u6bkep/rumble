@@ -1,1 +1,1 @@
-TextOverflow node=root.group.0.group.1.group.0.virtual_list[chat:history].group.5.group.1.group[chat:file-card:demo-pending].group.2.group.1.text.0 chat/file_card.rs:273 :: nowrap text exceeds its box by X=61; use .ellipsis(), wrap_text(), or a wider box
+TextOverflow node=root.group.0.group.1.group.0.virtual_list[chat:history].group.5.group.1.group[chat:file-card:demo-pending].group.2.group.1.text.0 chat/file_card.rs:282 :: nowrap text exceeds its box by X=61; use .ellipsis(), wrap_text(), or a wider box

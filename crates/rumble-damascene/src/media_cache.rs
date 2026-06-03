@@ -54,7 +54,11 @@ use rumble_client::BackendEvent;
 use rumble_client_traits::TransferStage;
 use tokio::{runtime::Handle, task::JoinHandle};
 
-use crate::{animated_gpu::AnimatedGpu, chat};
+use crate::{
+    animated_gpu::AnimatedGpu,
+    chat,
+    model::{self, LoadedModel, ModelError, ModelThumbnailer},
+};
 
 /// Cap on the longest edge of an inline chat thumbnail, in pixels.
 /// ~1024 keeps the 400px-tall preview rect sharp on a 2× display
@@ -121,6 +125,25 @@ pub struct MediaCache {
     /// gated on an event arriving.
     pending_video_thumb_retries: HashMap<String, (PathBuf, String)>,
 
+    /// Parsed 3D-model geometry keyed by `transfer_id`, kept so the
+    /// lightbox can project a live `chart3d` from the same upload the
+    /// thumbnail rendered. Cloning a [`LoadedModel`] is a cheap `Arc`
+    /// bump on the geometry handle.
+    models: HashMap<String, LoadedModel>,
+    /// Offscreen-rendered model poster thumbnails, keyed by `transfer_id`
+    /// (the 3D analogue of [`Self::video_thumbs`]). Populated by
+    /// [`Self::sync_model_thumbs`] once a model has been parsed and the
+    /// host's wgpu device is available.
+    model_thumbs: HashMap<String, Image>,
+    /// Transfer ids whose model parse failed — recorded so a repeat Done
+    /// event doesn't re-spawn a doomed parse.
+    model_failed: HashSet<String>,
+    /// In-flight off-thread model parses, keyed by `transfer_id`.
+    pending_model_loads: HashMap<String, JoinHandle<Result<LoadedModel, ModelError>>>,
+    /// Renders model posters offscreen. Lazily builds its `Runner` on the
+    /// first thumbnail; reused across models.
+    model_thumbnailer: ModelThumbnailer,
+
     /// Active full-res lightbox decode. Only one at a time — opening
     /// a new lightbox aborts the prior decode.
     pending_lightbox: Option<PendingLightboxDecode>,
@@ -143,6 +166,11 @@ impl MediaCache {
             failed_video_thumbs: HashMap::new(),
             pending_video_thumbs: HashMap::new(),
             pending_video_thumb_retries: HashMap::new(),
+            models: HashMap::new(),
+            model_thumbs: HashMap::new(),
+            model_failed: HashSet::new(),
+            pending_model_loads: HashMap::new(),
+            model_thumbnailer: ModelThumbnailer::new(),
             pending_lightbox: None,
             lightbox_full: HashMap::new(),
         }
@@ -210,6 +238,17 @@ impl MediaCache {
             self.pending_video_thumb_retries
                 .insert(id.to_string(), (local_path.to_path_buf(), name.to_string()));
         }
+        if model::is_model_name(name)
+            && !self.models.contains_key(id)
+            && !self.model_failed.contains(id)
+            && !self.pending_model_loads.contains_key(id)
+        {
+            // Parse off-thread — large STL/PLY meshes take real CPU time,
+            // same rationale as the video-thumbnail extract.
+            let path = local_path.to_path_buf();
+            let handle = self.runtime.spawn_blocking(move || model::load_model(&path));
+            self.pending_model_loads.insert(id.to_string(), handle);
+        }
     }
 
     /// Drive on a transfer that just terminated with `Failed`. Nothing
@@ -222,6 +261,9 @@ impl MediaCache {
             handle.abort();
         }
         self.pending_video_thumb_retries.remove(id);
+        if let Some(handle) = self.pending_model_loads.remove(id) {
+            handle.abort();
+        }
     }
 
     fn spawn_video_thumb(&mut self, id: String, path: PathBuf) {
@@ -245,7 +287,37 @@ impl MediaCache {
     pub fn drain_pending(&mut self) {
         self.drain_video_thumbs();
         self.maybe_respawn_video_thumbs();
+        self.drain_model_loads();
         self.drain_lightbox();
+    }
+
+    /// Land finished off-thread model parses. On success the geometry goes
+    /// into `models` (the thumbnail render happens later, in
+    /// [`Self::sync_model_thumbs`], when the wgpu device is available); on
+    /// failure the id is recorded so we don't re-attempt.
+    fn drain_model_loads(&mut self) {
+        let finished: Vec<String> = self
+            .pending_model_loads
+            .iter()
+            .filter(|(_, h)| h.is_finished())
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in finished {
+            let handle = self.pending_model_loads.remove(&id).unwrap();
+            match self.runtime.block_on(handle) {
+                Ok(Ok(model)) => {
+                    self.models.insert(id, model);
+                }
+                Ok(Err(e)) => {
+                    tracing::debug!("model parse failed for {id}: {e}");
+                    self.model_failed.insert(id);
+                }
+                Err(join_err) => {
+                    tracing::warn!("model parse task panicked for {id}: {join_err}");
+                    self.model_failed.insert(id);
+                }
+            }
+        }
     }
 
     fn drain_video_thumbs(&mut self) {
@@ -397,6 +469,33 @@ impl MediaCache {
         }
     }
 
+    /// Render a poster thumbnail for any parsed model that doesn't have one
+    /// yet. Called from `App::before_paint` once the wgpu device is
+    /// available (the offscreen render needs it). Each model renders once;
+    /// a model whose render momentarily fails (GPU readback hiccup) stays
+    /// un-thumbnailed and is retried next frame.
+    pub fn sync_model_thumbs(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        let pending: Vec<String> = self
+            .models
+            .keys()
+            .filter(|id| !self.model_thumbs.contains_key(*id))
+            .cloned()
+            .collect();
+        for id in pending {
+            let Some(model) = self.models.get(&id) else {
+                continue;
+            };
+            if let Some(image) = self.model_thumbnailer.render(device, queue, model) {
+                tracing::debug!(
+                    "model thumbnail rendered for {id}: {}x{}",
+                    image.width(),
+                    image.height()
+                );
+                self.model_thumbs.insert(id, image);
+            }
+        }
+    }
+
     // ---------- lightbox control ----------
 
     /// Kick off a full-resolution decode for a freshly-opened
@@ -467,6 +566,17 @@ impl MediaCache {
         self.video_thumbs.get(transfer_id)
     }
 
+    /// Poster thumbnail for a downloaded 3D model, if one has rendered.
+    pub fn model_thumb_for(&self, transfer_id: &str) -> Option<&Image> {
+        self.model_thumbs.get(transfer_id)
+    }
+
+    /// Parsed geometry for a downloaded 3D model, if the parse succeeded.
+    /// The lightbox clones this (cheap `Arc` bump) to build its scene.
+    pub fn model_for(&self, transfer_id: &str) -> Option<&LoadedModel> {
+        self.models.get(transfer_id)
+    }
+
     /// Best image available for the open lightbox: full-resolution if
     /// the decode has landed, otherwise the inline thumbnail.
     pub fn lightbox_image_for(&self, transfer_id: &str) -> Option<&chat::CachedImage> {
@@ -494,6 +604,18 @@ impl MediaCache {
     /// [`Self::image_cache_mut`].
     pub fn video_thumbs_mut(&mut self) -> &mut HashMap<String, Image> {
         &mut self.video_thumbs
+    }
+
+    /// Mutable model-thumb access for `dump_bundles` (seeds a poster
+    /// without a GPU render). See [`Self::image_cache_mut`].
+    pub fn model_thumbs_mut(&mut self) -> &mut HashMap<String, Image> {
+        &mut self.model_thumbs
+    }
+
+    /// Mutable parsed-model access for `dump_bundles` (seeds geometry for
+    /// the lightbox scene). See [`Self::image_cache_mut`].
+    pub fn models_mut(&mut self) -> &mut HashMap<String, LoadedModel> {
+        &mut self.models
     }
 }
 

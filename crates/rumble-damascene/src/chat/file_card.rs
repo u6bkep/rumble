@@ -201,12 +201,21 @@ fn sender_complete_row(transfer_id: &str) -> El {
 
 /// Open + Reveal buttons for a receiver whose download completed.
 fn receiver_complete_row(offer: &RelayFileSharePayload, status: &TransferStatus) -> El {
-    let is_playable_video = status.done_path().is_some() && crate::video::is_video_name(&offer.name);
+    let downloaded = status.done_path().is_some();
+    let is_playable_video = downloaded && crate::video::is_video_name(&offer.name);
+    let is_viewable_model = downloaded && crate::model::is_model_name(&offer.name);
     let mut btns: Vec<El> = vec![spacer()];
     if is_playable_video {
         btns.push(
             button_with_icon(IconName::Activity, "Play")
                 .key(crate::video::open_video_key(&offer.transfer_id))
+                .primary(),
+        );
+    }
+    if is_viewable_model {
+        btns.push(
+            button_with_icon(IconName::LayoutDashboard, "View 3D")
+                .key(crate::model::open_model_key(&offer.transfer_id))
                 .primary(),
         );
     }

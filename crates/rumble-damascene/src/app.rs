@@ -34,7 +34,7 @@ use crate::{
     chat,
     elevate::{self, ElevateOutcome, ElevateState},
     identity::Identity,
-    room_acl,
+    model, room_acl,
     room_tree::{self, RoomTreeOutcome, RoomTreeState},
     server_picker::{self, ServerForm, ServerPickerOutcome, ServerPickerState},
     settings::{self, SettingsOutcome, SettingsState},
@@ -236,6 +236,12 @@ pub struct RumbleApp<B: UiBackend = crate::backend::NativeUiBackend> {
     /// completed stream lands in `active_video` next frame.
     pending_video_open: Option<JoinHandle<PendingVideoOpenResult>>,
 
+    /// Currently-open 3D-model lightbox, if any. Holds the parsed
+    /// geometry; the orbit camera lives in damascene's `UiState` (keyed
+    /// by `model::KEY_SCENE`). Shares the overlay slot with the image and
+    /// video lightboxes — only one is ever open at a time.
+    active_model: Option<model::ActiveModel>,
+
     /// Queued toasts collected from backend events each frame.
     /// Drained by [`App::drain_toasts`] so damascene's runtime synthesizes
     /// the toast stack overlay automatically.
@@ -355,6 +361,7 @@ impl<B: UiBackend> RumbleApp<B> {
             gpu_device: None,
             active_video: None,
             pending_video_open: None,
+            active_model: None,
             pending_toasts: Vec::new(),
             pending_link_opens: Vec::new(),
             pending_cancel_confirm: HashMap::new(),
@@ -601,6 +608,19 @@ impl<B: UiBackend> App for RumbleApp<B> {
             None
         };
 
+        // Model lightbox shares the image/video lightbox overlay slot
+        // (only one open at a time) and the same modal-suppression rules.
+        let model_lightbox_layer = if !wizard_open
+            && unlock_layer.is_none()
+            && cert_layer.is_none()
+            && !self.settings_state.open
+            && let Some(active) = self.active_model.as_ref()
+        {
+            Some(model::render_lightbox(active))
+        } else {
+            None
+        };
+
         let file_ctx_layer =
             if !wizard_open && unlock_layer.is_none() && cert_layer.is_none() && !self.settings_state.open {
                 self.file_context_menu.as_ref().map(chat::render_file_context_menu)
@@ -672,6 +692,7 @@ impl<B: UiBackend> App for RumbleApp<B> {
                 room_tree_overlays.delete_room_modal,
                 lightbox_layer,
                 video_lightbox_layer,
+                model_lightbox_layer,
                 file_ctx_layer,
                 drop_target_layer,
                 voice_mode_layer,
@@ -1227,6 +1248,27 @@ impl<B: UiBackend> App for RumbleApp<B> {
             }
         }
 
+        // Model lightbox. Open via the inline model preview card or the
+        // file-card "View 3D" button; close via Close button, scrim, or
+        // Escape. Orbit/pan/zoom inside the panel is handled by
+        // damascene's `chart3d` element directly (it consumes its own
+        // pointer/wheel events), so there are no per-frame controls here.
+        if matches!(event.kind, UiEventKind::Click | UiEventKind::Activate)
+            && let Some(route) = event.route()
+            && let Some(transfer_id) = model::parse_open_model_key(route)
+        {
+            self.open_model_lightbox(transfer_id);
+            return;
+        }
+        if self.active_model.is_some()
+            && (event.is_click_or_activate(model::KEY_LIGHTBOX_CLOSE)
+                || (event.is_route(model::KEY_LIGHTBOX_DISMISS) && event.kind == UiEventKind::Click)
+                || event.kind == UiEventKind::Escape)
+        {
+            self.close_model_lightbox();
+            return;
+        }
+
         // Top toolbar.
         if event.is_click_or_activate("toolbar:mute") {
             let muted = self.backend.state().audio.self_muted;
@@ -1354,6 +1396,7 @@ impl<B: UiBackend> WinitWgpuApp for RumbleApp<B> {
     fn before_paint(&mut self, queue: &wgpu::Queue) {
         self.sync_animated_gpu(queue);
         self.sync_active_video_gpu(queue);
+        self.sync_model_thumbs(queue);
     }
 }
 
@@ -1973,6 +2016,9 @@ impl<B: UiBackend> RumbleApp<B> {
                 (o.transfer_id == transfer_id).then_some(o.name)
             })
             .unwrap_or_else(|| transfer_id.to_string());
+        // The three lightboxes share one overlay slot — close the others.
+        self.close_video_lightbox();
+        self.close_model_lightbox();
         self.image_lightbox = Some(chat::Lightbox::new(transfer_id, name));
         self.media_cache.force_resume_playback(transfer_id);
 
@@ -2038,8 +2084,11 @@ impl<B: UiBackend> RumbleApp<B> {
         let id = status.id.0.clone();
 
         // Drop any existing active video / pending open. Newer
-        // intent supersedes older.
+        // intent supersedes older. Close the image/model lightboxes too —
+        // the three share one overlay slot.
         self.active_video = None;
+        self.close_lightbox();
+        self.close_model_lightbox();
         if let Some(prev) = self.pending_video_open.take() {
             prev.abort();
         }
@@ -2061,6 +2110,38 @@ impl<B: UiBackend> RumbleApp<B> {
         if let Some(handle) = self.pending_video_open.take() {
             handle.abort();
         }
+    }
+
+    /// Open the orbit lightbox for a downloaded 3D model. Clones the
+    /// parsed geometry out of the media cache (cheap `Arc` bump) into
+    /// `active_model`; the lightbox rebuilds its `chart3d` scene from it
+    /// each frame. No-op if the model hasn't finished parsing, or if it's
+    /// already the open model (a stale re-activate shouldn't reset the
+    /// orbit camera). Closes any image/video lightbox first — the three
+    /// share one overlay slot.
+    fn open_model_lightbox(&mut self, transfer_id: &str) {
+        if self.active_model.as_ref().map(|a| a.transfer_id.as_str()) == Some(transfer_id) {
+            return;
+        }
+        let Some(loaded) = self.media_cache.model_for(transfer_id) else {
+            return;
+        };
+        let model = loaded.clone();
+        let name = self
+            .backend
+            .transfers()
+            .into_iter()
+            .find(|t| t.id.0 == transfer_id)
+            .map(|t| t.name)
+            .unwrap_or_else(|| transfer_id.to_string());
+        self.close_lightbox();
+        self.close_video_lightbox();
+        self.active_model = Some(model::ActiveModel::new(transfer_id, name, model));
+    }
+
+    /// Close the model lightbox.
+    fn close_model_lightbox(&mut self) {
+        self.active_model = None;
     }
 
     /// Drain a finished `VideoStream::open` task. On success,
@@ -2429,6 +2510,16 @@ impl<B: UiBackend> RumbleApp<B> {
         if let Some(gpu) = active.gpu.as_mut() {
             gpu.upload_if_changed(queue, &active.stream);
         }
+    }
+
+    /// Render poster thumbnails for any newly-parsed 3D models. Delegates
+    /// to `media_cache.sync_model_thumbs`, which needs the wgpu device for
+    /// its offscreen render — `gpu_setup` stashes it on App.
+    fn sync_model_thumbs(&mut self, queue: &wgpu::Queue) {
+        let Some(device) = self.gpu_device.as_ref() else {
+            return;
+        };
+        self.media_cache.sync_model_thumbs(device, queue);
     }
 
     // ---------- wizard plumbing ----------
@@ -2901,6 +2992,30 @@ impl<B: UiBackend> RumbleApp<B> {
             lb.zoom = zoom;
             lb.pan = pan;
         }
+    }
+
+    /// Test/scene-dump hook to seed a model poster thumbnail. The runtime
+    /// path renders it offscreen in `before_paint`; bundle dumps have no
+    /// GPU device, so push a synthetic poster directly.
+    pub fn insert_model_thumb_for_test(&mut self, transfer_id: impl Into<String>, img: Image) {
+        self.media_cache.model_thumbs_mut().insert(transfer_id.into(), img);
+    }
+
+    /// Test/scene-dump hook to seed parsed model geometry, so the lightbox
+    /// scene has a `chart3d` to project without a real download + parse.
+    pub fn insert_model_for_test(&mut self, transfer_id: impl Into<String>, model: model::LoadedModel) {
+        self.media_cache.models_mut().insert(transfer_id.into(), model);
+    }
+
+    /// Test/scene-dump hook to open the model lightbox without a click.
+    /// Mirrors `open_model_lightbox` but takes the geometry directly.
+    pub fn open_model_lightbox_for_test(
+        &mut self,
+        transfer_id: impl Into<String>,
+        name: impl Into<String>,
+        model: model::LoadedModel,
+    ) {
+        self.active_model = Some(model::ActiveModel::new(transfer_id, name, model));
     }
 }
 

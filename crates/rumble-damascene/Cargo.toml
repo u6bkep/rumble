@@ -53,6 +53,9 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 anyhow = { workspace = true }
 rfd = "0.17"
 image = { version = "0.25", default-features = false, features = ["bmp", "gif", "ico", "jpeg", "png", "tiff", "webp"] }
+# 3D model attachment previews (STL/PLY → damascene scene geometry).
+stl_io = "0.8"
+ply-rs = "0.1"
 arboard = "3"
 tempfile = "3"
 base64 = { workspace = true }

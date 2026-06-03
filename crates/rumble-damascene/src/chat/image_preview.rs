@@ -352,6 +352,62 @@ pub(super) fn video_preview(offer: &RelayFileSharePayload, thumb: &Image) -> El 
         .width(Size::Fill(1.0))
 }
 
+/// Inline preview card for a downloaded 3D model: an offscreen-rendered
+/// poster of the model (see [`crate::model::ModelThumbnailer`]) with a
+/// corner "3D" badge marking it as interactive. Clicking opens the orbit
+/// lightbox. Mirrors [`video_preview`]'s layout; the badge differs because
+/// a 3D model has no single "play" affordance — the whole card is the
+/// open target.
+pub(super) fn model_preview(offer: &RelayFileSharePayload, thumb: &Image) -> El {
+    const PREVIEW_HEIGHT: f32 = 400.0;
+
+    let poster = image(thumb.clone())
+        .radius(tokens::RADIUS_SM)
+        .width(Size::Fill(1.0))
+        .height(Size::Fill(1.0));
+
+    // Bottom-right "3D" pill so the card reads as a manipulable model
+    // rather than a flat render.
+    let badge = stack([text("3D")
+        .semibold()
+        .font_size(tokens::TEXT_XS.size)
+        .text_color(tokens::FOREGROUND)])
+    .padding(Sides::xy(tokens::SPACE_2, tokens::SPACE_1))
+    .fill(tokens::OVERLAY_SCRIM)
+    .radius(tokens::RADIUS_PILL);
+    let badge_corner = column([
+        spacer().height(Size::Fill(1.0)),
+        row([spacer().width(Size::Fill(1.0)), badge]).width(Size::Fill(1.0)),
+    ])
+    .padding(Sides::all(tokens::SPACE_2))
+    .width(Size::Fill(1.0))
+    .height(Size::Fill(1.0));
+
+    let inner = stack([poster, badge_corner])
+        .width(Size::Fill(1.0))
+        .height(Size::Fill(1.0));
+    let preview_layer = preview_card(inner, thumb.width(), thumb.height(), PREVIEW_HEIGHT, None);
+
+    let caption = text(format!("{} · {}", offer.name, format_size(offer.size)))
+        .muted()
+        .font_size(tokens::TEXT_XS.size)
+        .ellipsis()
+        .key(format!("chat:model-preview:{}.caption", offer.transfer_id))
+        .tooltip(offer.name.clone());
+
+    column([preview_layer, caption])
+        .key(crate::model::open_model_key(&offer.transfer_id))
+        .focusable()
+        .cursor(Cursor::Pointer)
+        .gap(tokens::SPACE_1)
+        .padding(Sides::all(tokens::SPACE_2))
+        .fill(tokens::SECONDARY)
+        .stroke(tokens::BORDER)
+        .stroke_width(1.0)
+        .radius(tokens::RADIUS_MD)
+        .width(Size::Fill(1.0))
+}
+
 /// Build the surface-based preview for an animated entry.
 fn animated_surface_preview(
     transfer_id: &str,
