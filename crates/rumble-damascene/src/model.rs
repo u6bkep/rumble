@@ -35,8 +35,8 @@ use std::{fs::File, io::BufReader, path::Path};
 use damascene_core::{
     prelude::*,
     scene::{
-        CameraControls, Framing, Material, MeshData, MeshHandle, MeshVertex, PointData, PointStyle, PointsHandle,
-        ScenePoint, SceneSpec, glam::Vec3,
+        Aabb, CameraControls, CameraState, Framing, Material, MeshData, MeshHandle, MeshVertex, PointData, PointStyle,
+        PointsHandle, ScenePoint, SceneSpec, glam::Vec3,
     },
 };
 use damascene_wgpu::Runner;
@@ -333,6 +333,16 @@ fn build_scene(model: &LoadedModel) -> SceneSpec {
     }
 }
 
+/// World-space bounds of a model's geometry. Each variant carries a single
+/// handle drawn with the identity transform, so the handle's cached bounds
+/// *are* the scene's content bounds — what the camera frames against.
+fn model_bounds(model: &LoadedModel) -> Aabb {
+    match model {
+        LoadedModel::Mesh(handle) => handle.bounds(),
+        LoadedModel::Points(handle) => handle.bounds(),
+    }
+}
+
 // ---- Offscreen thumbnail rendering ----
 
 /// Longest edge (square) of a rendered model poster, in physical px. 512
@@ -369,7 +379,20 @@ impl ModelThumbnailer {
         let runner = self
             .runner
             .get_or_insert_with(|| Runner::new(device, queue, THUMB_FORMAT));
-        let mut tree = chart3d(build_scene(model));
+        // Pin an explicit, pre-framed camera rather than `Framing::Auto`.
+        // Auto is keyed/spring-driven: it fits over several frames via a
+        // library-owned camera that persists in the runner's `UiState`.
+        // This runner is reused across models, so a second model's one-shot
+        // render would inherit the first model's distance (Auto only glides
+        // the look-at target on a bounds change, never the distance) — a
+        // stale "fixed" pose. `CameraState::framing` is exactly the pose the
+        // lightbox opens at (default angles, distance fit to the bounds), so
+        // the poster matches the lightbox; `Manual` makes draw_ops use it
+        // verbatim, immune to the persisted keyed camera.
+        let scene = build_scene(model)
+            .camera(CameraState::framing(model_bounds(model)))
+            .framing(Framing::Manual);
+        let mut tree = chart3d(scene);
         render_scene_to_image(runner, device, queue, &mut tree, THUMB_PX, THUMB_PX)
     }
 }
