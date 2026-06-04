@@ -60,6 +60,11 @@ pub struct PortalHotkeyBackend {
     session: Arc<Session<GlobalShortcuts>>,
     state: Arc<RwLock<PortalState>>,
     runtime_handle: tokio::runtime::Handle,
+    /// Handle to the background signal-listener task. Aborted and
+    /// awaited in [`Self::shutdown`] so the task releases its
+    /// `Arc<GlobalShortcuts>` (and the D-Bus signal streams it holds)
+    /// before we drop our own zbus references.
+    listener_handle: tokio::task::JoinHandle<()>,
     /// True once we've successfully bound at least one shortcut. Drives
     /// `is_available` for the manager-side fallback decision.
     has_bound: bool,
@@ -95,7 +100,7 @@ impl PortalHotkeyBackend {
         let listener_shortcuts = Arc::clone(&shortcuts);
         let listener_state = Arc::clone(&state);
         let listener_tx = event_tx.clone();
-        runtime_handle.spawn(async move {
+        let listener_handle = runtime_handle.spawn(async move {
             Self::listen_for_signals(listener_shortcuts, listener_state, listener_tx).await;
         });
 
@@ -106,6 +111,7 @@ impl PortalHotkeyBackend {
             session,
             state,
             runtime_handle,
+            listener_handle,
             has_bound: false,
         })
     }
@@ -355,6 +361,28 @@ impl PortalHotkeyBackend {
             }
             spawn_system_shortcut_settings();
         });
+    }
+
+    /// Tear down the portal session and its D-Bus connection cleanly.
+    ///
+    /// Consumes `self`, so the `Arc<GlobalShortcuts>` / `Arc<Session>`
+    /// references it owns are dropped at the end of this future. Must be
+    /// driven from inside a tokio runtime context (e.g. via
+    /// `runtime.block_on`): the underlying zbus connection spawns onto
+    /// the tokio executor as it closes, and panics with "there is no
+    /// reactor running" if dropped with no runtime in scope.
+    ///
+    /// We abort the listener task and await it first so it releases its
+    /// own `Arc<GlobalShortcuts>` clone (and the signal streams it holds)
+    /// *before* our references drop — that makes this `shutdown` the last
+    /// holder, so the connection actually closes here, inside the runtime,
+    /// rather than later on the main thread during `App` teardown.
+    pub async fn shutdown(self) {
+        self.listener_handle.abort();
+        // The abort propagates as a JoinError(cancelled); awaiting it
+        // guarantees the task's future has been dropped before we fall
+        // through and drop our own Arcs at end of scope.
+        let _ = self.listener_handle.await;
     }
 }
 

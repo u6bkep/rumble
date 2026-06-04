@@ -486,6 +486,27 @@ impl HotkeyManager {
     #[cfg(not(all(target_os = "linux", feature = "wayland-portal")))]
     pub fn open_portal_settings(&self) {}
 
+    /// Cleanly tear down the XDG portal D-Bus session before the owning
+    /// tokio runtime is dropped.
+    ///
+    /// `runtime` must be the same runtime the portal backend was
+    /// initialised against. The portal's zbus connection spawns onto the
+    /// tokio executor while closing, so dropping it on the main thread
+    /// during normal field teardown — after the runtime has already gone
+    /// away — panics with "there is no reactor running". Driving the drop
+    /// through `block_on` keeps a reactor in scope. No-op on non-portal
+    /// builds.
+    #[cfg(all(target_os = "linux", feature = "wayland-portal"))]
+    pub fn shutdown_portal(&mut self, runtime: &tokio::runtime::Runtime) {
+        if let Some(backend) = self.portal_backend.take() {
+            runtime.block_on(backend.shutdown());
+        }
+    }
+
+    /// No-op portal shutdown for non-portal builds.
+    #[cfg(not(all(target_os = "linux", feature = "wayland-portal")))]
+    pub fn shutdown_portal(&mut self, _runtime: &tokio::runtime::Runtime) {}
+
     fn detect_wayland() -> bool {
         #[cfg(target_os = "linux")]
         {

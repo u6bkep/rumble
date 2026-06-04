@@ -382,6 +382,19 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+impl<B: UiBackend> Drop for RumbleApp<B> {
+    fn drop(&mut self) {
+        // Close the XDG GlobalShortcuts portal's D-Bus session while the
+        // tokio `runtime` field is still alive. The portal's zbus
+        // connection spawns onto the tokio executor as it closes; left to
+        // the default field-drop order (`runtime` drops before
+        // `hotkeys`), that close runs on the main thread with no reactor
+        // in scope and panics with "there is no reactor running". Driving
+        // it here keeps the runtime in scope for the teardown.
+        self.hotkeys.shutdown_portal(&self.runtime);
+    }
+}
+
 impl<B: UiBackend> App for RumbleApp<B> {
     fn before_build(&mut self) {
         self.poll_agent_op();
