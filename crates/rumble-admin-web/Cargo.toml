@@ -1,0 +1,34 @@
+[package]
+name = "rumble-admin-web"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Rumble server web admin UI — a Damascene app compiled to wasm, talking to the server's REST control-plane."
+
+# `cdylib` is the wasm artifact wasm-pack bundles; `rlib` keeps the crate
+# usable as a normal library dependency (and lets `cargo build` type-check
+# the non-wasm-gated surface on the host target).
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Shared serde DTOs — the single source of truth for the REST wire shape,
+# depended on by both this UI and the server (`server::web`).
+rumble-web-types = { path = "../rumble-web-types" }
+
+# Damascene UI. `damascene-web` carries a native stub, so the crate still
+# type-checks on the host target; the real browser host activates under
+# `cfg(target_arch = "wasm32")`.
+damascene-core = { workspace = true }
+damascene-web = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Browser-only deps. Gated to wasm32 so the default native `cargo build`
+# (which type-checks this crate as a member) doesn't pull them in.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+gloo-net = { version = "0.6", default-features = false, features = ["http", "json"] }
+web-sys = { version = "0.3", features = ["console"] }

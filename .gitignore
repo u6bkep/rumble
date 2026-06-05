@@ -13,6 +13,10 @@ reference/
 # Generated artifacts from `cargo run -p rumble-damascene --bin dump_bundles`
 crates/rumble-damascene/out/
 
+# Generated wasm admin UI bundle (built by tools/build_admin_web.sh). The page
+# shell (web-dist/index.html) is tracked; the compiled bundle is not.
+crates/server/web-dist/pkg/
+
 # Local-only patch override for iterating against vendor/damascene; invoked via
 # `scripts/damascene-local.sh` (see .cargo/config.toml).
 .cargo/local-damascene.toml
