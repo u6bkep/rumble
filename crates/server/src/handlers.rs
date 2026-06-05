@@ -698,45 +698,12 @@ async fn handle_register_user(
         send_permission_denied(&sender, denied).await?;
         return Ok(());
     }
+    let _ = &persist; // persistence presence validated above; ops re-derives it.
 
-    // Get the target user's public key from active sessions
-    let target_key = match state.get_user_public_key(target_user_id) {
-        Some(key) => key,
-        None => {
-            return send_command_result(&sender, "RegisterUser", false, "User not found").await;
-        }
-    };
-
-    // Get the target user's current username
-    let target_client = match state.get_client(target_user_id) {
-        Some(c) => c,
-        None => return send_command_result(&sender, "RegisterUser", false, "User not found").await,
-    };
-    let username = target_client.get_username().await;
-
-    // Check if already registered
-    if persist.get_registered_user(&target_key).is_some() {
-        return send_command_result(&sender, "RegisterUser", false, "User already registered").await;
+    match crate::ops::apply_register_user(&state, persistence.as_ref(), target_user_id).await {
+        Ok(msg) => send_command_result(&sender, "RegisterUser", true, &msg).await,
+        Err(msg) => send_command_result(&sender, "RegisterUser", false, &msg).await,
     }
-
-    // Register
-    if let Err(e) = persist.register_user(
-        &target_key,
-        crate::persistence::RegisteredUser {
-            username: username.clone(),
-            last_room: None,
-        },
-    ) {
-        return send_command_result(&sender, "RegisterUser", false, &format!("Registration failed: {e}")).await;
-    }
-
-    send_command_result(
-        &sender,
-        "RegisterUser",
-        true,
-        &format!("Registered '{}' successfully", username),
-    )
-    .await
 }
 
 /// Handle UnregisterUser request.
@@ -764,33 +731,12 @@ async fn handle_unregister_user(
         send_permission_denied(&sender, denied).await?;
         return Ok(());
     }
+    let _ = &persist; // persistence presence validated above; ops re-derives it.
 
-    // Get the target user's public key
-    let target_key = match state.get_user_public_key(target_user_id) {
-        Some(key) => key,
-        None => {
-            return send_command_result(&sender, "UnregisterUser", false, "User not found").await;
-        }
-    };
-
-    // Get the username before unregistering
-    let username = match state.get_client(target_user_id) {
-        Some(c) => c.get_username().await,
-        None => "user".to_string(),
-    };
-
-    // Unregister
-    if let Err(e) = persist.unregister_user(&target_key) {
-        return send_command_result(&sender, "UnregisterUser", false, &format!("Unregistration failed: {e}")).await;
+    match crate::ops::apply_unregister_user(&state, persistence.as_ref(), target_user_id).await {
+        Ok(msg) => send_command_result(&sender, "UnregisterUser", true, &msg).await,
+        Err(msg) => send_command_result(&sender, "UnregisterUser", false, &msg).await,
     }
-
-    send_command_result(
-        &sender,
-        "UnregisterUser",
-        true,
-        &format!("Unregistered '{}' successfully", username),
-    )
-    .await
 }
 
 /// Send CommandResult message to client.
@@ -1180,44 +1126,14 @@ async fn handle_create_room(
     }
 
     let room_name = cr.name.clone();
-    let description = cr.description.clone();
-
-    // Create the room with parent and description
-    let room_uuid = state
-        .create_room_with_parent_desc(cr.name.clone(), parent_uuid, description.clone())
-        .await;
-
-    // Persist the new room
-    if let Some(persist) = &persistence {
-        let room = crate::persistence::PersistedRoom {
-            name: room_name.clone(),
-            parent: parent_uuid.map(|u| *u.as_bytes()),
-            description: description.clone().unwrap_or_default(),
-            permanent: true,
-        };
-        if let Err(e) = persist.save_room(&room_uuid.into_bytes(), &room) {
-            warn!("Failed to persist room: {e}");
+    match crate::ops::apply_create_room(&state, persistence.as_ref(), cr.name, parent_uuid, cr.description).await {
+        Ok(_uuid) => {
+            send_command_result(&sender, "CreateRoom", true, &format!("Created room '{}'", room_name)).await?;
+        }
+        Err(msg) => {
+            send_command_result(&sender, "CreateRoom", false, &msg).await?;
         }
     }
-
-    // Send incremental update to all clients
-    let room_info = proto::RoomInfo {
-        id: Some(room_id_from_uuid(room_uuid)),
-        name: cr.name,
-        parent_id: parent_uuid.map(room_id_from_uuid),
-        description,
-        inherit_acl: true,
-        acls: vec![],
-        effective_permissions: 0,
-    };
-    broadcast_state_update(
-        &state,
-        proto::state_update::Update::RoomCreated(proto::RoomCreated { room: Some(room_info) }),
-    )
-    .await?;
-
-    // Send confirmation to the requesting client
-    send_command_result(&sender, "CreateRoom", true, &format!("Created room '{}'", room_name)).await?;
     Ok(())
 }
 
@@ -1241,50 +1157,14 @@ async fn handle_delete_room(
         return Ok(());
     }
 
-    // Cannot delete the root room
-    if room_uuid == ROOT_ROOM_UUID {
-        return send_command_result(&sender, "DeleteRoom", false, "Cannot delete the Root room").await;
-    }
-
-    // Get room name before deleting
-    let room_name = state
-        .get_rooms()
-        .await
-        .iter()
-        .find(|r| r.id.as_ref().and_then(uuid_from_room_id) == Some(room_uuid))
-        .map(|r| r.name.clone())
-        .unwrap_or_else(|| "room".to_string());
-
-    info!("DeleteRoom: {}", room_uuid);
-    let deleted = state.delete_room(room_uuid).await;
-
-    if !deleted {
-        return send_command_result(&sender, "DeleteRoom", false, "Room not found").await;
-    }
-
-    // Remove from persistence
-    if let Some(persist) = &persistence {
-        if let Err(e) = persist.delete_room(&room_uuid.into_bytes()) {
-            warn!("Failed to remove room from persistence: {e}");
+    match crate::ops::apply_delete_room(&state, persistence.as_ref(), room_uuid).await {
+        Ok(room_name) => {
+            send_command_result(&sender, "DeleteRoom", true, &format!("Deleted room '{}'", room_name)).await?;
         }
-        // Clean up room ACL data
-        if let Err(e) = persist.delete_room_acl(&room_uuid.into_bytes()) {
-            warn!("Failed to remove room ACL data from persistence: {e}");
+        Err(msg) => {
+            send_command_result(&sender, "DeleteRoom", false, &msg).await?;
         }
     }
-
-    // Send incremental update to all clients
-    broadcast_state_update(
-        &state,
-        proto::state_update::Update::RoomDeleted(proto::RoomDeleted {
-            room_id: Some(room_id_from_uuid(room_uuid)),
-            fallback_room_id: Some(room_id_from_uuid(ROOT_ROOM_UUID)),
-        }),
-    )
-    .await?;
-
-    // Send confirmation to the requesting client
-    send_command_result(&sender, "DeleteRoom", true, &format!("Deleted room '{}'", room_name)).await?;
     Ok(())
 }
 
@@ -2049,56 +1929,16 @@ async fn handle_kick_user(
 
     let target_user_id = ku.target_user_id;
 
-    // Cannot kick yourself
+    // Cannot kick yourself (sender-relative; the shared core has no notion of "self")
     if target_user_id == sender.user_id {
         return send_command_result(&sender, "KickUser", false, "Cannot kick yourself").await;
     }
 
-    let target_client = match state.get_client(target_user_id) {
-        Some(c) => c,
-        None => {
-            return send_command_result(&sender, "KickUser", false, "User not found").await;
-        }
-    };
-
-    // Cannot kick elevated superusers
-    if target_client.is_superuser.load(Ordering::Relaxed) {
-        return send_command_result(&sender, "KickUser", false, "Cannot kick a superuser").await;
-    }
-
-    // Cannot kick bridge connections (would disconnect all virtual users)
-    if target_client.is_controller.load(Ordering::SeqCst) {
-        return send_command_result(&sender, "KickUser", false, "Cannot kick a bridge connection").await;
-    }
-
     let kicked_by = sender.get_username().await;
-    let target_username = target_client.get_username().await;
-    info!(
-        kicked_by = %kicked_by,
-        target = %target_username,
-        reason = %ku.reason,
-        "KickUser"
-    );
-
-    // Send UserKicked to the target
-    let kicked_env = proto::Envelope {
-        state_hash: Vec::new(),
-        payload: Some(Payload::UserKicked(proto::UserKicked {
-            user_id: target_user_id,
-            reason: ku.reason.clone(),
-            kicked_by: kicked_by.clone(),
-        })),
-    };
-    let frame = encode_frame(&kicked_env);
-    let _ = target_client.send_frame(&frame).await;
-
-    // Close the target's connection
-    target_client.conn.close(quinn::VarInt::from_u32(2), b"kicked");
-
-    // Clean up the kicked user (broadcasts UserLeft)
-    cleanup_client(&target_client, &state).await;
-
-    send_command_result(&sender, "KickUser", true, &format!("Kicked '{}'", target_username)).await
+    match crate::ops::apply_kick(&state, target_user_id, &ku.reason, &kicked_by).await {
+        Ok(msg) => send_command_result(&sender, "KickUser", true, &msg).await,
+        Err(msg) => send_command_result(&sender, "KickUser", false, &msg).await,
+    }
 }
 
 /// Handle BanUser - ban a user from the server.
@@ -2120,114 +1960,25 @@ async fn handle_ban_user(
 
     let target_user_id = bu.target_user_id;
 
-    // Cannot ban yourself
+    // Cannot ban yourself (sender-relative; the shared core has no notion of "self")
     if target_user_id == sender.user_id {
         return send_command_result(&sender, "BanUser", false, "Cannot ban yourself").await;
     }
 
-    let target_client = match state.get_client(target_user_id) {
-        Some(c) => c,
-        None => {
-            return send_command_result(&sender, "BanUser", false, "User not found").await;
-        }
-    };
-
-    // Cannot ban elevated superusers
-    if target_client.is_superuser.load(Ordering::Relaxed) {
-        return send_command_result(&sender, "BanUser", false, "Cannot ban a superuser").await;
-    }
-
-    // Cannot ban bridge connections
-    if target_client.is_controller.load(Ordering::SeqCst) {
-        return send_command_result(&sender, "BanUser", false, "Cannot ban a bridge connection").await;
-    }
-
-    let Some(persist) = &persistence else {
-        return send_command_result(&sender, "BanUser", false, "Persistence not enabled").await;
-    };
-
-    // Ensure "banned" group exists with the BANNED permission flag
-    if persist.get_group("banned").is_none() {
-        let _ = persist.create_group("banned", Permissions::BANNED.bits());
-    }
-
-    // Add target to "banned" group and persist a timed ban record.
-    let target_key = state.get_user_public_key(target_user_id);
-    if let Some(key) = target_key {
-        let _ = persist.add_user_to_group(&key, "banned");
-
-        // Record the ban with a creation timestamp so expiry can be computed.
-        let banned_at_secs = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let ban_record = crate::persistence::PersistedBan {
-            banned_at_secs: Some(banned_at_secs),
-            duration_seconds: bu.duration_seconds,
-            reason: bu.reason.clone(),
-            banned_by: sender.get_username().await,
-        };
-        if let Err(e) = persist.set_ban(&key, &ban_record) {
-            warn!("Failed to persist ban record: {e}");
-        }
-    } else {
-        return send_command_result(&sender, "BanUser", false, "Cannot resolve user's public key").await;
-    }
-
-    // Update cached groups if they're connected
-    {
-        let mut groups = target_client.identity.groups().await;
-        if !groups.contains(&"banned".to_string()) {
-            groups.push("banned".to_string());
-            target_client.identity.set_groups(groups).await;
-        }
-    }
-
     let banned_by = sender.get_username().await;
-    let target_username = target_client.get_username().await;
-    let duration_desc = if bu.duration_seconds == 0 {
-        "permanent".to_string()
-    } else {
-        format!("{}s", bu.duration_seconds)
-    };
-    info!(
-        banned_by = %banned_by,
-        target = %target_username,
-        reason = %bu.reason,
-        duration = %duration_desc,
-        "BanUser"
-    );
-
-    // Send UserKicked to the target (they see a ban message)
-    let ban_reason = if bu.reason.is_empty() {
-        format!("Banned by {} ({})", banned_by, duration_desc)
-    } else {
-        format!("Banned by {} ({}): {}", banned_by, duration_desc, bu.reason)
-    };
-    let kicked_env = proto::Envelope {
-        state_hash: Vec::new(),
-        payload: Some(Payload::UserKicked(proto::UserKicked {
-            user_id: target_user_id,
-            reason: ban_reason,
-            kicked_by: banned_by.clone(),
-        })),
-    };
-    let frame = encode_frame(&kicked_env);
-    let _ = target_client.send_frame(&frame).await;
-
-    // Close the target's connection
-    target_client.conn.close(quinn::VarInt::from_u32(3), b"banned");
-
-    // Clean up the banned user (broadcasts UserLeft)
-    cleanup_client(&target_client, &state).await;
-
-    send_command_result(
-        &sender,
-        "BanUser",
-        true,
-        &format!("Banned '{}' ({})", target_username, duration_desc),
+    match crate::ops::apply_ban(
+        &state,
+        persistence.as_ref(),
+        target_user_id,
+        bu.duration_seconds,
+        &bu.reason,
+        &banned_by,
     )
     .await
+    {
+        Ok(msg) => send_command_result(&sender, "BanUser", true, &msg).await,
+        Err(msg) => send_command_result(&sender, "BanUser", false, &msg).await,
+    }
 }
 
 /// Handle SetServerMute - set server mute on another user.
@@ -2383,58 +2134,10 @@ async fn handle_create_group(
         return Ok(());
     }
 
-    let Some(persist) = &persistence else {
-        return send_command_result(&sender, "CreateGroup", false, "Persistence not enabled").await;
-    };
-
-    if cg.name.is_empty() {
-        return send_command_result(&sender, "CreateGroup", false, "Group name cannot be empty").await;
+    match crate::ops::apply_create_group(&state, persistence.as_ref(), cg.name, cg.permissions).await {
+        Ok(msg) => send_command_result(&sender, "CreateGroup", true, &msg).await,
+        Err(msg) => send_command_result(&sender, "CreateGroup", false, &msg).await,
     }
-
-    // Prevent creating built-in groups
-    if cg.name == "default" || cg.name == "admin" {
-        return send_command_result(&sender, "CreateGroup", false, "Cannot create built-in groups").await;
-    }
-
-    // Check if group already exists
-    if persist.get_group(&cg.name).is_some() {
-        return send_command_result(&sender, "CreateGroup", false, "Group already exists").await;
-    }
-
-    // Validate group name doesn't collide with a registered username
-    // (username-as-group pattern from the spec)
-    if persist.is_username_registered(&cg.name) {
-        return send_command_result(
-            &sender,
-            "CreateGroup",
-            false,
-            "Group name conflicts with a registered username",
-        )
-        .await;
-    }
-
-    // Store group in persistence
-    if let Err(e) = persist.create_group(&cg.name, cg.permissions) {
-        return send_command_result(&sender, "CreateGroup", false, &format!("Failed: {e}")).await;
-    }
-
-    info!(group = %cg.name, permissions = cg.permissions, "CreateGroup");
-
-    // Broadcast GroupChanged state update
-    let _ = broadcast_state_update(
-        &state,
-        proto::state_update::Update::GroupChanged(proto::GroupChanged {
-            group: Some(proto::GroupInfo {
-                name: cg.name.clone(),
-                permissions: cg.permissions,
-                is_builtin: false,
-            }),
-            deleted: false,
-        }),
-    )
-    .await;
-
-    send_command_result(&sender, "CreateGroup", true, &format!("Created group '{}'", cg.name)).await
 }
 
 /// Handle DeleteGroup - delete a permission group.
@@ -2452,65 +2155,10 @@ async fn handle_delete_group(
         return Ok(());
     }
 
-    let Some(persist) = &persistence else {
-        return send_command_result(&sender, "DeleteGroup", false, "Persistence not enabled").await;
-    };
-
-    // Prevent deleting built-in groups
-    if dg.name == "default" || dg.name == "admin" {
-        return send_command_result(&sender, "DeleteGroup", false, "Cannot delete built-in groups").await;
+    match crate::ops::apply_delete_group(&state, persistence.as_ref(), dg.name).await {
+        Ok(msg) => send_command_result(&sender, "DeleteGroup", true, &msg).await,
+        Err(msg) => send_command_result(&sender, "DeleteGroup", false, &msg).await,
     }
-
-    info!(group = %dg.name, "DeleteGroup");
-
-    // Clean up user-group references BEFORE deleting the group itself.
-    // This ordering minimizes the crash window: if the server crashes
-    // mid-operation the group still exists in sled and the delete can be retried.
-
-    // Remove group from all connected clients' in-memory group lists
-    // and broadcast UserGroupChanged for each affected user
-    let clients = state.snapshot_clients();
-    for client in &clients {
-        let mut groups = client.identity.groups().await;
-        if groups.contains(&dg.name) {
-            groups.retain(|g| g != &dg.name);
-            client.identity.set_groups(groups).await;
-            let _ = broadcast_state_update(
-                &state,
-                proto::state_update::Update::UserGroupChanged(proto::UserGroupChanged {
-                    user_id: client.user_id,
-                    group: dg.name.clone(),
-                    added: false,
-                    expires_at: 0,
-                }),
-            )
-            .await;
-        }
-    }
-
-    // Clean up persistence: remove group from all users' stored group lists
-    persist.remove_group_from_all_users(&dg.name);
-
-    // Now delete the group itself
-    if let Err(e) = persist.delete_group(&dg.name) {
-        return send_command_result(&sender, "DeleteGroup", false, &format!("Failed: {e}")).await;
-    }
-
-    // Broadcast GroupChanged state update (deleted)
-    let _ = broadcast_state_update(
-        &state,
-        proto::state_update::Update::GroupChanged(proto::GroupChanged {
-            group: Some(proto::GroupInfo {
-                name: dg.name.clone(),
-                permissions: 0,
-                is_builtin: false,
-            }),
-            deleted: true,
-        }),
-    )
-    .await;
-
-    send_command_result(&sender, "DeleteGroup", true, &format!("Deleted group '{}'", dg.name)).await
 }
 
 /// Handle ModifyGroup - modify a permission group.
@@ -2528,38 +2176,10 @@ async fn handle_modify_group(
         return Ok(());
     }
 
-    let Some(persist) = &persistence else {
-        return send_command_result(&sender, "ModifyGroup", false, "Persistence not enabled").await;
-    };
-
-    match persist.modify_group(&mg.name, mg.permissions) {
-        Ok(false) => {
-            return send_command_result(&sender, "ModifyGroup", false, "Group not found").await;
-        }
-        Err(e) => {
-            return send_command_result(&sender, "ModifyGroup", false, &format!("Failed: {e}")).await;
-        }
-        Ok(true) => {}
+    match crate::ops::apply_modify_group(&state, persistence.as_ref(), mg.name, mg.permissions).await {
+        Ok(msg) => send_command_result(&sender, "ModifyGroup", true, &msg).await,
+        Err(msg) => send_command_result(&sender, "ModifyGroup", false, &msg).await,
     }
-
-    info!(group = %mg.name, permissions = mg.permissions, "ModifyGroup");
-
-    // Broadcast GroupChanged state update
-    let builtin = ["default", "admin"];
-    let _ = broadcast_state_update(
-        &state,
-        proto::state_update::Update::GroupChanged(proto::GroupChanged {
-            group: Some(proto::GroupInfo {
-                name: mg.name.clone(),
-                permissions: mg.permissions,
-                is_builtin: builtin.contains(&mg.name.as_str()),
-            }),
-            deleted: false,
-        }),
-    )
-    .await;
-
-    send_command_result(&sender, "ModifyGroup", true, &format!("Modified group '{}'", mg.name)).await
 }
 
 /// Handle SetUserGroup - add or remove a user from a group.
@@ -2577,70 +2197,19 @@ async fn handle_set_user_group(
         return Ok(());
     }
 
-    let Some(persist) = &persistence else {
-        return send_command_result(&sender, "SetUserGroup", false, "Persistence not enabled").await;
-    };
-
-    let target_user_id = sug.target_user_id;
-
-    // Update the target's cached groups if they're connected
-    if let Some(target_client) = state.get_client(target_user_id) {
-        let mut groups = target_client.identity.groups().await;
-        let before = groups.len();
-        if sug.add {
-            if !groups.contains(&sug.group) {
-                groups.push(sug.group.clone());
-            }
-        } else {
-            groups.retain(|g| g != &sug.group);
-        }
-        if groups.len() != before {
-            target_client.identity.set_groups(groups).await;
-        }
-    }
-
-    // Store in persistence
-    let target_key = state.get_user_public_key(target_user_id);
-    if let Some(key) = target_key {
-        if sug.add {
-            let _ = persist.add_user_to_group(&key, &sug.group);
-        } else {
-            let _ = persist.remove_user_from_group(&key, &sug.group);
-        }
-    }
-
-    let action = if sug.add { "Added" } else { "Removed" };
-    info!(
-        target_user_id,
-        group = %sug.group,
-        action,
-        "SetUserGroup"
-    );
-
-    // Broadcast UserGroupChanged state update
-    let _ = broadcast_state_update(
+    match crate::ops::apply_set_user_group(
         &state,
-        proto::state_update::Update::UserGroupChanged(proto::UserGroupChanged {
-            user_id: target_user_id,
-            group: sug.group.clone(),
-            added: sug.add,
-            expires_at: sug.expires_at,
-        }),
-    )
-    .await;
-
-    send_command_result(
-        &sender,
-        "SetUserGroup",
-        true,
-        &format!(
-            "{} user {} group '{}'",
-            action,
-            if sug.add { "to" } else { "from" },
-            sug.group
-        ),
+        persistence.as_ref(),
+        sug.target_user_id,
+        sug.group,
+        sug.add,
+        sug.expires_at,
     )
     .await
+    {
+        Ok(msg) => send_command_result(&sender, "SetUserGroup", true, &msg).await,
+        Err(msg) => send_command_result(&sender, "SetUserGroup", false, &msg).await,
+    }
 }
 
 /// Handle SetRoomAcl - set ACL entries on a room.
@@ -2668,77 +2237,10 @@ async fn handle_set_room_acl(
         return Ok(());
     }
 
-    let Some(persist) = &persistence else {
-        return send_command_result(&sender, "SetRoomAcl", false, "Persistence not enabled").await;
-    };
-
-    // Build the persisted ACL data using the correct persistence type
-    let persisted_acl = crate::persistence::PersistedRoomAcl {
-        inherit_acl: sra.inherit_acl,
-        entries: sra
-            .entries
-            .iter()
-            .map(|e| crate::persistence::PersistedAclEntry {
-                group: e.group.clone(),
-                grant: e.grant,
-                deny: e.deny,
-                apply_here: e.apply_here,
-                apply_subs: e.apply_subs,
-            })
-            .collect(),
-    };
-
-    if let Err(e) = persist.set_room_acl(room_uuid.as_bytes(), &persisted_acl) {
-        error!(room = %room_uuid, "Failed to persist room ACL: {e:?}");
-        return send_command_result(&sender, "SetRoomAcl", false, "Failed to persist ACL").await;
+    match crate::ops::apply_set_room_acl(&state, persistence.as_ref(), room_uuid, sra.inherit_acl, sra.entries).await {
+        Ok(msg) => send_command_result(&sender, "SetRoomAcl", true, &msg).await,
+        Err(msg) => send_command_result(&sender, "SetRoomAcl", false, &msg).await,
     }
-
-    // Update in-memory room state with new ACL data
-    state
-        .set_room_acl(room_uuid, sra.inherit_acl, sra.entries.clone())
-        .await;
-
-    info!(room = %room_uuid, entries = sra.entries.len(), "SetRoomAcl");
-
-    // Broadcast RoomAclChanged to all clients
-    broadcast_state_update(
-        &state,
-        proto::state_update::Update::RoomAclChanged(proto::RoomAclChanged {
-            room_id: Some(room_id_from_uuid(room_uuid)),
-            inherit_acl: sra.inherit_acl,
-            entries: sra.entries.clone(),
-        }),
-    )
-    .await?;
-
-    // Re-evaluate SPEAK permission for all users in this room
-    let room_members = state.get_room_members(room_uuid).await;
-    for member_id in room_members {
-        if let Some(client) = state.get_client(member_id) {
-            let speak_perms = acl::evaluate_user_permissions(&state, &client, room_uuid, &persistence).await;
-            let speak_denied = !speak_perms.contains(Permissions::SPEAK);
-            let manually_muted = client.manually_server_muted.load(Ordering::Relaxed);
-            let should_mute = speak_denied || manually_muted;
-            let was_muted = client.server_muted.load(Ordering::Relaxed);
-            if should_mute != was_muted {
-                client.server_muted.store(should_mute, Ordering::Relaxed);
-                let status = state.get_user_status(member_id).await;
-                let _ = broadcast_state_update(
-                    &state,
-                    proto::state_update::Update::UserStatusChanged(proto::UserStatusChanged {
-                        user_id: Some(proto::UserId { value: member_id }),
-                        is_muted: status.is_muted,
-                        is_deafened: status.is_deafened,
-                        server_muted: should_mute,
-                        is_elevated: client.is_superuser.load(Ordering::Relaxed),
-                    }),
-                )
-                .await;
-            }
-        }
-    }
-
-    send_command_result(&sender, "SetRoomAcl", true, "Room ACL updated").await
 }
 
 // =============================================================================

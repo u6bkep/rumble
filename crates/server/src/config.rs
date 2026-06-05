@@ -68,6 +68,21 @@ domain = "localhost"
 # Can also be set via RUMBLE_WELCOME_MESSAGE environment variable.
 # welcome_message = "Welcome to the Rumble server!"
 
+# Web Admin Control-Plane
+# =======================
+# An HTTP server for administering the running server from a browser
+# (groups, ACLs, rooms, bans, live monitoring). Authenticate with the sudo
+# password (see `server set-sudo-password`). Disabled by default.
+#
+# Bind to loopback (the default) and front it with a reverse proxy / SSH
+# tunnel for TLS and remote access. Can be toggled via RUMBLE_WEB_ENABLED=1
+# and RUMBLE_WEB_BIND.
+[web]
+enabled = false
+bind = "127.0.0.1:5001"
+# assets_dir = "admin-web"   # serve the wasm UI bundle from here (dev);
+#                            # omit to serve the bundle embedded in the binary.
+
 # Plugin Configuration
 # ====================
 # Each plugin has its own [plugins.<name>] section.
@@ -158,6 +173,52 @@ pub struct FileConfig {
     /// Each key is a plugin name, value is plugin-specific TOML.
     #[serde(default)]
     pub plugins: HashMap<String, toml::Value>,
+
+    /// Web admin control-plane settings (`[web]` section).
+    #[serde(default)]
+    pub web: WebFileConfig,
+}
+
+/// `[web]` configuration section: the HTTP admin control-plane.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebFileConfig {
+    /// Enable the web admin server. Disabled by default — remote exposure is
+    /// opt-in.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Address to bind the web server to. Defaults to loopback so remote
+    /// access requires an explicit bind change (or a reverse proxy / tunnel).
+    #[serde(default = "default_web_bind")]
+    pub bind: String,
+
+    /// Directory to serve the wasm admin UI bundle from (dev). When unset, the
+    /// embedded bundle baked into the binary is served.
+    #[serde(default)]
+    pub assets_dir: Option<PathBuf>,
+}
+
+fn default_web_bind() -> String {
+    "127.0.0.1:5001".to_string()
+}
+
+impl Default for WebFileConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind: default_web_bind(),
+            assets_dir: None,
+        }
+    }
+}
+
+/// Resolved web admin settings (present only when enabled).
+#[derive(Debug, Clone)]
+pub struct WebSettings {
+    /// Socket address the web admin server binds to.
+    pub bind: SocketAddr,
+    /// Optional directory to serve the admin UI from (dev override).
+    pub assets_dir: Option<PathBuf>,
 }
 
 fn default_bind() -> String {
@@ -190,6 +251,7 @@ impl Default for FileConfig {
             domain: default_domain(),
             welcome_message: None,
             plugins: HashMap::new(),
+            web: WebFileConfig::default(),
         }
     }
 }
@@ -215,6 +277,8 @@ pub struct ServerConfig {
     pub welcome_message: Option<String>,
     /// Plugin configuration sections (raw TOML, passed to plugin factories).
     pub plugins: HashMap<String, toml::Value>,
+    /// Resolved web admin settings, present only when `[web].enabled`.
+    pub web: Option<WebSettings>,
 }
 
 impl ServerConfig {
@@ -288,6 +352,24 @@ impl ServerConfig {
         let data_dir = resolve_path(&base_dir, &data_dir);
         let cert_dir = resolve_path(&base_dir, &cert_dir);
 
+        // Resolve web admin settings (env override for enable/bind to ease ops).
+        let web_enabled = std::env::var("RUMBLE_WEB_ENABLED")
+            .ok()
+            .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+            .unwrap_or(file_config.web.enabled);
+        let web = if web_enabled {
+            let web_bind_str = std::env::var("RUMBLE_WEB_BIND").unwrap_or(file_config.web.bind);
+            let web_bind = parse_bind_address(&web_bind_str)
+                .with_context(|| format!("Invalid web bind address: {}", web_bind_str))?;
+            let assets_dir = file_config.web.assets_dir.map(|d| resolve_path(&base_dir, &d));
+            Some(WebSettings {
+                bind: web_bind,
+                assets_dir,
+            })
+        } else {
+            None
+        };
+
         Ok(Self {
             bind,
             log_level,
@@ -297,6 +379,7 @@ impl ServerConfig {
             base_dir,
             welcome_message,
             plugins: file_config.plugins,
+            web,
         })
     }
 

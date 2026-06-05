@@ -223,6 +223,7 @@ async fn main() -> Result<()> {
         data_dir,
         welcome_message: server_config.welcome_message,
         plugins,
+        web: server_config.web,
     };
 
     let server = Server::new(config)?;

@@ -1,0 +1,183 @@
+//! Shared serde DTOs for the Rumble server's web admin REST API.
+//!
+//! These types define the JSON wire shape exchanged between the server's web
+//! control-plane (`server::web`) and the wasm admin UI (`rumble-admin-web`).
+//! They are deliberately explicit hand-written structs rather than the
+//! prost-generated protocol types: the HTTP surface is decoupled from the QUIC
+//! wire format, and both ends depend on this one crate so they cannot drift.
+//!
+//! UUIDs are carried as plain lowercase-hyphenated strings; permission masks
+//! are raw `u32` bitfields (see `rumble_protocol::permissions::Permissions`).
+
+#![forbid(unsafe_code)]
+
+use serde::{Deserialize, Serialize};
+
+// =============================================================================
+// Generic envelopes
+// =============================================================================
+
+/// A successful action with a human-readable message.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OkMessage {
+    pub message: String,
+}
+
+/// A failed action with a user-facing reason. Returned as the JSON body of 4xx
+/// responses.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiError {
+    pub error: String,
+}
+
+// =============================================================================
+// Auth & bootstrap
+// =============================================================================
+
+/// `POST /api/login` — authenticate with the server's sudo password. On success
+/// the server sets an HttpOnly session cookie.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoginRequest {
+    pub password: String,
+}
+
+/// `GET /api/session` — reports whether the caller holds a live session and
+/// whether the server still needs first-run bootstrap.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionInfo {
+    pub authenticated: bool,
+    /// True when no sudo password is configured yet, so the bootstrap flow is
+    /// available.
+    pub needs_bootstrap: bool,
+}
+
+/// `POST /api/bootstrap` — first-run setup, available only while no sudo
+/// password is configured. Guarded by the one-time setup token printed to the
+/// server log at startup.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BootstrapRequest {
+    /// The one-time token printed to the server log at startup.
+    pub setup_token: String,
+    /// The sudo password to set (also the web admin login credential).
+    pub sudo_password: String,
+    /// Base64 Ed25519 public key to seed into the `admin` group. Optional.
+    #[serde(default)]
+    pub admin_public_key_b64: Option<String>,
+}
+
+// =============================================================================
+// Permission groups
+// =============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupDto {
+    pub name: String,
+    pub permissions: u32,
+    pub is_builtin: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateGroupRequest {
+    pub name: String,
+    pub permissions: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModifyGroupRequest {
+    pub permissions: u32,
+}
+
+/// `POST /api/users/{id}/groups` — add or remove a connected user to/from a
+/// group.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetUserGroupRequest {
+    pub group: String,
+    pub add: bool,
+    #[serde(default)]
+    pub expires_at: u64,
+}
+
+// =============================================================================
+// Rooms & ACLs
+// =============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoomDto {
+    /// Room UUID as a lowercase-hyphenated string.
+    pub id: String,
+    pub name: String,
+    pub parent_id: Option<String>,
+    pub description: Option<String>,
+    pub inherit_acl: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateRoomRequest {
+    pub name: String,
+    #[serde(default)]
+    pub parent_id: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AclEntryDto {
+    pub group: String,
+    pub grant: u32,
+    pub deny: u32,
+    pub apply_here: bool,
+    pub apply_subs: bool,
+}
+
+/// `PUT /api/rooms/{uuid}/acl` — replace a room's ACL entries.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetRoomAclRequest {
+    pub inherit_acl: bool,
+    #[serde(default)]
+    pub entries: Vec<AclEntryDto>,
+}
+
+// =============================================================================
+// Moderation
+// =============================================================================
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct KickRequest {
+    #[serde(default)]
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BanRequest {
+    /// `0` means a permanent ban.
+    #[serde(default)]
+    pub duration_seconds: u64,
+    #[serde(default)]
+    pub reason: String,
+}
+
+// =============================================================================
+// Monitoring
+// =============================================================================
+
+/// A connected user as seen by the admin monitor.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserDto {
+    pub user_id: u64,
+    pub username: String,
+    pub room_id: Option<String>,
+    pub is_muted: bool,
+    pub is_deafened: bool,
+    pub server_muted: bool,
+    pub is_elevated: bool,
+    pub groups: Vec<String>,
+}
+
+/// `GET /api/state` — a snapshot of live server state for the dashboard.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StateSnapshot {
+    pub client_count: usize,
+    pub users: Vec<UserDto>,
+    pub rooms: Vec<RoomDto>,
+    pub groups: Vec<GroupDto>,
+}

@@ -18,6 +18,7 @@ default-members = [
     "crates/rumble-desktop-shell",
     "crates/rumble-protocol",
     "crates/rumble-video",
+    "crates/rumble-web-types",
     "crates/server",
     "xtask",
 ]

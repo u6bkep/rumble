@@ -1,0 +1,12 @@
+[package]
+name = "rumble-web-types"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Shared serde DTOs for the Rumble server web admin REST API"
+
+[lib]
+# Kept dependency-light and platform-neutral so it compiles for both the native
+# server and the wasm32 admin UI.
+[dependencies]
+serde = { workspace = true }

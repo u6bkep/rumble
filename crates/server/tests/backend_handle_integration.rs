@@ -1350,3 +1350,186 @@ fn test_set_output_device() {
 
     assert!(updated, "Selected output device should be updated");
 }
+
+// =============================================================================
+// Web admin control-plane ↔ QUIC cross-path integration
+// =============================================================================
+
+/// Start a server with the web admin control-plane enabled on `web_port`, with
+/// the bootstrap setup token pinned to `setup_token` (via RUMBLE_WEB_SETUP_TOKEN)
+/// so the test can complete first-run setup deterministically.
+fn start_server_with_web(port: u16, web_port: u16, setup_token: &str) -> ServerGuard {
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let cert_dir = temp_dir.path().join("certs");
+    let data_dir = temp_dir.path().join("data");
+    std::fs::create_dir_all(&cert_dir).expect("failed to create cert dir");
+    std::fs::create_dir_all(&data_dir).expect("failed to create data dir");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_server"))
+        .env("RUMBLE_NO_CONFIG", "1")
+        .env("RUMBLE_PORT", port.to_string())
+        .env("RUMBLE_CERT_DIR", cert_dir.to_str().unwrap())
+        .env("RUMBLE_DATA_DIR", data_dir.to_str().unwrap())
+        .env("RUMBLE_WEB_ENABLED", "1")
+        .env("RUMBLE_WEB_BIND", format!("127.0.0.1:{web_port}"))
+        .env("RUMBLE_WEB_SETUP_TOKEN", setup_token)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to start server binary");
+
+    if let Some(out) = child.stdout.take() {
+        std::thread::spawn(move || {
+            for line in BufReader::new(out).lines().map_while(Result::ok) {
+                println!("[web-server:{port} stdout] {line}");
+            }
+        });
+    }
+    if let Some(err) = child.stderr.take() {
+        std::thread::spawn(move || {
+            for line in BufReader::new(err).lines().map_while(Result::ok) {
+                eprintln!("[web-server:{port} stderr] {line}");
+            }
+        });
+    }
+
+    // Wait for certs to be generated.
+    let cert_path = cert_dir.join("fullchain.pem");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !cert_path.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    ServerGuard {
+        child: Some(child),
+        _temp_dir: temp_dir,
+        cert_path,
+    }
+}
+
+/// Minimal blocking HTTP/1.1 request helper for the web admin API. Returns
+/// `(status, body, set_cookie_value)`. Sends `Connection: close` so the server
+/// closes the socket after the response (letting us read to EOF).
+fn http_request(
+    addr: &str,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+    cookie: Option<&str>,
+) -> (u16, String, Option<String>) {
+    use std::io::{Read, Write};
+
+    let mut stream = std::net::TcpStream::connect(addr).expect("connect to web admin");
+    let body = body.unwrap_or("");
+    let mut req = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nContent-Type: \
+         application/json\r\nContent-Length: {}\r\n",
+        body.len()
+    );
+    if let Some(c) = cookie {
+        req.push_str(&format!("Cookie: {c}\r\n"));
+    }
+    req.push_str("\r\n");
+    req.push_str(body);
+    stream.write_all(req.as_bytes()).expect("write request");
+
+    let mut resp = String::new();
+    stream.read_to_string(&mut resp).expect("read response");
+
+    let status = resp
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let set_cookie = resp.lines().find_map(|l| {
+        let lower = l.to_ascii_lowercase();
+        if lower.starts_with("set-cookie:") {
+            l.splitn(2, ':')
+                .nth(1)
+                .map(|v| v.trim().split(';').next().unwrap_or("").to_string())
+        } else {
+            None
+        }
+    });
+    let body_part = resp.splitn(2, "\r\n\r\n").nth(1).unwrap_or("").to_string();
+    (status, body_part, set_cookie)
+}
+
+/// A room created via the REST admin API must be broadcast to an already
+/// connected QUIC client — proving the web path and the protocol path share
+/// the same `ops::*` mutation/broadcast cores.
+#[test]
+fn test_web_admin_mutation_reaches_connected_client() {
+    let port = next_test_port();
+    let web_port = next_test_port();
+    let setup_token = "test-setup-token";
+    let server = start_server_with_web(port, web_port, setup_token);
+    std::thread::sleep(Duration::from_millis(500));
+
+    let web_addr = format!("127.0.0.1:{web_port}");
+
+    // Bootstrap: set the sudo password via the pinned one-time setup token.
+    let (status, body, _) = http_request(
+        &web_addr,
+        "POST",
+        "/api/bootstrap",
+        Some(&format!(
+            "{{\"setup_token\":\"{setup_token}\",\"sudo_password\":\"webpass\"}}"
+        )),
+        None,
+    );
+    assert_eq!(status, 200, "bootstrap should succeed (body={body:?})");
+
+    // Log in to obtain a session cookie.
+    let (status, body, cookie) = http_request(
+        &web_addr,
+        "POST",
+        "/api/login",
+        Some("{\"password\":\"webpass\"}"),
+        None,
+    );
+    assert_eq!(status, 200, "login should succeed (body={body:?})");
+    let cookie = cookie.expect("login should set a session cookie");
+
+    // Connect a QUIC client.
+    let (handle, _repaint, public_key) = create_backend_with_repaint_and_cert(&server.cert_path);
+    send_connect(
+        &handle,
+        public_key,
+        format!("127.0.0.1:{port}"),
+        "web-observer".to_string(),
+        None,
+    );
+    assert!(
+        wait_for(&handle, Duration::from_secs(5), |s| s.connection.is_connected()),
+        "client should connect"
+    );
+    let initial_room_count = handle.state().rooms.len();
+
+    // Create a room via the REST API (authenticated).
+    let (status, _body, _) = http_request(
+        &web_addr,
+        "POST",
+        "/api/rooms",
+        Some("{\"name\":\"Web Created Room\"}"),
+        Some(&cookie),
+    );
+    assert_eq!(status, 200, "REST room creation should succeed");
+
+    // The connected QUIC client must observe the new room via the broadcast.
+    let observed = wait_for(&handle, Duration::from_secs(3), |s| {
+        s.rooms.len() > initial_room_count && s.rooms.iter().any(|r| r.name == "Web Created Room")
+    });
+    assert!(observed, "connected client should observe the REST-created room");
+
+    // An unauthenticated REST mutation must be rejected.
+    let (status, _body, _) = http_request(
+        &web_addr,
+        "POST",
+        "/api/rooms",
+        Some("{\"name\":\"Should Fail\"}"),
+        None,
+    );
+    assert_eq!(status, 401, "unauthenticated mutation should be rejected");
+}

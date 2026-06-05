@@ -38,6 +38,8 @@ pub struct Config {
     pub welcome_message: Option<String>,
     /// Server plugins (compile-time extensions).
     pub plugins: Vec<Box<dyn ServerPlugin>>,
+    /// Web admin control-plane settings, when enabled.
+    pub web: Option<crate::config::WebSettings>,
 }
 
 /// The Rumble VOIP server.
@@ -50,6 +52,7 @@ pub struct Server {
     persistence: Option<Arc<Persistence>>,
     plugins: Vec<Arc<dyn ServerPlugin>>,
     plugin_ctx: Arc<ServerCtx>,
+    web: Option<crate::config::WebSettings>,
 }
 
 impl Server {
@@ -104,6 +107,7 @@ impl Server {
             persistence,
             plugins,
             plugin_ctx,
+            web: config.web,
         })
     }
 
@@ -172,6 +176,11 @@ impl Server {
                     }
                 }
             });
+        }
+
+        // Start the web admin control-plane, if enabled.
+        if let Some(web_settings) = self.web.clone() {
+            crate::web::spawn(self.state.clone(), self.persistence.clone(), web_settings);
         }
 
         // Start plugins before accepting connections

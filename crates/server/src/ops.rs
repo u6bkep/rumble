@@ -1,0 +1,611 @@
+//! Sender-free admin mutation cores.
+//!
+//! Each `apply_*` function performs the *post-authorization* mutation for one
+//! admin operation: persist → mutate in-memory [`ServerState`] → broadcast the
+//! change to connected clients (and force-disconnect for kick/ban). They take
+//! no `ClientHandle` and run no permission checks, so the same logic is shared
+//! by two callers:
+//!
+//! - the QUIC protocol handlers in [`crate::handlers`], which authorize via
+//!   `acl::check_permission` against the requesting client and then delegate
+//!   here, and
+//! - the web control-plane in [`crate::web`], which authorizes via an admin
+//!   session (the sudo password) and then delegates here.
+//!
+//! This keeps the mutation/broadcast invariants encoded exactly once.
+//!
+//! Convention: every function returns `Result<T, String>` where `Err(msg)`
+//! carries a user-facing failure reason (e.g. "User not found"). Protocol
+//! handlers map this onto `CommandResult { success, message }`; the web layer
+//! maps `Err` onto an HTTP error body. `Ok` carries either a success message or
+//! a value the caller needs (e.g. the new room UUID).
+
+use crate::{
+    handlers::{broadcast_state_update, cleanup_client},
+    persistence::{PersistedAclEntry, PersistedBan, PersistedRoom, PersistedRoomAcl, Persistence, RegisteredUser},
+    state::ServerState,
+};
+use rumble_protocol::{encode_frame, permissions::Permissions, proto, proto::envelope::Payload, room_id_from_uuid};
+use std::{
+    sync::{Arc, atomic::Ordering},
+    time::{SystemTime, UNIX_EPOCH},
+};
+use tracing::{error, info, warn};
+use uuid::Uuid;
+
+/// Built-in group names that may not be created or deleted.
+const BUILTIN_GROUPS: [&str; 2] = ["default", "admin"];
+
+// =============================================================================
+// User moderation
+// =============================================================================
+
+/// Kick a connected user: notify them, close their connection, and broadcast
+/// their departure. `actor` is the human-readable name recorded as the kicker.
+///
+/// Rejects kicking superusers and controller (bridge) connections. Self-kick
+/// protection is the caller's concern (it is sender-relative).
+pub(crate) async fn apply_kick(
+    state: &Arc<ServerState>,
+    target_user_id: u64,
+    reason: &str,
+    actor: &str,
+) -> Result<String, String> {
+    let target_client = state
+        .get_client(target_user_id)
+        .ok_or_else(|| "User not found".to_string())?;
+
+    if target_client.is_superuser.load(Ordering::Relaxed) {
+        return Err("Cannot kick a superuser".to_string());
+    }
+    if target_client.is_controller.load(Ordering::SeqCst) {
+        return Err("Cannot kick a bridge connection".to_string());
+    }
+
+    let target_username = target_client.get_username().await;
+    info!(kicked_by = %actor, target = %target_username, reason = %reason, "KickUser");
+
+    let kicked_env = proto::Envelope {
+        state_hash: Vec::new(),
+        payload: Some(Payload::UserKicked(proto::UserKicked {
+            user_id: target_user_id,
+            reason: reason.to_string(),
+            kicked_by: actor.to_string(),
+        })),
+    };
+    let frame = encode_frame(&kicked_env);
+    let _ = target_client.send_frame(&frame).await;
+
+    target_client.conn.close(quinn::VarInt::from_u32(2), b"kicked");
+    cleanup_client(&target_client, state).await;
+
+    Ok(format!("Kicked '{}'", target_username))
+}
+
+/// Ban a connected user: add them to the `banned` group (creating it if
+/// needed), persist a timed ban record, then disconnect them. The `BANNED`
+/// flag is checked at auth time to reject future connections.
+///
+/// `duration_seconds == 0` means a permanent ban.
+pub(crate) async fn apply_ban(
+    state: &Arc<ServerState>,
+    persistence: Option<&Arc<Persistence>>,
+    target_user_id: u64,
+    duration_seconds: u64,
+    reason: &str,
+    actor: &str,
+) -> Result<String, String> {
+    let target_client = state
+        .get_client(target_user_id)
+        .ok_or_else(|| "User not found".to_string())?;
+
+    if target_client.is_superuser.load(Ordering::Relaxed) {
+        return Err("Cannot ban a superuser".to_string());
+    }
+    if target_client.is_controller.load(Ordering::SeqCst) {
+        return Err("Cannot ban a bridge connection".to_string());
+    }
+
+    let persist = persistence.ok_or_else(|| "Persistence not enabled".to_string())?;
+
+    // Ensure "banned" group exists with the BANNED permission flag.
+    if persist.get_group("banned").is_none() {
+        let _ = persist.create_group("banned", Permissions::BANNED.bits());
+    }
+
+    // Add target to "banned" group and persist a timed ban record.
+    let target_key = state
+        .get_user_public_key(target_user_id)
+        .ok_or_else(|| "Cannot resolve user's public key".to_string())?;
+
+    let _ = persist.add_user_to_group(&target_key, "banned");
+
+    let banned_at_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let ban_record = PersistedBan {
+        banned_at_secs: Some(banned_at_secs),
+        duration_seconds,
+        reason: reason.to_string(),
+        banned_by: actor.to_string(),
+    };
+    if let Err(e) = persist.set_ban(&target_key, &ban_record) {
+        warn!("Failed to persist ban record: {e}");
+    }
+
+    // Update cached groups on the live connection.
+    {
+        let mut groups = target_client.identity.groups().await;
+        if !groups.contains(&"banned".to_string()) {
+            groups.push("banned".to_string());
+            target_client.identity.set_groups(groups).await;
+        }
+    }
+
+    let target_username = target_client.get_username().await;
+    let duration_desc = if duration_seconds == 0 {
+        "permanent".to_string()
+    } else {
+        format!("{}s", duration_seconds)
+    };
+    info!(banned_by = %actor, target = %target_username, reason = %reason, duration = %duration_desc, "BanUser");
+
+    // Notify the target with a ban message, then disconnect.
+    let ban_reason = if reason.is_empty() {
+        format!("Banned by {} ({})", actor, duration_desc)
+    } else {
+        format!("Banned by {} ({}): {}", actor, duration_desc, reason)
+    };
+    let kicked_env = proto::Envelope {
+        state_hash: Vec::new(),
+        payload: Some(Payload::UserKicked(proto::UserKicked {
+            user_id: target_user_id,
+            reason: ban_reason,
+            kicked_by: actor.to_string(),
+        })),
+    };
+    let frame = encode_frame(&kicked_env);
+    let _ = target_client.send_frame(&frame).await;
+
+    target_client.conn.close(quinn::VarInt::from_u32(3), b"banned");
+    cleanup_client(&target_client, state).await;
+
+    Ok(format!("Banned '{}' ({})", target_username, duration_desc))
+}
+
+// =============================================================================
+// User registration
+// =============================================================================
+
+/// Register the connected user `target_user_id` under their current username.
+pub(crate) async fn apply_register_user(
+    state: &Arc<ServerState>,
+    persistence: Option<&Arc<Persistence>>,
+    target_user_id: u64,
+) -> Result<String, String> {
+    let persist = persistence.ok_or_else(|| "Registration not enabled".to_string())?;
+
+    let target_key = state
+        .get_user_public_key(target_user_id)
+        .ok_or_else(|| "User not found".to_string())?;
+    let target_client = state
+        .get_client(target_user_id)
+        .ok_or_else(|| "User not found".to_string())?;
+    let username = target_client.get_username().await;
+
+    if persist.get_registered_user(&target_key).is_some() {
+        return Err("User already registered".to_string());
+    }
+
+    persist
+        .register_user(
+            &target_key,
+            RegisteredUser {
+                username: username.clone(),
+                last_room: None,
+            },
+        )
+        .map_err(|e| format!("Registration failed: {e}"))?;
+
+    Ok(format!("Registered '{}' successfully", username))
+}
+
+/// Unregister the connected user `target_user_id`.
+pub(crate) async fn apply_unregister_user(
+    state: &Arc<ServerState>,
+    persistence: Option<&Arc<Persistence>>,
+    target_user_id: u64,
+) -> Result<String, String> {
+    let persist = persistence.ok_or_else(|| "Registration not enabled".to_string())?;
+
+    let target_key = state
+        .get_user_public_key(target_user_id)
+        .ok_or_else(|| "User not found".to_string())?;
+    let username = match state.get_client(target_user_id) {
+        Some(c) => c.get_username().await,
+        None => "user".to_string(),
+    };
+
+    persist
+        .unregister_user(&target_key)
+        .map_err(|e| format!("Unregistration failed: {e}"))?;
+
+    Ok(format!("Unregistered '{}' successfully", username))
+}
+
+// =============================================================================
+// Rooms
+// =============================================================================
+
+/// Create a room under `parent_uuid` (root if `None`) and broadcast it.
+/// Returns the new room's UUID.
+pub(crate) async fn apply_create_room(
+    state: &Arc<ServerState>,
+    persistence: Option<&Arc<Persistence>>,
+    name: String,
+    parent_uuid: Option<Uuid>,
+    description: Option<String>,
+) -> Result<Uuid, String> {
+    info!("CreateRoom: {}", name);
+
+    let room_uuid = state
+        .create_room_with_parent_desc(name.clone(), parent_uuid, description.clone())
+        .await;
+
+    if let Some(persist) = persistence {
+        let room = PersistedRoom {
+            name: name.clone(),
+            parent: parent_uuid.map(|u| *u.as_bytes()),
+            description: description.clone().unwrap_or_default(),
+            permanent: true,
+        };
+        if let Err(e) = persist.save_room(&room_uuid.into_bytes(), &room) {
+            warn!("Failed to persist room: {e}");
+        }
+    }
+
+    let room_info = proto::RoomInfo {
+        id: Some(room_id_from_uuid(room_uuid)),
+        name,
+        parent_id: parent_uuid.map(room_id_from_uuid),
+        description,
+        inherit_acl: true,
+        acls: vec![],
+        effective_permissions: 0,
+    };
+    broadcast_state_update(
+        state,
+        proto::state_update::Update::RoomCreated(proto::RoomCreated { room: Some(room_info) }),
+    )
+    .await
+    .map_err(|e| format!("Failed to broadcast room creation: {e}"))?;
+
+    Ok(room_uuid)
+}
+
+/// Delete a non-root room, moving its members to root, and broadcast the
+/// removal. Returns the deleted room's name.
+pub(crate) async fn apply_delete_room(
+    state: &Arc<ServerState>,
+    persistence: Option<&Arc<Persistence>>,
+    room_uuid: Uuid,
+) -> Result<String, String> {
+    if room_uuid == rumble_protocol::ROOT_ROOM_UUID {
+        return Err("Cannot delete the Root room".to_string());
+    }
+
+    let room_name = state
+        .get_rooms()
+        .await
+        .iter()
+        .find(|r| r.id.as_ref().and_then(rumble_protocol::uuid_from_room_id) == Some(room_uuid))
+        .map(|r| r.name.clone())
+        .unwrap_or_else(|| "room".to_string());
+
+    info!("DeleteRoom: {}", room_uuid);
+    if !state.delete_room(room_uuid).await {
+        return Err("Room not found".to_string());
+    }
+
+    if let Some(persist) = persistence {
+        if let Err(e) = persist.delete_room(&room_uuid.into_bytes()) {
+            warn!("Failed to remove room from persistence: {e}");
+        }
+        if let Err(e) = persist.delete_room_acl(&room_uuid.into_bytes()) {
+            warn!("Failed to remove room ACL data from persistence: {e}");
+        }
+    }
+
+    broadcast_state_update(
+        state,
+        proto::state_update::Update::RoomDeleted(proto::RoomDeleted {
+            room_id: Some(room_id_from_uuid(room_uuid)),
+            fallback_room_id: Some(room_id_from_uuid(rumble_protocol::ROOT_ROOM_UUID)),
+        }),
+    )
+    .await
+    .map_err(|e| format!("Failed to broadcast room deletion: {e}"))?;
+
+    Ok(room_name)
+}
+
+// =============================================================================
+// Permission groups
+// =============================================================================
+
+/// Create a permission group and broadcast it.
+pub(crate) async fn apply_create_group(
+    state: &Arc<ServerState>,
+    persistence: Option<&Arc<Persistence>>,
+    name: String,
+    permissions: u32,
+) -> Result<String, String> {
+    let persist = persistence.ok_or_else(|| "Persistence not enabled".to_string())?;
+
+    if name.is_empty() {
+        return Err("Group name cannot be empty".to_string());
+    }
+    if BUILTIN_GROUPS.contains(&name.as_str()) {
+        return Err("Cannot create built-in groups".to_string());
+    }
+    if persist.get_group(&name).is_some() {
+        return Err("Group already exists".to_string());
+    }
+    // Username-as-group invariant: a group name must not collide with a
+    // registered username.
+    if persist.is_username_registered(&name) {
+        return Err("Group name conflicts with a registered username".to_string());
+    }
+
+    persist
+        .create_group(&name, permissions)
+        .map_err(|e| format!("Failed: {e}"))?;
+
+    info!(group = %name, permissions, "CreateGroup");
+
+    let _ = broadcast_state_update(
+        state,
+        proto::state_update::Update::GroupChanged(proto::GroupChanged {
+            group: Some(proto::GroupInfo {
+                name: name.clone(),
+                permissions,
+                is_builtin: false,
+            }),
+            deleted: false,
+        }),
+    )
+    .await;
+
+    Ok(format!("Created group '{}'", name))
+}
+
+/// Delete a permission group, scrubbing it from every connected client and
+/// every persisted user-group list, then broadcast the deletion.
+pub(crate) async fn apply_delete_group(
+    state: &Arc<ServerState>,
+    persistence: Option<&Arc<Persistence>>,
+    name: String,
+) -> Result<String, String> {
+    let persist = persistence.ok_or_else(|| "Persistence not enabled".to_string())?;
+
+    if BUILTIN_GROUPS.contains(&name.as_str()) {
+        return Err("Cannot delete built-in groups".to_string());
+    }
+
+    info!(group = %name, "DeleteGroup");
+
+    // Scrub from connected clients first, broadcasting each removal. Doing this
+    // before the group delete keeps the crash window safe (group still in sled
+    // → delete retryable).
+    let clients = state.snapshot_clients();
+    for client in &clients {
+        let mut groups = client.identity.groups().await;
+        if groups.contains(&name) {
+            groups.retain(|g| g != &name);
+            client.identity.set_groups(groups).await;
+            let _ = broadcast_state_update(
+                state,
+                proto::state_update::Update::UserGroupChanged(proto::UserGroupChanged {
+                    user_id: client.user_id,
+                    group: name.clone(),
+                    added: false,
+                    expires_at: 0,
+                }),
+            )
+            .await;
+        }
+    }
+
+    persist.remove_group_from_all_users(&name);
+
+    persist.delete_group(&name).map_err(|e| format!("Failed: {e}"))?;
+
+    let _ = broadcast_state_update(
+        state,
+        proto::state_update::Update::GroupChanged(proto::GroupChanged {
+            group: Some(proto::GroupInfo {
+                name: name.clone(),
+                permissions: 0,
+                is_builtin: false,
+            }),
+            deleted: true,
+        }),
+    )
+    .await;
+
+    Ok(format!("Deleted group '{}'", name))
+}
+
+/// Change a group's permission bits and broadcast the change.
+pub(crate) async fn apply_modify_group(
+    state: &Arc<ServerState>,
+    persistence: Option<&Arc<Persistence>>,
+    name: String,
+    permissions: u32,
+) -> Result<String, String> {
+    let persist = persistence.ok_or_else(|| "Persistence not enabled".to_string())?;
+
+    match persist.modify_group(&name, permissions) {
+        Ok(false) => return Err("Group not found".to_string()),
+        Err(e) => return Err(format!("Failed: {e}")),
+        Ok(true) => {}
+    }
+
+    info!(group = %name, permissions, "ModifyGroup");
+
+    let _ = broadcast_state_update(
+        state,
+        proto::state_update::Update::GroupChanged(proto::GroupChanged {
+            group: Some(proto::GroupInfo {
+                name: name.clone(),
+                permissions,
+                is_builtin: BUILTIN_GROUPS.contains(&name.as_str()),
+            }),
+            deleted: false,
+        }),
+    )
+    .await;
+
+    Ok(format!("Modified group '{}'", name))
+}
+
+/// Add or remove `target_user_id` to/from `group`, updating both the live
+/// connection (if any) and persistence, then broadcast the change.
+pub(crate) async fn apply_set_user_group(
+    state: &Arc<ServerState>,
+    persistence: Option<&Arc<Persistence>>,
+    target_user_id: u64,
+    group: String,
+    add: bool,
+    expires_at: u64,
+) -> Result<String, String> {
+    let persist = persistence.ok_or_else(|| "Persistence not enabled".to_string())?;
+
+    // Update the live connection's cached groups, if connected.
+    if let Some(target_client) = state.get_client(target_user_id) {
+        let mut groups = target_client.identity.groups().await;
+        let before = groups.len();
+        if add {
+            if !groups.contains(&group) {
+                groups.push(group.clone());
+            }
+        } else {
+            groups.retain(|g| g != &group);
+        }
+        if groups.len() != before {
+            target_client.identity.set_groups(groups).await;
+        }
+    }
+
+    if let Some(key) = state.get_user_public_key(target_user_id) {
+        if add {
+            let _ = persist.add_user_to_group(&key, &group);
+        } else {
+            let _ = persist.remove_user_from_group(&key, &group);
+        }
+    }
+
+    let action = if add { "Added" } else { "Removed" };
+    info!(target_user_id, group = %group, action, "SetUserGroup");
+
+    let _ = broadcast_state_update(
+        state,
+        proto::state_update::Update::UserGroupChanged(proto::UserGroupChanged {
+            user_id: target_user_id,
+            group: group.clone(),
+            added: add,
+            expires_at,
+        }),
+    )
+    .await;
+
+    Ok(format!(
+        "{} user {} group '{}'",
+        action,
+        if add { "to" } else { "from" },
+        group
+    ))
+}
+
+// =============================================================================
+// Room ACLs
+// =============================================================================
+
+/// Replace a room's ACL entries, persist them, broadcast the change, and
+/// re-evaluate `SPEAK` for every member in the room (server-muting those who
+/// lost it, unmuting those who regained it unless manually muted).
+pub(crate) async fn apply_set_room_acl(
+    state: &Arc<ServerState>,
+    persistence: Option<&Arc<Persistence>>,
+    room_uuid: Uuid,
+    inherit_acl: bool,
+    entries: Vec<proto::RoomAclEntry>,
+) -> Result<String, String> {
+    let persist = persistence.ok_or_else(|| "Persistence not enabled".to_string())?;
+
+    let persisted_acl = PersistedRoomAcl {
+        inherit_acl,
+        entries: entries
+            .iter()
+            .map(|e| PersistedAclEntry {
+                group: e.group.clone(),
+                grant: e.grant,
+                deny: e.deny,
+                apply_here: e.apply_here,
+                apply_subs: e.apply_subs,
+            })
+            .collect(),
+    };
+
+    if let Err(e) = persist.set_room_acl(room_uuid.as_bytes(), &persisted_acl) {
+        error!(room = %room_uuid, "Failed to persist room ACL: {e:?}");
+        return Err("Failed to persist ACL".to_string());
+    }
+
+    state.set_room_acl(room_uuid, inherit_acl, entries.clone()).await;
+
+    info!(room = %room_uuid, entries = entries.len(), "SetRoomAcl");
+
+    broadcast_state_update(
+        state,
+        proto::state_update::Update::RoomAclChanged(proto::RoomAclChanged {
+            room_id: Some(room_id_from_uuid(room_uuid)),
+            inherit_acl,
+            entries: entries.clone(),
+        }),
+    )
+    .await
+    .map_err(|e| format!("Failed to broadcast ACL change: {e}"))?;
+
+    // Re-evaluate SPEAK for everyone currently in the room.
+    let persistence_owned = persistence.cloned();
+    let room_members = state.get_room_members(room_uuid).await;
+    for member_id in room_members {
+        if let Some(client) = state.get_client(member_id) {
+            let speak_perms =
+                crate::acl::evaluate_user_permissions(state, &client, room_uuid, &persistence_owned).await;
+            let speak_denied = !speak_perms.contains(Permissions::SPEAK);
+            let manually_muted = client.manually_server_muted.load(Ordering::Relaxed);
+            let should_mute = speak_denied || manually_muted;
+            let was_muted = client.server_muted.load(Ordering::Relaxed);
+            if should_mute != was_muted {
+                client.server_muted.store(should_mute, Ordering::Relaxed);
+                let status = state.get_user_status(member_id).await;
+                let _ = broadcast_state_update(
+                    state,
+                    proto::state_update::Update::UserStatusChanged(proto::UserStatusChanged {
+                        user_id: Some(proto::UserId { value: member_id }),
+                        is_muted: status.is_muted,
+                        is_deafened: status.is_deafened,
+                        server_muted: should_mute,
+                        is_elevated: client.is_superuser.load(Ordering::Relaxed),
+                    }),
+                )
+                .await;
+            }
+        }
+    }
+
+    Ok("Room ACL updated".to_string())
+}

@@ -1,0 +1,95 @@
+//! Read-only monitoring endpoints: live state snapshot, group and room lists.
+//! All require an admin session.
+
+use super::{ApiResult, WebState, auth::Admin};
+use axum::{Json, extract::State};
+use rumble_protocol::uuid_from_room_id;
+use rumble_web_types::{GroupDto, RoomDto, StateSnapshot, UserDto};
+use std::sync::atomic::Ordering;
+
+const BUILTIN_GROUPS: [&str; 2] = ["default", "admin"];
+
+/// Render a proto room into a wire DTO.
+fn room_dto(r: &rumble_protocol::proto::RoomInfo) -> RoomDto {
+    let id =
+        r.id.as_ref()
+            .and_then(uuid_from_room_id)
+            .map(|u| u.to_string())
+            .unwrap_or_default();
+    let parent_id = r.parent_id.as_ref().and_then(uuid_from_room_id).map(|u| u.to_string());
+    RoomDto {
+        id,
+        name: r.name.clone(),
+        parent_id,
+        description: r.description.clone(),
+        inherit_acl: r.inherit_acl,
+    }
+}
+
+/// `GET /api/state` — snapshot of connected users, rooms, and groups.
+pub async fn state_snapshot(_admin: Admin, State(st): State<WebState>) -> Json<StateSnapshot> {
+    let rooms: Vec<RoomDto> = st.state.get_rooms().await.iter().map(room_dto).collect();
+
+    let groups: Vec<GroupDto> = match st.persistence.as_ref() {
+        Some(p) => p
+            .list_groups()
+            .into_iter()
+            .map(|(name, g)| GroupDto {
+                is_builtin: BUILTIN_GROUPS.contains(&name.as_str()),
+                name,
+                permissions: g.permissions,
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+
+    let mut users = Vec::new();
+    for client in st.state.snapshot_clients() {
+        if !client.authenticated.load(Ordering::SeqCst) {
+            continue;
+        }
+        let user_id = client.user_id;
+        let status = st.state.get_user_status(user_id).await;
+        let room_id = st.state.get_user_room(user_id).await.map(|u| u.to_string());
+        users.push(UserDto {
+            user_id,
+            username: client.get_username().await,
+            room_id,
+            is_muted: status.is_muted,
+            is_deafened: status.is_deafened,
+            server_muted: client.server_muted.load(Ordering::Relaxed),
+            is_elevated: client.is_superuser.load(Ordering::Relaxed),
+            groups: client.identity.groups().await,
+        });
+    }
+
+    Json(StateSnapshot {
+        client_count: st.state.client_count(),
+        users,
+        rooms,
+        groups,
+    })
+}
+
+/// `GET /api/groups` — list permission groups.
+pub async fn list_groups(_admin: Admin, State(st): State<WebState>) -> ApiResult<Vec<GroupDto>> {
+    let groups = match st.persistence.as_ref() {
+        Some(p) => p
+            .list_groups()
+            .into_iter()
+            .map(|(name, g)| GroupDto {
+                is_builtin: BUILTIN_GROUPS.contains(&name.as_str()),
+                name,
+                permissions: g.permissions,
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    Ok(Json(groups))
+}
+
+/// `GET /api/rooms` — list rooms.
+pub async fn list_rooms(_admin: Admin, State(st): State<WebState>) -> ApiResult<Vec<RoomDto>> {
+    let rooms = st.state.get_rooms().await.iter().map(room_dto).collect();
+    Ok(Json(rooms))
+}

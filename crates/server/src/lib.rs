@@ -44,7 +44,7 @@
 //!     let server_config = ServerConfig::load()?;
 //!     let (certs, key) = server_config.load_certificates()?;
 //!     let data_dir = server_config.data_dir().ok().map(|p| p.to_string_lossy().to_string());
-//!     let config = Config { bind: server_config.bind, certs, key, data_dir, welcome_message: None, plugins: vec![] };
+//!     let config = Config { bind: server_config.bind, certs, key, data_dir, welcome_message: None, plugins: vec![], web: None };
 //!     let server = Server::new(config)?;
 //!     server.run().await
 //! }
@@ -55,14 +55,16 @@ pub mod config;
 pub mod echo_bot;
 pub mod handlers;
 pub mod link_cleaner;
+pub mod ops;
 pub mod persistence;
 pub mod plugin;
 pub mod relay_plugin;
 pub mod server;
 pub mod state;
+pub mod web;
 
 // Re-export main types for convenience
-pub use config::{ServerConfig, generate_self_signed_cert, load_pem_certificates};
+pub use config::{ServerConfig, WebSettings, generate_self_signed_cert, load_pem_certificates};
 pub use echo_bot::{EchoBotFactory, EchoBotPlugin};
 pub use link_cleaner::{LinkCleanerFactory, LinkCleanerPlugin};
 pub use persistence::{PersistedGroup, PersistedRoom, PersistedRoomAcl, Persistence, RegisteredUser};
