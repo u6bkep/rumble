@@ -8,21 +8,26 @@
 //! that also holds the host's redraw handle, so a completed fetch wakes the
 //! frame loop on-demand.
 //!
-//! Everything substantive is gated to `cfg(target_arch = "wasm32")`: the
-//! browser deps (`gloo-net`, `web-sys`, `wasm-bindgen`) only exist there,
-//! and `damascene-web`'s native stub keeps the crate type-checking on the
-//! host target so it can ride along as an ordinary workspace member.
+//! The projection (`app`, `inbox`, `api`) compiles on **both** targets: the
+//! browser deps (`gloo-net`, `web-sys`, `wasm-bindgen`) only exist under
+//! `cfg(target_arch = "wasm32")`, where the real `fetch` client lives, but
+//! `api` carries a native stub of its transport so the whole `App` — and
+//! therefore [`App::build`](damascene_core::prelude::App::build) — type-checks
+//! and *renders* on the host. That host render path is what the `lint` binary
+//! drives: it builds each screen against canned [`AdminApp`] state and runs
+//! damascene's lint pass, with no browser involved. Only the wasm entry point
+//! (`entry`, `#[wasm_bindgen(start)]`) stays `wasm32`-gated.
 //!
-//! Build with `tools/build_admin_web.sh` (wraps `wasm-pack build --target
-//! web --release`); the output `pkg/` + `index.html` are served by the
-//! axum control-plane.
+//! Build the browser bundle with `tools/build_admin_web.sh` (wraps `wasm-pack
+//! build --target web --release`); the output `pkg/` + `index.html` are served
+//! by the axum control-plane. Run the UI lint gate with
+//! `cargo run -p rumble-admin-web --bin lint`.
 
-#[cfg(target_arch = "wasm32")]
 mod api;
-#[cfg(target_arch = "wasm32")]
 mod app;
-#[cfg(target_arch = "wasm32")]
 mod inbox;
+
+pub use app::AdminApp;
 
 #[cfg(target_arch = "wasm32")]
 mod entry {

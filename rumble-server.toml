@@ -50,7 +50,7 @@ domain = "localhost"
 # tunnel for TLS and remote access. Can be toggled via RUMBLE_WEB_ENABLED=1
 # and RUMBLE_WEB_BIND.
 [web]
-enabled = false
-bind = "127.0.0.1:5001"
+enabled = true
+bind = "[::]:5001"
 # assets_dir = "admin-web"   # serve the wasm UI bundle from here (dev);
 #                            # omit to serve the bundle embedded in the binary.

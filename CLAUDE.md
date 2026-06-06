@@ -139,6 +139,26 @@ Each scene produces `rumble_<scene>.{svg,tree.txt,draw_ops.txt,lint.txt,shader_m
 
 To add a new scene, extend the `Scene` enum and `drive_setup` in `crates/rumble-damascene/src/bin/dump_bundles.rs`, then `--bless` to capture its goldens.
 
+## Web Admin UI Lint (rumble-admin-web)
+
+The browser admin SPA (`rumble-admin-web`) ships to wasm, but its damascene
+projection compiles on the **host** too: the `api` `fetch` transport is stubbed
+off-wasm so the whole `App` renders natively. The `lint` binary uses that to run
+damascene's lint pass (raw colors, overflow, weak focus, scrollbar overlap,
+duplicate ids, …) over each admin screen:
+
+```bash
+cargo run -p rumble-admin-web --bin lint            # render every scene, exit 1 on any finding
+LINT_DUMP=bootstrap cargo run -p rumble-admin-web --bin lint   # print one scene's layout tree
+```
+
+This is the **lint-gate-only** half of the bundle pipeline — no committed
+goldens, so it never needs blessing after an intended visual change; it just
+fails on lint findings. It runs in `scripts/ci.sh` (and thus GitHub CI), or
+standalone via `scripts/ci.sh admin-lint`. Scenes live in `scene_*` constructors
+on `AdminApp` (`#[cfg(not(target_arch = "wasm32"))]`) + the catalog in
+`crates/rumble-admin-web/src/bin/lint.rs`; add one by extending both.
+
 ## External Dependencies (git-pinned)
 
 Cargo consumes these from upstream GitHub at a pinned rev rather than crates.io. The `vendor/` directory is gitignored and holds local working copies for easy reference; Cargo does not consult it for builds.

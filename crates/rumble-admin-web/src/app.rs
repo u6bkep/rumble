@@ -34,10 +34,7 @@ const KEY_BOOT_SUBMIT: &str = "boot:submit";
 const KEY_REFRESH: &str = "refresh";
 const KEY_LOGOUT: &str = "logout";
 
-const KEY_TAB_OVERVIEW: &str = "tab:overview";
-const KEY_TAB_USERS: &str = "tab:users";
-const KEY_TAB_ROOMS: &str = "tab:rooms";
-const KEY_TAB_GROUPS: &str = "tab:groups";
+const KEY_TABS: &str = "dash:tabs"; // tabs_list namespace; triggers route `dash:tabs:tab:<slug>`
 
 const KEY_ROOM_NAME: &str = "room:name";
 const KEY_ROOM_DESC: &str = "room:desc";
@@ -280,14 +277,6 @@ fn parse_ae_route(route: &str) -> Option<(usize, &str, Option<&str>)> {
 }
 
 // ============================================================
-// Colors
-// ============================================================
-
-const BG: Color = Color::srgb_token("admin-bg", 26, 27, 30, 255);
-const COLOR_ERR: Color = Color::srgb_token("admin-err", 224, 92, 92, 255);
-const COLOR_OK: Color = Color::srgb_token("admin-ok", 96, 200, 124, 255);
-
-// ============================================================
 // State
 // ============================================================
 
@@ -309,6 +298,32 @@ enum Tab {
     Users,
     Rooms,
     Groups,
+}
+
+impl Tab {
+    fn slug(self) -> &'static str {
+        match self {
+            Tab::Overview => "overview",
+            Tab::Users => "users",
+            Tab::Rooms => "rooms",
+            Tab::Groups => "groups",
+        }
+    }
+    fn from_slug(s: &str) -> Option<Self> {
+        Some(match s {
+            "overview" => Tab::Overview,
+            "users" => Tab::Users,
+            "rooms" => Tab::Rooms,
+            "groups" => Tab::Groups,
+            _ => return None,
+        })
+    }
+}
+
+impl std::fmt::Display for Tab {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.slug())
+    }
 }
 
 #[derive(Default)]
@@ -366,6 +381,56 @@ impl AdminApp {
     fn enter_dashboard(&mut self) {
         self.phase = Phase::Dashboard;
         api::fetch_state(self.inbox.clone());
+    }
+}
+
+/// Offline scene builders for the `lint` binary: construct the app in a fixed
+/// screen state with no network round-trip, so damascene's lint pass can run
+/// against each screen on the host. Host-only — the wasm build always drives
+/// state through real fetches.
+#[cfg(not(target_arch = "wasm32"))]
+impl AdminApp {
+    fn offline() -> Self {
+        Self::new(std::rc::Rc::new(std::cell::RefCell::new(crate::inbox::Inbox::new())))
+    }
+
+    pub fn scene_login() -> Self {
+        let mut app = Self::offline();
+        app.phase = Phase::Login;
+        app
+    }
+
+    pub fn scene_bootstrap() -> Self {
+        let mut app = Self::offline();
+        app.phase = Phase::Bootstrap;
+        app
+    }
+
+    pub fn scene_dashboard(snapshot: rumble_web_types::StateSnapshot, tab_slug: &str) -> Self {
+        let mut app = Self::offline();
+        app.phase = Phase::Dashboard;
+        app.tab = Tab::from_slug(tab_slug).unwrap_or(Tab::Overview);
+        app.snapshot = Some(snapshot);
+        app
+    }
+
+    pub fn scene_group_editor(snapshot: rumble_web_types::StateSnapshot, group: &str) -> Self {
+        let mut app = Self::scene_dashboard(snapshot, "groups");
+        app.open_group_editor(group);
+        app
+    }
+
+    pub fn scene_acl_editor(snapshot: rumble_web_types::StateSnapshot, room_id: &str) -> Self {
+        let mut app = Self::scene_dashboard(snapshot, "rooms");
+        app.open_acl_editor(room_id);
+        // Expand the first rule so the tri-state permission grid is rendered
+        // (and linted), not just the collapsed entry headers.
+        if let Some(ae) = app.editing_acl.as_mut()
+            && !ae.entries.is_empty()
+        {
+            ae.expanded = Some(0);
+        }
+        app
     }
 }
 
@@ -431,11 +496,17 @@ impl App for AdminApp {
             .fill_size()
             .gap(tokens::SPACE_4)
             .padding(tokens::SPACE_5)
-            .fill(BG)
+            .fill(tokens::BACKGROUND)
     }
 
     fn selection(&self) -> Selection {
         self.selection.clone()
+    }
+
+    /// Match the desktop client (`rumble-damascene`): Radix slate + blue dark.
+    /// Every token reference in this app resolves through this palette.
+    fn theme(&self) -> Theme {
+        Theme::radix_slate_blue_dark()
     }
 
     fn on_event(&mut self, event: UiEvent) {
@@ -455,11 +526,31 @@ impl App for AdminApp {
             }
         }
 
-        // Everything else is a click / keyboard activation routed by key.
-        if matches!(event.kind, UiEventKind::Click | UiEventKind::Activate)
-            && let Some(route) = event.route()
+        if !matches!(event.kind, UiEventKind::Click | UiEventKind::Activate) {
+            return;
+        }
+
+        // Controlled segmented tabs: fold the trigger straight into `self.tab`,
+        // closing any open editor when the tab actually changes.
+        let prev_tab = self.tab;
+        if tabs::apply_event(&mut self.tab, &event, KEY_TABS, Tab::from_slug) {
+            if self.tab != prev_tab {
+                self.editing_group = None;
+                self.editing_acl = None;
+            }
+            return;
+        }
+
+        // The "inherit ACL" checkbox is a plain bool — let the widget fold it.
+        if let Some(ae) = self.editing_acl.as_mut()
+            && checkbox::apply_event(&mut ae.inherit_acl, &event, KEY_AE_INHERIT)
         {
-            self.handle_click(&route.to_string());
+            return;
+        }
+
+        // Everything else is a click / keyboard activation routed by key.
+        if let Some(route) = event.route() {
+            self.handle_click(route);
         }
     }
 }
@@ -519,10 +610,6 @@ impl AdminApp {
             }
             KEY_REFRESH => api::fetch_state(self.inbox.clone()),
             KEY_LOGOUT => api::logout(self.inbox.clone()),
-            KEY_TAB_OVERVIEW => self.switch_tab(Tab::Overview),
-            KEY_TAB_USERS => self.switch_tab(Tab::Users),
-            KEY_TAB_ROOMS => self.switch_tab(Tab::Rooms),
-            KEY_TAB_GROUPS => self.switch_tab(Tab::Groups),
             KEY_ROOM_CREATE => {
                 let name = self.room_name.trim();
                 if !name.is_empty() {
@@ -566,13 +653,6 @@ impl AdminApp {
                 }
             }
         }
-    }
-
-    /// Switch dashboard tab, closing any open editor first.
-    fn switch_tab(&mut self, tab: Tab) {
-        self.tab = tab;
-        self.editing_group = None;
-        self.editing_acl = None;
     }
 
     // --- group permission editor ---
@@ -689,12 +769,6 @@ impl AdminApp {
                 }
                 return true;
             }
-            KEY_AE_INHERIT => {
-                if let Some(ae) = self.editing_acl.as_mut() {
-                    ae.inherit_acl = !ae.inherit_acl;
-                }
-                return true;
-            }
             _ => {}
         }
         if let Some(group) = route.strip_prefix(KEY_AE_ADD) {
@@ -728,15 +802,13 @@ fn apply_ae_entry_action(ae: &mut AclEdit, idx: usize, action: &str, payload: Op
                 _ => Some(idx),
             };
         }
-        "remove" => {
-            if idx < ae.entries.len() {
-                ae.entries.remove(idx);
-                ae.expanded = match ae.expanded {
-                    Some(i) if i == idx => None,
-                    Some(i) if i > idx => Some(i - 1),
-                    other => other,
-                };
-            }
+        "remove" if idx < ae.entries.len() => {
+            ae.entries.remove(idx);
+            ae.expanded = match ae.expanded {
+                Some(i) if i == idx => None,
+                Some(i) if i > idx => Some(i - 1),
+                other => other,
+            };
         }
         "scope" => {
             if let Some(slug) = payload
@@ -781,8 +853,9 @@ impl AdminApp {
     fn status_line(&self) -> El {
         match &self.status {
             Some((msg, is_err)) => {
-                let color = if *is_err { COLOR_ERR } else { COLOR_OK };
-                row([text(msg.clone()).color(color)]).padding(tokens::SPACE_1)
+                let line = text(msg.clone());
+                let line = if *is_err { line.destructive() } else { line.success() };
+                row([line]).padding(tokens::SPACE_1)
             }
             None => spacer().height(Size::Fixed(0.0)),
         }
@@ -796,16 +869,19 @@ impl AdminApp {
             TextInputOpts::default().placeholder("Sudo password").password(),
         )
         .fill_width();
-        let form = titled_card(
+        let form = card_section(
             "Admin login",
+            tokens::SPACE_3,
             [
-                text("Sign in with the server's sudo password.").muted(),
+                text("Sign in with the server's sudo password.")
+                    .muted()
+                    .wrap_text()
+                    .fill_width(),
                 pw,
                 button("Log in").key(KEY_LOGIN_SUBMIT).primary(),
             ],
         )
-        .max_width(420.0)
-        .gap(tokens::SPACE_3);
+        .max_width(420.0);
         centered(form)
     }
 
@@ -839,33 +915,39 @@ impl AdminApp {
                 TextInputOpts::default().placeholder("Ed25519 public key to seed the admin group"),
             ),
         );
-        let form = titled_card(
+        let form = card_section(
             "First-run setup",
+            tokens::SPACE_3,
             [
-                text(
-                    "No sudo password is configured yet. Enter the one-time setup token printed to the server log to \
-                     complete bootstrap.",
-                )
-                .muted(),
+                // Keep to one line: a hug-height card measures wrapping text at
+                // its intrinsic single-line height, so a body string that
+                // reflows to two lines under-sizes the card (see the `lint`
+                // binary). The "First-run setup" title supplies the rest.
+                text("Enter the one-time setup token printed to the server log.")
+                    .muted()
+                    .wrap_text()
+                    .fill_width(),
                 token,
                 pw,
                 key,
                 button("Complete setup").key(KEY_BOOT_SUBMIT).primary(),
             ],
         )
-        .max_width(520.0)
-        .gap(tokens::SPACE_3);
+        .max_width(520.0);
         centered(form)
     }
 
     fn dashboard_view(&self) -> El {
-        let tabs = row([
-            tab_button("Overview", KEY_TAB_OVERVIEW, self.tab == Tab::Overview),
-            tab_button("Users", KEY_TAB_USERS, self.tab == Tab::Users),
-            tab_button("Rooms", KEY_TAB_ROOMS, self.tab == Tab::Rooms),
-            tab_button("Groups", KEY_TAB_GROUPS, self.tab == Tab::Groups),
-        ])
-        .gap(tokens::SPACE_2);
+        let tabs = tabs_list(
+            KEY_TABS,
+            &self.tab,
+            [
+                (Tab::Overview, "Overview"),
+                (Tab::Users, "Users"),
+                (Tab::Rooms, "Rooms"),
+                (Tab::Groups, "Groups"),
+            ],
+        );
 
         let content = match self.snapshot.as_ref() {
             None => column([text("Loading server state…").muted()]),
@@ -945,8 +1027,9 @@ impl AdminApp {
         if let Some(ge) = &self.editing_group {
             return self.group_editor(ge);
         }
-        let create = titled_card(
+        let create = card_section(
             "Create group",
+            tokens::SPACE_3,
             [
                 row([
                     text_input_with(
@@ -960,10 +1043,12 @@ impl AdminApp {
                 ])
                 .gap(tokens::SPACE_2)
                 .align(Align::Center),
-                text("New groups start with no permissions; grant them via per-room ACLs.").muted(),
+                text("New groups start with no permissions; grant them via per-room ACLs.")
+                    .muted()
+                    .wrap_text()
+                    .fill_width(),
             ],
-        )
-        .gap(tokens::SPACE_3);
+        );
 
         let mut rows: Vec<El> = vec![table_row([
             table_head("Group"),
@@ -1034,7 +1119,7 @@ impl AdminApp {
         if ge.is_builtin {
             body.push(
                 text("Built-in group — change its base permissions with care.")
-                    .color(COLOR_ERR)
+                    .warning()
                     .small(),
             );
         }
@@ -1053,7 +1138,7 @@ impl AdminApp {
             .fill_width(),
         );
 
-        titled_card("Group permissions", body).gap(tokens::SPACE_3)
+        card_section("Group permissions", tokens::SPACE_3, body)
     }
 
     // --- room ACL editor view ---
@@ -1112,11 +1197,11 @@ impl AdminApp {
         .align(Align::Center)
         .fill_width();
 
-        titled_card(
+        card_section(
             "Room permissions",
+            tokens::SPACE_3,
             vec![header, inherit, divider(), rules, add_row, divider(), footer],
         )
-        .gap(tokens::SPACE_3)
     }
 }
 
@@ -1240,17 +1325,26 @@ fn centered(child: El) -> El {
 }
 
 fn labeled_input(label: &str, input: El) -> El {
-    column([text(label).small().muted(), input.fill_width()]).gap(tokens::SPACE_1)
+    form_item([form_label(label), form_control(input.fill_width())])
 }
 
-fn tab_button(label: &str, key: &str, active: bool) -> El {
-    let b = button(label).key(key);
-    if active { b.primary() } else { b.ghost() }
+/// A `titled_card` whose body items are spaced by `gap`.
+///
+/// `titled_card(...).gap(g)` spaces only the title from the body block —
+/// `card_content` carries no default gap, so the body items otherwise render
+/// flush (overlapping focus rings / hit targets on adjacent controls). This
+/// lays the body out in a gapped column so `gap` lands where intended.
+fn card_section(title: &str, gap: f32, body: impl IntoIterator<Item = El>) -> El {
+    titled_card(
+        title,
+        [column(body.into_iter().collect::<Vec<_>>()).gap(gap).fill_width()],
+    )
 }
 
 fn overview_view(snap: &rumble_web_types::StateSnapshot) -> El {
-    titled_card(
+    card_section(
         "Overview",
+        tokens::SPACE_2,
         [
             stat_row("Connected clients", snap.client_count.to_string()),
             stat_row("Authenticated users", snap.users.len().to_string()),
@@ -1259,7 +1353,6 @@ fn overview_view(snap: &rumble_web_types::StateSnapshot) -> El {
         ],
     )
     .max_width(480.0)
-    .gap(tokens::SPACE_2)
 }
 
 fn stat_row(label: &str, value: String) -> El {

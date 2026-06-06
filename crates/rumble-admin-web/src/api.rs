@@ -12,13 +12,9 @@
 
 use std::{cell::RefCell, rc::Rc};
 
-use gloo_net::http::Request;
-use serde::{Serialize, de::DeserializeOwned};
-use wasm_bindgen_futures::spawn_local;
-
 use rumble_web_types::{
-    ApiError, BanRequest, BootstrapRequest, CreateGroupRequest, CreateRoomRequest, KickRequest, LoginRequest,
-    ModifyGroupRequest, OkMessage, SessionInfo, SetRoomAclRequest, StateSnapshot,
+    BanRequest, BootstrapRequest, CreateGroupRequest, CreateRoomRequest, KickRequest, LoginRequest, ModifyGroupRequest,
+    OkMessage, SessionInfo, SetRoomAclRequest, StateSnapshot,
 };
 
 use crate::inbox::{Inbox, Msg};
@@ -26,51 +22,103 @@ use crate::inbox::{Inbox, Msg};
 /// Shared handle to the app's mailbox.
 pub type Inb = Rc<RefCell<Inbox>>;
 
-// --- low-level helpers ------------------------------------------------------
+// --- transport --------------------------------------------------------------
+//
+// The browser build performs real `fetch`es on the wasm microtask queue; the
+// native build stubs the same surface so the `App` (and its `build` projection)
+// type-checks and renders on the host for the `lint` binary, without pulling in
+// the wasm-only browser deps. The stubs are never polled — `spawn_local` drops
+// the future on the host — so they only need to type-check.
 
-/// Send a built request and decode the JSON body, mapping a non-2xx response
-/// to the server's `{ "error": ... }` reason where present.
-async fn send<T: DeserializeOwned>(req: Request) -> Result<T, String> {
-    let resp = req.send().await.map_err(|e| e.to_string())?;
-    if resp.ok() {
-        resp.json::<T>().await.map_err(|e| format!("decode error: {e}"))
-    } else {
-        let status = resp.status();
-        match resp.json::<ApiError>().await {
-            Ok(err) => Err(err.error),
-            Err(_) => Err(format!("HTTP {status}")),
+#[cfg(target_arch = "wasm32")]
+use transport::{delete_empty, get, patch_json, post_empty, post_json, put_json};
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen_futures::spawn_local;
+
+#[cfg(target_arch = "wasm32")]
+mod transport {
+    use gloo_net::http::Request;
+    use serde::{Serialize, de::DeserializeOwned};
+
+    use rumble_web_types::ApiError;
+
+    /// Send a built request and decode the JSON body, mapping a non-2xx
+    /// response to the server's `{ "error": ... }` reason where present.
+    async fn send<T: DeserializeOwned>(req: Request) -> Result<T, String> {
+        let resp = req.send().await.map_err(|e| e.to_string())?;
+        if resp.ok() {
+            resp.json::<T>().await.map_err(|e| format!("decode error: {e}"))
+        } else {
+            let status = resp.status();
+            match resp.json::<ApiError>().await {
+                Ok(err) => Err(err.error),
+                Err(_) => Err(format!("HTTP {status}")),
+            }
         }
+    }
+
+    pub async fn get<T: DeserializeOwned>(url: &str) -> Result<T, String> {
+        let req = Request::get(url).build().map_err(|e| e.to_string())?;
+        send(req).await
+    }
+
+    pub async fn post_json<B: Serialize, T: DeserializeOwned>(url: &str, body: &B) -> Result<T, String> {
+        let req = Request::post(url).json(body).map_err(|e| e.to_string())?;
+        send(req).await
+    }
+
+    pub async fn patch_json<B: Serialize, T: DeserializeOwned>(url: &str, body: &B) -> Result<T, String> {
+        let req = Request::patch(url).json(body).map_err(|e| e.to_string())?;
+        send(req).await
+    }
+
+    pub async fn put_json<B: Serialize, T: DeserializeOwned>(url: &str, body: &B) -> Result<T, String> {
+        let req = Request::put(url).json(body).map_err(|e| e.to_string())?;
+        send(req).await
+    }
+
+    pub async fn post_empty<T: DeserializeOwned>(url: &str) -> Result<T, String> {
+        let req = Request::post(url).build().map_err(|e| e.to_string())?;
+        send(req).await
+    }
+
+    pub async fn delete_empty<T: DeserializeOwned>(url: &str) -> Result<T, String> {
+        let req = Request::delete(url).build().map_err(|e| e.to_string())?;
+        send(req).await
     }
 }
 
-async fn get<T: DeserializeOwned>(url: &str) -> Result<T, String> {
-    let req = Request::get(url).build().map_err(|e| e.to_string())?;
-    send(req).await
-}
+// Native stubs: the host never performs IO, so every request resolves to an
+// error and the dropped future is never polled.
+#[cfg(not(target_arch = "wasm32"))]
+use host_stub::*;
 
-async fn post_json<B: Serialize, T: DeserializeOwned>(url: &str, body: &B) -> Result<T, String> {
-    let req = Request::post(url).json(body).map_err(|e| e.to_string())?;
-    send(req).await
-}
+#[cfg(not(target_arch = "wasm32"))]
+mod host_stub {
+    use serde::{Serialize, de::DeserializeOwned};
 
-async fn patch_json<B: Serialize, T: DeserializeOwned>(url: &str, body: &B) -> Result<T, String> {
-    let req = Request::patch(url).json(body).map_err(|e| e.to_string())?;
-    send(req).await
-}
+    const OFFLINE: &str = "network unavailable on host";
 
-async fn put_json<B: Serialize, T: DeserializeOwned>(url: &str, body: &B) -> Result<T, String> {
-    let req = Request::put(url).json(body).map_err(|e| e.to_string())?;
-    send(req).await
-}
+    pub fn spawn_local<F: core::future::Future<Output = ()> + 'static>(_fut: F) {}
 
-async fn post_empty<T: DeserializeOwned>(url: &str) -> Result<T, String> {
-    let req = Request::post(url).build().map_err(|e| e.to_string())?;
-    send(req).await
-}
-
-async fn delete_empty<T: DeserializeOwned>(url: &str) -> Result<T, String> {
-    let req = Request::delete(url).build().map_err(|e| e.to_string())?;
-    send(req).await
+    pub async fn get<T: DeserializeOwned>(_url: &str) -> Result<T, String> {
+        Err(OFFLINE.to_string())
+    }
+    pub async fn post_json<B: Serialize, T: DeserializeOwned>(_url: &str, _body: &B) -> Result<T, String> {
+        Err(OFFLINE.to_string())
+    }
+    pub async fn patch_json<B: Serialize, T: DeserializeOwned>(_url: &str, _body: &B) -> Result<T, String> {
+        Err(OFFLINE.to_string())
+    }
+    pub async fn put_json<B: Serialize, T: DeserializeOwned>(_url: &str, _body: &B) -> Result<T, String> {
+        Err(OFFLINE.to_string())
+    }
+    pub async fn post_empty<T: DeserializeOwned>(_url: &str) -> Result<T, String> {
+        Err(OFFLINE.to_string())
+    }
+    pub async fn delete_empty<T: DeserializeOwned>(_url: &str) -> Result<T, String> {
+        Err(OFFLINE.to_string())
+    }
 }
 
 /// Push a message into the mailbox (wakes the render loop).

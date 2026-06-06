@@ -6,6 +6,7 @@
 #   scripts/ci.sh                # run every check
 #   scripts/ci.sh fmt            # only rustfmt
 #   scripts/ci.sh clippy         # only clippy
+#   scripts/ci.sh admin-lint     # only the rumble-admin-web UI lint gate
 #
 # Requires: stable toolchain with clippy, nightly toolchain with rustfmt.
 #   rustup toolchain install stable --component clippy
@@ -26,10 +27,16 @@ run_clippy() {
         -- -D warnings
 }
 
+run_admin_lint() {
+    echo "==> rumble-admin-web UI lint gate"
+    cargo run --locked -p rumble-admin-web --bin lint
+}
+
 case "${1:-all}" in
     all)
         run_fmt
         run_clippy
+        run_admin_lint
         ;;
     fmt)
         run_fmt
@@ -37,9 +44,12 @@ case "${1:-all}" in
     clippy)
         run_clippy
         ;;
+    admin-lint)
+        run_admin_lint
+        ;;
     *)
         echo "Unknown check: $1" >&2
-        echo "Usage: $0 [all|fmt|clippy]" >&2
+        echo "Usage: $0 [all|fmt|clippy|admin-lint]" >&2
         exit 2
         ;;
 esac
