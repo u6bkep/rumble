@@ -310,16 +310,28 @@ impl ServerConfig {
             .unwrap_or(Path::new("."))
             .to_path_buf();
 
+        // NOTE: config is loaded *before* the tracing subscriber is initialized
+        // (the subscriber's level comes from this config), so `info!`/`warn!`
+        // here would be dropped. Use `eprintln!` so the path is always visible —
+        // this is the quickest way to spot "edited the wrong copy" / wrong-cwd.
+        let cwd = std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default();
+
         // Check for RUMBLE_NO_CONFIG env var to skip config file entirely (for testing)
         let file_config = if std::env::var("RUMBLE_NO_CONFIG").is_ok() {
+            eprintln!("[config] RUMBLE_NO_CONFIG set — skipping config file, using built-in defaults");
             FileConfig::default()
         } else if config_path.exists() {
+            let shown = fs::canonicalize(config_path).unwrap_or_else(|_| config_path.clone());
+            eprintln!("[config] loading {}", shown.display());
             let content = fs::read_to_string(config_path)
                 .with_context(|| format!("Failed to read config file: {}", config_path.display()))?;
             toml::from_str(&content)
                 .with_context(|| format!("Failed to parse config file: {}", config_path.display()))?
         } else {
-            info!("Config file not found, creating default: {}", config_path.display());
+            eprintln!(
+                "[config] no config at {} (cwd: {cwd}) — creating default",
+                config_path.display(),
+            );
             fs::write(config_path, DEFAULT_CONFIG_CONTENT)
                 .with_context(|| format!("Failed to create config file: {}", config_path.display()))?;
             FileConfig::default()
