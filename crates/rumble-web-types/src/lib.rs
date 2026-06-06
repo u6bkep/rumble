@@ -176,6 +176,11 @@ pub struct UserDto {
     pub server_muted: bool,
     pub is_elevated: bool,
     pub groups: Vec<String>,
+    /// True when this connection's public key has a persisted registration.
+    /// A guest (unregistered) connection has no persistent identity, so its
+    /// group memberships cannot be managed.
+    #[serde(default)]
+    pub is_registered: bool,
 }
 
 /// A registered (persisted) user as seen by the admin monitor. Unlike

@@ -48,6 +48,7 @@ mod native {
                     server_muted: false,
                     is_elevated: true,
                     groups: vec!["admin".into()],
+                    is_registered: true,
                 },
                 UserDto {
                     user_id: 2,
@@ -58,6 +59,7 @@ mod native {
                     server_muted: true,
                     is_elevated: false,
                     groups: vec!["default".into(), "moderators".into()],
+                    is_registered: true,
                 },
                 UserDto {
                     user_id: 3,
@@ -68,6 +70,7 @@ mod native {
                     server_muted: false,
                     is_elevated: false,
                     groups: vec![],
+                    is_registered: false,
                 },
             ],
             rooms: vec![

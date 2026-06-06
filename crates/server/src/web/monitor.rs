@@ -72,6 +72,10 @@ pub async fn state_snapshot(_admin: Admin, State(st): State<WebState>) -> Json<S
         let user_id = client.user_id;
         let status = st.state.get_user_status(user_id).await;
         let room_id = st.state.get_user_room(user_id).await.map(|u| u.to_string());
+        let is_registered = match (st.persistence.as_ref(), st.state.get_user_public_key(user_id)) {
+            (Some(p), Some(key)) => p.is_registered(&key),
+            _ => false,
+        };
         users.push(UserDto {
             user_id,
             username: client.get_username().await,
@@ -81,6 +85,7 @@ pub async fn state_snapshot(_admin: Admin, State(st): State<WebState>) -> Json<S
             server_muted: client.server_muted.load(Ordering::Relaxed),
             is_elevated: client.is_superuser.load(Ordering::Relaxed),
             groups: client.identity.groups().await,
+            is_registered,
         });
     }
 

@@ -1495,7 +1495,8 @@ fn overview_view(snap: &rumble_web_types::StateSnapshot) -> El {
         tokens::SPACE_2,
         [
             stat_row("Connected clients", snap.client_count.to_string()),
-            stat_row("Authenticated users", snap.users.len().to_string()),
+            stat_row("Online users", snap.users.len().to_string()),
+            stat_row("Registered users", snap.registered_users.len().to_string()),
             stat_row("Rooms", snap.rooms.len().to_string()),
             stat_row("Permission groups", snap.groups.len().to_string()),
         ],
@@ -1544,7 +1545,19 @@ fn connected_users_card(users: &[UserDto]) -> El {
             } else {
                 u.groups.join(", ")
             };
-            let actions = row([
+            // Registered identities get a badge; guests show no badge and keep
+            // the Register action (registering is what gives them a persistent
+            // identity whose groups can then be managed).
+            let name_cell = if u.is_registered {
+                row([text(u.username.clone()).semibold(), badge("registered")])
+                    .gap(tokens::SPACE_2)
+                    .align(Align::Center)
+            } else {
+                row([text(u.username.clone()).semibold(), text("guest").muted().small()])
+                    .gap(tokens::SPACE_2)
+                    .align(Align::Center)
+            };
+            let mut buttons: Vec<El> = vec![
                 button("Kick")
                     .key(format!("{KEY_USER_KICK}{}", u.user_id))
                     .secondary()
@@ -1553,15 +1566,19 @@ fn connected_users_card(users: &[UserDto]) -> El {
                     .key(format!("{KEY_USER_BAN}{}", u.user_id))
                     .destructive()
                     .small(),
-                button("Register")
-                    .key(format!("{KEY_USER_REG}{}", u.user_id))
-                    .ghost()
-                    .small(),
-            ])
-            .gap(tokens::SPACE_2);
+            ];
+            if !u.is_registered {
+                buttons.push(
+                    button("Register")
+                        .key(format!("{KEY_USER_REG}{}", u.user_id))
+                        .ghost()
+                        .small(),
+                );
+            }
+            let actions = row(buttons).gap(tokens::SPACE_2);
 
             rows.push(table_row([
-                table_cell(text(u.username.clone()).semibold()),
+                table_cell(name_cell),
                 table_cell(text(status_text).muted().small()),
                 table_cell(text(groups_text).muted().small()),
                 table_cell(actions),
