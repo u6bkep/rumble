@@ -181,6 +181,8 @@ impl Server {
         // Start the web admin control-plane, if enabled.
         if let Some(web_settings) = self.web.clone() {
             crate::web::spawn(self.state.clone(), self.persistence.clone(), web_settings);
+        } else {
+            info!("web admin disabled (set [web] enabled = true, or RUMBLE_WEB_ENABLED=1)");
         }
 
         // Start plugins before accepting connections
