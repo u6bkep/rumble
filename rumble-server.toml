@@ -34,3 +34,23 @@ cert_dir = "certs"
 # Used for certificate generation and ACME support.
 # For development, "localhost" is used by default.
 domain = "localhost"
+
+# Welcome message (MOTD) sent to clients after authentication.
+# If not set, no welcome message is sent.
+# Can also be set via RUMBLE_WELCOME_MESSAGE environment variable.
+# welcome_message = "Welcome to the Rumble server!"
+
+# Web Admin Control-Plane
+# =======================
+# An HTTP server for administering the running server from a browser
+# (groups, ACLs, rooms, bans, live monitoring). Authenticate with the sudo
+# password (see `server set-sudo-password`). Disabled by default.
+#
+# Bind to loopback (the default) and front it with a reverse proxy / SSH
+# tunnel for TLS and remote access. Can be toggled via RUMBLE_WEB_ENABLED=1
+# and RUMBLE_WEB_BIND.
+[web]
+enabled = false
+bind = "127.0.0.1:5001"
+# assets_dir = "admin-web"   # serve the wasm UI bundle from here (dev);
+#                            # omit to serve the bundle embedded in the binary.
