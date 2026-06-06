@@ -10,7 +10,9 @@
 
 use damascene_core::prelude::*;
 
-use rumble_web_types::{BootstrapRequest, CreateGroupRequest, CreateRoomRequest, GroupDto, RoomDto, UserDto};
+use rumble_web_types::{
+    AclEntryDto, BootstrapRequest, CreateGroupRequest, CreateRoomRequest, GroupDto, RoomDto, SetRoomAclRequest, UserDto,
+};
 
 use crate::{
     api::{self, Inb},
@@ -45,50 +47,236 @@ const KEY_ROOM_DEL: &str = "room:del:"; // + uuid
 const KEY_GROUP_NAME: &str = "group:name";
 const KEY_GROUP_CREATE: &str = "group:create";
 const KEY_GROUP_DEL: &str = "group:del:"; // + name
+const KEY_GROUP_EDIT: &str = "group:edit:"; // + name
+
+// group permission editor
+const KEY_GE_PERM: &str = "ge:perm:"; // + 8-hex bit
+const KEY_GE_ALL: &str = "ge:all";
+const KEY_GE_CLEAR: &str = "ge:clear";
+const KEY_GE_SAVE: &str = "ge:save";
+const KEY_GE_CANCEL: &str = "ge:cancel";
+
+// room ACL editor
+const KEY_ROOM_ACL: &str = "room:acl:"; // + uuid
+const KEY_AE_INHERIT: &str = "ae:inherit";
+const KEY_AE_ADD: &str = "ae:add:"; // + group
+const KEY_AE_SAVE: &str = "ae:save";
+const KEY_AE_CANCEL: &str = "ae:cancel";
 
 const KEY_USER_KICK: &str = "user:kick:"; // + id
 const KEY_USER_BAN: &str = "user:ban:"; // + id
 const KEY_USER_REG: &str = "user:reg:"; // + id
 
 // ============================================================
-// Permission flag table (mirrors rumble_protocol::permissions)
+// Permission flag tables (mirror rumble_protocol::permissions)
 // ============================================================
 
-/// `(bit, short label)` for every permission flag, in wire order. Kept local
-/// so the wasm bundle doesn't pull in the full protocol crate; the bits are
-/// stable wire constants.
-const PERMS: &[(u32, &str)] = &[
-    (0x001, "traverse"),
-    (0x002, "enter"),
-    (0x004, "speak"),
-    (0x008, "text"),
-    (0x010, "file"),
-    (0x020, "mute/deafen"),
-    (0x040, "move"),
-    (0x080, "make-room"),
-    (0x100, "modify-room"),
-    (0x200, "write-acl"),
-    (0x10000, "kick"),
-    (0x20000, "ban"),
-    (0x40000, "register"),
-    (0x80000, "self-register"),
-    (0x100000, "manage-acl"),
-    (0x200000, "sudo"),
-    (0x800000, "manage-participants"),
+/// `(bit, label, description)` for the room-scoped permission flags, in wire
+/// order. Kept local so the wasm bundle doesn't pull in the full protocol
+/// crate; the bits are stable wire constants. These are the flags editable in
+/// a per-room ACL.
+const ROOM_PERMS: &[(u32, &str, &str)] = &[
+    (0x001, "Traverse", "Walk through to children"),
+    (0x002, "Enter", "Join this room"),
+    (0x004, "Speak", "Use voice here"),
+    (0x008, "Text", "Send chat messages"),
+    (0x010, "Files", "Upload / share files"),
+    (0x020, "Mute/Deafen", "Mute or deafen others"),
+    (0x040, "Move users", "Move users between rooms"),
+    (0x080, "Make room", "Create sub-rooms"),
+    (0x100, "Modify room", "Edit room settings"),
+    (0x200, "Write ACL", "Edit this room's ACL"),
 ];
 
-/// Comma-joined names of the bits set in `mask`, or `—` when empty.
-fn perm_summary(mask: u32) -> String {
-    let set: Vec<&str> = PERMS
+/// `(bit, label, description)` for the server-scoped permission flags. These
+/// only make sense in a group's base permission set, not a per-room ACL.
+const SERVER_PERMS: &[(u32, &str, &str)] = &[
+    (0x10000, "Kick", "Disconnect users"),
+    (0x20000, "Ban", "Ban users"),
+    (0x40000, "Register", "Register users"),
+    (0x80000, "Self-register", "Register own identity"),
+    (0x100000, "Manage ACL", "Create groups & edit ACLs"),
+    (0x200000, "Sudo", "Superuser elevation"),
+    (0x800000, "Manage participants", "Control bridge participants"),
+];
+
+/// Bitmask covering every room-scoped permission.
+fn all_room_bits() -> u32 {
+    ROOM_PERMS.iter().fold(0u32, |acc, (b, _, _)| acc | b)
+}
+
+/// Bitmask covering every permission we expose (room + server scoped).
+fn all_perm_bits() -> u32 {
+    ROOM_PERMS
         .iter()
-        .filter(|(bit, _)| mask & bit != 0)
-        .map(|(_, name)| *name)
+        .chain(SERVER_PERMS)
+        .fold(0u32, |acc, (b, _, _)| acc | b)
+}
+
+/// Comma-joined labels of the bits set in `mask`, or `—` when empty.
+fn perm_summary(mask: u32) -> String {
+    let set: Vec<&str> = ROOM_PERMS
+        .iter()
+        .chain(SERVER_PERMS)
+        .filter(|(bit, _, _)| mask & bit != 0)
+        .map(|(_, label, _)| *label)
         .collect();
     if set.is_empty() {
         "—".to_string()
     } else {
         set.join(", ")
     }
+}
+
+// ============================================================
+// Room-ACL editing model (mirrors rumble-damascene's room_acl.rs)
+// ============================================================
+
+/// How an ACL entry projects onto a room and its descendants — the
+/// `(apply_here, apply_subs)` pair as a single tri-state.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Scope {
+    Here,
+    Subtree,
+    Both,
+}
+
+impl Scope {
+    fn from_flags(apply_here: bool, apply_subs: bool) -> Self {
+        match (apply_here, apply_subs) {
+            (true, false) => Scope::Here,
+            (false, true) => Scope::Subtree,
+            // `{true,true}` and the illegal `{false,false}` both map to Both.
+            _ => Scope::Both,
+        }
+    }
+    fn apply_here(self) -> bool {
+        !matches!(self, Scope::Subtree)
+    }
+    fn apply_subs(self) -> bool {
+        !matches!(self, Scope::Here)
+    }
+    fn label(self) -> &'static str {
+        match self {
+            Scope::Here => "Here",
+            Scope::Subtree => "Subtree",
+            Scope::Both => "Here + Subtree",
+        }
+    }
+    fn slug(self) -> &'static str {
+        match self {
+            Scope::Here => "here",
+            Scope::Subtree => "subtree",
+            Scope::Both => "both",
+        }
+    }
+    fn from_slug(s: &str) -> Option<Self> {
+        Some(match s {
+            "here" => Scope::Here,
+            "subtree" => Scope::Subtree,
+            "both" => Scope::Both,
+            _ => return None,
+        })
+    }
+}
+
+/// Tri-state of one permission within one ACL entry.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Cell {
+    Allow,
+    Inherit,
+    Deny,
+}
+
+impl Cell {
+    fn slug(self) -> &'static str {
+        match self {
+            Cell::Allow => "allow",
+            Cell::Inherit => "inherit",
+            Cell::Deny => "deny",
+        }
+    }
+    fn from_slug(s: &str) -> Option<Self> {
+        Some(match s {
+            "allow" => Cell::Allow,
+            "inherit" => Cell::Inherit,
+            "deny" => Cell::Deny,
+            _ => return None,
+        })
+    }
+    fn glyph(self) -> &'static str {
+        match self {
+            Cell::Allow => "+",
+            Cell::Inherit => "·",
+            Cell::Deny => "−",
+        }
+    }
+}
+
+/// One editable ACL entry — a `(group, grant, deny, scope)` tuple while the
+/// editor is open. Mirrors `rumble_protocol::proto::RoomAclEntry`.
+struct AclEntry {
+    group: String,
+    grant: u32,
+    deny: u32,
+    scope: Scope,
+}
+
+impl AclEntry {
+    fn cell(&self, bit: u32) -> Cell {
+        if self.deny & bit != 0 {
+            Cell::Deny
+        } else if self.grant & bit != 0 {
+            Cell::Allow
+        } else {
+            Cell::Inherit
+        }
+    }
+    fn set_cell(&mut self, bit: u32, state: Cell) {
+        match state {
+            Cell::Allow => {
+                self.grant |= bit;
+                self.deny &= !bit;
+            }
+            Cell::Inherit => {
+                self.grant &= !bit;
+                self.deny &= !bit;
+            }
+            Cell::Deny => {
+                self.grant &= !bit;
+                self.deny |= bit;
+            }
+        }
+    }
+}
+
+/// In-progress group base-permission edit.
+struct GroupEdit {
+    name: String,
+    is_builtin: bool,
+    permissions: u32,
+}
+
+/// In-progress per-room ACL edit.
+struct AclEdit {
+    room_id: String,
+    room_name: String,
+    inherit_acl: bool,
+    entries: Vec<AclEntry>,
+    /// Index of the expanded entry card, at most one at a time.
+    expanded: Option<usize>,
+}
+
+/// Parse a per-entry route `ae:e:<idx>:<action>[:<payload>]`.
+fn parse_ae_route(route: &str) -> Option<(usize, &str, Option<&str>)> {
+    let rest = route.strip_prefix("ae:e:")?;
+    let (idx_str, tail) = rest.split_once(':')?;
+    let idx: usize = idx_str.parse().ok()?;
+    let (action, payload) = match tail.split_once(':') {
+        Some((a, p)) => (a, Some(p)),
+        None => (tail, None),
+    };
+    Some((idx, action, payload))
 }
 
 // ============================================================
@@ -146,6 +334,10 @@ pub struct AdminApp {
     room_desc: String,
     group_name: String,
 
+    // open editors (overlay the Groups / Rooms tab content when set)
+    editing_group: Option<GroupEdit>,
+    editing_acl: Option<AclEdit>,
+
     // fetched data
     snapshot: Option<rumble_web_types::StateSnapshot>,
 }
@@ -165,6 +357,8 @@ impl AdminApp {
             room_name: String::new(),
             room_desc: String::new(),
             group_name: String::new(),
+            editing_group: None,
+            editing_acl: None,
             snapshot: None,
         }
     }
@@ -208,6 +402,8 @@ impl App for AdminApp {
                 Msg::LoggedOut => {
                     self.phase = Phase::Login;
                     self.snapshot = None;
+                    self.editing_group = None;
+                    self.editing_acl = None;
                     self.status = Some(("Logged out.".to_string(), false));
                 }
                 Msg::State(snapshot) => {
@@ -299,6 +495,13 @@ impl AdminApp {
     }
 
     fn handle_click(&mut self, route: &str) {
+        // An open editor consumes its own routes first.
+        if self.handle_group_edit_click(route) {
+            return;
+        }
+        if self.handle_acl_edit_click(route) {
+            return;
+        }
         match route {
             KEY_LOGIN_SUBMIT => {
                 if !self.login_password.is_empty() {
@@ -316,10 +519,10 @@ impl AdminApp {
             }
             KEY_REFRESH => api::fetch_state(self.inbox.clone()),
             KEY_LOGOUT => api::logout(self.inbox.clone()),
-            KEY_TAB_OVERVIEW => self.tab = Tab::Overview,
-            KEY_TAB_USERS => self.tab = Tab::Users,
-            KEY_TAB_ROOMS => self.tab = Tab::Rooms,
-            KEY_TAB_GROUPS => self.tab = Tab::Groups,
+            KEY_TAB_OVERVIEW => self.switch_tab(Tab::Overview),
+            KEY_TAB_USERS => self.switch_tab(Tab::Users),
+            KEY_TAB_ROOMS => self.switch_tab(Tab::Rooms),
+            KEY_TAB_GROUPS => self.switch_tab(Tab::Groups),
             KEY_ROOM_CREATE => {
                 let name = self.room_name.trim();
                 if !name.is_empty() {
@@ -346,8 +549,12 @@ impl AdminApp {
                 }
             }
             _ => {
-                if let Some(id) = route.strip_prefix(KEY_ROOM_DEL) {
+                if let Some(id) = route.strip_prefix(KEY_ROOM_ACL) {
+                    self.open_acl_editor(id);
+                } else if let Some(id) = route.strip_prefix(KEY_ROOM_DEL) {
                     api::delete_room(self.inbox.clone(), id.to_string());
+                } else if let Some(name) = route.strip_prefix(KEY_GROUP_EDIT) {
+                    self.open_group_editor(name);
                 } else if let Some(name) = route.strip_prefix(KEY_GROUP_DEL) {
                     api::delete_group(self.inbox.clone(), name.to_string());
                 } else if let Some(id) = route.strip_prefix(KEY_USER_KICK).and_then(|s| s.parse::<u64>().ok()) {
@@ -359,6 +566,199 @@ impl AdminApp {
                 }
             }
         }
+    }
+
+    /// Switch dashboard tab, closing any open editor first.
+    fn switch_tab(&mut self, tab: Tab) {
+        self.tab = tab;
+        self.editing_group = None;
+        self.editing_acl = None;
+    }
+
+    // --- group permission editor ---
+
+    fn open_group_editor(&mut self, name: &str) {
+        if let Some(snap) = &self.snapshot
+            && let Some(g) = snap.groups.iter().find(|g| g.name == name)
+        {
+            self.editing_group = Some(GroupEdit {
+                name: g.name.clone(),
+                is_builtin: g.is_builtin,
+                permissions: g.permissions,
+            });
+            self.editing_acl = None;
+        }
+    }
+
+    /// Route a click while the group editor is open. Returns true if consumed.
+    fn handle_group_edit_click(&mut self, route: &str) -> bool {
+        if self.editing_group.is_none() {
+            return false;
+        }
+        match route {
+            KEY_GE_CANCEL => {
+                self.editing_group = None;
+                return true;
+            }
+            KEY_GE_SAVE => {
+                if let Some(ge) = self.editing_group.take() {
+                    api::modify_group(self.inbox.clone(), ge.name, ge.permissions);
+                }
+                return true;
+            }
+            KEY_GE_ALL => {
+                if let Some(ge) = self.editing_group.as_mut() {
+                    ge.permissions = all_perm_bits();
+                }
+                return true;
+            }
+            KEY_GE_CLEAR => {
+                if let Some(ge) = self.editing_group.as_mut() {
+                    ge.permissions = 0;
+                }
+                return true;
+            }
+            _ => {}
+        }
+        if let Some(hex) = route.strip_prefix(KEY_GE_PERM)
+            && let Ok(bit) = u32::from_str_radix(hex, 16)
+        {
+            if let Some(ge) = self.editing_group.as_mut() {
+                ge.permissions ^= bit;
+            }
+            return true;
+        }
+        false
+    }
+
+    // --- room ACL editor ---
+
+    fn open_acl_editor(&mut self, id: &str) {
+        if let Some(snap) = &self.snapshot
+            && let Some(r) = snap.rooms.iter().find(|r| r.id == id)
+        {
+            let entries = r
+                .acls
+                .iter()
+                .map(|e| AclEntry {
+                    group: e.group.clone(),
+                    grant: e.grant,
+                    deny: e.deny,
+                    scope: Scope::from_flags(e.apply_here, e.apply_subs),
+                })
+                .collect();
+            self.editing_acl = Some(AclEdit {
+                room_id: r.id.clone(),
+                room_name: r.name.clone(),
+                inherit_acl: r.inherit_acl,
+                entries,
+                expanded: None,
+            });
+            self.editing_group = None;
+        }
+    }
+
+    /// Route a click while the ACL editor is open. Returns true if consumed.
+    fn handle_acl_edit_click(&mut self, route: &str) -> bool {
+        if self.editing_acl.is_none() {
+            return false;
+        }
+        match route {
+            KEY_AE_CANCEL => {
+                self.editing_acl = None;
+                return true;
+            }
+            KEY_AE_SAVE => {
+                if let Some(ae) = self.editing_acl.take() {
+                    let entries: Vec<AclEntryDto> = ae
+                        .entries
+                        .iter()
+                        .map(|e| AclEntryDto {
+                            group: e.group.clone(),
+                            grant: e.grant,
+                            deny: e.deny,
+                            apply_here: e.scope.apply_here(),
+                            apply_subs: e.scope.apply_subs(),
+                        })
+                        .collect();
+                    let req = SetRoomAclRequest {
+                        inherit_acl: ae.inherit_acl,
+                        entries,
+                    };
+                    api::set_room_acl(self.inbox.clone(), ae.room_id, req);
+                }
+                return true;
+            }
+            KEY_AE_INHERIT => {
+                if let Some(ae) = self.editing_acl.as_mut() {
+                    ae.inherit_acl = !ae.inherit_acl;
+                }
+                return true;
+            }
+            _ => {}
+        }
+        if let Some(group) = route.strip_prefix(KEY_AE_ADD) {
+            if let Some(ae) = self.editing_acl.as_mut() {
+                ae.entries.push(AclEntry {
+                    group: group.to_string(),
+                    grant: 0,
+                    deny: 0,
+                    scope: Scope::Both,
+                });
+                ae.expanded = Some(ae.entries.len() - 1);
+            }
+            return true;
+        }
+        if let Some((idx, action, payload)) = parse_ae_route(route) {
+            if let Some(ae) = self.editing_acl.as_mut() {
+                apply_ae_entry_action(ae, idx, action, payload);
+            }
+            return true;
+        }
+        false
+    }
+}
+
+/// Mutate one ACL entry in response to a parsed `ae:e:*` route.
+fn apply_ae_entry_action(ae: &mut AclEdit, idx: usize, action: &str, payload: Option<&str>) {
+    match action {
+        "toggle" => {
+            ae.expanded = match ae.expanded {
+                Some(i) if i == idx => None,
+                _ => Some(idx),
+            };
+        }
+        "remove" => {
+            if idx < ae.entries.len() {
+                ae.entries.remove(idx);
+                ae.expanded = match ae.expanded {
+                    Some(i) if i == idx => None,
+                    Some(i) if i > idx => Some(i - 1),
+                    other => other,
+                };
+            }
+        }
+        "scope" => {
+            if let Some(slug) = payload
+                && let (Some(entry), Some(scope)) = (ae.entries.get_mut(idx), Scope::from_slug(slug))
+            {
+                entry.scope = scope;
+            }
+        }
+        "p" => {
+            // payload is `<8-hex bit>:<state slug>`
+            if let Some(rest) = payload
+                && let Some((hex, slug)) = rest.split_once(':')
+                && let (Ok(bit), Some(state), Some(entry)) = (
+                    u32::from_str_radix(hex, 16),
+                    Cell::from_slug(slug),
+                    ae.entries.get_mut(idx),
+                )
+            {
+                entry.set_cell(bit, state);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -483,6 +883,9 @@ impl AdminApp {
     }
 
     fn rooms_view(&self, rooms: &[RoomDto]) -> El {
+        if let Some(ae) = &self.editing_acl {
+            return self.acl_editor(ae);
+        }
         let create = titled_card(
             "Create room",
             [row([
@@ -516,15 +919,21 @@ impl AdminApp {
             rows.push(table_row([table_cell(text("No rooms.").muted())]));
         } else {
             for r in rooms {
+                let actions = row([
+                    button("Permissions")
+                        .key(format!("{KEY_ROOM_ACL}{}", r.id))
+                        .secondary()
+                        .small(),
+                    button("Delete")
+                        .key(format!("{KEY_ROOM_DEL}{}", r.id))
+                        .destructive()
+                        .small(),
+                ])
+                .gap(tokens::SPACE_2);
                 rows.push(table_row([
                     table_cell(text(r.name.clone())),
                     table_cell(text(r.description.clone().unwrap_or_default()).muted()),
-                    table_cell(
-                        button("Delete")
-                            .key(format!("{KEY_ROOM_DEL}{}", r.id))
-                            .destructive()
-                            .small(),
-                    ),
+                    table_cell(actions),
                 ]));
             }
         }
@@ -533,6 +942,9 @@ impl AdminApp {
     }
 
     fn groups_view(&self, groups: &[GroupDto]) -> El {
+        if let Some(ge) = &self.editing_group {
+            return self.group_editor(ge);
+        }
         let create = titled_card(
             "Create group",
             [
@@ -566,28 +978,262 @@ impl AdminApp {
             } else {
                 row([text(g.name.clone())]).align(Align::Center)
             };
-            let action = if g.is_builtin {
-                spacer().width(Size::Fixed(0.0))
-            } else {
-                button("Delete")
-                    .key(format!("{KEY_GROUP_DEL}{}", g.name))
-                    .destructive()
-                    .small()
-            };
+            let mut buttons: Vec<El> = vec![
+                button("Edit")
+                    .key(format!("{KEY_GROUP_EDIT}{}", g.name))
+                    .secondary()
+                    .small(),
+            ];
+            if !g.is_builtin {
+                buttons.push(
+                    button("Delete")
+                        .key(format!("{KEY_GROUP_DEL}{}", g.name))
+                        .destructive()
+                        .small(),
+                );
+            }
             rows.push(table_row([
                 table_cell(name_cell),
                 table_cell(text(perm_summary(g.permissions)).muted().small()),
-                table_cell(action),
+                table_cell(row(buttons).gap(tokens::SPACE_2)),
             ]));
         }
 
         column([create, titled_card("Groups", [table([table_body(rows)])])]).gap(tokens::SPACE_4)
+    }
+
+    // --- group permission editor view ---
+
+    fn group_editor(&self, ge: &GroupEdit) -> El {
+        let all = all_perm_bits();
+        let everything_on = ge.permissions & all == all;
+        let toggle_all = button(if everything_on { "Clear all" } else { "+ all" })
+            .key(if everything_on { KEY_GE_CLEAR } else { KEY_GE_ALL })
+            .secondary()
+            .small();
+
+        let header = row([
+            text(format!("Edit group: {}", ge.name)).semibold(),
+            spacer(),
+            toggle_all,
+        ])
+        .align(Align::Center)
+        .gap(tokens::SPACE_2)
+        .fill_width();
+
+        let room_rows: Vec<El> = ROOM_PERMS
+            .iter()
+            .map(|(bit, label, desc)| perm_switch_row(*bit, label, desc, ge.permissions & bit != 0))
+            .collect();
+        let server_rows: Vec<El> = SERVER_PERMS
+            .iter()
+            .map(|(bit, label, desc)| perm_switch_row(*bit, label, desc, ge.permissions & bit != 0))
+            .collect();
+
+        let mut body: Vec<El> = vec![header];
+        if ge.is_builtin {
+            body.push(
+                text("Built-in group — change its base permissions with care.")
+                    .color(COLOR_ERR)
+                    .small(),
+            );
+        }
+        body.push(text("Room-scoped").muted().small());
+        body.push(column(room_rows).gap(tokens::SPACE_1).fill_width());
+        body.push(text("Server-scoped").muted().small());
+        body.push(column(server_rows).gap(tokens::SPACE_1).fill_width());
+        body.push(divider());
+        body.push(
+            row([
+                spacer(),
+                button("Cancel").key(KEY_GE_CANCEL).ghost(),
+                button("Save").key(KEY_GE_SAVE).primary(),
+            ])
+            .gap(tokens::SPACE_2)
+            .fill_width(),
+        );
+
+        titled_card("Group permissions", body).gap(tokens::SPACE_3)
+    }
+
+    // --- room ACL editor view ---
+
+    fn acl_editor(&self, ae: &AclEdit) -> El {
+        let header = row([text(format!("Permissions — {}", ae.room_name)).semibold(), spacer()])
+            .align(Align::Center)
+            .fill_width();
+
+        let inherit = row([
+            checkbox(ae.inherit_acl).key(KEY_AE_INHERIT),
+            text("Inherit ACL from parent room"),
+        ])
+        .gap(tokens::SPACE_2)
+        .align(Align::Center)
+        .fill_width();
+
+        let rules: El = if ae.entries.is_empty() {
+            text("No local rules — inherited permissions apply unchanged. Add a group rule below.")
+                .muted()
+                .small()
+        } else {
+            column(
+                ae.entries
+                    .iter()
+                    .enumerate()
+                    .map(|(i, e)| acl_entry_card(i, e, ae.expanded == Some(i)))
+                    .collect::<Vec<_>>(),
+            )
+            .gap(tokens::SPACE_2)
+            .fill_width()
+        };
+
+        // One "+ group" button per defined group, to append a rule.
+        let groups = self.snapshot.as_ref().map(|s| s.groups.as_slice()).unwrap_or(&[]);
+        let mut add_children: Vec<El> = vec![text("Add rule:").muted().small()];
+        for g in groups {
+            add_children.push(
+                button(format!("+ {}", g.name))
+                    .key(format!("{KEY_AE_ADD}{}", g.name))
+                    .secondary()
+                    .small(),
+            );
+        }
+        let add_row = row(add_children).gap(tokens::SPACE_2).align(Align::Center).fill_width();
+
+        let footer = row([
+            text("Denies always beat allows; rules inherit down the room tree.")
+                .muted()
+                .small(),
+            spacer(),
+            button("Cancel").key(KEY_AE_CANCEL).ghost(),
+            button("Save changes").key(KEY_AE_SAVE).primary(),
+        ])
+        .gap(tokens::SPACE_2)
+        .align(Align::Center)
+        .fill_width();
+
+        titled_card(
+            "Room permissions",
+            vec![header, inherit, divider(), rules, add_row, divider(), footer],
+        )
+        .gap(tokens::SPACE_3)
     }
 }
 
 // ============================================================
 // Free view helpers
 // ============================================================
+
+/// One permission row in the group editor: label + description + a switch.
+fn perm_switch_row(bit: u32, label: &str, desc: &str, on: bool) -> El {
+    row([
+        column([text(label.to_string()).small(), text(desc.to_string()).muted().small()])
+            .gap(0.0)
+            .fill_width(),
+        switch(on).key(format!("{KEY_GE_PERM}{bit:08x}")),
+    ])
+    .gap(tokens::SPACE_3)
+    .align(Align::Center)
+    .fill_width()
+}
+
+/// One ACL entry card: a clickable header with a counts summary + scope badge,
+/// expanding to a scope selector and a tri-state grid over the room perms.
+fn acl_entry_card(idx: usize, entry: &AclEntry, open: bool) -> El {
+    let mask = all_room_bits();
+    let allow = (entry.grant & mask).count_ones();
+    let deny = (entry.deny & mask).count_ones();
+    let summary = if allow == 0 && deny == 0 {
+        "— no overrides".to_string()
+    } else {
+        let mut parts: Vec<String> = Vec::new();
+        if entry.grant & mask == mask {
+            parts.push("+ all".into());
+        } else if allow > 0 {
+            parts.push(format!("+{allow}"));
+        }
+        if deny > 0 {
+            parts.push(format!("−{deny}"));
+        }
+        parts.join(" ")
+    };
+    let chevron = if open { "▾" } else { "▸" };
+
+    let head = row([
+        text(format!("{chevron}  {}", entry.group))
+            .semibold()
+            .width(Size::Fixed(180.0)),
+        text(summary).muted().small().fill_width(),
+        badge(entry.scope.label()),
+    ])
+    .key(format!("ae:e:{idx}:toggle"))
+    .focusable()
+    .cursor(Cursor::Pointer)
+    .gap(tokens::SPACE_3)
+    .padding(Sides::xy(tokens::SPACE_3, tokens::SPACE_2))
+    .align(Align::Center)
+    .fill_width();
+
+    let mut children: Vec<El> = vec![head];
+    if open {
+        let perm_rows: Vec<El> = ROOM_PERMS
+            .iter()
+            .map(|(bit, label, desc)| acl_perm_row(idx, *bit, label, desc, entry.cell(*bit)))
+            .collect();
+        children.push(
+            column([
+                acl_scope_row(idx, entry.scope),
+                column(perm_rows).gap(tokens::SPACE_1).fill_width(),
+                row([
+                    spacer(),
+                    button("Remove rule")
+                        .key(format!("ae:e:{idx}:remove"))
+                        .destructive()
+                        .small(),
+                ])
+                .fill_width(),
+            ])
+            .padding(Sides::xy(tokens::SPACE_3, tokens::SPACE_2))
+            .gap(tokens::SPACE_2)
+            .fill_width(),
+        );
+    }
+    column(children).gap(0.0).fill_width()
+}
+
+/// The Here / Subtree / Both selector for one ACL entry.
+fn acl_scope_row(idx: usize, current: Scope) -> El {
+    row([Scope::Here, Scope::Subtree, Scope::Both].map(|s| {
+        let b = button(s.label()).key(format!("ae:e:{idx}:scope:{}", s.slug()));
+        if s == current {
+            b.primary().small()
+        } else {
+            b.secondary().small()
+        }
+    }))
+    .gap(tokens::SPACE_1)
+}
+
+/// One permission row in an ACL entry: label + description + a +/·/− tri-state.
+fn acl_perm_row(idx: usize, bit: u32, label: &str, desc: &str, current: Cell) -> El {
+    let tri = row([Cell::Allow, Cell::Inherit, Cell::Deny].map(|v| {
+        let b = button(v.glyph())
+            .key(format!("ae:e:{idx}:p:{bit:08x}:{}", v.slug()))
+            .width(Size::Fixed(34.0));
+        if v == current { b.primary() } else { b.secondary() }
+    }))
+    .gap(tokens::SPACE_1);
+
+    row([
+        column([text(label.to_string()).small(), text(desc.to_string()).muted().small()])
+            .gap(0.0)
+            .fill_width(),
+        tri,
+    ])
+    .gap(tokens::SPACE_2)
+    .align(Align::Center)
+    .fill_width()
+}
 
 fn centered(child: El) -> El {
     row([child]).fill_width().justify(Justify::Center)

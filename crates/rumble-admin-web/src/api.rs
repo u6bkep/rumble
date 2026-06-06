@@ -18,7 +18,7 @@ use wasm_bindgen_futures::spawn_local;
 
 use rumble_web_types::{
     ApiError, BanRequest, BootstrapRequest, CreateGroupRequest, CreateRoomRequest, KickRequest, LoginRequest,
-    OkMessage, SessionInfo, StateSnapshot,
+    ModifyGroupRequest, OkMessage, SessionInfo, SetRoomAclRequest, StateSnapshot,
 };
 
 use crate::inbox::{Inbox, Msg};
@@ -50,6 +50,16 @@ async fn get<T: DeserializeOwned>(url: &str) -> Result<T, String> {
 
 async fn post_json<B: Serialize, T: DeserializeOwned>(url: &str, body: &B) -> Result<T, String> {
     let req = Request::post(url).json(body).map_err(|e| e.to_string())?;
+    send(req).await
+}
+
+async fn patch_json<B: Serialize, T: DeserializeOwned>(url: &str, body: &B) -> Result<T, String> {
+    let req = Request::patch(url).json(body).map_err(|e| e.to_string())?;
+    send(req).await
+}
+
+async fn put_json<B: Serialize, T: DeserializeOwned>(url: &str, body: &B) -> Result<T, String> {
+    let req = Request::put(url).json(body).map_err(|e| e.to_string())?;
     send(req).await
 }
 
@@ -161,6 +171,21 @@ pub fn create_group(inbox: Inb, req: CreateGroupRequest) {
 pub fn delete_group(inbox: Inb, name: String) {
     spawn_local(async move {
         let res = delete_empty::<OkMessage>(&format!("/api/groups/{name}")).await;
+        settle_action(inbox, res);
+    });
+}
+
+pub fn modify_group(inbox: Inb, name: String, permissions: u32) {
+    spawn_local(async move {
+        let req = ModifyGroupRequest { permissions };
+        let res = patch_json::<_, OkMessage>(&format!("/api/groups/{name}"), &req).await;
+        settle_action(inbox, res);
+    });
+}
+
+pub fn set_room_acl(inbox: Inb, room_id: String, req: SetRoomAclRequest) {
+    spawn_local(async move {
+        let res = put_json::<_, OkMessage>(&format!("/api/rooms/{room_id}/acl"), &req).await;
         settle_action(inbox, res);
     });
 }

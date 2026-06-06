@@ -4,12 +4,12 @@
 use super::{ApiResult, WebState, auth::Admin};
 use axum::{Json, extract::State};
 use rumble_protocol::uuid_from_room_id;
-use rumble_web_types::{GroupDto, RoomDto, StateSnapshot, UserDto};
+use rumble_web_types::{AclEntryDto, GroupDto, RoomDto, StateSnapshot, UserDto};
 use std::sync::atomic::Ordering;
 
 const BUILTIN_GROUPS: [&str; 2] = ["default", "admin"];
 
-/// Render a proto room into a wire DTO.
+/// Render a proto room into a wire DTO, including its ACL entries.
 fn room_dto(r: &rumble_protocol::proto::RoomInfo) -> RoomDto {
     let id =
         r.id.as_ref()
@@ -17,18 +17,39 @@ fn room_dto(r: &rumble_protocol::proto::RoomInfo) -> RoomDto {
             .map(|u| u.to_string())
             .unwrap_or_default();
     let parent_id = r.parent_id.as_ref().and_then(uuid_from_room_id).map(|u| u.to_string());
+    let acls = r
+        .acls
+        .iter()
+        .map(|e| AclEntryDto {
+            group: e.group.clone(),
+            grant: e.grant,
+            deny: e.deny,
+            apply_here: e.apply_here,
+            apply_subs: e.apply_subs,
+        })
+        .collect();
     RoomDto {
         id,
         name: r.name.clone(),
         parent_id,
         description: r.description.clone(),
         inherit_acl: r.inherit_acl,
+        acls,
     }
 }
 
 /// `GET /api/state` — snapshot of connected users, rooms, and groups.
 pub async fn state_snapshot(_admin: Admin, State(st): State<WebState>) -> Json<StateSnapshot> {
-    let rooms: Vec<RoomDto> = st.state.get_rooms().await.iter().map(room_dto).collect();
+    // `build_room_list` hydrates each room's ACL entries from persistence, so
+    // the ACL editor opens with authoritative rules (in-memory `get_rooms`
+    // only carries ACLs touched since startup).
+    let rooms: Vec<RoomDto> = st
+        .state
+        .build_room_list(&st.persistence)
+        .await
+        .iter()
+        .map(room_dto)
+        .collect();
 
     let groups: Vec<GroupDto> = match st.persistence.as_ref() {
         Some(p) => p
@@ -90,6 +111,12 @@ pub async fn list_groups(_admin: Admin, State(st): State<WebState>) -> ApiResult
 
 /// `GET /api/rooms` — list rooms.
 pub async fn list_rooms(_admin: Admin, State(st): State<WebState>) -> ApiResult<Vec<RoomDto>> {
-    let rooms = st.state.get_rooms().await.iter().map(room_dto).collect();
+    let rooms = st
+        .state
+        .build_room_list(&st.persistence)
+        .await
+        .iter()
+        .map(room_dto)
+        .collect();
     Ok(Json(rooms))
 }

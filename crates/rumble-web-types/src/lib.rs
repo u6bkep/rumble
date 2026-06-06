@@ -109,6 +109,10 @@ pub struct RoomDto {
     pub parent_id: Option<String>,
     pub description: Option<String>,
     pub inherit_acl: bool,
+    /// The room's own ACL entries, so the admin UI can open the ACL editor
+    /// without a second round-trip. Empty when the room has no local rules.
+    #[serde(default)]
+    pub acls: Vec<AclEntryDto>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
