@@ -470,8 +470,10 @@ pub(crate) async fn apply_modify_group(
     Ok(format!("Modified group '{}'", name))
 }
 
-/// Add or remove `target_user_id` to/from `group`, updating both the live
-/// connection (if any) and persistence, then broadcast the change.
+/// Add or remove `target_user_id` to/from `group`. Group membership is keyed by
+/// the user's long-term public key, so this resolves the key from the live
+/// session and delegates to [`apply_set_user_group_by_key`]. Used by the QUIC
+/// handler and the web by-id endpoint, both of which target a connected user.
 pub(crate) async fn apply_set_user_group(
     state: &Arc<ServerState>,
     persistence: Option<&Arc<Persistence>>,
@@ -480,11 +482,44 @@ pub(crate) async fn apply_set_user_group(
     add: bool,
     expires_at: u64,
 ) -> Result<String, String> {
+    let key = state
+        .get_user_public_key(target_user_id)
+        .ok_or_else(|| "User is not connected".to_string())?;
+    apply_set_user_group_by_key(state, persistence, key, group, add, expires_at).await
+}
+
+/// Add or remove the identity owning `public_key` to/from `group`: persist the
+/// change, mirror it onto every live connection authenticated with that key
+/// (so their cached permissions update without a reconnect), and broadcast.
+///
+/// This is the canonical group-membership mutation — membership lives in
+/// persistence keyed by the public key, and a live connection's cached
+/// `identity.groups()` is a derived view kept in sync here. Works for offline
+/// registered users too (no live connection to mirror onto, nothing to
+/// broadcast).
+pub(crate) async fn apply_set_user_group_by_key(
+    state: &Arc<ServerState>,
+    persistence: Option<&Arc<Persistence>>,
+    public_key: [u8; 32],
+    group: String,
+    add: bool,
+    expires_at: u64,
+) -> Result<String, String> {
     let persist = persistence.ok_or_else(|| "Persistence not enabled".to_string())?;
 
-    // Update the live connection's cached groups, if connected.
-    if let Some(target_client) = state.get_client(target_user_id) {
-        let mut groups = target_client.identity.groups().await;
+    if add {
+        let _ = persist.add_user_to_group(&public_key, &group);
+    } else {
+        let _ = persist.remove_user_from_group(&public_key, &group);
+    }
+
+    // Mirror onto any live connection(s) sharing this key, and broadcast the
+    // change so other clients see the membership update.
+    for client in state.snapshot_clients() {
+        if state.get_user_public_key(client.user_id) != Some(public_key) {
+            continue;
+        }
+        let mut groups = client.identity.groups().await;
         let before = groups.len();
         if add {
             if !groups.contains(&group) {
@@ -494,31 +529,22 @@ pub(crate) async fn apply_set_user_group(
             groups.retain(|g| g != &group);
         }
         if groups.len() != before {
-            target_client.identity.set_groups(groups).await;
+            client.identity.set_groups(groups).await;
         }
-    }
-
-    if let Some(key) = state.get_user_public_key(target_user_id) {
-        if add {
-            let _ = persist.add_user_to_group(&key, &group);
-        } else {
-            let _ = persist.remove_user_from_group(&key, &group);
-        }
+        let _ = broadcast_state_update(
+            state,
+            proto::state_update::Update::UserGroupChanged(proto::UserGroupChanged {
+                user_id: client.user_id,
+                group: group.clone(),
+                added: add,
+                expires_at,
+            }),
+        )
+        .await;
     }
 
     let action = if add { "Added" } else { "Removed" };
-    info!(target_user_id, group = %group, action, "SetUserGroup");
-
-    let _ = broadcast_state_update(
-        state,
-        proto::state_update::Update::UserGroupChanged(proto::UserGroupChanged {
-            user_id: target_user_id,
-            group: group.clone(),
-            added: add,
-            expires_at,
-        }),
-    )
-    .await;
+    info!(group = %group, action, "SetUserGroup");
 
     Ok(format!(
         "{} user {} group '{}'",

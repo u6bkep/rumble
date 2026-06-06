@@ -14,7 +14,7 @@ use std::{cell::RefCell, rc::Rc};
 
 use rumble_web_types::{
     BanRequest, BootstrapRequest, CreateGroupRequest, CreateRoomRequest, KickRequest, LoginRequest, ModifyGroupRequest,
-    OkMessage, SessionInfo, SetRoomAclRequest, StateSnapshot,
+    OkMessage, SessionInfo, SetRoomAclRequest, SetUserGroupRequest, StateSnapshot,
 };
 
 use crate::inbox::{Inbox, Msg};
@@ -260,6 +260,20 @@ pub fn ban_user(inbox: Inb, user_id: u64, duration_seconds: u64, reason: String)
 pub fn register_user(inbox: Inb, user_id: u64) {
     spawn_local(async move {
         let res = post_empty::<OkMessage>(&format!("/api/users/{user_id}/register")).await;
+        settle_action(inbox, res);
+    });
+}
+
+/// Add or remove a registered user (by its URL-safe-base64 public key) to/from
+/// `group`. Drives the per-user group editor; each toggle is one call.
+pub fn set_user_group(inbox: Inb, public_key: String, group: String, add: bool) {
+    spawn_local(async move {
+        let req = SetUserGroupRequest {
+            group,
+            add,
+            expires_at: 0,
+        };
+        let res = post_json::<_, OkMessage>(&format!("/api/registered-users/{public_key}/groups"), &req).await;
         settle_action(inbox, res);
     });
 }

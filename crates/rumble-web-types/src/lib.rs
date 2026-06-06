@@ -87,8 +87,9 @@ pub struct ModifyGroupRequest {
     pub permissions: u32,
 }
 
-/// `POST /api/users/{id}/groups` — add or remove a connected user to/from a
-/// group.
+/// `POST /api/users/{id}/groups` (by live user id) or
+/// `POST /api/registered-users/{key}/groups` (by registered public key) — add
+/// or remove a user to/from a group.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SetUserGroupRequest {
     pub group: String,
@@ -177,6 +178,21 @@ pub struct UserDto {
     pub groups: Vec<String>,
 }
 
+/// A registered (persisted) user as seen by the admin monitor. Unlike
+/// [`UserDto`], these exist independent of any live connection — they are the
+/// persistent identities whose group memberships an admin manages. Keyed by the
+/// long-term Ed25519 public key rather than a session `user_id`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisteredUserDto {
+    /// URL-safe base64 (no padding) of the 32-byte Ed25519 public key. Used as
+    /// the path segment for `POST /api/registered-users/{key}/groups`.
+    pub public_key: String,
+    pub username: String,
+    pub groups: Vec<String>,
+    /// True when this identity currently has a live connection.
+    pub online: bool,
+}
+
 /// `GET /api/state` — a snapshot of live server state for the dashboard.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateSnapshot {
@@ -184,4 +200,8 @@ pub struct StateSnapshot {
     pub users: Vec<UserDto>,
     pub rooms: Vec<RoomDto>,
     pub groups: Vec<GroupDto>,
+    /// All persisted user registrations, with their group memberships. Empty
+    /// when persistence is disabled.
+    #[serde(default)]
+    pub registered_users: Vec<RegisteredUserDto>,
 }

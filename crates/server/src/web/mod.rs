@@ -158,6 +158,10 @@ fn router(web_state: WebState, assets_dir: Option<std::path::PathBuf>) -> Router
             post(api::register_user).delete(api::unregister_user),
         )
         .route("/api/users/{id}/groups", post(api::set_user_group))
+        .route(
+            "/api/registered-users/{key}/groups",
+            post(api::set_registered_user_group),
+        )
         .with_state(web_state);
 
     api.merge(assets::router(assets_dir))

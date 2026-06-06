@@ -189,6 +189,21 @@ impl Persistence {
             .and_then(|data| bincode::deserialize(&data).ok())
     }
 
+    /// List every registered user as `(public_key, RegisteredUser)`. Used by the
+    /// web admin to manage group memberships for users who may be offline.
+    pub fn list_registered_users(&self) -> Vec<([u8; 32], RegisteredUser)> {
+        self.registered_users
+            .iter()
+            .filter_map(|result| {
+                result.ok().and_then(|(key, value)| {
+                    let key: [u8; 32] = key.as_ref().try_into().ok()?;
+                    let user: RegisteredUser = bincode::deserialize(&value).ok()?;
+                    Some((key, user))
+                })
+            })
+            .collect()
+    }
+
     /// Register a user (bind username to public key).
     pub fn register_user(&self, public_key: &[u8; 32], user: RegisteredUser) -> Result<()> {
         let data = bincode::serialize(&user)?;
@@ -617,6 +632,41 @@ mod tests {
 
         persistence.unregister_user(&key).unwrap();
         assert!(persistence.get_registered_user(&key).is_none());
+    }
+
+    #[test]
+    fn test_list_registered_users() {
+        let persistence = Persistence::in_memory().unwrap();
+        assert!(persistence.list_registered_users().is_empty());
+
+        let key_a = [1u8; 32];
+        let key_b = [2u8; 32];
+        persistence
+            .register_user(
+                &key_a,
+                RegisteredUser {
+                    username: "alice".to_string(),
+                    last_room: None,
+                },
+            )
+            .unwrap();
+        persistence
+            .register_user(
+                &key_b,
+                RegisteredUser {
+                    username: "bob".to_string(),
+                    last_room: None,
+                },
+            )
+            .unwrap();
+
+        let mut listed = persistence.list_registered_users();
+        listed.sort_by(|a, b| a.1.username.cmp(&b.1.username));
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].0, key_a);
+        assert_eq!(listed[0].1.username, "alice");
+        assert_eq!(listed[1].0, key_b);
+        assert_eq!(listed[1].1.username, "bob");
     }
 
     #[test]

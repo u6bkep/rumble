@@ -4,8 +4,8 @@
 use super::{ApiResult, WebState, auth::Admin};
 use axum::{Json, extract::State};
 use rumble_protocol::uuid_from_room_id;
-use rumble_web_types::{AclEntryDto, GroupDto, RoomDto, StateSnapshot, UserDto};
-use std::sync::atomic::Ordering;
+use rumble_web_types::{AclEntryDto, GroupDto, RegisteredUserDto, RoomDto, StateSnapshot, UserDto};
+use std::{collections::HashSet, sync::atomic::Ordering};
 
 const BUILTIN_GROUPS: [&str; 2] = ["default", "admin"];
 
@@ -84,11 +84,35 @@ pub async fn state_snapshot(_admin: Admin, State(st): State<WebState>) -> Json<S
         });
     }
 
+    // Registered (persisted) users, keyed by public key — the population whose
+    // group memberships the admin manages, online or not. The set of currently
+    // connected keys marks which are live.
+    let online_keys: HashSet<[u8; 32]> = st
+        .state
+        .snapshot_clients()
+        .iter()
+        .filter_map(|c| st.state.get_user_public_key(c.user_id))
+        .collect();
+    let registered_users: Vec<RegisteredUserDto> = match st.persistence.as_ref() {
+        Some(p) => p
+            .list_registered_users()
+            .into_iter()
+            .map(|(key, user)| RegisteredUserDto {
+                public_key: base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, key),
+                username: user.username,
+                groups: p.get_user_groups(&key),
+                online: online_keys.contains(&key),
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+
     Json(StateSnapshot {
         client_count: st.state.client_count(),
         users,
         rooms,
         groups,
+        registered_users,
     })
 }
 

@@ -171,3 +171,37 @@ pub async fn set_user_group(
     )?;
     ok(msg)
 }
+
+/// `POST /api/registered-users/{key}/groups` — add/remove a registered user
+/// (identified by its URL-safe-base64 public key) to/from a group. Unlike
+/// [`set_user_group`], the target need not be connected.
+pub async fn set_registered_user_group(
+    _admin: Admin,
+    State(st): State<WebState>,
+    Path(key_b64): Path<String>,
+    Json(req): Json<SetUserGroupRequest>,
+) -> ApiResult<OkMessage> {
+    let key = decode_public_key(&key_b64)?;
+    let msg = map_op(
+        ops::apply_set_user_group_by_key(
+            &st.state,
+            st.persistence.as_ref(),
+            key,
+            req.group,
+            req.add,
+            req.expires_at,
+        )
+        .await,
+    )?;
+    ok(msg)
+}
+
+/// Decode a URL-safe-base64 (no padding) 32-byte Ed25519 public key, the form
+/// used in the registered-user DTO and route path.
+fn decode_public_key(s: &str) -> Result<[u8; 32], ApiErrorResponse> {
+    let bytes = base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, s)
+        .map_err(|_| ApiErrorResponse::bad_request("Invalid public key"))?;
+    bytes
+        .try_into()
+        .map_err(|_| ApiErrorResponse::bad_request("Public key must be 32 bytes"))
+}

@@ -11,8 +11,11 @@
 use damascene_core::prelude::*;
 
 use rumble_web_types::{
-    AclEntryDto, BootstrapRequest, CreateGroupRequest, CreateRoomRequest, GroupDto, RoomDto, SetRoomAclRequest, UserDto,
+    AclEntryDto, BootstrapRequest, CreateGroupRequest, CreateRoomRequest, GroupDto, RegisteredUserDto, RoomDto,
+    SetRoomAclRequest, UserDto,
 };
+
+use std::collections::BTreeSet;
 
 use crate::{
     api::{self, Inb},
@@ -63,6 +66,11 @@ const KEY_AE_CANCEL: &str = "ae:cancel";
 const KEY_USER_KICK: &str = "user:kick:"; // + id
 const KEY_USER_BAN: &str = "user:ban:"; // + id
 const KEY_USER_REG: &str = "user:reg:"; // + id
+const KEY_USER_GROUPS: &str = "user:groups:"; // + registered-user index
+
+// per-user group-membership editor
+const KEY_UG_TOGGLE: &str = "ug:toggle:"; // + group name
+const KEY_UG_DONE: &str = "ug:done";
 
 // ============================================================
 // Permission flag tables (mirror rumble_protocol::permissions)
@@ -254,6 +262,16 @@ struct GroupEdit {
     permissions: u32,
 }
 
+/// In-progress per-user group-membership edit. The membership API is per-group,
+/// so each toggle dispatches immediately; `member_of` mirrors the change
+/// optimistically so the switches track intent before the refetch lands.
+struct UserGroupsEdit {
+    /// URL-safe base64 public key — the mutation target.
+    public_key: String,
+    username: String,
+    member_of: BTreeSet<String>,
+}
+
 /// In-progress per-room ACL edit.
 struct AclEdit {
     room_id: String,
@@ -349,9 +367,10 @@ pub struct AdminApp {
     room_desc: String,
     group_name: String,
 
-    // open editors (overlay the Groups / Rooms tab content when set)
+    // open editors (overlay the Groups / Rooms / Users tab content when set)
     editing_group: Option<GroupEdit>,
     editing_acl: Option<AclEdit>,
+    editing_user_groups: Option<UserGroupsEdit>,
 
     // fetched data
     snapshot: Option<rumble_web_types::StateSnapshot>,
@@ -374,6 +393,7 @@ impl AdminApp {
             group_name: String::new(),
             editing_group: None,
             editing_acl: None,
+            editing_user_groups: None,
             snapshot: None,
         }
     }
@@ -417,6 +437,12 @@ impl AdminApp {
     pub fn scene_group_editor(snapshot: rumble_web_types::StateSnapshot, group: &str) -> Self {
         let mut app = Self::scene_dashboard(snapshot, "groups");
         app.open_group_editor(group);
+        app
+    }
+
+    pub fn scene_user_groups_editor(snapshot: rumble_web_types::StateSnapshot, user_idx: usize) -> Self {
+        let mut app = Self::scene_dashboard(snapshot, "users");
+        app.open_user_groups_editor(user_idx);
         app
     }
 
@@ -469,6 +495,7 @@ impl App for AdminApp {
                     self.snapshot = None;
                     self.editing_group = None;
                     self.editing_acl = None;
+                    self.editing_user_groups = None;
                     self.status = Some(("Logged out.".to_string(), false));
                 }
                 Msg::State(snapshot) => {
@@ -537,6 +564,7 @@ impl App for AdminApp {
             if self.tab != prev_tab {
                 self.editing_group = None;
                 self.editing_acl = None;
+                self.editing_user_groups = None;
             }
             return;
         }
@@ -591,6 +619,9 @@ impl AdminApp {
             return;
         }
         if self.handle_acl_edit_click(route) {
+            return;
+        }
+        if self.handle_user_groups_click(route) {
             return;
         }
         match route {
@@ -650,6 +681,11 @@ impl AdminApp {
                     api::ban_user(self.inbox.clone(), id, 0, String::new());
                 } else if let Some(id) = route.strip_prefix(KEY_USER_REG).and_then(|s| s.parse::<u64>().ok()) {
                     api::register_user(self.inbox.clone(), id);
+                } else if let Some(idx) = route
+                    .strip_prefix(KEY_USER_GROUPS)
+                    .and_then(|s| s.parse::<usize>().ok())
+                {
+                    self.open_user_groups_editor(idx);
                 }
             }
         }
@@ -786,6 +822,48 @@ impl AdminApp {
         if let Some((idx, action, payload)) = parse_ae_route(route) {
             if let Some(ae) = self.editing_acl.as_mut() {
                 apply_ae_entry_action(ae, idx, action, payload);
+            }
+            return true;
+        }
+        false
+    }
+
+    // --- per-user group-membership editor ---
+
+    fn open_user_groups_editor(&mut self, idx: usize) {
+        if let Some(snap) = &self.snapshot
+            && let Some(u) = snap.registered_users.get(idx)
+        {
+            self.editing_user_groups = Some(UserGroupsEdit {
+                public_key: u.public_key.clone(),
+                username: u.username.clone(),
+                member_of: u.groups.iter().cloned().collect(),
+            });
+            self.editing_group = None;
+            self.editing_acl = None;
+        }
+    }
+
+    /// Route a click while the user-groups editor is open. Returns true if
+    /// consumed.
+    fn handle_user_groups_click(&mut self, route: &str) -> bool {
+        if self.editing_user_groups.is_none() {
+            return false;
+        }
+        if route == KEY_UG_DONE {
+            self.editing_user_groups = None;
+            return true;
+        }
+        if let Some(group) = route.strip_prefix(KEY_UG_TOGGLE) {
+            if let Some(ug) = self.editing_user_groups.as_mut() {
+                let group = group.to_string();
+                let add = !ug.member_of.contains(&group);
+                if add {
+                    ug.member_of.insert(group.clone());
+                } else {
+                    ug.member_of.remove(&group);
+                }
+                api::set_user_group(self.inbox.clone(), ug.public_key.clone(), group, add);
             }
             return true;
         }
@@ -953,7 +1031,7 @@ impl AdminApp {
             None => column([text("Loading server state…").muted()]),
             Some(snap) => match self.tab {
                 Tab::Overview => overview_view(snap),
-                Tab::Users => users_view(&snap.users),
+                Tab::Users => self.users_view(snap),
                 Tab::Rooms => self.rooms_view(&snap.rooms),
                 Tab::Groups => self.groups_view(&snap.groups),
             },
@@ -1203,6 +1281,76 @@ impl AdminApp {
             vec![header, inherit, divider(), rules, add_row, divider(), footer],
         )
     }
+
+    // --- users tab ---
+
+    fn users_view(&self, snap: &rumble_web_types::StateSnapshot) -> El {
+        // The membership editor takes over the whole tab while open.
+        if let Some(ug) = &self.editing_user_groups {
+            return self.user_groups_editor(ug, &snap.groups);
+        }
+        column([
+            connected_users_card(&snap.users),
+            registered_users_card(&snap.registered_users),
+        ])
+        .gap(tokens::SPACE_4)
+    }
+
+    /// The per-user group-membership editor: one switch per defined group,
+    /// reflecting (and toggling) the user's membership.
+    fn user_groups_editor(&self, ug: &UserGroupsEdit, groups: &[GroupDto]) -> El {
+        let header = row([
+            text(format!("Groups — {}", ug.username)).semibold(),
+            spacer(),
+            button("Done").key(KEY_UG_DONE).primary().small(),
+        ])
+        .align(Align::Center)
+        .gap(tokens::SPACE_2)
+        .fill_width();
+
+        let mut body: Vec<El> = vec![
+            header,
+            text("Toggle group membership — each change is saved immediately.")
+                .muted()
+                .small()
+                .wrap_text()
+                .fill_width(),
+            divider(),
+        ];
+        if groups.is_empty() {
+            body.push(
+                text("No groups defined — create one on the Groups tab.")
+                    .muted()
+                    .small(),
+            );
+        } else {
+            let rows: Vec<El> = groups
+                .iter()
+                .map(|g| {
+                    let member = ug.member_of.contains(&g.name);
+                    row([
+                        column([
+                            text(g.name.clone()).small(),
+                            text(perm_summary(g.permissions))
+                                .muted()
+                                .small()
+                                .ellipsis()
+                                .fill_width(),
+                        ])
+                        .gap(0.0)
+                        .fill_width(),
+                        switch(member).key(format!("{KEY_UG_TOGGLE}{}", g.name)),
+                    ])
+                    .gap(tokens::SPACE_3)
+                    .align(Align::Center)
+                    .fill_width()
+                })
+                .collect();
+            body.push(column(rows).gap(tokens::SPACE_1).fill_width());
+        }
+
+        card_section("User groups", tokens::SPACE_3, body)
+    }
 }
 
 // ============================================================
@@ -1361,7 +1509,7 @@ fn stat_row(label: &str, value: String) -> El {
         .align(Align::Center)
 }
 
-fn users_view(users: &[UserDto]) -> El {
+fn connected_users_card(users: &[UserDto]) -> El {
     let mut rows: Vec<El> = vec![table_row([
         table_head("User"),
         table_head("Status"),
@@ -1422,4 +1570,48 @@ fn users_view(users: &[UserDto]) -> El {
     }
 
     titled_card("Connected users", [table([table_body(rows)])])
+}
+
+/// The registered-users table: every persisted identity with its group
+/// memberships and an "Edit groups" action. These exist independent of any live
+/// connection, so this is where an admin manages a user's groups while offline.
+fn registered_users_card(users: &[RegisteredUserDto]) -> El {
+    let mut rows: Vec<El> = vec![table_row([
+        table_head("User"),
+        table_head("Presence"),
+        table_head("Groups"),
+        table_head("Actions"),
+    ])];
+
+    if users.is_empty() {
+        rows.push(table_row([table_cell(
+            text("No registered users. Register a connected user to manage their groups.").muted(),
+        )]));
+    } else {
+        for (idx, u) in users.iter().enumerate() {
+            let presence = if u.online {
+                badge("online")
+            } else {
+                text("offline").muted().small()
+            };
+            let groups_text = if u.groups.is_empty() {
+                "—".to_string()
+            } else {
+                u.groups.join(", ")
+            };
+            let actions = row([button("Edit groups")
+                .key(format!("{KEY_USER_GROUPS}{idx}"))
+                .secondary()
+                .small()])
+            .gap(tokens::SPACE_2);
+            rows.push(table_row([
+                table_cell(text(u.username.clone()).semibold()),
+                table_cell(presence),
+                table_cell(text(groups_text).muted().small()),
+                table_cell(actions),
+            ]));
+        }
+    }
+
+    titled_card("Registered users", [table([table_body(rows)])])
 }

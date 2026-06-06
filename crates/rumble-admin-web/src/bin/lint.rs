@@ -26,7 +26,7 @@ fn main() {
 mod native {
     use damascene_core::prelude::*;
     use rumble_admin_web::AdminApp;
-    use rumble_web_types::{AclEntryDto, GroupDto, RoomDto, StateSnapshot, UserDto};
+    use rumble_web_types::{AclEntryDto, GroupDto, RegisteredUserDto, RoomDto, StateSnapshot, UserDto};
 
     // Matches the real browser viewport (`damascene_web::VIEWPORT`) so layout —
     // and therefore overflow/scrollbar findings — reflects what users see.
@@ -117,6 +117,20 @@ mod native {
                     is_builtin: false,
                 },
             ],
+            registered_users: vec![
+                RegisteredUserDto {
+                    public_key: "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVowMTIz".into(),
+                    username: "alice".into(),
+                    groups: vec!["admin".into()],
+                    online: true,
+                },
+                RegisteredUserDto {
+                    public_key: "MDEyMzQ1Njc4OUFCQ0RFRkdISUpLTE1OT1BRUlNU".into(),
+                    username: "dave".into(),
+                    groups: vec![],
+                    online: false,
+                },
+            ],
         }
     }
 
@@ -138,6 +152,10 @@ mod native {
             ),
             ("group_editor", AdminApp::scene_group_editor(sample_snapshot(), "admin")),
             ("acl_editor", AdminApp::scene_acl_editor(sample_snapshot(), "root")),
+            (
+                "user_groups_editor",
+                AdminApp::scene_user_groups_editor(sample_snapshot(), 0),
+            ),
         ]
     }
 
