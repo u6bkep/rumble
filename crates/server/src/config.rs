@@ -13,7 +13,7 @@
 //! - `domain`: Server domain name (for certificate generation/ACME)
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -113,10 +113,18 @@ bind = "127.0.0.1:5001"
 #[derive(Parser, Debug)]
 #[command(name = "rumble-server")]
 #[command(about = "Rumble VOIP Server", long_about = None)]
+#[command(
+    after_help = "With no subcommand, starts the server. The admin subcommands run a one-shot mutation against the \
+                  database (resolved from --config / --data-dir, same as the server) and then exit."
+)]
 pub struct CliArgs {
+    /// Admin database subcommand to run instead of starting the server.
+    #[command(subcommand)]
+    pub command: Option<Command>,
+
     /// Path to the configuration file.
     /// If the file doesn't exist, it will be created with default values.
-    #[arg(short, long, default_value = "rumble-server.toml")]
+    #[arg(short, long, global = true, default_value = "rumble-server.toml")]
     pub config: PathBuf,
 
     /// Socket address to bind to (overrides config file).
@@ -130,7 +138,8 @@ pub struct CliArgs {
     pub log_level: Option<String>,
 
     /// Directory for server data (overrides config file).
-    #[arg(short, long)]
+    /// Also selects which database the admin subcommands operate on.
+    #[arg(short, long, global = true)]
     pub data_dir: Option<PathBuf>,
 
     /// Directory containing TLS certificates (overrides config file).
@@ -140,6 +149,39 @@ pub struct CliArgs {
     /// Server domain name (overrides config file).
     #[arg(long)]
     pub domain: Option<String>,
+}
+
+/// One-shot administrative subcommands that mutate the database and exit
+/// (instead of starting the server). Public keys are base64-encoded 32-byte
+/// Ed25519 keys. The target database is resolved exactly as for normal
+/// startup, so these always operate on the same DB the running server uses.
+#[derive(Subcommand, Debug, Clone)]
+pub enum Command {
+    /// Add a public key to the `admin` group (grants all permissions).
+    AddAdmin {
+        /// Base64-encoded Ed25519 public key.
+        public_key: String,
+    },
+    /// Set the sudo elevation password — also the web-admin login credential.
+    /// Stored bcrypt-hashed.
+    SetSudoPassword {
+        /// The password to set.
+        password: String,
+    },
+    /// Grant a key MANAGE_PARTICIPANTS by adding it to the `controllers` group
+    /// (for Mumble-bridge / bot controllers).
+    AddController {
+        /// Base64-encoded Ed25519 public key.
+        public_key: String,
+    },
+    /// Set the default participant group that a controller's anonymous
+    /// participants inherit.
+    SetParticipantGroup {
+        /// Base64-encoded Ed25519 public key of the controller.
+        public_key: String,
+        /// Group name to assign as the controller's participant default.
+        group: String,
+    },
 }
 
 /// TOML configuration file structure.
@@ -314,7 +356,9 @@ impl ServerConfig {
         // (the subscriber's level comes from this config), so `info!`/`warn!`
         // here would be dropped. Use `eprintln!` so the path is always visible —
         // this is the quickest way to spot "edited the wrong copy" / wrong-cwd.
-        let cwd = std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default();
+        let cwd = std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
 
         // Check for RUMBLE_NO_CONFIG env var to skip config file entirely (for testing)
         let file_config = if std::env::var("RUMBLE_NO_CONFIG").is_ok() {

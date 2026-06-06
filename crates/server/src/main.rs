@@ -19,153 +19,99 @@
 //! Run with `--help` for available options.
 
 use anyhow::Result;
+use clap::Parser;
 use server::{
     Config, EchoBotFactory, FileTransferRelayFactory, LinkCleanerFactory, Persistence, Server, ServerConfig,
+    config::{CliArgs, Command},
     plugin::PluginFactory,
 };
 use tracing::{info, warn};
 
-/// Handle admin CLI subcommands that run against the database and then exit.
-/// Returns `Some(())` if a subcommand was handled, `None` if normal startup should proceed.
-fn handle_subcommand() -> Result<Option<()>> {
-    let args: Vec<String> = std::env::args().collect();
+/// Decode a base64-encoded 32-byte Ed25519 public key.
+fn decode_ed25519_key(key_b64: &str) -> Result<[u8; 32]> {
+    let key_bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, key_b64)
+        .map_err(|e| anyhow::anyhow!("Invalid base64 public key: {e}"))?;
+    if key_bytes.len() != 32 {
+        anyhow::bail!(
+            "Public key must be 32 bytes (got {}). Provide a base64-encoded Ed25519 public key.",
+            key_bytes.len()
+        );
+    }
+    Ok(key_bytes.try_into().unwrap())
+}
 
-    if args.len() >= 3 && args[1] == "add-admin" {
-        let key_b64 = &args[2];
-        let data_dir = args.get(3).cloned().unwrap_or_else(|| "data".to_string());
+/// Run an admin [`Command`] against the database under `data_dir`, then return.
+/// `data_dir` is the fully-resolved server data directory, so subcommands act
+/// on the same database the running server uses.
+fn handle_subcommand(command: Command, data_dir: &std::path::Path) -> Result<()> {
+    std::fs::create_dir_all(data_dir)?;
+    let db_path = format!("{}/rumble.db", data_dir.display());
+    let persistence = Persistence::open(&db_path)?;
 
-        // Decode the base64 public key
-        let key_bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, key_b64)
-            .map_err(|e| anyhow::anyhow!("Invalid base64 public key: {e}"))?;
-
-        if key_bytes.len() != 32 {
-            anyhow::bail!(
-                "Public key must be 32 bytes (got {}). Provide a base64-encoded Ed25519 public key.",
-                key_bytes.len()
-            );
+    match command {
+        Command::AddAdmin { public_key } => {
+            let key = decode_ed25519_key(&public_key)?;
+            // Ensure default groups exist (creates admin group if needed).
+            persistence.ensure_default_groups()?;
+            persistence.add_user_to_group(&key, "admin")?;
+            persistence.flush()?;
+            println!("Added public key to admin group.");
+            println!("Key: {public_key}");
+            println!("Database: {db_path}");
         }
-
-        let key: [u8; 32] = key_bytes.try_into().unwrap();
-
-        // Open database
-        std::fs::create_dir_all(&data_dir)?;
-        let db_path = format!("{}/rumble.db", data_dir);
-        let persistence = Persistence::open(&db_path)?;
-
-        // Ensure default groups exist (creates admin group if needed)
-        persistence.ensure_default_groups()?;
-
-        // Add user to admin group
-        persistence.add_user_to_group(&key, "admin")?;
-        persistence.flush()?;
-
-        println!("Added public key to admin group.");
-        println!("Key: {key_b64}");
-        println!("Database: {db_path}");
-
-        return Ok(Some(()));
+        Command::SetSudoPassword { password } => {
+            let hash = bcrypt::hash(&password, bcrypt::DEFAULT_COST)
+                .map_err(|e| anyhow::anyhow!("Failed to hash password: {e}"))?;
+            persistence.set_sudo_password(&hash)?;
+            persistence.flush()?;
+            println!("Sudo password set successfully.");
+            println!("Database: {db_path}");
+        }
+        Command::AddController { public_key } => {
+            let key = decode_ed25519_key(&public_key)?;
+            persistence.ensure_default_groups()?;
+            // Ensure a "controllers" group exists granting only MANAGE_PARTICIPANTS —
+            // the authority to mint participants, kept separate from the group whose
+            // permissions minted participants inherit.
+            if persistence.get_group("controllers").is_none() {
+                persistence.create_group(
+                    "controllers",
+                    rumble_protocol::permissions::Permissions::MANAGE_PARTICIPANTS.bits(),
+                )?;
+            }
+            persistence.add_user_to_group(&key, "controllers")?;
+            persistence.flush()?;
+            println!("Added public key to controllers group (grants MANAGE_PARTICIPANTS).");
+            println!("Key: {public_key}");
+            println!("Database: {db_path}");
+        }
+        Command::SetParticipantGroup { public_key, group } => {
+            let key = decode_ed25519_key(&public_key)?;
+            persistence.set_participant_default_group(&key, Some(&group))?;
+            persistence.flush()?;
+            println!("Set default participant group for controller to '{group}'.");
+            println!("Anonymous participants minted by this controller will inherit it.");
+            println!("Database: {db_path}");
+        }
     }
 
-    if args.len() >= 3 && args[1] == "set-sudo-password" {
-        let password = &args[2];
-        let data_dir = args.get(3).cloned().unwrap_or_else(|| "data".to_string());
-
-        // Hash the password with bcrypt
-        let hash = bcrypt::hash(password, bcrypt::DEFAULT_COST)
-            .map_err(|e| anyhow::anyhow!("Failed to hash password: {e}"))?;
-
-        // Open database
-        std::fs::create_dir_all(&data_dir)?;
-        let db_path = format!("{}/rumble.db", data_dir);
-        let persistence = Persistence::open(&db_path)?;
-
-        persistence.set_sudo_password(&hash)?;
-        persistence.flush()?;
-
-        println!("Sudo password set successfully.");
-        println!("Database: {db_path}");
-
-        return Ok(Some(()));
-    }
-
-    if args.len() >= 3 && args[1] == "add-controller" {
-        let key_b64 = &args[2];
-        let data_dir = args.get(3).cloned().unwrap_or_else(|| "data".to_string());
-
-        let key_bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, key_b64)
-            .map_err(|e| anyhow::anyhow!("Invalid base64 public key: {e}"))?;
-        if key_bytes.len() != 32 {
-            anyhow::bail!(
-                "Public key must be 32 bytes (got {}). Provide a base64-encoded Ed25519 public key.",
-                key_bytes.len()
-            );
-        }
-        let key: [u8; 32] = key_bytes.try_into().unwrap();
-
-        std::fs::create_dir_all(&data_dir)?;
-        let db_path = format!("{}/rumble.db", data_dir);
-        let persistence = Persistence::open(&db_path)?;
-        persistence.ensure_default_groups()?;
-
-        // Ensure a "controllers" group exists granting only MANAGE_PARTICIPANTS —
-        // the authority to mint participants, kept separate from the group whose
-        // permissions minted participants inherit.
-        if persistence.get_group("controllers").is_none() {
-            persistence.create_group(
-                "controllers",
-                rumble_protocol::permissions::Permissions::MANAGE_PARTICIPANTS.bits(),
-            )?;
-        }
-        persistence.add_user_to_group(&key, "controllers")?;
-        persistence.flush()?;
-
-        println!("Added public key to controllers group (grants MANAGE_PARTICIPANTS).");
-        println!("Key: {key_b64}");
-        println!("Database: {db_path}");
-
-        return Ok(Some(()));
-    }
-
-    if args.len() >= 4 && args[1] == "set-participant-group" {
-        let key_b64 = &args[2];
-        let group = &args[3];
-        let data_dir = args.get(4).cloned().unwrap_or_else(|| "data".to_string());
-
-        let key_bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, key_b64)
-            .map_err(|e| anyhow::anyhow!("Invalid base64 public key: {e}"))?;
-        if key_bytes.len() != 32 {
-            anyhow::bail!(
-                "Public key must be 32 bytes (got {}). Provide a base64-encoded Ed25519 public key.",
-                key_bytes.len()
-            );
-        }
-        let key: [u8; 32] = key_bytes.try_into().unwrap();
-
-        std::fs::create_dir_all(&data_dir)?;
-        let db_path = format!("{}/rumble.db", data_dir);
-        let persistence = Persistence::open(&db_path)?;
-        persistence.set_participant_default_group(&key, Some(group))?;
-        persistence.flush()?;
-
-        println!("Set default participant group for controller to '{group}'.");
-        println!("Anonymous participants minted by this controller will inherit it.");
-        println!("Database: {db_path}");
-
-        return Ok(Some(()));
-    }
-
-    Ok(None)
+    Ok(())
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Check for subcommands before normal startup
-    if handle_subcommand()?.is_some() {
-        return Ok(());
-    }
+    let args = CliArgs::parse();
+    let command = args.command.clone();
 
-    // Load configuration (CLI args + config file)
-    let server_config = ServerConfig::load()?;
+    // Resolve configuration (CLI args + env + config file). Doing this for
+    // subcommands too means they operate on the same data dir / database the
+    // server would use, rather than a hardcoded "./data".
+    let server_config = ServerConfig::load_with_args(args)?;
+
+    // Admin subcommands mutate the database and exit before normal startup.
+    if let Some(command) = command {
+        return handle_subcommand(command, &server_config.data_dir);
+    }
 
     // Initialize logging with configured level
     let env_filter = tracing_subscriber::EnvFilter::try_new(&server_config.log_level)
