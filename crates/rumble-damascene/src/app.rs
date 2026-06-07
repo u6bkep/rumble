@@ -523,25 +523,27 @@ impl<B: UiBackend> App for RumbleApp<B> {
         } else {
             None
         };
+        // Session-gate modals (wizard / unlock / cert) lock the whole
+        // session; while any is up, lower layers are suppressed.
+        let session_gate_clear = !wizard_open && unlock_layer.is_none() && cert_layer.is_none();
+        // Content overlays (lightboxes, file context menu) also yield to
+        // the settings dialog, which would otherwise paint behind them
+        // while still interactive.
+        let content_layers_clear = session_gate_clear && !self.settings_state.open;
         // Suppress the server form whenever a higher-priority modal is up.
-        let connect_layer = if !wizard_open && unlock_layer.is_none() && cert_layer.is_none() {
+        let connect_layer = if session_gate_clear {
             server_picker::render_form_modal(&self.server_picker, &self.selection)
         } else {
             None
         };
 
-        let voice_mode_layer = if self.voice_mode_menu_open
-            && !wizard_open
-            && unlock_layer.is_none()
-            && cert_layer.is_none()
-            && state.connection.is_connected()
-        {
+        let voice_mode_layer = if self.voice_mode_menu_open && session_gate_clear && state.connection.is_connected() {
             Some(voice_mode_menu(state.audio.voice_mode))
         } else {
             None
         };
 
-        let (settings_panel, settings_popover) = if !wizard_open && unlock_layer.is_none() && cert_layer.is_none() {
+        let (settings_panel, settings_popover) = if session_gate_clear {
             settings::render(
                 &self.settings_state,
                 &state,
@@ -557,8 +559,7 @@ impl<B: UiBackend> App for RumbleApp<B> {
             (None, None)
         };
 
-        let lower_layers_block_room_menus =
-            wizard_open || unlock_layer.is_some() || cert_layer.is_some() || self.settings_state.open;
+        let lower_layers_block_room_menus = !content_layers_clear;
         let room_tree_overlays = if lower_layers_block_room_menus {
             room_tree::RoomTreeOverlays::default()
         } else {
@@ -576,10 +577,7 @@ impl<B: UiBackend> App for RumbleApp<B> {
         // when ready; until then we fall back to the chat thumbnail
         // so the panel opens instantly and just gets sharper a frame
         // later.
-        let lightbox_layer = if !wizard_open
-            && unlock_layer.is_none()
-            && cert_layer.is_none()
-            && !self.settings_state.open
+        let lightbox_layer = if content_layers_clear
             && let Some(lightbox_state) = self.image_lightbox.as_ref()
             && let Some(cached) = self.media_cache.lightbox_image_for(&lightbox_state.transfer_id)
         {
@@ -599,12 +597,7 @@ impl<B: UiBackend> App for RumbleApp<B> {
         // they don't visually conflict. Same modal-suppression
         // rules apply (no popping over wizard / cert / unlock /
         // settings).
-        let video_lightbox_layer = if !wizard_open
-            && unlock_layer.is_none()
-            && cert_layer.is_none()
-            && !self.settings_state.open
-            && let Some(active) = self.active_video.as_ref()
-        {
+        let video_lightbox_layer = if content_layers_clear && let Some(active) = self.active_video.as_ref() {
             Some(video::render_lightbox(active))
         } else {
             None
@@ -612,48 +605,34 @@ impl<B: UiBackend> App for RumbleApp<B> {
 
         // Model lightbox shares the image/video lightbox overlay slot
         // (only one open at a time) and the same modal-suppression rules.
-        let model_lightbox_layer = if !wizard_open
-            && unlock_layer.is_none()
-            && cert_layer.is_none()
-            && !self.settings_state.open
-            && let Some(active) = self.active_model.as_ref()
-        {
+        let model_lightbox_layer = if content_layers_clear && let Some(active) = self.active_model.as_ref() {
             Some(model::render_lightbox(active))
         } else {
             None
         };
 
-        let file_ctx_layer =
-            if !wizard_open && unlock_layer.is_none() && cert_layer.is_none() && !self.settings_state.open {
-                self.file_context_menu.as_ref().map(chat::render_file_context_menu)
-            } else {
-                None
-            };
+        let file_ctx_layer = if content_layers_clear {
+            self.file_context_menu.as_ref().map(chat::render_file_context_menu)
+        } else {
+            None
+        };
 
         // Per-room ACL editor modal. Suppressed under cert / unlock /
         // wizard for the same reason settings is — those gate the
         // session itself. Renders above the settings dialog when both
         // are somehow open (shouldn't happen by normal flow).
-        let (room_acl_modal_layer, room_acl_popover_layer) = if !wizard_open
-            && unlock_layer.is_none()
-            && cert_layer.is_none()
-            && let Some(modal) = self.room_acl_modal.as_ref()
-        {
-            let layers = room_acl::render(modal, &state, &self.selection);
-            (layers.modal, layers.popover)
-        } else {
-            (None, None)
-        };
+        let (room_acl_modal_layer, room_acl_popover_layer) =
+            if session_gate_clear && let Some(modal) = self.room_acl_modal.as_ref() {
+                let layers = room_acl::render(modal, &state, &self.selection);
+                (layers.modal, layers.popover)
+            } else {
+                (None, None)
+            };
 
         // Drop-target hint while the OS is reporting a hovered file.
         // Suppressed under modals (the user can still drop a file then,
         // but the prompt would visually fight whatever modal is up).
-        let drop_target_layer = if self.file_drop_hover
-            && !wizard_open
-            && unlock_layer.is_none()
-            && cert_layer.is_none()
-            && state.connection.is_connected()
-        {
+        let drop_target_layer = if self.file_drop_hover && session_gate_clear && state.connection.is_connected() {
             Some(drop_target_hint())
         } else {
             None
@@ -663,11 +642,7 @@ impl<B: UiBackend> App for RumbleApp<B> {
         // modals (wizard/unlock/cert). Renders above settings since the
         // App closes settings when opening it — no overlap by design,
         // but the explicit ordering keeps the precedence obvious.
-        let elevate_layer = if !wizard_open
-            && unlock_layer.is_none()
-            && cert_layer.is_none()
-            && let Some(es) = self.elevate.as_ref()
-        {
+        let elevate_layer = if session_gate_clear && let Some(es) = self.elevate.as_ref() {
             Some(elevate::render(es, &self.selection))
         } else {
             None
