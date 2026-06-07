@@ -18,6 +18,7 @@ pub mod backend;
 pub mod chat;
 pub mod elevate;
 pub mod identity;
+pub mod lightbox;
 pub mod media_cache;
 pub mod model;
 pub mod password_input;

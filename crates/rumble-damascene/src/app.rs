@@ -34,7 +34,7 @@ use crate::{
     chat,
     elevate::{self, ElevateOutcome, ElevateState},
     identity::Identity,
-    model, room_acl,
+    lightbox, model, room_acl,
     room_tree::{self, RoomTreeOutcome, RoomTreeState},
     server_picker::{self, ServerForm, ServerPickerOutcome, ServerPickerState},
     settings::{self, SettingsOutcome, SettingsState},
@@ -43,7 +43,7 @@ use crate::{
 };
 
 /// Result yielded by `pending_video_open`: `(transfer_id, file_name, stream)` or libmpv error.
-type PendingVideoOpenResult = Result<(String, String, rumble_video::VideoStream), rumble_video::Error>;
+pub type PendingVideoOpenResult = Result<(String, String, rumble_video::VideoStream), rumble_video::Error>;
 
 pub struct RumbleApp<B: UiBackend = crate::backend::NativeUiBackend> {
     backend: B,
@@ -162,10 +162,9 @@ pub struct RumbleApp<B: UiBackend = crate::backend::NativeUiBackend> {
     /// drained each frame in `drain_backend_events`.
     media_cache: crate::media_cache::MediaCache,
 
-    /// Click-to-enlarge image viewer state. `Some` when a chat image
-    /// preview was clicked; cleared by Close / Escape / scrim click.
-    /// The image bytes come from [`media_cache`].
-    image_lightbox: Option<chat::Lightbox>,
+    /// The three mutually-exclusive media lightboxes (image / video /
+    /// 3D model). See [`crate::lightbox::Lightboxes`].
+    lightboxes: crate::lightbox::Lightboxes,
 
     /// Right-click context menu for a file card. `Some` while open;
     /// cleared by any menu action, the dismiss scrim, or Escape.
@@ -196,23 +195,6 @@ pub struct RumbleApp<B: UiBackend = crate::backend::NativeUiBackend> {
     /// `None` before the host has finished bringing up wgpu (e.g.
     /// while running tests against a `MockUiBackend`).
     gpu_device: Option<wgpu::Device>,
-
-    /// Currently-open video lightbox, if any. Owns the libmpv
-    /// stream + decode worker + GPU mirror; dropped on close to
-    /// free everything in one shot. Only one video plays at a
-    /// time — opening a second supersedes the first.
-    active_video: Option<video::ActiveVideo>,
-    /// In-flight `VideoStream::open` task. `load_file` blocks for
-    /// 10–50ms while libmpv negotiates the container, so opening
-    /// is offloaded to the runtime to avoid stalling the UI; the
-    /// completed stream lands in `active_video` next frame.
-    pending_video_open: Option<JoinHandle<PendingVideoOpenResult>>,
-
-    /// Currently-open 3D-model lightbox, if any. Holds the parsed
-    /// geometry; the orbit camera lives in damascene's `UiState` (keyed
-    /// by `model::KEY_SCENE`). Shares the overlay slot with the image and
-    /// video lightboxes — only one is ever open at a time.
-    active_model: Option<model::ActiveModel>,
 
     /// Queued toasts collected from backend events each frame.
     /// Drained by [`App::drain_toasts`] so damascene's runtime synthesizes
@@ -318,16 +300,13 @@ impl<B: UiBackend> RumbleApp<B> {
             pending_file_dialog: None,
             auto_handled_offers: HashSet::new(),
             media_cache: crate::media_cache::MediaCache::new(runtime_handle_for_media_cache, initial_gif_autoplay),
-            image_lightbox: None,
+            lightboxes: crate::lightbox::Lightboxes::default(),
             file_context_menu: None,
             pending_save_as: None,
             pending_pick_download_dir: None,
             file_drop_hover: false,
             room_acl_modal: None,
             gpu_device: None,
-            active_video: None,
-            pending_video_open: None,
-            active_model: None,
             pending_toasts: Vec::new(),
             pending_link_opens: Vec::new(),
             pending_cancel_confirm: HashMap::new(),
@@ -385,7 +364,7 @@ impl<B: UiBackend> App for RumbleApp<B> {
         self.pump_hotkeys();
         self.pending_cancel_confirm
             .retain(|_, t| now.duration_since(*t).as_secs() < 3);
-        if let Some(active) = self.active_video.as_mut() {
+        if let Some(active) = self.lightboxes.video.as_mut() {
             active.refresh_scrub_value();
         }
     }
@@ -553,7 +532,7 @@ impl<B: UiBackend> App for RumbleApp<B> {
         // so the panel opens instantly and just gets sharper a frame
         // later.
         let lightbox_layer = if content_layers_clear
-            && let Some(lightbox_state) = self.image_lightbox.as_ref()
+            && let Some(lightbox_state) = self.lightboxes.image.as_ref()
             && let Some(cached) = self.media_cache.lightbox_image_for(&lightbox_state.transfer_id)
         {
             let playback = self.media_cache.gif_playback_for(&lightbox_state.transfer_id);
@@ -572,7 +551,7 @@ impl<B: UiBackend> App for RumbleApp<B> {
         // they don't visually conflict. Same modal-suppression
         // rules apply (no popping over wizard / cert / unlock /
         // settings).
-        let video_lightbox_layer = if content_layers_clear && let Some(active) = self.active_video.as_ref() {
+        let video_lightbox_layer = if content_layers_clear && let Some(active) = self.lightboxes.video.as_ref() {
             Some(video::render_lightbox(active))
         } else {
             None
@@ -580,7 +559,7 @@ impl<B: UiBackend> App for RumbleApp<B> {
 
         // Model lightbox shares the image/video lightbox overlay slot
         // (only one open at a time) and the same modal-suppression rules.
-        let model_lightbox_layer = if content_layers_clear && let Some(active) = self.active_model.as_ref() {
+        let model_lightbox_layer = if content_layers_clear && let Some(active) = self.lightboxes.model.as_ref() {
             Some(model::render_lightbox(active))
         } else {
             None
@@ -960,190 +939,28 @@ impl<B: UiBackend> App for RumbleApp<B> {
             }
         }
 
-        // Per-GIF play/pause and explicit-open-lightbox icons live on
-        // top of the preview card (`stack([preview, controls])`), so
-        // their routes win over the underlying `chat:preview:*` route.
-        // Handle them before the body click below.
-        if matches!(event.kind, UiEventKind::Click | UiEventKind::Activate)
-            && let Some(route) = event.route()
-        {
-            if let Some(transfer_id) = chat::parse_gif_play_key(route) {
-                self.toggle_gif_playback(transfer_id);
+        // Media lightboxes (image / video / 3D model). The module owns
+        // the shared overlay state + dispatch; collaborator-heavy opens
+        // run here in response to the returned action.
+        match lightbox::handle_event(&mut self.lightboxes, &event, cx, &mut self.media_cache) {
+            lightbox::LightboxAction::Ignored => {}
+            lightbox::LightboxAction::Handled => return,
+            lightbox::LightboxAction::OpenImage(id) => {
+                self.open_lightbox(&id);
                 return;
             }
-            if let Some(transfer_id) = chat::parse_gif_lightbox_key(route) {
-                self.open_lightbox(transfer_id);
+            lightbox::LightboxAction::OpenVideo(id) => {
+                self.open_video_lightbox(&id);
                 return;
             }
-        }
-
-        // Image lightbox. Open by clicking (or keyboard-activating) an
-        // inline image preview; close via the panel's Close button, the
-        // scrim, or Escape. Open/close are stateless beyond toggling
-        // `image_lightbox` — the panel re-reads the image from
-        // `image_cache` each frame so a transfer evicted out from under
-        // an open lightbox dismisses it cleanly.
-        if event.kind == UiEventKind::Click
-            && let Some(route) = event.route()
-            && let Some(transfer_id) = chat::parse_preview_key(route)
-        {
-            self.open_lightbox(transfer_id);
-            return;
-        }
-        if self.image_lightbox.is_some()
-            && (event.is_click_or_activate(chat::KEY_LIGHTBOX_CLOSE)
-                || (event.is_route(chat::KEY_LIGHTBOX_DISMISS) && event.kind == UiEventKind::Click)
-                || event.kind == UiEventKind::Escape)
-        {
-            self.close_lightbox();
-            return;
-        }
-        let lightbox_image_size = self.image_lightbox.as_ref().and_then(|lightbox| {
-            let cached = self.media_cache.lightbox_image_for(&lightbox.transfer_id)?;
-            let playback = self.media_cache.gif_playback_for(&lightbox.transfer_id);
-            Some(cached.current_frame_size(playback))
-        });
-        let lightbox_body_size = cx.rect_of_key(chat::KEY_LIGHTBOX_IMAGE).map(|r| (r.w, r.h));
-        if let Some(lightbox) = self.image_lightbox.as_mut() {
-            if event.is_click_or_activate(chat::KEY_LIGHTBOX_ZOOM_IN) {
-                lightbox.zoom_in(lightbox_body_size, lightbox_image_size);
+            lightbox::LightboxAction::OpenModel(id) => {
+                self.open_model_lightbox(&id);
                 return;
             }
-            if event.is_click_or_activate(chat::KEY_LIGHTBOX_ZOOM_OUT) {
-                lightbox.zoom_out(lightbox_body_size, lightbox_image_size);
+            lightbox::LightboxAction::ToggleGif(id) => {
+                self.toggle_gif_playback(&id);
                 return;
             }
-            if event.is_click_or_activate(chat::KEY_LIGHTBOX_ZOOM_FIT) {
-                lightbox.fit();
-                return;
-            }
-            if event.is_click_or_activate(chat::KEY_LIGHTBOX_ZOOM_NATURAL) {
-                lightbox.natural_size();
-                return;
-            }
-            // Drag-to-pan on the image surface. Gated on "scaled image
-            // overflows the body" rather than `zoom > 1.0`: a large
-            // image at <100% can still extend past the viewport, and
-            // the user expects to be able to pan it in that case.
-            let overflows = lightbox_image_size
-                .is_some_and(|(w, h)| lightbox.image_overflows_body((w as f32, h as f32), lightbox_body_size));
-            if event.route() == Some(chat::KEY_LIGHTBOX_IMAGE) && overflows {
-                match event.kind {
-                    UiEventKind::PointerDown => {
-                        if let Some(pos) = event.pointer {
-                            lightbox.drag.anchor = Some((pos, lightbox.pan));
-                        }
-                        return;
-                    }
-                    UiEventKind::Drag => {
-                        if let Some((anchor_pos, start_pan)) = lightbox.drag.anchor
-                            && let Some(pos) = event.pointer
-                        {
-                            lightbox.pan = (
-                                start_pan.0 + (pos.0 - anchor_pos.0),
-                                start_pan.1 + (pos.1 - anchor_pos.1),
-                            );
-                        }
-                        return;
-                    }
-                    UiEventKind::PointerUp => {
-                        lightbox.drag.anchor = None;
-                        return;
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        // Video lightbox. Open via the file-card "Play" button on
-        // a downloaded video; close via Close button, scrim, or
-        // Escape. Controls (play/pause, mute, scrub) live inside
-        // the panel so they only reach this handler when the
-        // panel is open.
-        if event.kind == UiEventKind::Click
-            && let Some(route) = event.route()
-            && let Some(transfer_id) = video::parse_open_video_key(route)
-        {
-            self.open_video_lightbox(transfer_id);
-            return;
-        }
-        if self.active_video.is_some()
-            && (event.is_click_or_activate(video::KEY_LIGHTBOX_CLOSE)
-                || (event.is_route(video::KEY_LIGHTBOX_DISMISS) && event.kind == UiEventKind::Click)
-                || event.kind == UiEventKind::Escape)
-        {
-            self.close_video_lightbox();
-            return;
-        }
-        if let Some(active) = self.active_video.as_mut() {
-            // Keyboard shortcuts: arrows (seek ±5s, +Shift =
-            // ±30s), Home/End (seek to start/end), M (mute).
-            // Space is handled separately via Activate routed to
-            // the focused surface — damascene translates focused-
-            // Space into Activate before KeyDown reaches us.
-            if video::handle_lightbox_key(active, &event) {
-                return;
-            }
-            // Click or Space/Enter on the surface itself toggles
-            // play. Conventional video-player behaviour and the
-            // primary path for play/pause once focus has landed
-            // anywhere inside the lightbox.
-            if event.is_click_or_activate(video::KEY_LIGHTBOX_SURFACE) {
-                active.toggle_play();
-                return;
-            }
-            if event.is_click_or_activate(video::KEY_PLAY_PAUSE) {
-                active.toggle_play();
-                return;
-            }
-            if event.is_click_or_activate(video::KEY_MUTE) {
-                active.toggle_mute();
-                return;
-            }
-            // Scrub bar: pointer-down anchors a drag, drag fires
-            // seeks at the new value, pointer-up clears the
-            // scrubbing flag so refresh_scrub_value resumes
-            // tracking the playhead.
-            if event.is_route(video::KEY_SCRUB)
-                && let (Some(rect), Some(x)) = (event.target_rect(), event.pointer_x())
-            {
-                match event.kind {
-                    UiEventKind::PointerDown | UiEventKind::Drag => {
-                        let n = damascene_core::widgets::slider::normalized_from_event(rect, x);
-                        active.scrubbing = true;
-                        active.seek_normalized(n);
-                        return;
-                    }
-                    UiEventKind::PointerUp | UiEventKind::Click => {
-                        let n = damascene_core::widgets::slider::normalized_from_event(rect, x);
-                        active.seek_normalized(n);
-                        active.scrubbing = false;
-                        return;
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        // Model lightbox. Open via the inline model preview card or the
-        // file-card "View 3D" button; close via Close button, scrim, or
-        // Escape. Orbit/pan/zoom inside the panel is handled by
-        // damascene's `chart3d` element directly (it consumes its own
-        // pointer/wheel events), so there are no per-frame controls here.
-        if matches!(event.kind, UiEventKind::Click | UiEventKind::Activate)
-            && let Some(route) = event.route()
-            && let Some(transfer_id) = model::parse_open_model_key(route)
-        {
-            self.open_model_lightbox(transfer_id);
-            return;
-        }
-        if self.active_model.is_some()
-            && (event.is_click_or_activate(model::KEY_LIGHTBOX_CLOSE)
-                || (event.is_route(model::KEY_LIGHTBOX_DISMISS) && event.kind == UiEventKind::Click)
-                || event.kind == UiEventKind::Escape)
-        {
-            self.close_model_lightbox();
-            return;
         }
 
         // Top toolbar.
@@ -1232,14 +1049,14 @@ impl<B: UiBackend> App for RumbleApp<B> {
     /// fall through to the default (forward to `on_event`, no consume),
     /// so chat / room-tree / settings scrolling all keep working.
     fn on_wheel_event(&mut self, event: UiEvent, cx: &EventCx) -> bool {
-        if self.image_lightbox.is_some() {
-            let image_size = self.image_lightbox.as_ref().and_then(|lightbox| {
+        if self.lightboxes.image.is_some() {
+            let image_size = self.lightboxes.image.as_ref().and_then(|lightbox| {
                 let cached = self.media_cache.lightbox_image_for(&lightbox.transfer_id)?;
                 let playback = self.media_cache.gif_playback_for(&lightbox.transfer_id);
                 Some(cached.current_frame_size(playback))
             });
             let body_size = cx.rect_of_key(chat::KEY_LIGHTBOX_IMAGE).map(|r| (r.w, r.h));
-            if let Some(lightbox) = self.image_lightbox.as_mut()
+            if let Some(lightbox) = self.lightboxes.image.as_mut()
                 && let Some((_, dy)) = event.wheel_delta
             {
                 if dy < 0.0 {
@@ -1822,7 +1639,7 @@ impl<B: UiBackend> RumbleApp<B> {
         // The three lightboxes share one overlay slot — close the others.
         self.close_video_lightbox();
         self.close_model_lightbox();
-        self.image_lightbox = Some(chat::Lightbox::new(transfer_id, name));
+        self.lightboxes.image = Some(chat::Lightbox::new(transfer_id, name));
         self.media_cache.force_resume_playback(transfer_id);
 
         // Look up the local file path from the live transfer set; if
@@ -1845,8 +1662,7 @@ impl<B: UiBackend> RumbleApp<B> {
     /// in-flight decode so it can't deliver a result we'd just throw
     /// away.
     fn close_lightbox(&mut self) {
-        self.image_lightbox = None;
-        self.media_cache.close_lightbox();
+        self.lightboxes.close_image(&mut self.media_cache);
     }
 
     /// Open the video lightbox for `transfer_id`. Looks up the
@@ -1854,7 +1670,7 @@ impl<B: UiBackend> RumbleApp<B> {
     /// kicks off `VideoStream::open` on the runtime — `load_file`
     /// blocks 10–50ms while libmpv parses the container, which
     /// would hitch the UI if done synchronously. The completed
-    /// stream lands in `self.active_video` next frame via
+    /// stream lands in `self.lightboxes.video` next frame via
     /// [`Self::poll_video_open`].
     ///
     /// Closing any previous video lightbox (or aborting an
@@ -1867,7 +1683,7 @@ impl<B: UiBackend> RumbleApp<B> {
         // libmpv handle and re-opening from scratch when a
         // stale Activate (e.g. focus left on the chat-side
         // preview, user hits Space) sends us the same id.
-        if self.active_video.as_ref().map(|a| a.transfer_id.as_str()) == Some(transfer_id) {
+        if self.lightboxes.video.as_ref().map(|a| a.transfer_id.as_str()) == Some(transfer_id) {
             return;
         }
         // Find the file's name + path from the live transfer set.
@@ -1886,14 +1702,14 @@ impl<B: UiBackend> RumbleApp<B> {
         // Drop any existing active video / pending open. Newer
         // intent supersedes older. Close the image/model lightboxes too —
         // the three share one overlay slot.
-        self.active_video = None;
+        self.lightboxes.video = None;
         self.close_lightbox();
         self.close_model_lightbox();
-        if let Some(prev) = self.pending_video_open.take() {
+        if let Some(prev) = self.lightboxes.pending_video_open.take() {
             prev.abort();
         }
 
-        self.pending_video_open = Some(self.runtime.spawn_blocking(move || {
+        self.lightboxes.pending_video_open = Some(self.runtime.spawn_blocking(move || {
             // Open looped so the lightbox doesn't freeze the
             // moment a short clip ends — matches the "preview"
             // expectation users have for chat-attachment video.
@@ -1906,10 +1722,7 @@ impl<B: UiBackend> RumbleApp<B> {
     /// joins the worker and terminates libmpv), drop the GPU
     /// mirror, abort any in-flight open.
     fn close_video_lightbox(&mut self) {
-        self.active_video = None;
-        if let Some(handle) = self.pending_video_open.take() {
-            handle.abort();
-        }
+        self.lightboxes.close_video();
     }
 
     /// Open the orbit lightbox for a downloaded 3D model. Clones the
@@ -1920,7 +1733,7 @@ impl<B: UiBackend> RumbleApp<B> {
     /// orbit camera). Closes any image/video lightbox first — the three
     /// share one overlay slot.
     fn open_model_lightbox(&mut self, transfer_id: &str) {
-        if self.active_model.as_ref().map(|a| a.transfer_id.as_str()) == Some(transfer_id) {
+        if self.lightboxes.model.as_ref().map(|a| a.transfer_id.as_str()) == Some(transfer_id) {
             return;
         }
         let Some(loaded) = self.media_cache.model_for(transfer_id) else {
@@ -1936,12 +1749,12 @@ impl<B: UiBackend> RumbleApp<B> {
             .unwrap_or_else(|| transfer_id.to_string());
         self.close_lightbox();
         self.close_video_lightbox();
-        self.active_model = Some(model::ActiveModel::new(transfer_id, name, model));
+        self.lightboxes.model = Some(model::ActiveModel::new(transfer_id, name, model));
     }
 
     /// Close the model lightbox.
     fn close_model_lightbox(&mut self) {
-        self.active_model = None;
+        self.lightboxes.close_model();
     }
 
     /// Drain a finished `VideoStream::open` task. On success,
@@ -1950,13 +1763,13 @@ impl<B: UiBackend> RumbleApp<B> {
     /// [`Self::sync_active_video_gpu`] once the host's wgpu
     /// device is available.
     fn poll_video_open(&mut self) {
-        let Some(handle) = self.pending_video_open.as_ref() else {
+        let Some(handle) = self.lightboxes.pending_video_open.as_ref() else {
             return;
         };
         if !handle.is_finished() {
             return;
         }
-        let handle = self.pending_video_open.take().unwrap();
+        let handle = self.lightboxes.pending_video_open.take().unwrap();
         let result = match self.runtime.block_on(handle) {
             Ok(r) => r,
             Err(e) => {
@@ -1966,7 +1779,7 @@ impl<B: UiBackend> RumbleApp<B> {
         };
         match result {
             Ok((id, name, stream)) => {
-                self.active_video = Some(video::ActiveVideo::new(id, name, stream));
+                self.lightboxes.video = Some(video::ActiveVideo::new(id, name, stream));
             }
             Err(e) => {
                 tracing::warn!(error = %e, "video: stream open failed");
@@ -2229,7 +2042,7 @@ impl<B: UiBackend> RumbleApp<B> {
         let Some(device) = self.gpu_device.as_ref() else {
             return;
         };
-        let Some(active) = self.active_video.as_mut() else {
+        let Some(active) = self.lightboxes.video.as_mut() else {
             return;
         };
         if active.gpu.is_none() {
@@ -2706,7 +2519,7 @@ impl<B: UiBackend> RumbleApp<B> {
     /// Mirrors `open_lightbox` but skips the chat-history lookup so the
     /// scene can target a synthetic offer directly.
     pub fn open_lightbox_for_test(&mut self, transfer_id: impl Into<String>, name: impl Into<String>) {
-        self.image_lightbox = Some(chat::Lightbox::new(transfer_id, name));
+        self.lightboxes.image = Some(chat::Lightbox::new(transfer_id, name));
     }
 
     /// Test/scene-dump hook to set the lightbox's zoom + pan directly,
@@ -2715,7 +2528,7 @@ impl<B: UiBackend> RumbleApp<B> {
     /// path goes through `Lightbox::set_zoom` / drag handlers and so
     /// always stays in range.
     pub fn set_lightbox_zoom_for_test(&mut self, zoom: f32, pan: (f32, f32)) {
-        if let Some(lb) = self.image_lightbox.as_mut() {
+        if let Some(lb) = self.lightboxes.image.as_mut() {
             lb.fit_to_window = false;
             lb.zoom = zoom;
             lb.pan = pan;
@@ -2743,7 +2556,7 @@ impl<B: UiBackend> RumbleApp<B> {
         name: impl Into<String>,
         model: model::LoadedModel,
     ) {
-        self.active_model = Some(model::ActiveModel::new(transfer_id, name, model));
+        self.lightboxes.model = Some(model::ActiveModel::new(transfer_id, name, model));
     }
 }
 
