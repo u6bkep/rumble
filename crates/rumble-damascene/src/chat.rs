@@ -594,7 +594,7 @@ fn composer(state: &State, chat_input: &str, selection: &Selection, cmd_selected
     let mut paste = icon_button(SVG_CLIPBOARD.clone())
         .key(KEY_PASTE_IMAGE)
         .ghost()
-        .tooltip("Paste image from clipboard");
+        .tooltip("Paste image from clipboard (Ctrl+V)");
     let mut sync = icon_button(IconName::RefreshCw)
         .key(KEY_SYNC_HISTORY)
         .ghost()

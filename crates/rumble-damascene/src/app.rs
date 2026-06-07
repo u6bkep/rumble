@@ -1008,6 +1008,23 @@ impl<B: UiBackend> App for RumbleApp<B> {
                 }
                 return;
             }
+            // Ctrl/Cmd+V with an image on the clipboard. The host only
+            // forwards the raw paste keypress when `get_text()` came back
+            // empty (text wins and is rewritten to a TextInput event before
+            // we see it), so reaching here means there's no clipboard text —
+            // try an image paste. `paste_clipboard_image` self-guards on
+            // connection and a missing image, toasting on either miss.
+            if let UiEventKind::KeyDown = event.kind
+                && let Some(kp) = event.key_press.as_ref()
+                && let UiKey::Character(c) = &kp.key
+                && c.eq_ignore_ascii_case("v")
+                && (kp.modifiers.ctrl || kp.modifiers.logo)
+                && !kp.modifiers.shift
+                && !kp.modifiers.alt
+            {
+                self.paste_clipboard_image();
+                return;
+            }
             text_area::apply_event(&mut self.chat_input, &mut self.selection, chat::KEY_INPUT, &event);
             // The text (and thus the suggestion list) just changed; drop any
             // arrow-key highlight so a stale index never points at the wrong row.
