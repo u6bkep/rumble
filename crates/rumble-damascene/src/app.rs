@@ -102,14 +102,9 @@ pub struct RumbleApp<B: UiBackend = crate::backend::NativeUiBackend> {
     /// folds keypresses + clicks back into this single field.
     selection: Selection,
 
-    chat_input: String,
-
-    /// Index of the arrow-key-highlighted slash-command suggestion, if any.
-    /// `None` means nothing is highlighted (the default — Tab still completes
-    /// the top row, Enter still sends). Up/Down move it; any text edit or caret
-    /// move resets it to `None` since the suggestion list is recomputed. Always
-    /// kept in range of the current suggestion list. See `chat::composer`.
-    chat_command_selected: Option<usize>,
+    /// Chat composer state (text buffer + slash-command highlight). See
+    /// [`crate::chat::composer`].
+    composer: chat::composer::ChatComposerState,
 
     /// Proportional split weights `[chat, tree]` for the main row divider.
     /// Dragging the handle redistributes between the two; each panel
@@ -311,8 +306,7 @@ impl<B: UiBackend> RumbleApp<B> {
             force_unlock_for_test: false,
             default_username: default_username(),
             selection: Selection::default(),
-            chat_input: String::new(),
-            chat_command_selected: None,
+            composer: chat::composer::ChatComposerState::default(),
             chat_weights: [1.0, 2.5],
             chat_sidebar_drag: ResizeWeightsDrag::default(),
             chat_row_w: Cell::new(0.0),
@@ -459,9 +453,9 @@ impl<B: UiBackend> App for RumbleApp<B> {
                     &self.media_cache,
                     &transfers,
                     &self.pending_cancel_confirm,
-                    &self.chat_input,
+                    &self.composer.input,
                     &self.selection,
-                    self.chat_command_selected,
+                    self.composer.command_selected,
                     state.my_user_id,
                     own_username,
                 )
@@ -864,117 +858,25 @@ impl<B: UiBackend> App for RumbleApp<B> {
             return;
         }
 
-        // Slash-command suggestion picked (clicked) from the composer list.
-        if let Some(key) = event.target_key()
-            && key.starts_with(chat::KEY_CMD_PREFIX)
-            && event.is_click_or_activate(key)
+        // Chat composer: slash-command navigation/completion, send-on-Enter,
+        // Ctrl+V image paste, and plain text editing. The module owns the
+        // composer state and returns what the App should do.
         {
-            let name = key[chat::KEY_CMD_PREFIX.len()..].to_string();
-            self.complete_slash_command(&name);
-            return;
-        }
-
-        // Chat composer.
-        if event.target_key() == Some(chat::KEY_INPUT) {
-            // Slash-command suggestion navigation/completion. The list only
-            // shows for a single-line `/command` fragment (no whitespace), so
-            // intercepting Up/Down here never steals multiline caret movement.
-            if let UiEventKind::KeyDown = event.kind
-                && let Some(kp) = event.key_press.as_ref()
-            {
-                let suggestions = {
-                    let snap = self.backend.state();
-                    chat::command_suggestions(&self.chat_input, &snap)
-                };
-                if !suggestions.is_empty() {
-                    let n = suggestions.len();
-                    // Clamp any stale highlight (defensive — text edits already
-                    // reset it) so the index below is always in range.
-                    let sel = self.chat_command_selected.filter(|i| *i < n);
-                    match kp.key {
-                        UiKey::ArrowDown if !kp.modifiers.shift => {
-                            self.chat_command_selected = Some(sel.map_or(0, |i| (i + 1) % n));
-                            return;
-                        }
-                        UiKey::ArrowUp if !kp.modifiers.shift => {
-                            self.chat_command_selected = Some(sel.map_or(n - 1, |i| (i + n - 1) % n));
-                            return;
-                        }
-                        // Escape just dismisses the highlight, leaving the typed
-                        // text; only meaningful when a row is highlighted.
-                        UiKey::Escape if sel.is_some() => {
-                            self.chat_command_selected = None;
-                            return;
-                        }
-                        // Tab completes the highlighted row, or the top one when
-                        // nothing is highlighted yet.
-                        UiKey::Tab if !kp.modifiers.shift => {
-                            let name = suggestions[sel.unwrap_or(0)].0.clone();
-                            self.complete_slash_command(&name);
-                            return;
-                        }
-                        // Enter completes the highlighted row instead of sending
-                        // — once the user has arrow-navigated into the list,
-                        // Enter means "pick this", matching Discord/Slack. With
-                        // nothing highlighted it falls through to send below.
-                        UiKey::Enter
-                            if sel.is_some()
-                                && !kp.modifiers.shift
-                                && !kp.modifiers.ctrl
-                                && !kp.modifiers.alt
-                                && !kp.modifiers.logo =>
-                        {
-                            let name = suggestions[sel.unwrap()].0.clone();
-                            self.complete_slash_command(&name);
-                            return;
-                        }
-                        _ => {}
+            let app_state = self.backend.state();
+            match chat::composer::handle_event(&mut self.composer, &mut self.selection, &event, &app_state) {
+                chat::composer::ComposerOutcome::Ignored => {}
+                chat::composer::ComposerOutcome::Handled => return,
+                chat::composer::ComposerOutcome::Send(cmds) => {
+                    for cmd in cmds {
+                        self.backend.send(cmd);
                     }
+                    return;
+                }
+                chat::composer::ComposerOutcome::PasteImage => {
+                    self.paste_clipboard_image();
+                    return;
                 }
             }
-            // Send on bare Enter. Shift+Enter and Ctrl+J fall through
-            // to `text_area::apply_event` for newline insertion; slash
-            // commands route through `parse_and_send_chat`, plain text
-            // falls through to a `Command::SendChat`.
-            if let UiEventKind::KeyDown = event.kind
-                && let Some(kp) = event.key_press.as_ref()
-                && matches!(kp.key, UiKey::Enter)
-                && !kp.modifiers.shift
-                && !kp.modifiers.ctrl
-                && !kp.modifiers.alt
-                && !kp.modifiers.logo
-            {
-                let trimmed = self.chat_input.trim().to_string();
-                if !trimmed.is_empty() {
-                    self.parse_and_send_chat(&trimmed);
-                    self.chat_input.clear();
-                    self.selection = Selection::default();
-                    self.chat_command_selected = None;
-                }
-                return;
-            }
-            // Ctrl/Cmd+V with an image on the clipboard. The host only
-            // forwards the raw paste keypress when `get_text()` came back
-            // empty (text wins and is rewritten to a TextInput event before
-            // we see it), so reaching here means there's no clipboard text —
-            // try an image paste. `paste_clipboard_image` self-guards on
-            // connection and a missing image, toasting on either miss.
-            if let UiEventKind::KeyDown = event.kind
-                && let Some(kp) = event.key_press.as_ref()
-                && let UiKey::Character(c) = &kp.key
-                && c.eq_ignore_ascii_case("v")
-                && (kp.modifiers.ctrl || kp.modifiers.logo)
-                && !kp.modifiers.shift
-                && !kp.modifiers.alt
-            {
-                self.paste_clipboard_image();
-                return;
-            }
-            text_area::apply_event(&mut self.chat_input, &mut self.selection, chat::KEY_INPUT, &event);
-            // The text (and thus the suggestion list) just changed; drop any
-            // arrow-key highlight so a stale index never points at the wrong row.
-            self.chat_command_selected = None;
-            return;
         }
         if event.is_click_or_activate(chat::KEY_PASTE_IMAGE) {
             self.paste_clipboard_image();
@@ -1556,80 +1458,6 @@ impl<B: UiBackend> RumbleApp<B> {
     }
 
     // ---------- chat ----------
-
-    /// Replace the composer line with a completed slash command (`/<name> `)
-    /// and place the caret at the end, ready for arguments. Used by Tab and by
-    /// clicking a suggestion row in the composer.
-    fn complete_slash_command(&mut self, name: &str) {
-        let text = format!("/{name} ");
-        let caret = text.len();
-        self.chat_input = text;
-        self.selection = Selection::caret(chat::KEY_INPUT, caret);
-        // The trailing space hides the suggestion list; drop any highlight.
-        self.chat_command_selected = None;
-    }
-
-    /// Parse the composer line. Slash commands (`/msg`, `/tree`)
-    /// dispatch their dedicated `Command` variants; usage errors land
-    /// in the local chat log via `Command::LocalMessage`. Plain text
-    /// goes out as a `Command::SendChat` to the current room.
-    fn parse_and_send_chat(&mut self, raw: &str) {
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            return;
-        }
-        if trimmed == "/msg" || trimmed.starts_with("/msg ") {
-            let rest = trimmed.strip_prefix("/msg").unwrap().trim_start();
-            match rest.split_once(' ') {
-                Some((target_name, body)) => {
-                    let body = body.trim();
-                    if body.is_empty() {
-                        self.backend.send(Command::LocalMessage {
-                            text: "Usage: /msg <username> <message>".to_string(),
-                        });
-                        return;
-                    }
-                    let snapshot = self.backend.state();
-                    let target = snapshot.users.iter().find(|u| u.username == target_name);
-                    match target {
-                        Some(user) => {
-                            let uid = user.user_id.as_ref().map(|id| id.value).unwrap_or(0);
-                            self.backend.send(Command::SendDirectMessage {
-                                target_user_id: uid,
-                                target_username: target_name.to_string(),
-                                text: body.to_string(),
-                            });
-                        }
-                        None => {
-                            self.backend.send(Command::LocalMessage {
-                                text: format!("User '{target_name}' not found"),
-                            });
-                        }
-                    }
-                }
-                None => {
-                    self.backend.send(Command::LocalMessage {
-                        text: "Usage: /msg <username> <message>".to_string(),
-                    });
-                }
-            }
-            return;
-        }
-        if trimmed == "/tree" || trimmed.starts_with("/tree ") {
-            let rest = trimmed.strip_prefix("/tree").unwrap().trim_start();
-            if rest.is_empty() {
-                self.backend.send(Command::LocalMessage {
-                    text: "Usage: /tree <message>".to_string(),
-                });
-            } else {
-                self.backend.send(Command::SendTreeChat { text: rest.to_string() });
-            }
-            return;
-        }
-        self.backend.send(Command::SendChat {
-            text: trimmed.to_string(),
-        });
-    }
 
     /// Spawn the OS file picker on `runtime`. The result is consumed
     /// by [`Self::poll_file_dialog`] on the next frame so we don't
@@ -2804,13 +2632,13 @@ impl<B: UiBackend> RumbleApp<B> {
     /// Test/scene-dump hook to seed the chat composer text, e.g. `"/"` to
     /// render the slash-command suggestion list.
     pub fn set_chat_input_for_test(&mut self, text: impl Into<String>) {
-        self.chat_input = text.into();
+        self.composer.input = text.into();
     }
 
     /// Highlight a slash-command suggestion row, as Up/Down arrows would.
     /// Lets `dump_bundles` snapshot the keyboard-navigated list state.
     pub fn set_chat_command_selected_for_test(&mut self, idx: Option<usize>) {
-        self.chat_command_selected = idx;
+        self.composer.command_selected = idx;
     }
 
     /// Test/scene-dump hook for the settings dialog. Snapshots the

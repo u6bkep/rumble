@@ -8,10 +8,12 @@
 //! selection)` and returns an `El`. The App owns event handling, slash
 //! command parsing, and the async file-picker pump.
 
+pub mod composer;
 pub mod file_card;
 pub mod image_preview;
 pub mod lightbox;
 
+pub use composer::{ChatComposerState, ComposerOutcome};
 pub use file_card::{FileContextMenu, render_file_context_menu};
 pub use image_preview::{
     AnimatedTextureMap, CachedImage, GifPlayback, ImageCache, VideoThumbMap, is_image_name, is_svg_name,
