@@ -25,6 +25,7 @@ pub mod room_acl;
 pub mod room_tree;
 pub mod server_picker;
 pub mod settings;
+pub mod sfx;
 pub mod theme;
 pub mod video;
 pub mod wizard;

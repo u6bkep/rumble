@@ -143,24 +143,9 @@ pub struct RumbleApp<B: UiBackend = crate::backend::NativeUiBackend> {
     /// don't auto-pin like `scroll().pin_end()`, so we drive it explicitly.
     pending_scroll_to_bottom: Option<String>,
 
-    /// `connection.is_connected()` at the previous frame, to fire
-    /// `SfxKind::Connect`/`Disconnect` on transitions.
-    prev_connected: bool,
-
-    /// Our room id and the remote user ids in it at the previous frame,
-    /// to fire `SfxKind::UserJoin`/`UserLeave`. Reseeded without firing
-    /// when our room id changes (room switch, connect, disconnect).
-    prev_room_id: Option<uuid::Uuid>,
-    prev_room_members: HashSet<u64>,
-
-    /// Room id of a locally-initiated `JoinRoom` awaiting confirmation, so
-    /// `pump_sfx` can tell our own channel switch (`SelfChannelJoin`) apart
-    /// from being relocated by an admin/other user (`SelfChannelMoved`).
-    pending_self_join: Option<uuid::Uuid>,
-
-    /// Our `server_muted` flag at the previous frame, to fire
-    /// `SfxKind::ServerMute` when an admin mutes us server-side.
-    prev_server_muted: bool,
+    /// Sound-effect edge detector. Owns the previous-frame snapshot for
+    /// connect/mute/room transitions; see [`crate::sfx::SfxEngine`].
+    sfx: crate::sfx::SfxEngine,
 
     /// In-flight OS file picker, spawned on `runtime` when the user
     /// clicks the share-file button. `Some(handle)` while the dialog is
@@ -335,11 +320,7 @@ impl<B: UiBackend> RumbleApp<B> {
             room_tree: RoomTreeState::default(),
             prev_chat_count: 0,
             pending_scroll_to_bottom: None,
-            prev_connected: false,
-            prev_room_id: None,
-            prev_room_members: HashSet::new(),
-            pending_self_join: None,
-            prev_server_muted: false,
+            sfx: crate::sfx::SfxEngine::default(),
             pending_file_dialog: None,
             auto_handled_offers: HashSet::new(),
             media_cache: crate::media_cache::MediaCache::new(runtime_handle_for_media_cache, initial_gif_autoplay),
@@ -1323,7 +1304,7 @@ impl<B: UiBackend> App for RumbleApp<B> {
                 let has_join = commands.iter().any(|c| matches!(c, Command::JoinRoom { .. }));
                 for cmd in &commands {
                     if let Command::JoinRoom { room_id } = cmd {
-                        self.pending_self_join = Some(*room_id);
+                        self.sfx.pending_self_join = Some(*room_id);
                     }
                 }
                 for cmd in commands {
@@ -2245,8 +2226,6 @@ impl<B: UiBackend> RumbleApp<B> {
     /// a flurry of beeps.
     fn pump_sfx(&mut self) {
         let snapshot = self.backend.state();
-
-        // New remote chat messages. Direct messages get a distinct cue.
         let count = snapshot.chat_messages.len();
 
         // Backlog grew (initial load or a new message) → stick the virtual chat
@@ -2262,92 +2241,22 @@ impl<B: UiBackend> RumbleApp<B> {
             self.pending_scroll_to_bottom = Some(chat::chat_row_key(last));
         }
 
-        if count > self.prev_chat_count && self.prev_chat_count > 0 {
-            let mut had_dm = false;
-            let mut had_room = false;
-            for m in snapshot.chat_messages[self.prev_chat_count..].iter().filter(|m| {
-                !matches!(
-                    m.visibility,
-                    rumble_client::ChatMessageVisibility::System | rumble_client::ChatMessageVisibility::SenderMirror
-                )
-            }) {
-                match m.kind {
-                    rumble_client::ChatMessageKind::DirectMessage { .. } => had_dm = true,
-                    _ => had_room = true,
-                }
-            }
-            if had_dm {
-                self.play_sfx(SfxKind::PrivateMessage);
-            }
-            if had_room {
-                self.play_sfx(SfxKind::Message);
-            }
-        }
-        self.prev_chat_count = count;
-
-        // Connect / disconnect transitions. A kick produces a disconnect
-        // with `kicked` set — play the harsher Kicked cue instead.
-        let connected = snapshot.connection.is_connected();
-        if connected != self.prev_connected {
-            self.play_sfx(if connected {
-                SfxKind::Connect
-            } else if snapshot.kicked.is_some() {
-                SfxKind::Kicked
-            } else {
-                SfxKind::Disconnect
-            });
-            self.prev_connected = connected;
-        }
-
-        // Server-side mute by an admin (distinct from our own self-mute).
-        let server_muted = snapshot
-            .my_user_id
-            .and_then(|id| snapshot.get_user(id))
-            .is_some_and(|u| u.server_muted);
-        if server_muted && !self.prev_server_muted {
-            self.play_sfx(SfxKind::ServerMute);
-        }
-        self.prev_server_muted = server_muted;
-
-        // Our own room changes (SelfChannelJoin / SelfChannelMoved) and
-        // remote users entering / leaving our room (UserJoin / UserLeave).
-        let my_id = snapshot.my_user_id;
-        let members: HashSet<u64> = match snapshot.my_room_id {
-            Some(room) => snapshot
-                .users_in_room(room)
-                .iter()
-                .filter_map(|u| u.user_id.as_ref().map(|id| id.value))
-                .filter(|id| Some(*id) != my_id)
-                .collect(),
-            None => HashSet::new(),
-        };
-        if snapshot.my_room_id == self.prev_room_id {
-            if members.difference(&self.prev_room_members).next().is_some() {
-                self.play_sfx(SfxKind::UserJoin);
-            }
-            if self.prev_room_members.difference(&members).next().is_some() {
-                self.play_sfx(SfxKind::UserLeave);
-            }
+        // Cold-connect gate: only feed the engine message cues once a
+        // baseline exists, so the historical backlog doesn't beep.
+        let new_messages: &[_] = if self.prev_chat_count > 0 && count > self.prev_chat_count {
+            &snapshot.chat_messages[self.prev_chat_count..]
         } else {
-            // Our room id changed. Skip connect/disconnect transitions
-            // (prev or current room is None) — Connect/Disconnect cover
-            // those. A switch to the room we just asked to join is our own
-            // action; anything else means we were relocated.
-            if self.prev_room_id.is_some() && snapshot.my_room_id.is_some() {
-                if snapshot.my_room_id == self.pending_self_join {
-                    self.play_sfx(SfxKind::SelfChannelJoin);
-                } else {
-                    self.play_sfx(SfxKind::SelfChannelMoved);
-                }
-            }
-            self.pending_self_join = None;
+            &[]
+        };
+        let sounds = self.sfx.detect(&snapshot, new_messages);
+        self.prev_chat_count = count;
+        for kind in sounds {
+            self.play_sfx(kind);
         }
-        self.prev_room_id = snapshot.my_room_id;
-        self.prev_room_members = members;
 
         // Drop accepted-offer ids when the connection drops so a
         // fresh session re-runs auto-download evaluation.
-        if !connected && !self.auto_handled_offers.is_empty() {
+        if !snapshot.connection.is_connected() && !self.auto_handled_offers.is_empty() {
             self.auto_handled_offers.clear();
         }
     }
