@@ -95,7 +95,7 @@ pub use domain_events::{
 // Projection task: consumes every domain channel and (phase 2) is
 // the sole writer of `Arc<RwLock<State>>`.
 pub mod projection;
-pub use projection::{EventBus, spawn_projection_task};
+pub use projection::{BusReceivers, EventBus, spawn_projection_task};
 
 // Backend handle (generic over Platform)
 pub mod handle;

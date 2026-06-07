@@ -85,6 +85,39 @@ impl EventBus {
             transfer: broadcast::channel(CAP).0,
         }
     }
+
+    /// Subscribe to every domain channel at once, returning the projection's
+    /// receiver set.
+    ///
+    /// Call this **before** spawning any emitter (the audio task, the
+    /// connection task) so the receivers buffer events from the very start.
+    /// A `tokio::broadcast` send with zero live receivers is silently
+    /// dropped — so if the projection only subscribed *inside* its task
+    /// (which runs on a separately-spawned runtime thread), an event emitted
+    /// in the gap before that thread is first scheduled would be lost. For a
+    /// connected client the lag/hash resync would paper over it, but a
+    /// disconnected client (e.g. an early `SetInputDevice`) has no resync
+    /// path and loses the update permanently. Subscribing up front closes
+    /// that race.
+    pub fn subscribe_all(&self) -> BusReceivers {
+        BusReceivers {
+            chat: self.chat.subscribe(),
+            voice: self.voice.subscribe(),
+            connection: self.connection.subscribe(),
+            room: self.room.subscribe(),
+            transfer: self.transfer.subscribe(),
+        }
+    }
+}
+
+/// The projection task's receiver set, subscribed up front by
+/// [`EventBus::subscribe_all`] and moved into [`spawn_projection_task`].
+pub struct BusReceivers {
+    chat: broadcast::Receiver<ChatEvent>,
+    voice: broadcast::Receiver<VoiceEvent>,
+    connection: broadcast::Receiver<ConnectionEvent>,
+    room: broadcast::Receiver<RoomEvent>,
+    transfer: broadcast::Receiver<TransferEvent>,
 }
 
 impl Default for EventBus {
@@ -102,7 +135,11 @@ impl Default for EventBus {
 pub fn spawn_projection_task(
     state: Arc<RwLock<State>>,
     repaint: Arc<dyn Fn() + Send + Sync>,
-    bus: &EventBus,
+    // Receivers subscribed up front via [`EventBus::subscribe_all`], before
+    // any emitter was spawned, so no startup event is missed. Passed in
+    // (rather than subscribed here) because this fn runs on a runtime thread
+    // that may be scheduled well after the emitters have begun.
+    receivers: BusReceivers,
     audio_task: AudioTaskHandle,
     file_transfer: Arc<RwLock<Option<Arc<dyn FileTransferPlugin>>>>,
     // Command channel back into the connection task, used to request a
@@ -113,11 +150,13 @@ pub fn spawn_projection_task(
     // whose reply arrives as a `FullStateReplaced` event applied here.
     command_tx: mpsc::UnboundedSender<Command>,
 ) -> tokio::task::JoinHandle<()> {
-    let mut chat_rx = bus.chat.subscribe();
-    let mut voice_rx = bus.voice.subscribe();
-    let mut conn_rx = bus.connection.subscribe();
-    let mut room_rx = bus.room.subscribe();
-    let mut transfer_rx = bus.transfer.subscribe();
+    let BusReceivers {
+        chat: mut chat_rx,
+        voice: mut voice_rx,
+        connection: mut conn_rx,
+        room: mut room_rx,
+        transfer: mut transfer_rx,
+    } = receivers;
 
     tokio::spawn(async move {
         loop {

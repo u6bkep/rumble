@@ -60,7 +60,10 @@ use rumble_protocol::{
 };
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard},
+    sync::{
+        Arc, RwLock, RwLockReadGuard, RwLockWriteGuard,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::mpsc;
@@ -315,6 +318,14 @@ impl<P: Platform> BackendHandle<P> {
         // writer of `State`. External subscribers attach via the
         // `subscribe_*` methods on `BackendHandle`.
         let bus = crate::projection::EventBus::new();
+        // Subscribe the projection's receivers *now*, before the audio or
+        // connection tasks are spawned, so no event emitted during startup is
+        // dropped for want of a live receiver. (A `broadcast` send with zero
+        // receivers is silently discarded; the projection task itself runs on
+        // a runtime thread that may not be scheduled until after the emitters
+        // have begun — e.g. an early `SetInputDevice` on a not-yet-connected
+        // handle, which has no resync path to recover a lost event.)
+        let projection_receivers = bus.subscribe_all();
         // Sampled-signal channels: writers go to the audio task, readers
         // stay on the handle for the UI. See `crate::snapshot`.
         let (meter_writer, meter) = crate::snapshot::Snapshot::new(crate::meter::MeterSnapshot::default());
@@ -344,7 +355,6 @@ impl<P: Platform> BackendHandle<P> {
             repaint: repaint_callback.clone(),
         };
         let bus_for_task = bus.clone();
-        let bus_for_projection = bus.clone();
         let state_for_projection = state.clone();
         let repaint_for_projection = repaint_callback.clone();
         let audio_task_for_projection = audio_task.clone();
@@ -360,13 +370,13 @@ impl<P: Platform> BackendHandle<P> {
         let runtime_thread = std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("create tokio runtime");
             rt.block_on(async move {
-                // Projection task: subscribes to every domain channel
-                // and maintains `State`. Sole writer of the snapshot the
-                // UI reads each frame.
+                // Projection task: drains every domain channel (via the
+                // receivers subscribed up front) and maintains `State`. Sole
+                // writer of the snapshot the UI reads each frame.
                 let _projection_handle = crate::projection::spawn_projection_task(
                     state_for_projection,
                     repaint_for_projection,
-                    &bus_for_projection,
+                    projection_receivers,
                     audio_task_for_projection,
                     file_transfer_for_projection,
                     command_tx_for_projection,
@@ -880,6 +890,15 @@ async fn run_connection_task<P: Platform>(
 ) {
     // Connection state
     let mut transport: Option<P::Transport> = None;
+    // Set to `true` by a *local* teardown (Disconnect/Shutdown) before the
+    // transport is closed, so the receiver task can tell an intentional
+    // close (→ `Disconnected`) apart from an unexpected drop
+    // (→ `ConnectionLost`). A fresh flag is minted per connection; the
+    // receiver task holds a clone. Reading `State.connection` for this is
+    // racy — the projection applies the connection bus asynchronously, so
+    // the receiver routinely observes stale "Connected" state and clobbers
+    // a clean `Disconnected` with a spurious `ConnectionLost`.
+    let mut local_close: Option<Arc<AtomicBool>> = None;
     let mut client_name = String::new();
     let mut _session_identity: Option<SessionIdentity> = None;
     let mut file_transfer: Option<Arc<dyn FileTransferPlugin>> = None;
@@ -1083,13 +1102,15 @@ async fn run_connection_task<P: Platform>(
                                 let ft_for_dispatch: Option<Arc<dyn FileTransferPlugin>> = ft_arc.clone();
 
                                 // Spawn receiver task for reliable messages
+                                let close_flag = Arc::new(AtomicBool::new(false));
+                                local_close = Some(close_flag.clone());
                                 let state_clone = state.clone();
                                 let audio_task_clone = audio_task.clone();
                                 let command_tx_clone = command_tx.clone();
                                 let ft_slot_for_recv = file_transfer_slot.clone();
                                 let bus_for_recv = bus.clone();
                                 tokio::spawn(async move {
-                                    run_receiver_task(recv_stream, state_clone, audio_task_clone, command_tx_clone, ft_slot_for_recv, bus_for_recv).await;
+                                    run_receiver_task(recv_stream, state_clone, audio_task_clone, command_tx_clone, ft_slot_for_recv, bus_for_recv, close_flag).await;
                                 });
 
                                 // Spawn stream dispatch task for server-initiated bi-directional streams
@@ -1255,13 +1276,15 @@ async fn run_connection_task<P: Platform>(
                                     let ft_for_dispatch: Option<Arc<dyn FileTransferPlugin>> = ft_arc.clone();
 
                                     // Spawn receiver task
+                                    let close_flag = Arc::new(AtomicBool::new(false));
+                                    local_close = Some(close_flag.clone());
                                     let state_clone = state.clone();
                                     let audio_task_clone = audio_task.clone();
                                     let command_tx_clone = command_tx.clone();
                                     let ft_slot_for_recv = file_transfer_slot.clone();
                                     let bus_for_recv = bus.clone();
                                     tokio::spawn(async move {
-                                        run_receiver_task(recv_stream, state_clone, audio_task_clone, command_tx_clone, ft_slot_for_recv, bus_for_recv).await;
+                                        run_receiver_task(recv_stream, state_clone, audio_task_clone, command_tx_clone, ft_slot_for_recv, bus_for_recv, close_flag).await;
                                     });
 
                                     // Spawn stream dispatch task for server-initiated bi-directional streams
@@ -1290,6 +1313,12 @@ async fn run_connection_task<P: Platform>(
                     }
 
                     Command::Disconnect => {
+                        // Mark this as a local teardown *before* closing the
+                        // transport, so the receiver task — which wakes on the
+                        // close — reports `Disconnected`, not `ConnectionLost`.
+                        if let Some(flag) = local_close.take() {
+                            flag.store(true, Ordering::SeqCst);
+                        }
                         // Notify audio task before closing
                         audio_task.send(AudioCommand::ConnectionClosed);
 
@@ -1318,6 +1347,9 @@ async fn run_connection_task<P: Platform>(
                         // BackendHandle's Drop can join this thread before
                         // the process exits. Without this the server only
                         // notices we're gone after its QUIC idle timeout.
+                        if let Some(flag) = local_close.take() {
+                            flag.store(true, Ordering::SeqCst);
+                        }
                         audio_task.send(AudioCommand::ConnectionClosed);
                         if let Some(mut t) = transport.take() {
                             send_disconnect_envelope(&mut t, "client shutdown").await;
@@ -2096,6 +2128,10 @@ async fn run_receiver_task(
     command_tx: mpsc::UnboundedSender<Command>,
     file_transfer_slot: Arc<RwLock<Option<Arc<dyn FileTransferPlugin>>>>,
     bus: crate::projection::EventBus,
+    // Set by the connection task when *it* tears the transport down
+    // (Disconnect/Shutdown). When set, the close we observe below is
+    // intentional, so we must not emit `ConnectionLost`.
+    local_close: Arc<AtomicBool>,
 ) {
     loop {
         // Bound the wait so a wedged server (alive QUIC connection, but
@@ -2149,9 +2185,16 @@ async fn run_receiver_task(
         *slot = None;
     }
 
-    // Update state only if not already disconnected (explicit disconnect sets Disconnected)
+    // Only report loss for an *unexpected* drop. A local teardown sets
+    // `local_close` before closing the transport (the close is what woke us
+    // here), so observing it means the connection task already owns the
+    // `Disconnected` transition — emitting `ConnectionLost` would race it and
+    // clobber the clean state. The `already_disconnected` read is a
+    // best-effort secondary guard for any other path that has already landed
+    // `Disconnected`; `local_close` is the authoritative, race-free signal.
+    let local = local_close.load(Ordering::SeqCst);
     let already_disconnected = matches!(read_state(&state).connection, ConnectionState::Disconnected);
-    if !already_disconnected {
+    if !local && !already_disconnected {
         let _ = bus.connection.send(crate::ConnectionEvent::ConnectionLost {
             error: "Connection closed".to_string(),
         });

@@ -15,8 +15,31 @@ use std::{
 };
 
 use rumble_client::{Command as BackendCommand, ConnectConfig, ConnectionState};
+use rumble_client_traits::test_audio::{MOCK_FRAME_SIZE, MockAudio, MockAudioBackend};
 
-type BackendHandle = rumble_client::handle::BackendHandle<rumble_desktop::NativePlatform>;
+/// Test platform: real Quinn transport + real Opus codec, but a headless
+/// [`MockAudioBackend`] instead of a real cpal device. The mock lets each test
+/// drive capture frames deterministically (`MockAudio::inject_capture`), so
+/// `is_transmitting` flips on an injected frame rather than on a real audio
+/// device's first callback — whose latency under machine load was the source
+/// of the onset-test flakiness. Mirrors the platform in `voice_relay.rs`.
+struct TestPlatform;
+
+impl rumble_client_traits::Platform for TestPlatform {
+    type Transport = rumble_desktop::QuinnTransport;
+    type AudioBackend = MockAudioBackend;
+    type Codec = rumble_desktop::NativeOpusCodec;
+
+    fn create_file_transfer_plugin(
+        _opener: Arc<dyn rumble_client_traits::StreamOpener>,
+        _downloads_dir: PathBuf,
+        _event_sink: Option<rumble_client_traits::PluginEventSink>,
+    ) -> Option<Arc<dyn rumble_client_traits::FileTransferPlugin>> {
+        None
+    }
+}
+
+type BackendHandle = rumble_client::handle::BackendHandle<TestPlatform>;
 use ed25519_dalek::SigningKey;
 use tempfile::TempDir;
 
@@ -108,42 +131,85 @@ fn start_server(port: u16) -> ServerGuard {
 /// ("127.0.0.1"), so we pin the leaf cert by fingerprint (the same name-
 /// independent TOFU path a real user takes after accepting the cert) rather than
 /// trusting it as a CA root (which would fail WebPKI's hostname check).
-fn create_backend_with_repaint_and_cert(cert_path: &std::path::Path) -> (BackendHandle, Arc<AtomicBool>, [u8; 32]) {
+/// Build a backend on the mock-audio [`TestPlatform`]. Returns the engine
+/// handle, the [`MockAudio`] driver (inject capture frames / observe playback),
+/// a repaint flag, and the client public key. When `cert` is `Some`, its leaf
+/// is trusted so the handle can connect to that server. Wiring the mock lives
+/// here so the thin wrappers below all share one construction path.
+fn build_backend(cert: Option<&std::path::Path>) -> (BackendHandle, MockAudio, Arc<AtomicBool>, [u8; 32]) {
     let repaint_called = Arc::new(AtomicBool::new(false));
     let repaint_called_clone = repaint_called.clone();
 
-    let pem = std::fs::read(cert_path).expect("read server cert");
-    let leaf_der = rustls_pemfile::certs(&mut pem.as_slice())
-        .next()
-        .expect("at least one cert in fullchain.pem")
-        .expect("parse leaf cert")
-        .to_vec();
     let mut config = ConnectConfig::new();
-    config.accepted_certs.push(leaf_der);
+    if let Some(cert_path) = cert {
+        let pem = std::fs::read(cert_path).expect("read server cert");
+        let leaf_der = rustls_pemfile::certs(&mut pem.as_slice())
+            .next()
+            .expect("at least one cert in fullchain.pem")
+            .expect("parse leaf cert")
+            .to_vec();
+        config.accepted_certs.push(leaf_der);
+    }
     let (public_key, signer) = build_test_signer();
+    let (mock_backend, audio) = MockAudioBackend::new();
 
-    let handle = BackendHandle::with_config(
+    let handle = BackendHandle::with_audio_backend(
         move || repaint_called_clone.store(true, Ordering::SeqCst),
         config,
         signer,
+        mock_backend,
     );
 
-    (handle, repaint_called, public_key)
+    (handle, audio, repaint_called, public_key)
+}
+
+/// Backend trusting `cert_path`, for tests that don't drive audio.
+fn create_backend_with_repaint_and_cert(cert_path: &std::path::Path) -> (BackendHandle, Arc<AtomicBool>, [u8; 32]) {
+    let (handle, _audio, repaint, public_key) = build_backend(Some(cert_path));
+    (handle, repaint, public_key)
+}
+
+/// Backend trusting `cert_path`, returning the [`MockAudio`] driver for tests
+/// that assert on transmission state (see [`drive_transmitting`]).
+fn create_backend_with_audio(cert_path: &std::path::Path) -> (BackendHandle, MockAudio, [u8; 32]) {
+    let (handle, audio, _repaint, public_key) = build_backend(Some(cert_path));
+    (handle, audio, public_key)
 }
 
 /// Helper to create a BackendHandle without any certificate (for tests that don't connect).
 fn create_backend_without_cert() -> (BackendHandle, Arc<AtomicBool>) {
-    let repaint_called = Arc::new(AtomicBool::new(false));
-    let repaint_called_clone = repaint_called.clone();
-    let (_, signer) = build_test_signer();
+    let (handle, _audio, repaint, _public_key) = build_backend(None);
+    (handle, repaint)
+}
 
-    let handle = BackendHandle::with_config(
-        move || repaint_called_clone.store(true, Ordering::SeqCst),
-        ConnectConfig::new(),
-        signer,
+/// One 20 ms capture frame (48 kHz mono): a low-amplitude 220 Hz sine, so the
+/// frame carries real signal rather than digital silence.
+fn voice_frame(seq: usize) -> Vec<f32> {
+    (0..MOCK_FRAME_SIZE)
+        .map(|i| {
+            let t = (seq * MOCK_FRAME_SIZE + i) as f32 / 48_000.0;
+            0.2 * (2.0 * std::f32::consts::PI * 220.0 * t).sin()
+        })
+        .collect()
+}
+
+/// Deterministically drive the engine to the transmitting state: wait for it to
+/// arm capture (its mute/PTT/continuous gating decided capture should run),
+/// then inject enough frames to clear the 3-frame warm-up discard and latch the
+/// transmitting edge, and assert `is_transmitting` goes true. This replaces
+/// waiting on a real device's first callback — the prior onset-flake source.
+fn drive_transmitting(handle: &BackendHandle, audio: &MockAudio) {
+    assert!(
+        audio.wait_for_capture_active(Duration::from_secs(2)),
+        "engine should arm capture before frames can be injected"
     );
-
-    (handle, repaint_called)
+    for i in 0..8 {
+        audio.inject_capture(voice_frame(i));
+    }
+    assert!(
+        wait_for(handle, Duration::from_secs(2), |s| s.audio.is_transmitting),
+        "should be transmitting after injected capture frames"
+    );
 }
 
 /// Wait for a condition to become true, polling state periodically.
@@ -821,7 +887,7 @@ fn test_set_transmission_mode_updates_state() {
     let server = start_server(port);
     std::thread::sleep(Duration::from_millis(500));
 
-    let (handle, _repaint, public_key) = create_backend_with_repaint_and_cert(&server.cert_path);
+    let (handle, audio, public_key) = create_backend_with_audio(&server.cert_path);
 
     // Connect first
     send_connect(
@@ -845,11 +911,7 @@ fn test_set_transmission_mode_updates_state() {
     assert!(mode_changed, "Voice mode should change to Continuous");
 
     // In continuous mode while connected, should be transmitting
-    let transmitting = wait_for(&handle, Duration::from_secs(2), |s| s.audio.is_transmitting);
-    assert!(
-        transmitting,
-        "Should be transmitting in Continuous mode while connected"
-    );
+    drive_transmitting(&handle, &audio);
 
     // Set muted
     handle.send(BackendCommand::SetMuted { muted: true });
@@ -859,13 +921,13 @@ fn test_set_transmission_mode_updates_state() {
     });
     assert!(muted, "Should not be transmitting when muted");
 
-    // Unmute
+    // Unmute — capture re-arms, so resume transmitting on injected frames.
     handle.send(BackendCommand::SetMuted { muted: false });
-
-    let unmuted = wait_for(&handle, Duration::from_secs(2), |s| {
-        !s.audio.self_muted && s.audio.is_transmitting
-    });
-    assert!(unmuted, "Should resume transmitting when unmuted in Continuous mode");
+    assert!(
+        wait_for(&handle, Duration::from_secs(2), |s| !s.audio.self_muted),
+        "Should unmute"
+    );
+    drive_transmitting(&handle, &audio);
 
     // Change back to PTT mode
     handle.send(BackendCommand::SetVoiceMode {
@@ -877,7 +939,7 @@ fn test_set_transmission_mode_updates_state() {
     });
     assert!(ptt, "Should be in PushToTalk mode");
     assert!(
-        !handle.state().audio.is_transmitting,
+        wait_for(&handle, Duration::from_secs(2), |s| !s.audio.is_transmitting),
         "Should not be transmitting in PTT mode without key pressed"
     );
 }
@@ -888,7 +950,7 @@ fn test_ptt_start_stop_transmit() {
     let server = start_server(port);
     std::thread::sleep(Duration::from_millis(500));
 
-    let (handle, _repaint, public_key) = create_backend_with_repaint_and_cert(&server.cert_path);
+    let (handle, audio, public_key) = create_backend_with_audio(&server.cert_path);
 
     send_connect(
         &handle,
@@ -903,8 +965,7 @@ fn test_ptt_start_stop_transmit() {
     // Start transmitting (simulate PTT press)
     handle.send(BackendCommand::StartTransmit);
 
-    let transmitting = wait_for(&handle, Duration::from_secs(2), |s| s.audio.is_transmitting);
-    assert!(transmitting, "Should be transmitting after StartTransmit");
+    drive_transmitting(&handle, &audio);
 
     // Stop transmitting (simulate PTT release)
     handle.send(BackendCommand::StopTransmit);
@@ -919,7 +980,7 @@ fn test_ptt_in_continuous_mode_ignored() {
     let server = start_server(port);
     std::thread::sleep(Duration::from_millis(500));
 
-    let (handle, _repaint, public_key) = create_backend_with_repaint_and_cert(&server.cert_path);
+    let (handle, audio, public_key) = create_backend_with_audio(&server.cert_path);
 
     send_connect(
         &handle,
@@ -936,7 +997,7 @@ fn test_ptt_in_continuous_mode_ignored() {
         mode: rumble_client::VoiceMode::Continuous,
     });
 
-    wait_for(&handle, Duration::from_secs(2), |s| s.audio.is_transmitting);
+    drive_transmitting(&handle, &audio);
 
     // Simulate PTT press and release while in continuous mode
     // These should be ignored - transmission should remain active
@@ -962,7 +1023,7 @@ fn test_switch_from_continuous_to_ptt_while_ptt_held() {
     let server = start_server(port);
     std::thread::sleep(Duration::from_millis(500));
 
-    let (handle, _repaint, public_key) = create_backend_with_repaint_and_cert(&server.cert_path);
+    let (handle, audio, public_key) = create_backend_with_audio(&server.cert_path);
 
     send_connect(
         &handle,
@@ -979,7 +1040,7 @@ fn test_switch_from_continuous_to_ptt_while_ptt_held() {
         mode: rumble_client::VoiceMode::Continuous,
     });
 
-    wait_for(&handle, Duration::from_secs(2), |s| s.audio.is_transmitting);
+    drive_transmitting(&handle, &audio);
 
     // Simulate PTT press (while in continuous mode - this gets tracked)
     handle.send(BackendCommand::StartTransmit);
@@ -1012,7 +1073,7 @@ fn test_switch_from_ptt_to_continuous_continues_transmission() {
     let server = start_server(port);
     std::thread::sleep(Duration::from_millis(500));
 
-    let (handle, _repaint, public_key) = create_backend_with_repaint_and_cert(&server.cert_path);
+    let (handle, audio, public_key) = create_backend_with_audio(&server.cert_path);
 
     send_connect(
         &handle,
@@ -1027,7 +1088,7 @@ fn test_switch_from_ptt_to_continuous_continues_transmission() {
     // Start PTT transmission
     handle.send(BackendCommand::StartTransmit);
 
-    wait_for(&handle, Duration::from_secs(2), |s| s.audio.is_transmitting);
+    drive_transmitting(&handle, &audio);
 
     // Switch to Continuous mode while transmitting
     handle.send(BackendCommand::SetVoiceMode {
@@ -1060,7 +1121,7 @@ fn test_continuous_mode_starts_on_connect() {
     let server = start_server(port);
     std::thread::sleep(Duration::from_millis(500));
 
-    let (handle, _repaint, public_key) = create_backend_with_repaint_and_cert(&server.cert_path);
+    let (handle, audio, public_key) = create_backend_with_audio(&server.cert_path);
 
     // Set continuous mode BEFORE connecting
     handle.send(BackendCommand::SetVoiceMode {
@@ -1080,12 +1141,9 @@ fn test_continuous_mode_starts_on_connect() {
 
     wait_for(&handle, Duration::from_secs(5), |s| s.connection.is_connected());
 
-    // Should automatically start transmitting on connect in continuous mode
-    let transmitting = wait_for(&handle, Duration::from_secs(2), |s| s.audio.is_transmitting);
-    assert!(
-        transmitting,
-        "Should start transmitting on connect when in Continuous mode"
-    );
+    // Should automatically arm capture on connect in continuous mode, then
+    // transmit on the injected frames.
+    drive_transmitting(&handle, &audio);
 }
 
 #[test]
@@ -1094,7 +1152,7 @@ fn test_muted_does_not_transmit() {
     let server = start_server(port);
     std::thread::sleep(Duration::from_millis(500));
 
-    let (handle, _repaint, public_key) = create_backend_with_repaint_and_cert(&server.cert_path);
+    let (handle, audio, public_key) = create_backend_with_audio(&server.cert_path);
 
     send_connect(
         &handle,
@@ -1111,11 +1169,17 @@ fn test_muted_does_not_transmit() {
 
     wait_for(&handle, Duration::from_secs(2), |s| s.audio.self_muted);
 
-    // PTT commands should be ignored when muted
+    // PTT commands should be ignored when muted: capture must never arm, so
+    // even injected frames are dropped and nothing transmits.
     handle.send(BackendCommand::StartTransmit);
 
     std::thread::sleep(Duration::from_millis(200));
+    for i in 0..8 {
+        audio.inject_capture(voice_frame(i));
+    }
+    std::thread::sleep(Duration::from_millis(200));
 
+    assert!(!audio.is_capture_active(), "Muting should keep capture disarmed");
     assert!(!handle.state().audio.is_transmitting, "Should not transmit when muted");
 }
 
@@ -1125,7 +1189,7 @@ fn test_mute_stops_continuous_transmission() {
     let server = start_server(port);
     std::thread::sleep(Duration::from_millis(500));
 
-    let (handle, _repaint, public_key) = create_backend_with_repaint_and_cert(&server.cert_path);
+    let (handle, audio, public_key) = create_backend_with_audio(&server.cert_path);
 
     send_connect(
         &handle,
@@ -1142,7 +1206,7 @@ fn test_mute_stops_continuous_transmission() {
         mode: rumble_client::VoiceMode::Continuous,
     });
 
-    wait_for(&handle, Duration::from_secs(2), |s| s.audio.is_transmitting);
+    drive_transmitting(&handle, &audio);
 
     // Mute
     handle.send(BackendCommand::SetMuted { muted: true });
@@ -1157,7 +1221,7 @@ fn test_disconnect_clears_transmission_state() {
     let server = start_server(port);
     std::thread::sleep(Duration::from_millis(500));
 
-    let (handle, _repaint, public_key) = create_backend_with_repaint_and_cert(&server.cert_path);
+    let (handle, audio, public_key) = create_backend_with_audio(&server.cert_path);
 
     send_connect(
         &handle,
@@ -1174,7 +1238,7 @@ fn test_disconnect_clears_transmission_state() {
         mode: rumble_client::VoiceMode::Continuous,
     });
 
-    wait_for(&handle, Duration::from_secs(2), |s| s.audio.is_transmitting);
+    drive_transmitting(&handle, &audio);
 
     // Disconnect
     handle.send(BackendCommand::Disconnect);
@@ -1194,7 +1258,7 @@ fn test_continuous_mode_resumes_on_reconnect() {
     let server = start_server(port);
     std::thread::sleep(Duration::from_millis(500));
 
-    let (handle, _repaint, public_key) = create_backend_with_repaint_and_cert(&server.cert_path);
+    let (handle, audio, public_key) = create_backend_with_audio(&server.cert_path);
 
     // Set continuous mode
     handle.send(BackendCommand::SetVoiceMode {
@@ -1211,7 +1275,7 @@ fn test_continuous_mode_resumes_on_reconnect() {
     );
 
     wait_for(&handle, Duration::from_secs(5), |s| s.connection.is_connected());
-    wait_for(&handle, Duration::from_secs(2), |s| s.audio.is_transmitting);
+    drive_transmitting(&handle, &audio);
 
     // Disconnect
     handle.send(BackendCommand::Disconnect);
@@ -1238,12 +1302,8 @@ fn test_continuous_mode_resumes_on_reconnect() {
 
     wait_for(&handle, Duration::from_secs(5), |s| s.connection.is_connected());
 
-    // Should resume transmitting
-    let transmitting = wait_for(&handle, Duration::from_secs(2), |s| s.audio.is_transmitting);
-    assert!(
-        transmitting,
-        "Should resume transmitting on reconnect in Continuous mode"
-    );
+    // Should resume transmitting on reconnect in Continuous mode
+    drive_transmitting(&handle, &audio);
 }
 
 #[test]
@@ -1253,7 +1313,7 @@ fn test_ptt_not_transmitting_after_disconnect() {
     let server = start_server(port);
     std::thread::sleep(Duration::from_millis(500));
 
-    let (handle, _repaint, public_key) = create_backend_with_repaint_and_cert(&server.cert_path);
+    let (handle, audio, public_key) = create_backend_with_audio(&server.cert_path);
 
     send_connect(
         &handle,
@@ -1268,7 +1328,7 @@ fn test_ptt_not_transmitting_after_disconnect() {
     // Start PTT transmission
     handle.send(BackendCommand::StartTransmit);
 
-    wait_for(&handle, Duration::from_secs(2), |s| s.audio.is_transmitting);
+    drive_transmitting(&handle, &audio);
 
     // Disconnect while transmitting
     handle.send(BackendCommand::Disconnect);
