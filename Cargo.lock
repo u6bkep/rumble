@@ -3391,6 +3391,7 @@ name = "mumble-bridge"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "base64",
  "bytes",
  "clap",
  "dashmap",

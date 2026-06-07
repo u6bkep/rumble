@@ -2,7 +2,6 @@ use std::sync::{Arc, RwLock};
 
 use anyhow::Result;
 use clap::Parser;
-use ed25519_dalek::SigningKey;
 use prost::Message;
 use tokio::sync::{mpsc, watch};
 use tracing::{error, info, warn};
@@ -47,6 +46,13 @@ struct Cli {
     /// Only for trusted networks/testing.
     #[arg(long)]
     rumble_insecure: bool,
+
+    /// Path to the bridge's persistent Ed25519 identity file. Generated on
+    /// first run (0600 on Unix); authorize it once on the server with
+    /// `server add-controller <public-key>`. A stable identity is required so
+    /// the controller authorization survives restarts.
+    #[arg(long, value_name = "PATH", default_value = "bridge-identity.key")]
+    identity_file: std::path::PathBuf,
 }
 
 /// Parse a hex SHA-256 fingerprint (colons/whitespace allowed) into 32 bytes.
@@ -139,8 +145,15 @@ async fn main() -> Result<()> {
         "Starting Mumble Bridge"
     );
 
-    // Generate Ed25519 keypair for the bridge identity
-    let signing_key = SigningKey::from_bytes(&rand::random());
+    // Load (or first-run generate) the bridge's persistent Ed25519 identity so
+    // the server's controller authorization survives restarts.
+    let signing_key = mumble_bridge::identity::load_or_create_identity(&cli.identity_file)?;
+    let controller_key_b64 = mumble_bridge::identity::public_key_b64(&signing_key);
+    info!(
+        identity_file = %cli.identity_file.display(),
+        public_key = %controller_key_b64,
+        "Bridge identity ready — authorize once with `server add-controller <public_key>`"
+    );
 
     // Shutdown signal: ctrl_c or SIGTERM
     let (shutdown_tx, shutdown_rx) = watch::channel(false);

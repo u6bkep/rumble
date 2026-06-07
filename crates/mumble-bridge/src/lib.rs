@@ -1,5 +1,6 @@
 pub mod bridge;
 pub mod config;
+pub mod identity;
 pub mod mumble_framing;
 pub mod mumble_proto;
 pub mod mumble_server;

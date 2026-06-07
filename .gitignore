@@ -20,3 +20,6 @@ crates/server/web-dist/pkg/
 # Local-only patch override for iterating against vendor/damascene; invoked via
 # `scripts/damascene-local.sh` (see .cargo/config.toml).
 .cargo/local-damascene.toml
+
+# Bridge persistent Ed25519 identity (default path; private key, 0600).
+bridge-identity.key
