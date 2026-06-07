@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 /// Bridge configuration.
 #[derive(Debug, Clone)]
 pub struct BridgeConfig {
@@ -11,6 +13,27 @@ pub struct BridgeConfig {
     pub welcome_text: String,
     /// Maximum bandwidth advertised to Mumble clients (bits/sec).
     pub max_bandwidth: u32,
+    /// How to verify the Rumble server's TLS certificate.
+    pub rumble_tls: RumbleTlsTrust,
+}
+
+/// How the bridge establishes trust in the Rumble server's TLS certificate.
+///
+/// Defaults to [`RumbleTlsTrust::WebPki`] (fail-closed); operators pin a
+/// self-signed server explicitly.
+#[derive(Debug, Clone, Default)]
+pub enum RumbleTlsTrust {
+    /// Standard WebPKI verification against system roots, matching the dialed
+    /// hostname. Correct for a Rumble server behind a CA-signed cert.
+    #[default]
+    WebPki,
+    /// Trust the CA/leaf certificate(s) in this PEM or DER file.
+    CertFile(PathBuf),
+    /// Pin the server's leaf cert by its SHA-256 fingerprint (hostname-independent).
+    Fingerprint([u8; 32]),
+    /// Accept any certificate without verification. Dangerous; requires the
+    /// `dangerous-accept-invalid-certs` feature in rumble-desktop.
+    Insecure,
 }
 
 impl Default for BridgeConfig {
@@ -21,6 +44,7 @@ impl Default for BridgeConfig {
             bridge_name: "MumbleBridge".to_string(),
             welcome_text: "Connected to Rumble via Mumble Bridge".to_string(),
             max_bandwidth: 558000,
+            rumble_tls: RumbleTlsTrust::default(),
         }
     }
 }

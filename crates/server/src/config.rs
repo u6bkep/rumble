@@ -261,6 +261,9 @@ pub struct WebSettings {
     pub bind: SocketAddr,
     /// Optional directory to serve the admin UI from (dev override).
     pub assets_dir: Option<PathBuf>,
+    /// Server data directory, used to persist the one-time bootstrap token to a
+    /// `0600` file instead of logging the secret.
+    pub data_dir: PathBuf,
 }
 
 fn default_bind() -> String {
@@ -421,6 +424,7 @@ impl ServerConfig {
             Some(WebSettings {
                 bind: web_bind,
                 assets_dir,
+                data_dir: data_dir.clone(),
             })
         } else {
             None

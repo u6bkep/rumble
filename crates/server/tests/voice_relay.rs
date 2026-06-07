@@ -141,7 +141,16 @@ fn build_test_signer() -> ([u8; 32], Arc<dyn rumble_client_traits::KeySigning>) 
 
 fn make_backend(cert_path: &std::path::Path) -> (TestBackend, MockAudio, [u8; 32]) {
     let (mock_backend, audio) = MockAudioBackend::new();
-    let config = ConnectConfig::new().with_cert(cert_path);
+    // Dev cert SAN is "localhost" but tests dial by IP, so pin the leaf cert by
+    // fingerprint (name-independent) rather than trusting it as a CA root.
+    let pem = std::fs::read(cert_path).expect("read server cert");
+    let leaf_der = rustls_pemfile::certs(&mut pem.as_slice())
+        .next()
+        .expect("at least one cert in fullchain.pem")
+        .expect("parse leaf cert")
+        .to_vec();
+    let mut config = ConnectConfig::new();
+    config.accepted_certs.push(leaf_der);
     let (public_key, signer) = build_test_signer();
     let handle = TestBackend::with_audio_backend(|| {}, config, signer, mock_backend);
     (handle, audio, public_key)

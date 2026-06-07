@@ -25,6 +25,10 @@ audio = ["dep:cpal"]
 pulse = ["audio", "dep:libpulse-binding", "dep:libpulse-simple-binding"]
 # Opus voice codec. Drop for daemons that just relay opaque opus payloads.
 codec = ["dep:opus"]
+# Compile the AcceptAllVerifier (skip-all TLS verification). Off by default so
+# the interactive desktop client can never silently disable cert verification;
+# server-to-server daemons (e.g. mumble-bridge) opt in explicitly.
+dangerous-accept-invalid-certs = []
 
 [dependencies]
 rumble-client-traits = { path = "../rumble-client-traits" }

@@ -77,6 +77,31 @@ impl IntoResponse for ApiErrorResponse {
 /// Result alias for JSON API handlers.
 pub type ApiResult<T> = Result<Json<T>, ApiErrorResponse>;
 
+/// Write the one-time bootstrap token to `path`, owner-read/write only (`0600`)
+/// on Unix so the secret is not exposed to other local users.
+fn write_token_file(path: &std::path::Path, token: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    #[cfg(unix)]
+    {
+        use std::{io::Write, os::unix::fs::OpenOptionsExt};
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        writeln!(file, "{token}")
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, format!("{token}\n"))
+    }
+}
+
 /// Spawn the web admin server as a background task. Returns the join handle.
 ///
 /// Generates a one-time setup token and, when the server still needs bootstrap
@@ -85,6 +110,10 @@ pub type ApiResult<T> = Result<Json<T>, ApiErrorResponse>;
 pub fn spawn(state: Arc<ServerState>, persistence: Option<Arc<Persistence>>, settings: WebSettings) -> JoinHandle<()> {
     // Operators can pin the one-time bootstrap token (e.g. for automated
     // provisioning) via RUMBLE_WEB_SETUP_TOKEN; otherwise it is random.
+    let token_is_pinned = std::env::var("RUMBLE_WEB_SETUP_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty())
+        .is_some();
     let setup_token = std::env::var("RUMBLE_WEB_SETUP_TOKEN")
         .ok()
         .filter(|t| !t.is_empty())
@@ -95,14 +124,31 @@ pub fn spawn(state: Arc<ServerState>, persistence: Option<Arc<Persistence>>, set
         .map(|p| p.get_sudo_password().is_none())
         .unwrap_or(false);
     if needs_bootstrap {
-        warn!(
-            "web admin: no sudo password set — first-run bootstrap is open. Setup token: {}",
-            setup_token
-        );
-        info!(
-            "web admin: complete setup at http://{}/ using the setup token above",
-            settings.bind
-        );
+        // Never log the token itself — it grants first-run admin. When the
+        // operator pinned it via env they already have it; otherwise write it to
+        // a 0600 file in the data dir and log only the path.
+        if token_is_pinned {
+            info!(
+                "web admin: no sudo password set — first-run bootstrap is open. Using setup token from \
+                 RUMBLE_WEB_SETUP_TOKEN. Complete setup at http://{}/",
+                settings.bind
+            );
+        } else {
+            let token_path = settings.data_dir.join("web-setup-token.txt");
+            match write_token_file(&token_path, &setup_token) {
+                Ok(()) => info!(
+                    "web admin: no sudo password set — first-run bootstrap is open. Setup token written to {} \
+                     (delete after setup). Complete setup at http://{}/",
+                    token_path.display(),
+                    settings.bind
+                ),
+                Err(e) => warn!(
+                    "web admin: no sudo password set — first-run bootstrap is open, but failed to write setup token \
+                     to {}: {e}. Set RUMBLE_WEB_SETUP_TOKEN to provide one explicitly.",
+                    token_path.display()
+                ),
+            }
+        }
     }
 
     let web_state = WebState {

@@ -96,9 +96,12 @@ fn build_connect_config(settings: &SettingsStore) -> ConnectConfig {
     let mut config = ConnectConfig::new();
     // Trust the repo dev cert when running from the project root so
     // `cargo run -p rumble-damascene` against `cargo run --bin server`
-    // works without an approval round-trip.
+    // works without an approval round-trip. Gated behind the `dev-certs`
+    // feature so release builds never implicitly trust a cert from CWD.
+    #[cfg(feature = "dev-certs")]
     for candidate in ["dev-certs/server-cert.der", "certs/fullchain.pem"] {
         if std::path::Path::new(candidate).exists() {
+            tracing::warn!("dev-certs: trusting repo dev certificate {candidate} from working directory");
             config = config.with_cert(candidate);
         }
     }

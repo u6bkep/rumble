@@ -13,9 +13,30 @@ use quinn::{Endpoint, crypto::rustls::QuicClientConfig};
 use rumble_client_traits::transport::{
     BiRecvStream, BiSendStream, BiStreamHandle, DatagramTransport, TlsConfig, Transport, TransportRecvStream,
 };
-use rustls::RootCertStore;
+use rustls::{RootCertStore, crypto::CryptoProvider};
 
-use crate::cert_verifier::{AcceptAllVerifier, FingerprintVerifier, InteractiveCertVerifier};
+use crate::cert_verifier::InteractiveCertVerifier;
+
+/// Build a rustls `ClientConfig` that accepts any server certificate without
+/// verification. Only available when the `dangerous-accept-invalid-certs`
+/// feature is compiled in; otherwise the request fails closed.
+#[cfg(feature = "dangerous-accept-invalid-certs")]
+fn build_accept_all_config(provider: &Arc<CryptoProvider>) -> anyhow::Result<rustls::ClientConfig> {
+    let verifier = Arc::new(crate::cert_verifier::AcceptAllVerifier::new());
+    Ok(rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth())
+}
+
+#[cfg(not(feature = "dangerous-accept-invalid-certs"))]
+fn build_accept_all_config(_provider: &Arc<CryptoProvider>) -> anyhow::Result<rustls::ClientConfig> {
+    anyhow::bail!(
+        "TlsConfig.accept_invalid_certs is set, but this build was compiled without the \
+         `dangerous-accept-invalid-certs` feature; refusing to skip certificate verification"
+    )
+}
 
 /// Datagram handle for QUIC voice data, wrapping a cloneable `quinn::Connection`.
 ///
@@ -209,29 +230,18 @@ impl Transport for QuinnTransport {
         }
 
         let mut client_cfg = if tls_config.accept_invalid_certs {
-            // Danger: accept any certificate
-            let verifier = Arc::new(AcceptAllVerifier::new());
-            rustls::ClientConfig::builder_with_provider(provider.clone())
-                .with_protocol_versions(&[&rustls::version::TLS13])?
-                .dangerous()
-                .with_custom_certificate_verifier(verifier)
-                .with_no_client_auth()
-        } else if let Some(captured_cert) = tls_config.captured_cert {
-            // Interactive verification: captures unknown certs for user confirmation
+            // Danger: accept any certificate (feature-gated, fails closed otherwise).
+            build_accept_all_config(&provider)?
+        } else if !tls_config.accepted_fingerprints.is_empty() || tls_config.captured_cert.is_some() {
+            // Interactive / pinned verification: trust certs whose fingerprint the
+            // user already accepted (name-independent TOFU), and capture unknown
+            // certs for confirmation when a `captured_cert` slot is provided.
             let verifier = Arc::new(InteractiveCertVerifier::new(
                 root_store,
                 provider.clone(),
-                captured_cert,
+                tls_config.accepted_fingerprints,
+                tls_config.captured_cert,
             ));
-            rustls::ClientConfig::builder_with_provider(provider.clone())
-                .with_protocol_versions(&[&rustls::version::TLS13])?
-                .dangerous()
-                .with_custom_certificate_verifier(verifier)
-                .with_no_client_auth()
-        } else if !tls_config.accepted_fingerprints.is_empty() {
-            // Fingerprint-pinned verification
-            let verifier =
-                Arc::new(FingerprintVerifier::new(tls_config.accepted_fingerprints).with_additional_roots(root_store));
             rustls::ClientConfig::builder_with_provider(provider.clone())
                 .with_protocol_versions(&[&rustls::version::TLS13])?
                 .dangerous()
@@ -272,9 +282,12 @@ impl Transport for QuinnTransport {
         let mut endpoint = Endpoint::client(bind_addr)?;
         endpoint.set_default_client_config(quinn_client_config);
 
-        // Use "localhost" as the SNI server name (matching existing backend behavior)
+        // Use the real dialed host as the SNI / cert-validation name so that
+        // CA-signed certs validate by hostname. For IP-literal hosts rustls
+        // produces an IP `ServerName` and checks IP SANs accordingly. Self-signed
+        // servers fail WebPKI here and fall to the fingerprint-pin / capture path.
         let connection = endpoint
-            .connect(socket_addr, "localhost")?
+            .connect(socket_addr, &host)?
             .await
             .context("QUIC handshake failed")?;
 

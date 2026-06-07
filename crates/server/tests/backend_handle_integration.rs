@@ -103,11 +103,23 @@ fn start_server(port: u16) -> ServerGuard {
 }
 
 /// Helper to create a BackendHandle with the specified certificate and a repaint counter.
+///
+/// The dev server's self-signed cert has SAN "localhost", but tests dial by IP
+/// ("127.0.0.1"), so we pin the leaf cert by fingerprint (the same name-
+/// independent TOFU path a real user takes after accepting the cert) rather than
+/// trusting it as a CA root (which would fail WebPKI's hostname check).
 fn create_backend_with_repaint_and_cert(cert_path: &std::path::Path) -> (BackendHandle, Arc<AtomicBool>, [u8; 32]) {
     let repaint_called = Arc::new(AtomicBool::new(false));
     let repaint_called_clone = repaint_called.clone();
 
-    let config = ConnectConfig::new().with_cert(cert_path);
+    let pem = std::fs::read(cert_path).expect("read server cert");
+    let leaf_der = rustls_pemfile::certs(&mut pem.as_slice())
+        .next()
+        .expect("at least one cert in fullchain.pem")
+        .expect("parse leaf cert")
+        .to_vec();
+    let mut config = ConnectConfig::new();
+    config.accepted_certs.push(leaf_der);
     let (public_key, signer) = build_test_signer();
 
     let handle = BackendHandle::with_config(
@@ -1445,14 +1457,13 @@ fn http_request(
     let set_cookie = resp.lines().find_map(|l| {
         let lower = l.to_ascii_lowercase();
         if lower.starts_with("set-cookie:") {
-            l.splitn(2, ':')
-                .nth(1)
-                .map(|v| v.trim().split(';').next().unwrap_or("").to_string())
+            l.split_once(':')
+                .map(|(_, v)| v.trim().split(';').next().unwrap_or("").to_string())
         } else {
             None
         }
     });
-    let body_part = resp.splitn(2, "\r\n\r\n").nth(1).unwrap_or("").to_string();
+    let body_part = resp.split_once("\r\n\r\n").map(|x| x.1).unwrap_or("").to_string();
     (status, body_part, set_cookie)
 }
 

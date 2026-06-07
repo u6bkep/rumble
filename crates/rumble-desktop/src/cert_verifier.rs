@@ -1,9 +1,22 @@
 //! TLS certificate verification for QUIC connections.
 //!
-//! Provides three verifiers:
-//! - `InteractiveCertVerifier`: captures unknown certs for user confirmation
-//! - `FingerprintVerifier`: accepts certs whose SHA-256 fingerprint is in a known set
-//! - `AcceptAllVerifier`: danger verifier that accepts any certificate (for testing)
+//! Two verifiers:
+//! - [`InteractiveCertVerifier`]: the production path. It runs standard WebPKI
+//!   verification, but layers two extra behaviours on top for self-signed
+//!   servers:
+//!     1. **Fingerprint pinning (TOFU re-trust).** Any leaf cert whose SHA-256
+//!        fingerprint is in the caller-supplied pin set is accepted regardless
+//!        of issuer *or* hostname. This is how a previously-accepted self-signed
+//!        cert is trusted on reconnect — independent of the cert's SAN, which a
+//!        self-signed dev cert often does not match the dialed host.
+//!     2. **Capture for confirmation.** An unknown (untrusted-issuer) cert is
+//!        stored in `captured_cert` so the caller can prompt the user, then
+//!        retry with the fingerprint pinned.
+//! - [`AcceptAllVerifier`]: a danger verifier that accepts any certificate
+//!   without verification. Compiled **only** when the
+//!   `dangerous-accept-invalid-certs` feature is enabled (server-to-server
+//!   daemons like the Mumble bridge opt in); never present in the desktop
+//!   client binary.
 
 use std::sync::Arc;
 
@@ -23,17 +36,20 @@ pub fn compute_sha256_fingerprint(cert_der: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-/// A certificate verifier that captures self-signed certificates for user confirmation.
+/// A certificate verifier that pins accepted self-signed certs by fingerprint
+/// and captures unknown certs for interactive user confirmation.
 ///
-/// This verifier:
-/// 1. Delegates to the standard WebPKI verifier for normal certificates
-/// 2. When verification fails due to unknown issuer (self-signed cert), stores
-///    the certificate info in `captured_cert` for later retrieval by the caller
-/// 3. The caller can then prompt the user and retry with the fingerprint accepted
+/// See the module docs for the full trust model.
 pub struct InteractiveCertVerifier {
     root_store: Arc<RootCertStore>,
     provider: Arc<CryptoProvider>,
-    captured_cert: CapturedCert,
+    /// SHA-256 fingerprints the user has already accepted. A leaf cert matching
+    /// one of these is trusted regardless of issuer or hostname (TOFU pin).
+    pinned_fingerprints: Vec<[u8; 32]>,
+    /// Storage for an unknown cert captured for user confirmation. `None` when
+    /// the caller cannot prompt (e.g. a headless daemon) — unknown certs then
+    /// simply fail verification.
+    captured_cert: Option<CapturedCert>,
 }
 
 impl std::fmt::Debug for InteractiveCertVerifier {
@@ -41,18 +57,38 @@ impl std::fmt::Debug for InteractiveCertVerifier {
         f.debug_struct("InteractiveCertVerifier")
             .field("root_store", &"<RootCertStore>")
             .field("provider", &"<CryptoProvider>")
+            .field("pinned_fingerprints", &self.pinned_fingerprints.len())
             .field("captured_cert", &self.captured_cert)
             .finish()
     }
 }
 
 impl InteractiveCertVerifier {
-    /// Create a new interactive certificate verifier with shared captured cert storage.
-    pub fn new(root_store: RootCertStore, provider: Arc<CryptoProvider>, captured_cert: CapturedCert) -> Self {
+    /// Create a new interactive verifier.
+    ///
+    /// - `root_store` — WebPKI roots (system roots plus any file-provided CAs).
+    /// - `pinned_fingerprints` — SHA-256 fingerprints to accept name-independently.
+    /// - `captured_cert` — where to stash an unknown cert for the user prompt;
+    ///   pass `None` for non-interactive callers.
+    pub fn new(
+        root_store: RootCertStore,
+        provider: Arc<CryptoProvider>,
+        pinned_fingerprints: Vec<[u8; 32]>,
+        captured_cert: Option<CapturedCert>,
+    ) -> Self {
         Self {
             root_store: Arc::new(root_store),
             provider,
+            pinned_fingerprints,
             captured_cert,
+        }
+    }
+
+    fn clear_captured(&self) {
+        if let Some(captured) = &self.captured_cert
+            && let Ok(mut slot) = captured.lock()
+        {
+            *slot = None;
         }
     }
 }
@@ -66,6 +102,17 @@ impl ServerCertVerifier for InteractiveCertVerifier {
         ocsp_response: &[u8],
         now: UnixTime,
     ) -> Result<ServerCertVerified, Error> {
+        // 1. TOFU pin: a fingerprint the user already approved is trusted
+        //    regardless of issuer or hostname. This is what makes reconnects to
+        //    self-signed servers work even when the cert's SAN doesn't match the
+        //    dialed host (e.g. an IP literal, or the dev default SAN "localhost").
+        let fingerprint = compute_sha256_fingerprint(end_entity.as_ref());
+        if self.pinned_fingerprints.contains(&fingerprint) {
+            self.clear_captured();
+            return Ok(ServerCertVerified::assertion());
+        }
+
+        // 2. Standard WebPKI verification (CA-signed certs for the real host).
         let inner =
             rustls::client::WebPkiServerVerifier::builder_with_provider(self.root_store.clone(), self.provider.clone())
                 .build()
@@ -73,13 +120,17 @@ impl ServerCertVerifier for InteractiveCertVerifier {
 
         match inner.verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now) {
             Ok(verified) => {
-                if let Ok(mut captured) = self.captured_cert.lock() {
-                    *captured = None;
-                }
+                self.clear_captured();
                 Ok(verified)
             }
-            Err(Error::InvalidCertificate(CertificateError::UnknownIssuer))
-            | Err(Error::InvalidCertificate(CertificateError::BadSignature)) => {
+            // 3. Untrusted issuer or name mismatch: capture for the user prompt.
+            //    Name mismatch is included so a self-signed cert presented for a
+            //    host not in its SAN (e.g. dialing by IP a cert whose SAN is
+            //    "localhost") becomes a TOFU prompt rather than a hard failure.
+            Err(err @ Error::InvalidCertificate(CertificateError::UnknownIssuer))
+            | Err(err @ Error::InvalidCertificate(CertificateError::BadSignature))
+            | Err(err @ Error::InvalidCertificate(CertificateError::NotValidForName))
+            | Err(err @ Error::InvalidCertificate(CertificateError::NotValidForNameContext { .. })) => {
                 let server_name_str = match server_name {
                     ServerName::DnsName(name) => name.as_ref().to_string(),
                     ServerName::IpAddress(ip) => format!("{:?}", ip),
@@ -89,16 +140,18 @@ impl ServerCertVerifier for InteractiveCertVerifier {
                 let cert_info = ServerCertInfo::new(end_entity.as_ref(), &server_name_str);
 
                 tracing::warn!(
-                    "Self-signed certificate detected for '{}' (fingerprint: {})",
+                    "Untrusted server certificate for '{}' (fingerprint: {})",
                     cert_info.server_name,
                     cert_info.fingerprint_hex()
                 );
 
-                if let Ok(mut captured) = self.captured_cert.lock() {
-                    *captured = Some(cert_info);
+                if let Some(captured) = &self.captured_cert
+                    && let Ok(mut slot) = captured.lock()
+                {
+                    *slot = Some(cert_info);
                 }
 
-                Err(Error::InvalidCertificate(CertificateError::UnknownIssuer))
+                Err(err)
             }
             Err(other_error) => Err(other_error),
         }
@@ -127,87 +180,25 @@ impl ServerCertVerifier for InteractiveCertVerifier {
     }
 }
 
-/// A certificate verifier that accepts certificates whose SHA-256 fingerprint
-/// is in a provided set.
-#[derive(Debug)]
-pub struct FingerprintVerifier {
-    fingerprints: Vec<[u8; 32]>,
-    root_store: Arc<RootCertStore>,
-    provider: Arc<CryptoProvider>,
-}
-
-impl FingerprintVerifier {
-    pub fn new(fingerprints: Vec<[u8; 32]>) -> Self {
-        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-        Self {
-            fingerprints,
-            root_store: Arc::new(RootCertStore::empty()),
-            provider,
-        }
-    }
-
-    pub fn with_additional_roots(mut self, roots: RootCertStore) -> Self {
-        self.root_store = Arc::new(roots);
-        self
-    }
-}
-
-impl ServerCertVerifier for FingerprintVerifier {
-    fn verify_server_cert(
-        &self,
-        end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: UnixTime,
-    ) -> Result<ServerCertVerified, Error> {
-        let fingerprint = compute_sha256_fingerprint(end_entity.as_ref());
-
-        if self.fingerprints.iter().any(|fp| fp == &fingerprint) {
-            return Ok(ServerCertVerified::assertion());
-        }
-
-        Err(Error::General(format!(
-            "certificate fingerprint {:02X}{:02X}{:02X}{:02X}... not in accepted set",
-            fingerprint[0], fingerprint[1], fingerprint[2], fingerprint[3],
-        )))
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, Error> {
-        verify_tls12_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, Error> {
-        verify_tls13_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        self.provider.signature_verification_algorithms.supported_schemes()
-    }
-}
-
 /// A danger verifier that accepts any certificate without verification.
+///
+/// Compiled only when the `dangerous-accept-invalid-certs` feature is enabled.
+/// Intended for server-to-server daemons (e.g. the Mumble bridge) that opt into
+/// an unverified link, never for the interactive desktop client.
+#[cfg(feature = "dangerous-accept-invalid-certs")]
 #[derive(Debug)]
 pub struct AcceptAllVerifier {
     provider: Arc<CryptoProvider>,
 }
 
+#[cfg(feature = "dangerous-accept-invalid-certs")]
 impl Default for AcceptAllVerifier {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(feature = "dangerous-accept-invalid-certs")]
 impl AcceptAllVerifier {
     pub fn new() -> Self {
         Self {
@@ -216,6 +207,7 @@ impl AcceptAllVerifier {
     }
 }
 
+#[cfg(feature = "dangerous-accept-invalid-certs")]
 impl ServerCertVerifier for AcceptAllVerifier {
     fn verify_server_cert(
         &self,

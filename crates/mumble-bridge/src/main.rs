@@ -33,6 +33,81 @@ struct Cli {
     /// Welcome text shown to Mumble clients
     #[arg(short, long, default_value = "Connected to Rumble via Mumble Bridge")]
     welcome_text: String,
+
+    /// Trust the Rumble server's TLS cert from this PEM/DER file (CA or leaf).
+    #[arg(long, value_name = "PATH")]
+    rumble_cert: Option<std::path::PathBuf>,
+
+    /// Pin the Rumble server's leaf cert by SHA-256 fingerprint (hex, colons
+    /// optional). Hostname-independent; correct for self-signed servers.
+    #[arg(long, value_name = "HEX")]
+    rumble_cert_fingerprint: Option<String>,
+
+    /// DANGER: accept any Rumble server certificate without verification.
+    /// Only for trusted networks/testing.
+    #[arg(long)]
+    rumble_insecure: bool,
+}
+
+/// Parse a hex SHA-256 fingerprint (colons/whitespace allowed) into 32 bytes.
+fn parse_fingerprint(s: &str) -> Result<[u8; 32]> {
+    let cleaned: String = s.chars().filter(|c| !c.is_whitespace() && *c != ':').collect();
+    let bytes = (0..cleaned.len())
+        .step_by(2)
+        .map(|i| {
+            cleaned
+                .get(i..i + 2)
+                .and_then(|b| u8::from_str_radix(b, 16).ok())
+                .ok_or_else(|| anyhow::anyhow!("invalid hex in fingerprint"))
+        })
+        .collect::<Result<Vec<u8>>>()?;
+    bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("fingerprint must be 32 bytes (64 hex chars)"))
+}
+
+/// Build the Rumble server cert trust policy from the CLI flags.
+fn resolve_tls_trust(cli: &Cli) -> Result<mumble_bridge::config::RumbleTlsTrust> {
+    use mumble_bridge::config::RumbleTlsTrust;
+    match (&cli.rumble_cert, &cli.rumble_cert_fingerprint, cli.rumble_insecure) {
+        (Some(_), _, true) | (_, Some(_), true) | (Some(_), Some(_), _) => {
+            anyhow::bail!("--rumble-cert, --rumble-cert-fingerprint and --rumble-insecure are mutually exclusive")
+        }
+        (Some(path), None, false) => Ok(RumbleTlsTrust::CertFile(path.clone())),
+        (None, Some(fp), false) => Ok(RumbleTlsTrust::Fingerprint(parse_fingerprint(fp)?)),
+        (None, None, true) => Ok(RumbleTlsTrust::Insecure),
+        (None, None, false) => Ok(RumbleTlsTrust::WebPki),
+    }
+}
+
+/// Translate the trust policy into a transport `TlsConfig`.
+fn build_tls_config(
+    trust: &mumble_bridge::config::RumbleTlsTrust,
+) -> Result<rumble_client_traits::transport::TlsConfig> {
+    use mumble_bridge::config::RumbleTlsTrust;
+    use rumble_client_traits::transport::TlsConfig;
+    Ok(match trust {
+        RumbleTlsTrust::WebPki => TlsConfig::default(),
+        RumbleTlsTrust::CertFile(path) => {
+            let bytes = std::fs::read(path)
+                .map_err(|e| anyhow::anyhow!("failed to read --rumble-cert {}: {e}", path.display()))?;
+            TlsConfig {
+                additional_ca_certs: vec![bytes],
+                ..Default::default()
+            }
+        }
+        RumbleTlsTrust::Fingerprint(fp) => TlsConfig {
+            accepted_fingerprints: vec![*fp],
+            ..Default::default()
+        },
+        RumbleTlsTrust::Insecure => {
+            warn!("--rumble-insecure: skipping Rumble server certificate verification");
+            TlsConfig {
+                accept_invalid_certs: true,
+                ..Default::default()
+            }
+        }
+    })
 }
 
 #[tokio::main]
@@ -46,11 +121,14 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
+    let rumble_tls = resolve_tls_trust(&cli)?;
+
     let config = Arc::new(BridgeConfig {
         rumble_addr: cli.rumble_addr,
         mumble_port: cli.mumble_port,
         bridge_name: cli.name,
         welcome_text: cli.welcome_text,
+        rumble_tls,
         ..Default::default()
     });
 
@@ -121,26 +199,28 @@ async fn main() -> Result<()> {
         }
 
         info!("Connecting to Rumble server at {}", config.rumble_addr);
-        let rumble_conn = match rumble_client::connect(&config.rumble_addr, &config.bridge_name, &signing_key).await {
-            Ok(conn) => {
-                backoff_secs = 1; // Reset backoff on successful connection
-                conn
-            }
-            Err(e) => {
-                error!(error = %e, "Failed to connect to Rumble server");
-                info!(backoff_secs, "Reconnecting after backoff");
-                let mut shutdown_wait = shutdown_rx.clone();
-                tokio::select! {
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
-                    _ = shutdown_wait.changed() => {
-                        info!("Shutdown during reconnect backoff");
-                        break;
-                    }
+        let tls_config = build_tls_config(&config.rumble_tls)?;
+        let rumble_conn =
+            match rumble_client::connect(&config.rumble_addr, &config.bridge_name, &signing_key, tls_config).await {
+                Ok(conn) => {
+                    backoff_secs = 1; // Reset backoff on successful connection
+                    conn
                 }
-                backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
-                continue;
-            }
-        };
+                Err(e) => {
+                    error!(error = %e, "Failed to connect to Rumble server");
+                    info!(backoff_secs, "Reconnecting after backoff");
+                    let mut shutdown_wait = shutdown_rx.clone();
+                    tokio::select! {
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
+                        _ = shutdown_wait.changed() => {
+                            info!("Shutdown during reconnect backoff");
+                            break;
+                        }
+                    }
+                    backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
+                    continue;
+                }
+            };
 
         let mut rumble_conn = rumble_conn;
         info!(user_id = rumble_conn.user_id, "Connected to Rumble server");

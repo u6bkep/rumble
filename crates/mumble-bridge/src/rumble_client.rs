@@ -32,17 +32,16 @@ pub struct RumbleConnection {
 
 /// Connect to a Rumble server and perform the full auth handshake.
 ///
-/// Returns a `RumbleConnection` with the initial server state.
-pub async fn connect(addr: &str, username: &str, signing_key: &SigningKey) -> Result<RumbleConnection> {
+/// `tls_config` carries the server-cert trust policy (see
+/// [`crate::config::RumbleTlsTrust`]). Returns a `RumbleConnection` with the
+/// initial server state.
+pub async fn connect(
+    addr: &str,
+    username: &str,
+    signing_key: &SigningKey,
+    tls_config: TlsConfig,
+) -> Result<RumbleConnection> {
     info!(server_addr = %addr, username, "Connecting to Rumble server");
-
-    // Use Transport trait for QUIC connection with accept-all cert verification (bridge use case)
-    let tls_config = TlsConfig {
-        accept_invalid_certs: true,
-        additional_ca_certs: Vec::new(),
-        accepted_fingerprints: Vec::new(),
-        captured_cert: None,
-    };
 
     let mut transport = QuinnTransport::connect(addr, tls_config).await?;
     info!("Connected to Rumble server via Transport");

@@ -27,6 +27,36 @@ use sha2::{Digest, Sha256};
 #[cfg(feature = "ssh-agent")]
 use tokio::sync::Mutex as TokioMutex;
 
+/// Write `contents` to `path`, owner-read/write only (`0600`) on Unix.
+///
+/// The identity file can hold a plaintext private key, so it must not be
+/// world-readable. On Unix we create with mode `0600` and also tighten an
+/// existing file (whose mode predates this change or a looser umask). On other
+/// platforms we fall back to a plain write — the user profile directory is the
+/// access boundary there.
+fn write_private(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::{
+            io::Write,
+            os::unix::fs::{OpenOptionsExt, PermissionsExt},
+        };
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        // `.mode()` only applies on creation; fix perms if the file pre-existed.
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        file.write_all(contents)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, contents)
+    }
+}
+
 /// How the key is stored.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum KeySource {
@@ -284,7 +314,7 @@ impl KeyManager {
         if let Some(config) = &self.config {
             std::fs::create_dir_all(&self.config_dir)?;
             let contents = serde_json::to_string_pretty(config)?;
-            std::fs::write(&self.config_path, contents)?;
+            write_private(&self.config_path, contents.as_bytes())?;
             tracing::info!("Saved identity config to {}", self.config_path.display());
         }
         Ok(())

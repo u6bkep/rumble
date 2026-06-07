@@ -13,8 +13,11 @@ rumble-protocol = { path = "../rumble-protocol" }
 rumble-client-traits = { path = "../rumble-client-traits" }
 # The bridge is a server-side daemon; it uses rumble-desktop only for the QUIC
 # transport pieces and never opens audio devices. Disable default features to
-# drop the libpulse runtime dep — keeps the docker image tiny.
-rumble-desktop = { path = "../rumble-desktop", default-features = false }
+# drop the libpulse runtime dep — keeps the docker image tiny. Opt into
+# dangerous-accept-invalid-certs so `--rumble-insecure` can skip verification.
+rumble-desktop = { path = "../rumble-desktop", default-features = false, features = [
+    "dangerous-accept-invalid-certs",
+] }
 tokio = { workspace = true, features = ["full"] }
 prost = { workspace = true }
 rustls = { workspace = true, features = ["aws-lc-rs"] }

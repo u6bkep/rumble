@@ -6,6 +6,14 @@ license = "MIT"
 description = "Rumble client built on the damascene UI library"
 default-run = "rumble-damascene"
 
+[features]
+default = []
+# Auto-trust repo dev certs (dev-certs/server-cert.der, certs/fullchain.pem)
+# found in the current working directory, for `cargo run` against a local dev
+# server. Off by default so release builds never implicitly trust a cert from
+# CWD. The explicit RUMBLE_SERVER_CERT_PATH override is always honoured.
+dev-certs = []
+
 # Disable the default libtest bench harness on the lib/bins so
 # `cargo bench -p rumble-damascene` dispatches only to the criterion bench
 # (libtest rejects criterion flags like --save-baseline).

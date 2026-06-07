@@ -140,13 +140,20 @@ pub async fn read_exact(recv: &mut (impl BiRecvStream + ?Sized), buf: &mut [u8])
 }
 
 /// TLS configuration for transport connections.
+#[derive(Clone, Default)]
 pub struct TlsConfig {
+    /// Skip certificate verification entirely. Requires the transport to be
+    /// built with its dangerous-accept-invalid-certs feature; otherwise the
+    /// connection fails closed. Server-to-server daemons only — never the
+    /// interactive client.
     pub accept_invalid_certs: bool,
     /// Additional CA certificates to trust. Each entry is the raw file bytes —
     /// either DER (binary) or PEM (begins with `-----BEGIN`). The transport
     /// implementation is responsible for detecting the format and converting.
     pub additional_ca_certs: Vec<Vec<u8>>,
-    /// SHA-256 fingerprints of accepted server certificates.
+    /// SHA-256 fingerprints of pinned server certificates. A leaf cert matching
+    /// one of these is accepted regardless of issuer or hostname — this is the
+    /// TOFU re-trust path for previously-accepted self-signed certs.
     pub accepted_fingerprints: Vec<[u8; 32]>,
     /// Optional storage for captured certificate info during interactive
     /// verification. When set, the transport implementation should use an

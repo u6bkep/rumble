@@ -1937,15 +1937,21 @@ async fn connect_to_server<T: Transport>(
         }
     }
 
-    // Add user-accepted certificates (from interactive prompts). Always DER.
-    for cert_der in &config.accepted_certs {
-        additional_ca_certs.push(cert_der.clone());
-    }
+    // User-accepted certificates (from interactive prompts) are pinned by
+    // SHA-256 fingerprint rather than added as CA roots. Pinning is
+    // hostname-independent, so a self-signed cert the user approved is trusted
+    // on reconnect even when its SAN doesn't match the dialed host (e.g. an IP
+    // literal, or the dev default SAN "localhost").
+    let accepted_fingerprints = config
+        .accepted_certs
+        .iter()
+        .map(|der| rumble_client_traits::cert::compute_sha256_fingerprint(der))
+        .collect();
 
     let tls_config = TlsConfig {
         accept_invalid_certs: false,
         additional_ca_certs,
-        accepted_fingerprints: Vec::new(),
+        accepted_fingerprints,
         captured_cert: Some(captured_cert),
     };
 
