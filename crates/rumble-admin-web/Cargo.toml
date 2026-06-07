@@ -1,6 +1,6 @@
 [package]
 name = "rumble-admin-web"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 publish = false
 description = "Rumble server web admin UI — a Damascene app compiled to wasm, talking to the server's REST control-plane."

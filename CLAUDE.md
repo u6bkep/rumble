@@ -17,6 +17,15 @@ cargo +nightly fmt             # Format code
 RUST_LOG=debug cargo run -p rumble-damascene  # Run with debug logging
 ```
 
+## Releasing
+
+Releases are cut by pushing an umbrella `vX.Y.Z` git tag (CI builds binaries +
+docker images, named from the tag). Crate `Cargo.toml` versions are bumped
+**independently** as each crate changes — they're informational bookkeeping, not
+build inputs (path deps, nothing on crates.io). Run `cargo xtask release-status`
+to see which crates changed since the last tag and flag any missing a bump. Full
+policy and steps: **`RELEASING.md`**.
+
 ## Crate Architecture
 
 ```
