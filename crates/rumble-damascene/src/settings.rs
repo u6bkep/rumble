@@ -658,6 +658,18 @@ pub fn render(
         SettingsTab::About => render_about(),
     };
 
+    // These tabs paint live audio data pulled fresh each frame
+    // (`backend.meter()` / `.outputs()` / `.stats()`) rather than from
+    // `State`, so a state-change wakeup won't refresh them. Ask the host
+    // to keep ticking at ~30fps while one is on screen — the same
+    // self-scheduling `redraw_within` pattern animated GIFs and the video
+    // surface use. Every other tab is static and falls back to 0fps idle.
+    let body = if matches!(tab, SettingsTab::Devices | SettingsTab::Processing | SettingsTab::Stats) {
+        body.redraw_within(std::time::Duration::from_millis(33))
+    } else {
+        body
+    };
+
     // Vertical nav rail. Reuses the same routed-key format as
     // `tabs_list` (`{KEY_TABS}:tab:{slug}`) so `tabs::apply_event` in
     // `handle_event` still routes selections — only the visual shell

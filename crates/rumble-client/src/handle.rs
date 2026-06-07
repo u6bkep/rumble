@@ -161,6 +161,13 @@ pub struct BackendHandle<P: Platform> {
     /// Receiver half, wrapped in an `Option` so `take_event_receiver`
     /// can hand ownership to the UI on first call.
     event_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<BackendEvent>>>,
+    /// The repaint callback, also retained here so [`Self::push_event`]
+    /// can poke it. The UI drains `BackendEvent`s only while building a
+    /// frame, so under push-driven (0fps-idle) redraw a toast or
+    /// transfer-stage event that rides this channel — rather than a
+    /// `State` change — must itself schedule a frame, or it would not
+    /// surface until the next unrelated repaint.
+    repaint: Arc<dyn Fn() + Send + Sync>,
     /// Marker for the platform type parameter.
     _phantom: std::marker::PhantomData<P>,
 }
@@ -332,7 +339,10 @@ impl<P: Platform> BackendHandle<P> {
         let audio_task_for_connection = audio_task.clone();
         let command_tx_for_task = command_tx.clone();
         let file_transfer_for_task = file_transfer.clone();
-        let event_tx_for_task = event_tx.clone();
+        let event_sink_for_task = EventSink {
+            tx: event_tx.clone(),
+            repaint: repaint_callback.clone(),
+        };
         let bus_for_task = bus.clone();
         let bus_for_projection = bus.clone();
         let state_for_projection = state.clone();
@@ -369,7 +379,7 @@ impl<P: Platform> BackendHandle<P> {
                     key_signer_for_task,
                     audio_task_for_connection,
                     file_transfer_for_task,
-                    event_tx_for_task,
+                    event_sink_for_task,
                     bus_for_task,
                 )
                 .await;
@@ -390,6 +400,7 @@ impl<P: Platform> BackendHandle<P> {
             outputs,
             event_tx,
             event_rx: std::sync::Mutex::new(Some(event_rx)),
+            repaint: repaint_callback.clone(),
             _phantom: std::marker::PhantomData,
         }
     }
@@ -665,6 +676,9 @@ impl<P: Platform> BackendHandle<P> {
     /// [`Self::take_event_receiver`].
     pub fn push_event(&self, event: BackendEvent) {
         let _ = self.event_tx.send(event);
+        // Schedule a frame so the UI drains and shows this event promptly
+        // even when otherwise idle (no accompanying `State` change).
+        (self.repaint)();
     }
 
     /// Hand ownership of the event receiver to the caller.
@@ -829,6 +843,28 @@ enum DeferredAction {
     },
 }
 
+/// A [`BackendEvent`] sender that also schedules a UI frame.
+///
+/// The UI drains the `BackendEvent` channel only while building a frame,
+/// so under push-driven (0fps-idle) redraw every send must itself poke the
+/// repaint callback or the event (a toast, a transfer-stage change) would
+/// not surface until some unrelated repaint. Bundling the poke into one
+/// `send` keeps that invariant in a single place rather than at every call
+/// site. Mirrors what [`BackendHandle::push_event`] does for the
+/// handle-owned sender.
+#[derive(Clone)]
+struct EventSink {
+    tx: mpsc::UnboundedSender<BackendEvent>,
+    repaint: Arc<dyn Fn() + Send + Sync>,
+}
+
+impl EventSink {
+    fn send(&self, event: BackendEvent) {
+        let _ = self.tx.send(event);
+        (self.repaint)();
+    }
+}
+
 /// It notifies the audio task when a connection is established or closed.
 #[allow(clippy::too_many_arguments)] // private helper; bundling its args would just push churn
 async fn run_connection_task<P: Platform>(
@@ -839,7 +875,7 @@ async fn run_connection_task<P: Platform>(
     key_signer: Arc<dyn KeySigning>,
     audio_task: AudioTaskHandle,
     file_transfer_slot: Arc<RwLock<Option<Arc<dyn FileTransferPlugin>>>>,
-    event_tx: mpsc::UnboundedSender<BackendEvent>,
+    events: EventSink,
     bus: crate::projection::EventBus,
 ) {
     // Connection state
@@ -899,7 +935,7 @@ async fn run_connection_task<P: Platform>(
                             // upload state from the plugin (which shows
                             // complete). A toast keeps them informed that
                             // nobody else got it.
-                            let _ = event_tx.send(BackendEvent::Toast {
+                            events.send(BackendEvent::Toast {
                                 level: NotificationLevel::Error,
                                 text: format!("Failed to broadcast share: {e}"),
                             });
@@ -1028,7 +1064,7 @@ async fn run_connection_task<P: Platform>(
                                     .unwrap_or_else(|| std::env::temp_dir().join("rumble_downloads"));
                                 let opener: Arc<dyn rumble_client_traits::StreamOpener> =
                                     Arc::new(rumble_client_traits::BiStreamOpener::new(opener_handle));
-                                let event_sink = plugin_event_sink(event_tx.clone(), bus.clone());
+                                let event_sink = plugin_event_sink(events.clone(), bus.clone());
                                 let ft_arc: Option<Arc<dyn FileTransferPlugin>> =
                                     P::create_file_transfer_plugin(opener, downloads_dir, Some(event_sink));
 
@@ -1200,7 +1236,7 @@ async fn run_connection_task<P: Platform>(
                                         .unwrap_or_else(|| std::env::temp_dir().join("rumble_downloads"));
                                     let opener: Arc<dyn rumble_client_traits::StreamOpener> =
                                         Arc::new(rumble_client_traits::BiStreamOpener::new(opener_handle));
-                                    let event_sink = plugin_event_sink(event_tx.clone(), bus.clone());
+                                    let event_sink = plugin_event_sink(events.clone(), bus.clone());
                                     let ft_arc: Option<Arc<dyn FileTransferPlugin>> =
                                         P::create_file_transfer_plugin(opener, downloads_dir, Some(event_sink));
 
@@ -1560,7 +1596,7 @@ async fn run_connection_task<P: Platform>(
                     Command::ShareFile { path } => {
                         let Some(ft) = file_transfer.as_ref() else {
                             warn!("ShareFile: no file transfer plugin available");
-                            let _ = event_tx.send(BackendEvent::Toast {
+                            events.send(BackendEvent::Toast {
                                 level: NotificationLevel::Error,
                                 text: "File sharing is not currently available".to_string(),
                             });
@@ -1616,7 +1652,7 @@ async fn run_connection_task<P: Platform>(
                                 // (e.g. file unreadable). Surface as a system
                                 // chat line — no card to attach to.
                                 warn!("File share failed: {}", e);
-                                let _ = event_tx.send(BackendEvent::Toast {
+                                events.send(BackendEvent::Toast {
                                     level: NotificationLevel::Error,
                                     text: format!("File share failed: {e}"),
                                 });
@@ -1630,7 +1666,7 @@ async fn run_connection_task<P: Platform>(
                                 Ok(id) => info!("Download started: {}", id.0),
                                 Err(e) => {
                                     warn!("Download failed: {}", e);
-                                    let _ = event_tx.send(BackendEvent::Toast {
+                                    events.send(BackendEvent::Toast {
                                         level: NotificationLevel::Error,
                                         text: format!("Download failed: {e}"),
                                     });
@@ -1638,7 +1674,7 @@ async fn run_connection_task<P: Platform>(
                             }
                         } else {
                             warn!("DownloadFile: no file transfer plugin available");
-                            let _ = event_tx.send(BackendEvent::Toast {
+                            events.send(BackendEvent::Toast {
                                 level: NotificationLevel::Error,
                                 text: "File downloads are not currently available".to_string(),
                             });
@@ -1657,7 +1693,7 @@ async fn run_connection_task<P: Platform>(
                             if let Err(e) = ft.cancel(&id, false) {
                                 warn!("Cancel failed for {}: {}", id.0, e);
                             } else {
-                                let _ = event_tx.send(BackendEvent::Toast {
+                                events.send(BackendEvent::Toast {
                                     level: NotificationLevel::Info,
                                     text: format!("Transfer cancelled: {name}"),
                                 });
@@ -2218,10 +2254,7 @@ async fn watch_share_upload(
 /// [`BackendEvent`] channel. Defined here so the connection task can
 /// build it inline without `rumble-client-traits` taking a dependency
 /// on `BackendEvent`.
-fn plugin_event_sink(
-    event_tx: mpsc::UnboundedSender<BackendEvent>,
-    bus: crate::projection::EventBus,
-) -> rumble_client_traits::PluginEventSink {
+fn plugin_event_sink(events: EventSink, bus: crate::projection::EventBus) -> rumble_client_traits::PluginEventSink {
     use rumble_client_traits::PluginEvent;
     Arc::new(move |event| {
         match event {
@@ -2231,7 +2264,7 @@ fn plugin_event_sink(
                     rumble_client_traits::PluginNotificationLevel::Warn => NotificationLevel::Warn,
                     rumble_client_traits::PluginNotificationLevel::Error => NotificationLevel::Error,
                 };
-                let _ = event_tx.send(BackendEvent::Toast { level, text });
+                events.send(BackendEvent::Toast { level, text });
             }
             PluginEvent::TransferStageChanged {
                 id,
@@ -2241,7 +2274,7 @@ fn plugin_event_sink(
             } => {
                 // mpsc UX-notification path (legacy): the UI's media
                 // cache drains this each frame.
-                let _ = event_tx.send(BackendEvent::TransferStageChanged {
+                events.send(BackendEvent::TransferStageChanged {
                     id: id.clone(),
                     direction,
                     name: name.clone(),
