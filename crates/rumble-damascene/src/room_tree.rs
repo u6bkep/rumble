@@ -16,10 +16,7 @@
 //! for a server-admin tree, an embedded mini-tree in another panel,
 //! and so on — any caller that can supply the same two halves.
 
-use std::{
-    panic::Location,
-    sync::{Arc, LazyLock, Mutex},
-};
+use std::{panic::Location, sync::LazyLock};
 
 use damascene_core::prelude::*;
 use rumble_client::{Command, State};
@@ -63,8 +60,10 @@ const DRAG_ACTIVATE_PX: f32 = 6.0;
 // ============================================================
 
 /// All ephemeral UI state owned by the room tree: which row is
-/// highlighted, which context menu / modal is open, in-flight drag
-/// source, and the rect snapshot that drag-drop hit-tests against.
+/// highlighted, which context menu / modal is open, and the in-flight
+/// drag source. Drop hit-testing resolves against live layout via
+/// [`find_room_at`] / [`EventCx::rect_of_key`], so no rect snapshot is
+/// kept here.
 ///
 /// The App owns one of these on its struct. `Default` produces an
 /// empty tree (nothing selected, no menus open).
@@ -78,28 +77,58 @@ pub struct RoomTreeState {
     pub(crate) tree_drag: Option<TreeDrag>,
     pub(crate) move_room_modal: Option<MoveRoomModal>,
     pub(crate) delete_room_modal: Option<DeleteRoomModal>,
-    /// Last-laid-out room-drop hit zones, refreshed each frame by the
-    /// rect-tracker custom layout fn so `PointerUp` after a drag can
-    /// hit-test the drop point against every room row (and the user
-    /// rows below it, mapped back to the parent room). The same target
-    /// room can appear multiple times — once for the room row, once
-    /// per user row — and [`Self::find_room_at`] returns the first
-    /// match. `Mutex` is unconditional because the layout closure is
-    /// `Fn(LayoutCtx) -> Vec<Rect>` — no `FnMut` allowed.
-    pub(crate) room_rects: Arc<Mutex<Vec<(Uuid, Rect)>>>,
 }
 
-impl RoomTreeState {
-    /// Hit-test `point` against the room rects we captured during the
-    /// last layout pass. Used by drag-and-drop to resolve the drop
-    /// target on `PointerUp`. Returns `None` when the pointer is over
-    /// empty space, the rooms scroll viewport border, or a row that
-    /// hasn't been laid out yet.
-    fn find_room_at(&self, point: (f32, f32)) -> Option<Uuid> {
-        let list = self.room_rects.lock().ok()?;
-        list.iter()
-            .find_map(|(id, rect)| rect.contains(point.0, point.1).then_some(*id))
+/// Hit-test `point` against the live layout to resolve a drag-drop
+/// target on `PointerUp`. Rebuilds the `(row key, target room)` pairs
+/// the same way [`render`] lays the tree out, then asks the runtime
+/// where each keyed row actually landed via [`EventCx::rect_of_key`].
+///
+/// Each room can appear multiple times — once for its own row, once per
+/// user row beneath it (a drop onto a user resolves to that user's
+/// room) — but the rows don't overlap on screen, so the first rect that
+/// contains `point` is the answer. Returns `None` when the pointer is
+/// over empty space or a row that hasn't been laid out yet.
+fn find_room_at(point: (f32, f32), cx: &EventCx, app_state: &State) -> Option<Uuid> {
+    collect_drop_targets(app_state).into_iter().find_map(|(key, room_id)| {
+        cx.rect_of_key(&key)
+            .filter(|rect| rect.contains(point.0, point.1))
+            .map(|_| room_id)
+    })
+}
+
+/// Walk the room tree exactly as [`push_room_subtree`] renders it,
+/// emitting the `(row key, drop-target room)` pairs [`find_room_at`]
+/// hit-tests against. Room rows map to their own id; user rows map to
+/// their parent room. Built fresh at `PointerUp` rather than snapshotted
+/// each frame — the keys are deterministic, so the live rects come from
+/// [`EventCx::rect_of_key`].
+fn collect_drop_targets(state: &State) -> Vec<(String, Uuid)> {
+    fn walk(state: &State, room_id: Uuid, out: &mut Vec<(String, Uuid)>) {
+        use rumble_protocol::uuid_from_room_id;
+        let Some(node) = state.room_tree.nodes.get(&room_id) else {
+            return;
+        };
+        out.push((room_route_key(room_id), room_id));
+        for user in state.users.iter().filter(|u| {
+            u.current_room
+                .as_ref()
+                .and_then(uuid_from_room_id)
+                .is_some_and(|id| id == room_id)
+        }) {
+            let user_id = user.user_id.as_ref().map(|u| u.value).unwrap_or(0);
+            out.push((user_route_key(user_id, room_id), room_id));
+        }
+        for &child in &node.children {
+            walk(state, child, out);
+        }
     }
+
+    let mut out = Vec::new();
+    for &root_id in &state.room_tree.roots {
+        walk(state, root_id, &mut out);
+    }
+    out
 }
 
 #[derive(Clone, Debug)]
@@ -237,7 +266,7 @@ const KEY_DELETE_CONFIRM: &str = "delete_room:confirm";
 #[track_caller]
 pub fn render(state: &RoomTreeState, app_state: &State) -> El {
     let _loc = Location::caller();
-    rooms_view(app_state, state.selected_room_id, &state.room_rects)
+    rooms_view(app_state, state.selected_room_id)
 }
 
 /// Floating layers (context menus + confirmation modals) the App
@@ -278,22 +307,15 @@ pub fn render_overlays(state: &RoomTreeState, app_state: &State) -> RoomTreeOver
     }
 }
 
-fn rooms_view(state: &State, selected_room_id: Option<Uuid>, room_rects: &Arc<Mutex<Vec<(Uuid, Rect)>>>) -> El {
+fn rooms_view(state: &State, selected_room_id: Option<Uuid>) -> El {
     let mut entries: Vec<El> = Vec::new();
-    // (key, drop_target_room_id) pairs handed to the rect tracker
-    // closure. Rooms register their own UUID; users below a room
-    // register that room's UUID so dragging onto a user resolves to
-    // dropping into the user's room.
-    let mut hit_rows: Vec<(String, Uuid)> = Vec::new();
     for &root_id in &state.room_tree.roots {
-        push_room_subtree(state, root_id, 0, selected_room_id, &mut entries, &mut hit_rows);
+        push_room_subtree(state, root_id, 0, selected_room_id, &mut entries);
     }
 
     if entries.is_empty() {
         entries.push(text("No rooms received yet.").muted());
     }
-
-    let tracker = room_rect_tracker(hit_rows, Arc::clone(room_rects));
 
     column([
         text("Rooms")
@@ -305,51 +327,12 @@ fn rooms_view(state: &State, selected_room_id: Option<Uuid>, room_rects: &Arc<Mu
             .gap(tokens::SPACE_1)
             .width(Size::Fill(1.0))
             .height(Size::Fill(1.0)),
-        tracker,
     ])
     .width(Size::Fill(1.0))
     .height(Size::Fill(1.0))
 }
 
-/// Hidden zero-size element whose only job is to snapshot the laid-out
-/// rect of every room row each frame. Sits as the last child of
-/// `rooms_view`'s column so by the time its custom layout fn runs, all
-/// room rows (inside the scroll viewport above) have been laid out and
-/// their rects are addressable via `LayoutCtx::rect_of_key`.
-///
-/// User rows are captured too, mapped back to their parent room — so
-/// dropping a drag onto a user counts as dropping into the user's room
-/// (since the room row only spans the room's own line, and the user
-/// rows below it would otherwise resolve to "no drop target").
-///
-/// Returns rects post-scroll-translation, which is exactly what
-/// `PointerUp` hit-testing in screen coordinates needs.
-fn room_rect_tracker(rows: Vec<(String, Uuid)>, rects: Arc<Mutex<Vec<(Uuid, Rect)>>>) -> El {
-    El::new(Kind::Custom("room-rect-tracker"))
-        .width(Size::Fixed(0.0))
-        .height(Size::Fixed(0.0))
-        .layout(move |ctx| {
-            if let Ok(mut list) = rects.lock() {
-                list.clear();
-                for (key, target) in &rows {
-                    if let Some(rect) = (ctx.rect_of_key)(key) {
-                        list.push((*target, rect));
-                    }
-                }
-            }
-            // Custom layout returns one Rect per child; we have none.
-            Vec::new()
-        })
-}
-
-fn push_room_subtree(
-    state: &State,
-    room_id: Uuid,
-    depth: usize,
-    selected_room_id: Option<Uuid>,
-    out: &mut Vec<El>,
-    hit_rows: &mut Vec<(String, Uuid)>,
-) {
+fn push_room_subtree(state: &State, room_id: Uuid, depth: usize, selected_room_id: Option<Uuid>, out: &mut Vec<El>) {
     use rumble_protocol::uuid_from_room_id;
 
     let Some(node) = state.room_tree.nodes.get(&room_id) else {
@@ -406,7 +389,6 @@ fn push_room_subtree(
         row_el = row_el.fill(tokens::ACCENT);
     }
     out.push(row_el);
-    hit_rows.push((room_route_key(room_id), room_id));
 
     for user in state.users.iter().filter(|u| {
         u.current_room
@@ -437,25 +419,22 @@ fn push_room_subtree(
             name_el = name_el.text_color(palette::ELEVATED);
         }
 
-        let user_key = user_route_key(user_id, room_id);
         out.push(
             row([
                 spacer().width(Size::Fixed(indent + tokens::SPACE_4)),
                 icon(mic_icon).icon_size(tokens::ICON_MD),
                 name_el,
             ])
-            .key(user_key.clone())
+            .key(user_route_key(user_id, room_id))
             .gap(tokens::SPACE_2)
             .align(Align::Center)
             .padding(Sides::xy(tokens::SPACE_1, tokens::SPACE_1))
             .focusable(),
         );
-        // User row drops into its parent room.
-        hit_rows.push((user_key, room_id));
     }
 
     for &child in &node.children {
-        push_room_subtree(state, child, depth + 1, selected_room_id, out, hit_rows);
+        push_room_subtree(state, child, depth + 1, selected_room_id, out);
     }
 }
 
@@ -628,7 +607,7 @@ fn render_delete_room_modal(state: &DeleteRoomModal) -> El {
 /// handlers; otherwise [`Handled`][RoomTreeOutcome::Handled] /
 /// [`Dispatch`][RoomTreeOutcome::Dispatch] indicates the App should
 /// short-circuit and (optionally) fire the carried commands.
-pub fn handle_event(state: &mut RoomTreeState, event: &UiEvent, app_state: &State) -> RoomTreeOutcome {
+pub fn handle_event(state: &mut RoomTreeState, event: &UiEvent, app_state: &State, cx: &EventCx) -> RoomTreeOutcome {
     // Open the room / user context menu on a SecondaryClick on the
     // appropriate row key. Has to come before the menu-item routing
     // below so a SecondaryClick that opens a fresh menu doesn't fall
@@ -659,7 +638,7 @@ pub fn handle_event(state: &mut RoomTreeState, event: &UiEvent, app_state: &Stat
     if let Some(out) = handle_delete_room_modal_event(state, event) {
         return out;
     }
-    if let Some(out) = handle_drag_event(state, event, app_state) {
+    if let Some(out) = handle_drag_event(state, event, app_state, cx) {
         return out;
     }
 
@@ -890,15 +869,20 @@ fn handle_delete_room_modal_event(state: &mut RoomTreeState, event: &UiEvent) ->
 
 /// Drag-and-drop pipeline: `PointerDown` on a tree row arms a candidate
 /// drag (room reparent or self-user join), `Drag` past `DRAG_ACTIVATE_PX`
-/// promotes it, and `PointerUp` resolves the drop target via the rect
-/// snapshot in [`RoomTreeState::room_rects`].
+/// promotes it, and `PointerUp` resolves the drop target against live
+/// layout via [`find_room_at`].
 ///
 /// Returns `None` so the caller continues processing — `PointerDown`
 /// and `Drag` aren't consumed (the runtime needs them for its own
 /// bookkeeping, and a tap that doesn't promote to a drag still needs
 /// to fire `Click`). `PointerUp` returns `Some` only when an active
 /// drag actually produced a backend command.
-fn handle_drag_event(state: &mut RoomTreeState, event: &UiEvent, app_state: &State) -> Option<RoomTreeOutcome> {
+fn handle_drag_event(
+    state: &mut RoomTreeState,
+    event: &UiEvent,
+    app_state: &State,
+    cx: &EventCx,
+) -> Option<RoomTreeOutcome> {
     if event.kind == UiEventKind::PointerDown
         && let Some(key) = event.route()
         && let Some(point) = event.pointer_pos()
@@ -941,7 +925,7 @@ fn handle_drag_event(state: &mut RoomTreeState, event: &UiEvent, app_state: &Sta
         && let Some(drag) = state.tree_drag.take()
         && drag.active
         && let Some(point) = event.pointer_pos()
-        && let Some(target) = state.find_room_at(point)
+        && let Some(target) = find_room_at(point, cx, app_state)
     {
         match drag.source {
             TreeDragSource::Room(source) if source != target => {

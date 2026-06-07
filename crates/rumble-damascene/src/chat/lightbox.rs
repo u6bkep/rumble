@@ -1,5 +1,3 @@
-use std::sync::{Arc, Mutex};
-
 use damascene_core::{prelude::*, surface::SurfaceAlpha};
 
 use crate::animated_gpu::AnimatedGpu;
@@ -153,15 +151,21 @@ fn next_zoom_step(zoom: f32, direction: ZoomDirection) -> f32 {
 }
 
 /// Build the click-to-enlarge image viewer overlay.
+///
+/// `body_size` is the lightbox body's rect from the previous frame's
+/// layout — the App reads it via [`BuildCx::rect_of_key`] on
+/// [`KEY_LIGHTBOX_IMAGE`] and threads it in. It only drives the
+/// render-time grab-cursor decision; one frame stale is fine there.
+/// Event-time zoom uses the live `EventCx::rect_of_key` answer instead.
 pub fn render_lightbox(
     lightbox: &Lightbox,
-    body_size_sink: Arc<Mutex<Option<(f32, f32)>>>,
+    body_size: Option<(f32, f32)>,
     cached: &CachedImage,
     playback: Option<&GifPlayback>,
     gpu: Option<&AnimatedGpu>,
 ) -> El {
     let header = lightbox_header(lightbox);
-    let body = lightbox_body(lightbox, body_size_sink, cached, playback, gpu);
+    let body = lightbox_body(lightbox, body_size, cached, playback, gpu);
 
     let panel = column([header, body])
         .style_profile(StyleProfile::Surface)
@@ -234,7 +238,7 @@ fn lightbox_header(lightbox: &Lightbox) -> El {
 
 fn lightbox_body(
     lightbox: &Lightbox,
-    body_size_sink: Arc<Mutex<Option<(f32, f32)>>>,
+    body_size: Option<(f32, f32)>,
     cached: &CachedImage,
     playback: Option<&GifPlayback>,
     gpu: Option<&AnimatedGpu>,
@@ -244,8 +248,8 @@ fn lightbox_body(
         (w as f32, h as f32)
     };
     let fit_to_window = lightbox.fit_to_window;
-    // Last frame's laid-out body size, used to decide the grab cursor.
-    let prev_body_size = body_size_sink.lock().ok().and_then(|s| *s);
+    // Previous frame's laid-out body size, used to decide the grab cursor.
+    let prev_body_size = body_size;
 
     let inner = match (cached, gpu) {
         (CachedImage::Animated { frames, .. }, Some(gpu)) => {
@@ -305,12 +309,6 @@ fn lightbox_body(
     stack([inner])
         .key(KEY_LIGHTBOX_IMAGE)
         .layout(move |ctx: LayoutCtx| {
-            // Stash the body's laid-out size for the App so a Fit→explicit-zoom
-            // transition can step from the actual fitted scale instead of from `1.0`.
-            if let Ok(mut size) = body_size_sink.lock() {
-                *size = Some((ctx.container.w, ctx.container.h));
-            }
-
             if fit_to_window {
                 return vec![ctx.container];
             }

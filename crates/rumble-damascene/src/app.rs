@@ -7,7 +7,7 @@ use std::{
     cell::Cell,
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::{Arc, LazyLock, Mutex},
+    sync::LazyLock,
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -187,14 +187,6 @@ pub struct RumbleApp<B: UiBackend = crate::backend::NativeUiBackend> {
     /// The image bytes come from [`media_cache`].
     image_lightbox: Option<chat::Lightbox>,
 
-    /// Last laid-out size of the lightbox body, refreshed each frame by
-    /// the body's custom layout closure. Read at `+`/`-` click time so a
-    /// Fit→explicit-zoom transition can start from the actual fitted
-    /// scale. `Mutex` is unconditional because the layout closure is
-    /// `Fn(LayoutCtx) -> Vec<Rect>` — no `FnMut` allowed. Mirrors the
-    /// `room_rects` channel on [`RoomTreeState`].
-    lightbox_body_size: Arc<Mutex<Option<(f32, f32)>>>,
-
     /// Right-click context menu for a file card. `Some` while open;
     /// cleared by any menu action, the dismiss scrim, or Escape.
     file_context_menu: Option<chat::FileContextMenu>,
@@ -352,7 +344,6 @@ impl<B: UiBackend> RumbleApp<B> {
             auto_handled_offers: HashSet::new(),
             media_cache: crate::media_cache::MediaCache::new(runtime_handle_for_media_cache, initial_gif_autoplay),
             image_lightbox: None,
-            lightbox_body_size: Arc::new(Mutex::new(None)),
             file_context_menu: None,
             pending_save_as: None,
             pending_pick_download_dir: None,
@@ -594,13 +585,11 @@ impl<B: UiBackend> App for RumbleApp<B> {
         {
             let playback = self.media_cache.gif_playback_for(&lightbox_state.transfer_id);
             let gpu = self.media_cache.animated_gpu_for(&lightbox_state.transfer_id);
-            Some(chat::render_lightbox(
-                lightbox_state,
-                self.lightbox_body_size.clone(),
-                cached,
-                playback,
-                gpu,
-            ))
+            // Previous frame's laid-out body rect (one frame stale, fine
+            // for the grab-cursor decision); event-time zoom re-queries
+            // it live via `EventCx::rect_of_key`.
+            let body_size = cx.rect_of_key(chat::KEY_LIGHTBOX_IMAGE).map(|r| (r.w, r.h));
+            Some(chat::render_lightbox(lightbox_state, body_size, cached, playback, gpu))
         } else {
             None
         };
@@ -725,7 +714,7 @@ impl<B: UiBackend> App for RumbleApp<B> {
         self.selection.clone()
     }
 
-    fn on_event(&mut self, event: UiEvent, _cx: &EventCx) {
+    fn on_event(&mut self, event: UiEvent, cx: &EventCx) {
         // The runtime emits `SelectionChanged` when a press / focus move
         // lands somewhere other than a text input — fold it into our
         // single selection slot so static-text + cross-leaf selections
@@ -1156,7 +1145,7 @@ impl<B: UiBackend> App for RumbleApp<B> {
             let playback = self.media_cache.gif_playback_for(&lightbox.transfer_id);
             Some(cached.current_frame_size(playback))
         });
-        let lightbox_body_size = self.lightbox_body_size.lock().ok().and_then(|s| *s);
+        let lightbox_body_size = cx.rect_of_key(chat::KEY_LIGHTBOX_IMAGE).map(|r| (r.w, r.h));
         if let Some(lightbox) = self.image_lightbox.as_mut() {
             if event.is_click_or_activate(chat::KEY_LIGHTBOX_ZOOM_IN) {
                 lightbox.zoom_in(lightbox_body_size, lightbox_image_size);
@@ -1351,7 +1340,7 @@ impl<B: UiBackend> App for RumbleApp<B> {
         // and the confirmation modals those drags fall into. The module
         // owns its own state and returns commands the App fires here.
         let room_tree_state = self.backend.state();
-        match room_tree::handle_event(&mut self.room_tree, &event, &room_tree_state) {
+        match room_tree::handle_event(&mut self.room_tree, &event, &room_tree_state, cx) {
             RoomTreeOutcome::Ignored => {}
             RoomTreeOutcome::Handled => (),
             RoomTreeOutcome::Dispatch(commands) => {
@@ -1391,7 +1380,7 @@ impl<B: UiBackend> App for RumbleApp<B> {
                 let playback = self.media_cache.gif_playback_for(&lightbox.transfer_id);
                 Some(cached.current_frame_size(playback))
             });
-            let body_size = self.lightbox_body_size.lock().ok().and_then(|s| *s);
+            let body_size = cx.rect_of_key(chat::KEY_LIGHTBOX_IMAGE).map(|r| (r.w, r.h));
             if let Some(lightbox) = self.image_lightbox.as_mut()
                 && let Some((_, dy)) = event.wheel_delta
             {
@@ -2073,9 +2062,6 @@ impl<B: UiBackend> RumbleApp<B> {
     /// away.
     fn close_lightbox(&mut self) {
         self.image_lightbox = None;
-        if let Ok(mut size) = self.lightbox_body_size.lock() {
-            *size = None;
-        }
         self.media_cache.close_lightbox();
     }
 
