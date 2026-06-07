@@ -91,10 +91,10 @@ fn get_encoded(
     path: &str,
     encoding: Option<(&'static str, &'static str)>,
 ) -> Option<(rust_embed::EmbeddedFile, &'static str)> {
-    if let Some((token, suffix)) = encoding {
-        if let Some(file) = Assets::get(&format!("{path}.{suffix}")) {
-            return Some((file, token));
-        }
+    if let Some((token, suffix)) = encoding
+        && let Some(file) = Assets::get(&format!("{path}.{suffix}"))
+    {
+        return Some((file, token));
     }
     Assets::get(path).map(|file| (file, ""))
 }
@@ -154,14 +154,14 @@ fn asset_response(
 
     // Conditional request: if the client already has this exact version, save
     // the (potentially large) body.
-    if let Some(inm) = req_headers.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok()) {
-        if inm.split(',').any(|t| t.trim() == etag) {
-            let mut resp = StatusCode::NOT_MODIFIED.into_response();
-            resp.headers_mut().insert(header::ETAG, header_value(&etag));
-            resp.headers_mut()
-                .insert(header::CACHE_CONTROL, HeaderValue::from_static(CACHE_CONTROL));
-            return resp;
-        }
+    if let Some(inm) = req_headers.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok())
+        && inm.split(',').any(|t| t.trim() == etag)
+    {
+        let mut resp = StatusCode::NOT_MODIFIED.into_response();
+        resp.headers_mut().insert(header::ETAG, header_value(&etag));
+        resp.headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static(CACHE_CONTROL));
+        return resp;
     }
 
     let mut headers = axum::http::HeaderMap::new();
