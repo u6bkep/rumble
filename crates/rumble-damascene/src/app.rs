@@ -2840,15 +2840,13 @@ fn drop_target_hint() -> El {
     .stroke_width(2.0)
     .radius(tokens::RADIUS_LG);
 
-    overlay([
-        El::new(Kind::Custom("drop-target-scrim"))
-            .fill(tokens::OVERLAY_SCRIM)
-            .fill_size(),
-        stack([banner])
-            .fill_size()
-            .padding(Sides::all(tokens::SPACE_7))
-            .align(Align::Center),
-    ])
+    // The centred-banner container carries the translucent scrim fill
+    // itself — no separate full-size scrim layer needed.
+    stack([banner])
+        .fill(tokens::OVERLAY_SCRIM)
+        .fill_size()
+        .padding(Sides::all(tokens::SPACE_7))
+        .align(Align::Center)
 }
 
 /// Open `path` with the OS default application. Fires and forgets;

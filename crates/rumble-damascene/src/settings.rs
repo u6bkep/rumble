@@ -1245,7 +1245,7 @@ fn zone_label_strip(zones: &[(f32, f32, Role, Option<String>)], min: f32, max: f
         let lo_n = norm(*lo);
         let hi_n = norm(*hi).max(lo_n);
         if lo_n > cursor + f32::EPSILON {
-            cells.push(El::new(Kind::Group).width(Size::Fixed((lo_n - cursor) * bar_w)));
+            cells.push(spacer().width(Size::Fixed((lo_n - cursor) * bar_w)));
         }
         let w = (hi_n - lo_n) * bar_w;
         let label = label.clone().unwrap_or_default();
