@@ -5,6 +5,8 @@ target/
 vendor/
 data/
 certs/
+bridge-data/
+.env
 chat_logs/
 client_configs/
 reference/

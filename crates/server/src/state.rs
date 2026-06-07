@@ -419,7 +419,11 @@ pub struct ServerState {
     /// Reverse index: session_id → user_id for peer mapping.
     sessions_by_id: DashMap<[u8; 32], u64>,
     /// Server's TLS certificate DER bytes (for computing cert hash).
-    server_cert_der: Vec<u8>,
+    ///
+    /// Behind a lock so it can be swapped on a live cert reload (SIGHUP after a
+    /// certbot renewal). The auth handshake is channel-bound to this hash, so it
+    /// must track whatever cert the QUIC endpoint is currently presenting.
+    server_cert_der: std::sync::RwLock<Vec<u8>>,
     /// Per-user voice datagram rate limiters: user_id → VoiceRateLimit.
     voice_rate_limits: DashMap<u64, VoiceRateLimit>,
     /// Welcome message (MOTD) sent to clients after authentication.
@@ -445,7 +449,7 @@ impl ServerState {
             pending_auth: DashMap::new(),
             sessions: DashMap::new(),
             sessions_by_id: DashMap::new(),
-            server_cert_der: Vec::new(),
+            server_cert_der: std::sync::RwLock::new(Vec::new()),
             voice_rate_limits: DashMap::new(),
             welcome_message: None,
             audio_sinks: DashMap::new(),
@@ -463,7 +467,7 @@ impl ServerState {
             pending_auth: DashMap::new(),
             sessions: DashMap::new(),
             sessions_by_id: DashMap::new(),
-            server_cert_der: cert_der,
+            server_cert_der: std::sync::RwLock::new(cert_der),
             voice_rate_limits: DashMap::new(),
             welcome_message: None,
             audio_sinks: DashMap::new(),
@@ -486,7 +490,16 @@ impl ServerState {
 
     /// Get the server's certificate hash.
     pub fn server_cert_hash(&self) -> [u8; 32] {
-        rumble_protocol::compute_cert_hash(&self.server_cert_der)
+        let der = self.server_cert_der.read().expect("cert lock poisoned");
+        rumble_protocol::compute_cert_hash(&der)
+    }
+
+    /// Replace the server's certificate DER after a live cert reload.
+    ///
+    /// New handshakes immediately bind to the new cert hash; existing
+    /// authenticated connections are unaffected (they re-auth only on reconnect).
+    pub fn set_server_cert_der(&self, cert_der: Vec<u8>) {
+        *self.server_cert_der.write().expect("cert lock poisoned") = cert_der;
     }
 
     /// Store pending authentication state.

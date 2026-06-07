@@ -166,6 +166,7 @@ async fn main() -> Result<()> {
         bind: server_config.bind,
         certs,
         key,
+        cert_dir: server_config.cert_dir.clone(),
         data_dir,
         welcome_message: server_config.welcome_message,
         plugins,

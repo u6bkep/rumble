@@ -23,3 +23,7 @@ crates/server/web-dist/pkg/
 
 # Bridge persistent Ed25519 identity (default path; private key, 0600).
 bridge-identity.key
+
+# docker-compose deployment runtime state
+bridge-data/
+.env

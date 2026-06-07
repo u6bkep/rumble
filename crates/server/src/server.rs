@@ -18,6 +18,7 @@ use rumble_protocol::{
 };
 use std::{
     net::SocketAddr,
+    path::PathBuf,
     sync::{Arc, atomic::AtomicBool},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -32,6 +33,9 @@ pub struct Config {
     pub certs: Vec<rustls::pki_types::CertificateDer<'static>>,
     /// TLS private key (PEM format).
     pub key: rustls::pki_types::PrivateKeyDer<'static>,
+    /// Directory holding `fullchain.pem` / `privkey.pem`. Retained so a live
+    /// reload (SIGHUP) can re-read the certs after a certbot renewal.
+    pub cert_dir: PathBuf,
     /// Optional path for the persistence database.
     pub data_dir: Option<String>,
     /// Welcome message (MOTD) sent to clients after authentication.
@@ -48,6 +52,7 @@ pub struct Config {
 /// for running and managing the server.
 pub struct Server {
     endpoint: Endpoint,
+    cert_dir: PathBuf,
     state: Arc<ServerState>,
     persistence: Option<Arc<Persistence>>,
     plugins: Vec<Arc<dyn ServerPlugin>>,
@@ -60,6 +65,7 @@ impl Server {
     pub fn new(config: Config) -> Result<Self> {
         // Store first cert DER for hash computation (leaf certificate)
         let cert_der = config.certs.first().map(|c| c.to_vec()).unwrap_or_default();
+        let cert_dir = config.cert_dir.clone();
 
         let endpoint = make_server_endpoint(&config)?;
         let state = Arc::new(ServerState::with_cert_and_welcome(cert_der, config.welcome_message));
@@ -103,6 +109,7 @@ impl Server {
 
         Ok(Self {
             endpoint,
+            cert_dir,
             state,
             persistence,
             plugins,
@@ -178,6 +185,33 @@ impl Server {
             });
         }
 
+        // On Unix, reload the TLS certificate on SIGHUP so a certbot renewal is
+        // applied without dropping live connections. A certbot deploy-hook runs
+        // `docker compose kill -s HUP rumble-server` (tini forwards the signal).
+        #[cfg(unix)]
+        {
+            let endpoint = self.endpoint.clone();
+            let state = self.state.clone();
+            let cert_dir = self.cert_dir.clone();
+            tokio::spawn(async move {
+                use tokio::signal::unix::{SignalKind, signal};
+                let mut hup = match signal(SignalKind::hangup()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        error!("failed to install SIGHUP handler (cert reload disabled): {e}");
+                        return;
+                    }
+                };
+                while hup.recv().await.is_some() {
+                    info!(cert_dir = %cert_dir.display(), "SIGHUP received — reloading TLS certificate");
+                    match reload_certificate(&cert_dir, &endpoint, &state) {
+                        Ok(()) => info!("TLS certificate reloaded; new connections use the renewed cert"),
+                        Err(e) => error!("TLS certificate reload failed (keeping current cert): {e}"),
+                    }
+                }
+            });
+        }
+
         // Start the web admin control-plane, if enabled.
         if let Some(web_settings) = self.web.clone() {
             crate::web::spawn(self.state.clone(), self.persistence.clone(), web_settings);
@@ -231,13 +265,19 @@ impl Server {
     }
 }
 
-/// Create a QUIC server endpoint with the given configuration.
-fn make_server_endpoint(config: &Config) -> Result<Endpoint> {
+/// Build a quinn [`ServerConfig`] from a cert chain + key.
+///
+/// Shared by initial startup and live cert reload so both paths produce an
+/// identical TLS + transport configuration.
+fn build_quic_server_config(
+    certs: Vec<rustls::pki_types::CertificateDer<'static>>,
+    key: rustls::pki_types::PrivateKeyDer<'static>,
+) -> Result<ServerConfig> {
     let mut rustls_config =
         rustls::ServerConfig::builder_with_provider(rustls::crypto::aws_lc_rs::default_provider().into())
             .with_protocol_versions(&[&rustls::version::TLS13])?
             .with_no_client_auth()
-            .with_single_cert(config.certs.clone(), config.key.clone_key())?;
+            .with_single_cert(certs, key)?;
     rustls_config.alpn_protocols = vec![b"rumble".to_vec()];
 
     let mut server_config = ServerConfig::with_crypto(Arc::new(quinn::crypto::rustls::QuicServerConfig::try_from(
@@ -255,6 +295,32 @@ fn make_server_endpoint(config: &Config) -> Result<Endpoint> {
     transport_config.datagram_receive_buffer_size(Some(65536));
     server_config.transport_config(Arc::new(transport_config));
 
+    Ok(server_config)
+}
+
+/// Re-read `fullchain.pem` / `privkey.pem` from `cert_dir` and apply them to the
+/// live endpoint and the auth cert-hash.
+///
+/// Unlike startup, this never falls back to a self-signed cert: if the files are
+/// missing or invalid it returns an error and the caller keeps the current cert.
+/// The cert-hash is updated before the endpoint so a connection that handshakes
+/// against the renewed cert finds the matching hash at auth time; a connection
+/// mid-handshake across the swap may need one reconnect (rare, monthly).
+#[cfg(unix)]
+fn reload_certificate(cert_dir: &std::path::Path, endpoint: &Endpoint, state: &Arc<ServerState>) -> Result<()> {
+    let fullchain = cert_dir.join("fullchain.pem");
+    let privkey = cert_dir.join("privkey.pem");
+    let (certs, key) = crate::config::load_pem_certificates(&fullchain, &privkey)?;
+    let leaf = certs.first().map(|c| c.to_vec()).unwrap_or_default();
+    let server_config = build_quic_server_config(certs, key)?;
+    state.set_server_cert_der(leaf);
+    endpoint.set_server_config(Some(server_config));
+    Ok(())
+}
+
+/// Create a QUIC server endpoint with the given configuration.
+fn make_server_endpoint(config: &Config) -> Result<Endpoint> {
+    let server_config = build_quic_server_config(config.certs.clone(), config.key.clone_key())?;
     let endpoint = Endpoint::server(server_config, config.bind)?;
     Ok(endpoint)
 }

@@ -25,5 +25,7 @@ RUN apk add --no-cache ca-certificates tini \
 COPY --from=builder /src/target/release/server /usr/local/bin/server
 
 USER rumble
-EXPOSE 5000/udp
+# QUIC voice/control (UDP) + web admin (TCP). tini (PID 1) forwards SIGHUP to
+# the server so a certbot deploy-hook can trigger a live cert reload.
+EXPOSE 5000/udp 5001/tcp
 ENTRYPOINT ["/sbin/tini", "--", "/usr/local/bin/server"]

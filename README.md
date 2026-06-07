@@ -85,6 +85,7 @@ voice from snapshots to avoid holding locks during I/O.
 Start with [`docs/architecture.md`](docs/architecture.md) for the full picture. Deeper
 references:
 
+- [`docs/deployment.md`](docs/deployment.md) — docker-compose + host certbot: TLS, renewal hot-reload, bootstrap, bridge
 - [`docs/quic-protocol.md`](docs/quic-protocol.md) — wire protocol, framing, auth, state sync, voice
 - [`docs/acl-system.md`](docs/acl-system.md) — permissions, groups, per-room ACLs, evaluation
 - [`docs/audio-subsystem.md`](docs/audio-subsystem.md) — Opus codec, jitter buffers, processor pipeline

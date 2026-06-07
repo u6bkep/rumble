@@ -1,0 +1,72 @@
+# Rumble voice server + Mumble bridge, for a single-host deployment with
+# certbot managing TLS on the host. See docs/deployment.md for the full guide
+# (first-run bootstrap, the certbot deploy-hook, and bridge authorization).
+#
+# Quick start:
+#   cp .env.example .env          # set RUMBLE_DOMAIN
+#   mkdir -p certs data bridge-data
+#   sudo chown -R 10001:10001 certs data bridge-data   # containers run as uid 10001
+#   docker compose up -d --build
+
+services:
+  rumble-server:
+    build:
+      context: .
+      dockerfile: docker/server.Dockerfile
+    restart: unless-stopped
+    environment:
+      RUMBLE_BIND: "[::]:5000"
+      RUMBLE_DOMAIN: "${RUMBLE_DOMAIN:?set RUMBLE_DOMAIN in .env}"
+      # The certbot deploy-hook copies fullchain.pem/privkey.pem here (owned by
+      # uid 10001). On first boot, before any cert exists, the server writes a
+      # self-signed dev cert here instead so it can start.
+      RUMBLE_CERT_DIR: "/certs"
+      RUMBLE_DATA_DIR: "/data"
+      RUMBLE_WEB_ENABLED: "1"
+      RUMBLE_WEB_BIND: "0.0.0.0:5001"
+      RUMBLE_LOG_LEVEL: "info"
+    ports:
+      # Public QUIC voice/control endpoint (UDP).
+      - "5000:5000/udp"
+      # Web admin — published to the HOST LOOPBACK only. Reach it via an SSH
+      # tunnel:  ssh -L 5001:127.0.0.1:5001 you@host
+      # then open http://127.0.0.1:5001/ in your browser.
+      - "127.0.0.1:5001:5001/tcp"
+    volumes:
+      # Cert dir written by the certbot deploy-hook (see docs/deployment.md).
+      - ./certs:/certs
+      # Persistence DB + the one-time web-setup-token.txt land here.
+      - ./data:/data
+    networks:
+      default:
+        aliases:
+          # Lets the bridge dial the server by its public domain so the
+          # Let's Encrypt cert validates by hostname (and keeps working across
+          # renewals — no fingerprint pinning needed on the internal hop).
+          - "${RUMBLE_DOMAIN}"
+
+  mumble-bridge:
+    build:
+      context: .
+      dockerfile: docker/mumble-bridge.Dockerfile
+    restart: unless-stopped
+    depends_on:
+      - rumble-server
+    # The bridge dials the server by its public domain (resolved to the server
+    # container via the network alias above) so standard WebPKI verification
+    # succeeds. Authorize it once with `add-controller` — see docs/deployment.md.
+    command:
+      - "--rumble-addr"
+      - "${RUMBLE_DOMAIN}:5000"
+      - "--identity-file"
+      - "/data/bridge-identity.key"
+      - "--name"
+      - "Mumble"
+    ports:
+      - "64738:64738/tcp"
+      - "64738:64738/udp"
+    volumes:
+      - ./bridge-data:/data
+
+networks:
+  default:

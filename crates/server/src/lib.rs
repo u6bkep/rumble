@@ -44,7 +44,8 @@
 //!     let server_config = ServerConfig::load()?;
 //!     let (certs, key) = server_config.load_certificates()?;
 //!     let data_dir = server_config.data_dir().ok().map(|p| p.to_string_lossy().to_string());
-//!     let config = Config { bind: server_config.bind, certs, key, data_dir, welcome_message: None, plugins: vec![], web: None };
+//!     let cert_dir = server_config.cert_dir.clone();
+//!     let config = Config { bind: server_config.bind, certs, key, cert_dir, data_dir, welcome_message: None, plugins: vec![], web: None };
 //!     let server = Server::new(config)?;
 //!     server.run().await
 //! }
