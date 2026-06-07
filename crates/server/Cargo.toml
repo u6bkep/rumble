@@ -49,7 +49,7 @@ url = { workspace = true }
 serde_json = { workspace = true }
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["fs", "cors"] }
+tower-http = { version = "0.6", features = ["fs", "cors", "compression-gzip", "set-header"] }
 rust-embed = { version = "8", features = ["mime-guess"] }
 
 [dev-dependencies]

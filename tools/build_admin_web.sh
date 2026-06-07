@@ -53,6 +53,37 @@ wasm-pack build "$CRATE_DIR" --target web "$PROFILE_FLAG" --out-dir "$DIST_DIR/p
 echo "==> staging index.html"
 cp "$CRATE_DIR/index.html" "$DIST_DIR/index.html"
 
+# Precompress the served assets so the server can hand out `.br`/`.gz` variants
+# without recompressing the (tens-of-MB) wasm on every request. The server
+# negotiates Accept-Encoding and falls back to the raw bytes when a sibling is
+# absent, so missing tools here degrade gracefully rather than breaking serving.
+echo "==> precompressing assets (brotli + gzip)"
+compress_one() {
+    local f="$1"
+    # Stale variants would be served with a fresh ETag but old bytes — always
+    # regenerate from the current file.
+    rm -f "$f.br" "$f.gz"
+    if command -v brotli >/dev/null 2>&1; then
+        brotli -q 11 -f -o "$f.br" "$f"
+    fi
+    if command -v gzip >/dev/null 2>&1; then
+        gzip -9 -k -f "$f"
+    fi
+}
+
+if ! command -v brotli >/dev/null 2>&1; then
+    echo "    note: 'brotli' not found — skipping .br variants (install for best ratios)" >&2
+fi
+if ! command -v gzip >/dev/null 2>&1; then
+    echo "    note: 'gzip' not found — skipping .gz variants" >&2
+fi
+
+# Compress the wasm, the JS glue, and the page shell. (Tiny files compress too,
+# but the wasm module is where this pays off.)
+for f in "$DIST_DIR"/pkg/*.wasm "$DIST_DIR"/pkg/*.js "$DIST_DIR/index.html"; do
+    [ -f "$f" ] && compress_one "$f"
+done
+
 echo
 echo "==> bundle staged in $DIST_DIR/"
 echo "    Serve it by enabling [web] in the server config, then open the bind address."

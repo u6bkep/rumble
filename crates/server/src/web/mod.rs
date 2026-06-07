@@ -208,6 +208,11 @@ fn router(web_state: WebState, assets_dir: Option<std::path::PathBuf>) -> Router
             "/api/registered-users/{key}/groups",
             post(api::set_registered_user_group),
         )
+        // Compress JSON API responses on the fly (gzip). Static assets are
+        // served precompressed (see `assets`), so this layer only meaningfully
+        // applies to the dynamic `/api/*` bodies — tower-http skips responses
+        // that already carry a `Content-Encoding`.
+        .layer(tower_http::compression::CompressionLayer::new().gzip(true))
         .with_state(web_state);
 
     api.merge(assets::router(assets_dir))
