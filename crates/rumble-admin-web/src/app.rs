@@ -536,7 +536,7 @@ impl App for AdminApp {
         Theme::radix_slate_blue_dark()
     }
 
-    fn on_event(&mut self, event: UiEvent) {
+    fn on_event(&mut self, event: UiEvent, _cx: &EventCx) {
         // Fold cross-leaf selection changes (clicks off a text field) into
         // our single selection slot.
         if event.kind == UiEventKind::SelectionChanged {

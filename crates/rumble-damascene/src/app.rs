@@ -725,7 +725,7 @@ impl<B: UiBackend> App for RumbleApp<B> {
         self.selection.clone()
     }
 
-    fn on_event(&mut self, event: UiEvent) {
+    fn on_event(&mut self, event: UiEvent, _cx: &EventCx) {
         // The runtime emits `SelectionChanged` when a press / focus move
         // lands somewhere other than a text input — fold it into our
         // single selection slot so static-text + cross-leaf selections
@@ -1384,7 +1384,7 @@ impl<B: UiBackend> App for RumbleApp<B> {
     /// doesn't move the chat list underneath the overlay. Other modes
     /// fall through to the default (forward to `on_event`, no consume),
     /// so chat / room-tree / settings scrolling all keep working.
-    fn on_wheel_event(&mut self, event: UiEvent) -> bool {
+    fn on_wheel_event(&mut self, event: UiEvent, cx: &EventCx) -> bool {
         if self.image_lightbox.is_some() {
             let image_size = self.image_lightbox.as_ref().and_then(|lightbox| {
                 let cached = self.media_cache.lightbox_image_for(&lightbox.transfer_id)?;
@@ -1403,7 +1403,7 @@ impl<B: UiBackend> App for RumbleApp<B> {
             }
             return true;
         }
-        self.on_event(event);
+        self.on_event(event, cx);
         false
     }
 }

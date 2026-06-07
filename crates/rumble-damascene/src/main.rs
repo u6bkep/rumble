@@ -1,7 +1,7 @@
-use std::time::Duration;
+use std::sync::{Arc, OnceLock};
 
 use damascene_core::{Rect, color::ColorPreferences};
-use damascene_winit_wgpu::HostConfig;
+use damascene_winit_wgpu::{HostConfig, Wakeup};
 use rumble_client::{ConnectConfig, handle::BackendHandle};
 use rumble_damascene::{Identity, NativeUiBackend, RumbleApp};
 use rumble_desktop_shell::SettingsStore;
@@ -24,13 +24,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let settings = SettingsStore::load_from_path(Some(config_dir.join("desktop-shell.json")));
     let connect_config = build_connect_config(&settings);
 
-    // Damascene's host doesn't expose an event-loop wakeup hook today, so
-    // we use the host's `redraw_interval` to poll the backend's
-    // `State` ~30fps. When state actually changes the next frame
-    // picks it up; idle frames are cheap (no input events, animations
-    // settle, GPU stays idle).
+    // Push-driven redraws: the projection task (sole writer of `State`)
+    // calls this repaint callback on every state change, which pokes the
+    // host's external `Wakeup` to schedule one frame. Between events the
+    // app idles at 0fps — no `redraw_interval` polling. The `Wakeup`
+    // handle only exists once the event loop is running, so the callback
+    // reads it from a shared slot the host fills via
+    // `with_external_wakeup` below; pre-loop state changes are harmless
+    // (the initial frame reads current state anyway).
+    //
+    // Continuous visuals that aren't state changes drive their own frames
+    // via `redraw_within`: animated images (chat + lightbox), the video
+    // surface, and the live audio meters in the Settings dialog. Damascene
+    // widgets like spinners self-tick through the runtime's animation path.
+    let wakeup: Arc<OnceLock<Wakeup>> = Arc::new(OnceLock::new());
+    let wakeup_for_repaint = wakeup.clone();
     let signer = identity.signer();
-    let backend = BackendHandle::<rumble_desktop::NativePlatform>::with_config(|| {}, connect_config, signer);
+    let backend = BackendHandle::<rumble_desktop::NativePlatform>::with_config(
+        move || {
+            if let Some(w) = wakeup_for_repaint.get() {
+                w.wake();
+            }
+        },
+        connect_config,
+        signer,
+    );
 
     // Optional Unix-socket RPC server for external process control —
     // notably the "system DE shortcut → rumble-ctl command" path on
@@ -67,13 +85,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let app = RumbleApp::new(backend, identity, settings, runtime);
     let viewport = Rect::new(0.0, 0.0, 1280.0, 800.0);
+    // Hand the backend's repaint callback the host wakeup handle as soon
+    // as the loop hands it to us (runs on the UI thread before the loop
+    // starts). Poking it from the projection thread schedules a frame.
+    let wakeup_for_hook = wakeup.clone();
     // Mailbox present so window content tracks the cursor during
     // interactive resize on Wayland/Mesa instead of trailing in slow
-    // motion as the swapchain queue drains at vsync. The 33ms redraw
-    // cadence still bounds idle work; animation frames render at GPU
-    // speed during transitions, which is what we want here.
+    // motion as the swapchain queue drains at vsync. Resize repaints are
+    // driven by winit resize events, not a poll, so this stays smooth
+    // without the old `redraw_interval` idle cadence.
     let host_config = HostConfig::default()
-        .with_redraw_interval(Duration::from_millis(33))
+        .with_external_wakeup(move |w| {
+            let _ = wakeup_for_hook.set(w);
+        })
         .with_low_latency_present(true)
         // Reverse-DNS app id (matches our `ProjectDirs` qualifier/org/app)
         // so the Wayland `xdg_toplevel.app_id` / X11 `WM_CLASS` we present

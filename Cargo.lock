@@ -1357,8 +1357,8 @@ dependencies = [
 
 [[package]]
 name = "damascene-core"
-version = "0.4.0"
-source = "git+https://github.com/computer-whisperer/damascene?rev=e4ec29d9f74498e1142c29390b40ac94d0937c5a#e4ec29d9f74498e1142c29390b40ac94d0937c5a"
+version = "0.4.1"
+source = "git+https://github.com/computer-whisperer/damascene?rev=eb094b7d7e25f4cd4d03212b1dd3f1adbe4fabc7#eb094b7d7e25f4cd4d03212b1dd3f1adbe4fabc7"
 dependencies = [
  "bytemuck",
  "cosmic-text",
@@ -1366,6 +1366,7 @@ dependencies = [
  "fdsm",
  "fdsm-ttf-parser",
  "glam 0.33.0",
+ "half",
  "image",
  "kurbo",
  "lru",
@@ -1381,8 +1382,8 @@ dependencies = [
 
 [[package]]
 name = "damascene-fonts"
-version = "0.4.0"
-source = "git+https://github.com/computer-whisperer/damascene?rev=e4ec29d9f74498e1142c29390b40ac94d0937c5a#e4ec29d9f74498e1142c29390b40ac94d0937c5a"
+version = "0.4.1"
+source = "git+https://github.com/computer-whisperer/damascene?rev=eb094b7d7e25f4cd4d03212b1dd3f1adbe4fabc7#eb094b7d7e25f4cd4d03212b1dd3f1adbe4fabc7"
 dependencies = [
  "damascene-fonts-emoji",
  "damascene-fonts-inter",
@@ -1393,27 +1394,27 @@ dependencies = [
 [[package]]
 name = "damascene-fonts-emoji"
 version = "0.1.0"
-source = "git+https://github.com/computer-whisperer/damascene?rev=e4ec29d9f74498e1142c29390b40ac94d0937c5a#e4ec29d9f74498e1142c29390b40ac94d0937c5a"
+source = "git+https://github.com/computer-whisperer/damascene?rev=eb094b7d7e25f4cd4d03212b1dd3f1adbe4fabc7#eb094b7d7e25f4cd4d03212b1dd3f1adbe4fabc7"
 
 [[package]]
 name = "damascene-fonts-inter"
 version = "0.1.0"
-source = "git+https://github.com/computer-whisperer/damascene?rev=e4ec29d9f74498e1142c29390b40ac94d0937c5a#e4ec29d9f74498e1142c29390b40ac94d0937c5a"
+source = "git+https://github.com/computer-whisperer/damascene?rev=eb094b7d7e25f4cd4d03212b1dd3f1adbe4fabc7#eb094b7d7e25f4cd4d03212b1dd3f1adbe4fabc7"
 
 [[package]]
 name = "damascene-fonts-jetbrains-mono"
 version = "0.1.0"
-source = "git+https://github.com/computer-whisperer/damascene?rev=e4ec29d9f74498e1142c29390b40ac94d0937c5a#e4ec29d9f74498e1142c29390b40ac94d0937c5a"
+source = "git+https://github.com/computer-whisperer/damascene?rev=eb094b7d7e25f4cd4d03212b1dd3f1adbe4fabc7#eb094b7d7e25f4cd4d03212b1dd3f1adbe4fabc7"
 
 [[package]]
 name = "damascene-fonts-symbols"
 version = "0.1.0"
-source = "git+https://github.com/computer-whisperer/damascene?rev=e4ec29d9f74498e1142c29390b40ac94d0937c5a#e4ec29d9f74498e1142c29390b40ac94d0937c5a"
+source = "git+https://github.com/computer-whisperer/damascene?rev=eb094b7d7e25f4cd4d03212b1dd3f1adbe4fabc7#eb094b7d7e25f4cd4d03212b1dd3f1adbe4fabc7"
 
 [[package]]
 name = "damascene-markdown"
-version = "0.4.0"
-source = "git+https://github.com/computer-whisperer/damascene?rev=e4ec29d9f74498e1142c29390b40ac94d0937c5a#e4ec29d9f74498e1142c29390b40ac94d0937c5a"
+version = "0.4.1"
+source = "git+https://github.com/computer-whisperer/damascene?rev=eb094b7d7e25f4cd4d03212b1dd3f1adbe4fabc7#eb094b7d7e25f4cd4d03212b1dd3f1adbe4fabc7"
 dependencies = [
  "damascene-core",
  "pulldown-cmark 0.13.4",
@@ -1423,8 +1424,8 @@ dependencies = [
 
 [[package]]
 name = "damascene-web"
-version = "0.4.0"
-source = "git+https://github.com/computer-whisperer/damascene?rev=e4ec29d9f74498e1142c29390b40ac94d0937c5a#e4ec29d9f74498e1142c29390b40ac94d0937c5a"
+version = "0.4.1"
+source = "git+https://github.com/computer-whisperer/damascene?rev=eb094b7d7e25f4cd4d03212b1dd3f1adbe4fabc7#eb094b7d7e25f4cd4d03212b1dd3f1adbe4fabc7"
 dependencies = [
  "console_error_panic_hook",
  "console_log",
@@ -1442,8 +1443,8 @@ dependencies = [
 
 [[package]]
 name = "damascene-wgpu"
-version = "0.4.0"
-source = "git+https://github.com/computer-whisperer/damascene?rev=e4ec29d9f74498e1142c29390b40ac94d0937c5a#e4ec29d9f74498e1142c29390b40ac94d0937c5a"
+version = "0.4.1"
+source = "git+https://github.com/computer-whisperer/damascene?rev=eb094b7d7e25f4cd4d03212b1dd3f1adbe4fabc7#eb094b7d7e25f4cd4d03212b1dd3f1adbe4fabc7"
 dependencies = [
  "bytemuck",
  "cosmic-text",
@@ -1455,8 +1456,8 @@ dependencies = [
 
 [[package]]
 name = "damascene-winit-wgpu"
-version = "0.4.0"
-source = "git+https://github.com/computer-whisperer/damascene?rev=e4ec29d9f74498e1142c29390b40ac94d0937c5a#e4ec29d9f74498e1142c29390b40ac94d0937c5a"
+version = "0.4.1"
+source = "git+https://github.com/computer-whisperer/damascene?rev=eb094b7d7e25f4cd4d03212b1dd3f1adbe4fabc7#eb094b7d7e25f4cd4d03212b1dd3f1adbe4fabc7"
 dependencies = [
  "arboard",
  "damascene-core",
