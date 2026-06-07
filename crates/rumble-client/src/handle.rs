@@ -368,7 +368,20 @@ impl<P: Platform> BackendHandle<P> {
         // can subscribe to the broadcast channels in scope.
         let key_signer_for_task = key_signer.clone();
         let runtime_thread = std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().expect("create tokio runtime");
+            // This runtime carries only I/O-bound work: the projection task,
+            // the connection select-loop, the per-connection receiver/dispatch
+            // tasks, and upload watchers. The CPU-heavy path (Opus codec, audio
+            // pipeline) lives on the audio task's own `current_thread` runtime,
+            // and a single QUIC connection doesn't parallelize across workers.
+            // The default `Runtime::new()` sizes the pool to one worker per core
+            // — 34 OS threads for one idle, disconnected client on a 32-core box
+            // — which is pure overhead. Two workers is ample (and matches the
+            // damascene GUI's own runtime, `rumble-damascene/src/main.rs`).
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("create tokio runtime");
             rt.block_on(async move {
                 // Projection task: drains every domain channel (via the
                 // receivers subscribed up front) and maintains `State`. Sole
