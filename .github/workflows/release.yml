@@ -141,14 +141,6 @@ jobs:
     name: Build and push docker images
     runs-on: ubuntu-latest
     needs: release
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - image: rumble-server
-            dockerfile: docker/server.Dockerfile
-          - image: mumble-bridge
-            dockerfile: docker/mumble-bridge.Dockerfile
 
     steps:
       - name: Checkout
@@ -167,10 +159,9 @@ jobs:
           fi
           # Lowercase the owner — GHCR rejects uppercase in image paths.
           OWNER="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
-          IMAGE_REF="ghcr.io/${OWNER}/${{ matrix.image }}"
           echo "version=$VERSION"      >> "$GITHUB_OUTPUT"
           echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
-          echo "image_ref=$IMAGE_REF"   >> "$GITHUB_OUTPUT"
+          echo "owner=$OWNER"           >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -186,22 +177,44 @@ jobs:
         id: tags
         run: |
           set -euo pipefail
-          REF="${{ steps.meta.outputs.image_ref }}"
+          OWNER="${{ steps.meta.outputs.owner }}"
           VERSION="${{ steps.meta.outputs.version }}"
-          TAGS="$REF:$VERSION"
-          # Only stable releases get :latest.
-          if [ "${{ steps.meta.outputs.prerelease }}" = "false" ]; then
-            TAGS="$TAGS,$REF:latest"
-          fi
-          echo "tags=$TAGS" >> "$GITHUB_OUTPUT"
-          echo "Image tags: $TAGS"
+          # `image=tag1,tag2` per line, expanded per build step below.
+          tags_for() {
+            local ref="ghcr.io/${OWNER}/$1"
+            local out="$ref:$VERSION"
+            # Only stable releases get :latest.
+            if [ "${{ steps.meta.outputs.prerelease }}" = "false" ]; then
+              out="$out,$ref:latest"
+            fi
+            echo "$out"
+          }
+          {
+            echo "server=$(tags_for rumble-server)"
+            echo "bridge=$(tags_for mumble-bridge)"
+          } >> "$GITHUB_OUTPUT"
 
-      - name: Build and push
+      # Both images share one Dockerfile and one gha cache scope. Building the
+      # server target compiles the shared `builder` stage (both binaries); the
+      # bridge target then reuses it straight from cache instead of recompiling.
+      - name: Build and push server
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ${{ matrix.dockerfile }}
+          file: docker/Dockerfile
+          target: server
           push: true
-          tags: ${{ steps.tags.outputs.tags }}
-          cache-from: type=gha,scope=${{ matrix.image }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+          tags: ${{ steps.tags.outputs.server }}
+          cache-from: type=gha,scope=images
+          cache-to: type=gha,mode=max,scope=images
+
+      - name: Build and push bridge
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: bridge
+          push: true
+          tags: ${{ steps.tags.outputs.bridge }}
+          cache-from: type=gha,scope=images
+          cache-to: type=gha,mode=max,scope=images

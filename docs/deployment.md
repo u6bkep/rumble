@@ -5,8 +5,8 @@ host using `docker-compose.yml`, with **certbot on the host** issuing and
 renewing the TLS certificate.
 
 The supporting files live in the repo root: `docker-compose.yml`, `.env.example`,
-`docker/server.Dockerfile`, `docker/mumble-bridge.Dockerfile`, and
-`docker/certbot-deploy-hook.sh`.
+`docker/Dockerfile` (a shared multi-stage build — `target: server` and
+`target: bridge` select each image), and `docker/certbot-deploy-hook.sh`.
 
 ## Architecture at a glance
 
