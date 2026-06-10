@@ -77,6 +77,21 @@ const MAX_LIGHTBOX_PX: u32 = 4096;
 /// libmpv forever on files that genuinely won't decode.
 const THUMB_MAX_ATTEMPTS: u8 = 3;
 
+/// Maximum number of frames decoded from one animated image (GIF, APNG,
+/// animated WebP). Animations that exceed this are truncated to the
+/// frames collected so far and play as a shorter loop. A 256-frame cap
+/// covers essentially all real GIFs while preventing a pathological
+/// many-frame file from allocating unboundedly.
+const MAX_ANIMATED_FRAMES: usize = 256;
+
+/// Maximum total RGBA bytes accumulated across all frames of one animated
+/// image, measured at source resolution *before* the thumbnail downscale.
+/// Limiting the pre-thumbnail budget bounds peak RSS during decode.
+/// 256 MiB accommodates a 1024×1024 animation at the full frame cap
+/// (256 frames × 4 MiB/frame = 1 GiB at natural res, capped here at 256 MiB
+/// so a moderate-resolution many-frame file still triggers the guard).
+const MAX_ANIMATED_RGBA_BYTES: usize = 256 * 1024 * 1024;
+
 /// Per-attempt delay schedule between video-thumbnail retries.
 /// Indexed by completed-attempt count: after the 1st failure wait 2s,
 /// after the 2nd wait 8s. Long enough to outlast a busy upload reader
@@ -111,6 +126,10 @@ pub struct MediaCache {
     /// re-attempting on every subsequent Done event for the same id
     /// (won't happen with stable UUIDs but cheap insurance).
     image_failed: HashSet<String>,
+    /// In-flight off-thread image decodes, keyed by `transfer_id`.
+    /// Guarded on both maps in `on_transfer_done` to match the model
+    /// path's two-map discipline and prevent duplicate spawns.
+    pending_image_decodes: HashMap<String, JoinHandle<Result<chat::CachedImage, image::ImageError>>>,
 
     gif_playback: HashMap<String, chat::GifPlayback>,
     animated_gpu: HashMap<String, AnimatedGpu>,
@@ -160,6 +179,7 @@ impl MediaCache {
             gif_autoplay_default,
             image_cache: HashMap::new(),
             image_failed: HashSet::new(),
+            pending_image_decodes: HashMap::new(),
             gif_playback: HashMap::new(),
             animated_gpu: HashMap::new(),
             video_thumbs: HashMap::new(),
@@ -204,29 +224,28 @@ impl MediaCache {
         }
     }
 
-    /// Drive on a transfer that just landed at `local_path`. Inline
-    /// image decode is intentional (PNG/JPEG at MAX_PREVIEW_PX
-    /// finish in single-digit ms on modern hardware, and a single
-    /// per-transfer cost). Video thumbs go async — libmpv cold-start
-    /// is 50–200ms.
+    /// Drive on a transfer that just landed at `local_path`. Image
+    /// decoding (static and animated) runs off-thread via
+    /// `spawn_blocking` — animated GIFs can be many MB and hundreds of
+    /// frames, enough to freeze the UI for seconds on the UI thread.
+    /// Video thumbs likewise go async; libmpv cold-start is 50–200ms.
     fn on_transfer_done(&mut self, id: &str, name: &str, local_path: &Path) {
-        if chat::is_image_name(name) && !self.image_cache.contains_key(id) && !self.image_failed.contains(id) {
-            match decode_image(local_path, Some(MAX_PREVIEW_PX)) {
-                Ok(cached) => {
-                    if cached.is_animated() {
-                        self.gif_playback
-                            .entry(id.to_string())
-                            .or_insert_with(|| chat::GifPlayback::new(self.gif_autoplay_default));
-                    }
-                    self.image_cache.insert(id.to_string(), cached);
-                }
-                Err(e) => {
-                    tracing::debug!("image preview decode failed for {name} ({}): {e}", local_path.display());
-                    self.image_failed.insert(id.to_string());
-                }
-            }
+        if chat::is_image_name(name)
+            && !self.image_cache.contains_key(id)
+            && !self.image_failed.contains(id)
+            && !self.pending_image_decodes.contains_key(id)
+        {
+            let path = local_path.to_path_buf();
+            let label = id.to_string();
+            let handle = self
+                .runtime
+                .spawn_blocking(move || decode_image(&path, Some(MAX_PREVIEW_PX), &label));
+            self.pending_image_decodes.insert(id.to_string(), handle);
         }
-        if crate::video::is_video_name(name) && !self.video_thumbs.contains_key(id) {
+        if crate::video::is_video_name(name)
+            && !self.video_thumbs.contains_key(id)
+            && !self.pending_video_thumbs.contains_key(id)
+        {
             // Drop any prior failure record so the retry counter
             // starts fresh (events are transitions, so seeing Done
             // again means a successful upload after a transient
@@ -257,6 +276,9 @@ impl MediaCache {
     /// somehow raced in. Belt-and-suspenders against future code
     /// paths that might fire Done→Failed in quick succession.
     fn on_transfer_failed(&mut self, id: &str) {
+        if let Some(handle) = self.pending_image_decodes.remove(id) {
+            handle.abort();
+        }
         if let Some(handle) = self.pending_video_thumbs.remove(id) {
             handle.abort();
         }
@@ -285,10 +307,46 @@ impl MediaCache {
     /// last frame, plus respawn any video-thumb retries whose backoff
     /// has elapsed. Called once per frame from `App::before_build`.
     pub fn drain_pending(&mut self) {
+        self.drain_image_decodes();
         self.drain_video_thumbs();
         self.maybe_respawn_video_thumbs();
         self.drain_model_loads();
         self.drain_lightbox();
+    }
+
+    /// Land finished off-thread image decodes. Animated results get a
+    /// `GifPlayback` entry using the current autoplay default; static
+    /// and SVG results go straight into `image_cache`. Failures are
+    /// recorded in `image_failed` so subsequent Done events for the
+    /// same id are no-ops.
+    fn drain_image_decodes(&mut self) {
+        let finished: Vec<String> = self
+            .pending_image_decodes
+            .iter()
+            .filter(|(_, h)| h.is_finished())
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in finished {
+            let handle = self.pending_image_decodes.remove(&id).unwrap();
+            match self.runtime.block_on(handle) {
+                Ok(Ok(cached)) => {
+                    if cached.is_animated() {
+                        self.gif_playback
+                            .entry(id.clone())
+                            .or_insert_with(|| chat::GifPlayback::new(self.gif_autoplay_default));
+                    }
+                    self.image_cache.insert(id, cached);
+                }
+                Ok(Err(e)) => {
+                    tracing::debug!("image preview decode failed for {id}: {e}");
+                    self.image_failed.insert(id);
+                }
+                Err(join_err) => {
+                    tracing::warn!("image decode task panicked for {id}: {join_err}");
+                    self.image_failed.insert(id);
+                }
+            }
+        }
     }
 
     /// Land finished off-thread model parses. On success the geometry goes
@@ -508,9 +566,10 @@ impl MediaCache {
             prev.handle.abort();
         }
         self.lightbox_full.remove(transfer_id);
+        let label = transfer_id.to_string();
         let handle = self
             .runtime
-            .spawn_blocking(move || decode_image(&path, Some(MAX_LIGHTBOX_PX)));
+            .spawn_blocking(move || decode_image(&path, Some(MAX_LIGHTBOX_PX), &label));
         self.pending_lightbox = Some(PendingLightboxDecode {
             transfer_id: transfer_id.to_string(),
             handle,
@@ -623,13 +682,14 @@ impl MediaCache {
 
 /// Decode `path` into a [`chat::CachedImage`]. `max_px` caps the
 /// longest edge of every emitted frame — `Some(n)` downsamples,
-/// `None` loads the source at its natural resolution.
+/// `None` loads the source at its natural resolution. `label` is a
+/// transfer-id string used only in diagnostic log messages.
 ///
 /// Animated GIF, animated WebP, and APNG decode every frame and
 /// produce [`chat::CachedImage::Animated`]; single-frame animations
 /// and all other formats collapse to `Static`. SVG goes through
 /// damascene's vector parser.
-fn decode_image(path: &Path, max_px: Option<u32>) -> Result<chat::CachedImage, image::ImageError> {
+fn decode_image(path: &Path, max_px: Option<u32>, label: &str) -> Result<chat::CachedImage, image::ImageError> {
     use image::{
         AnimationDecoder, ImageFormat,
         codecs::{gif::GifDecoder, png::PngDecoder, webp::WebPDecoder},
@@ -657,18 +717,18 @@ fn decode_image(path: &Path, max_px: Option<u32>) -> Result<chat::CachedImage, i
     match reader.format() {
         Some(ImageFormat::Gif) => {
             let decoder = GifDecoder::new(BufReader::new(std::fs::File::open(path)?))?;
-            return collect_animated_frames(decoder.into_frames(), max_px);
+            return collect_animated_frames(decoder.into_frames(), max_px, label);
         }
         Some(ImageFormat::WebP) => {
             let decoder = WebPDecoder::new(BufReader::new(std::fs::File::open(path)?))?;
             if decoder.has_animation() {
-                return collect_animated_frames(decoder.into_frames(), max_px);
+                return collect_animated_frames(decoder.into_frames(), max_px, label);
             }
         }
         Some(ImageFormat::Png) => {
             let decoder = PngDecoder::new(BufReader::new(std::fs::File::open(path)?))?;
             if decoder.is_apng()? {
-                return collect_animated_frames(decoder.apng()?.into_frames(), max_px);
+                return collect_animated_frames(decoder.apng()?.into_frames(), max_px, label);
             }
         }
         _ => {}
@@ -690,20 +750,46 @@ fn decode_image(path: &Path, max_px: Option<u32>) -> Result<chat::CachedImage, i
 /// Drain an animation decoder's frames, downsample each by `max_px`,
 /// pack into [`chat::CachedImage::Animated`]. A 20ms floor matches
 /// browsers' behaviour on pathologically-tiny per-frame delays.
+///
+/// Truncates to at most [`MAX_ANIMATED_FRAMES`] frames or
+/// [`MAX_ANIMATED_RGBA_BYTES`] total pre-thumbnail RGBA bytes,
+/// whichever limit is hit first. Truncated animations loop over the
+/// frames collected so far. `label` identifies the transfer in
+/// diagnostic messages.
 fn collect_animated_frames(
     frames: image::Frames<'_>,
     max_px: Option<u32>,
+    label: &str,
 ) -> Result<chat::CachedImage, image::ImageError> {
     use image::DynamicImage;
 
     let mut out: Vec<(Image, Duration)> = Vec::new();
+    let mut total_decoded_bytes: usize = 0;
+    let mut truncated = false;
+
     for frame in frames {
+        // Check frame-count cap before decoding the next frame.
+        if out.len() >= MAX_ANIMATED_FRAMES {
+            truncated = true;
+            break;
+        }
+
         let frame = frame?;
         let (numer, denom) = frame.delay().numer_denom_ms();
         let micros = (numer as u64).saturating_mul(1000) / (denom.max(1) as u64);
         let delay = Duration::from_micros(micros).max(Duration::from_millis(20));
 
         let mut dynimg = DynamicImage::ImageRgba8(frame.into_buffer());
+
+        // Byte budget checked at pre-thumbnail resolution; that is the
+        // peak allocation point during decode.
+        let frame_bytes = dynimg.width() as usize * dynimg.height() as usize * 4;
+        if total_decoded_bytes.saturating_add(frame_bytes) > MAX_ANIMATED_RGBA_BYTES {
+            truncated = true;
+            break;
+        }
+        total_decoded_bytes += frame_bytes;
+
         if let Some(cap) = max_px
             && dynimg.width().max(dynimg.height()) > cap
         {
@@ -712,6 +798,16 @@ fn collect_animated_frames(
         let rgba = dynimg.to_rgba8();
         let img = Image::from_rgba8(rgba.width(), rgba.height(), rgba.into_raw());
         out.push((img, delay));
+    }
+
+    if truncated {
+        tracing::warn!(
+            "media_cache: animated image {label}: truncated to {} frames ({:.1} MiB pre-thumbnail) — exceeded cap \
+             ({MAX_ANIMATED_FRAMES} frames / {} MiB)",
+            out.len(),
+            total_decoded_bytes as f64 / (1024.0 * 1024.0),
+            MAX_ANIMATED_RGBA_BYTES / (1024 * 1024),
+        );
     }
 
     if out.len() <= 1 {
