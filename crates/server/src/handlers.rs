@@ -1742,8 +1742,8 @@ pub async fn build_relay_packet(
         "server: received voice datagram"
     );
 
-    // Snapshot room memberships to avoid holding locks during relay.
-    let room_memberships = state.snapshot_room_memberships().await;
+    // Snapshot room memberships + deafened set to avoid holding locks during relay.
+    let (room_memberships, deafened) = state.snapshot_voice_routing().await;
 
     // Only relay if the sender is actually in a room.
     let Some(actual_room) = room_memberships
@@ -1769,9 +1769,17 @@ pub async fn build_relay_packet(
     };
     let bytes = voice_dgram.encode_to_vec();
 
+    // Exclude the sender and any self-deafened recipient: deaf is enforced
+    // server-side, not by client courtesy.
     let recipients = room_memberships
         .get(&actual_room)
-        .map(|members| members.iter().copied().filter(|&id| id != effective_sender).collect())
+        .map(|members| {
+            members
+                .iter()
+                .copied()
+                .filter(|&id| id != effective_sender && !deafened.contains(&id))
+                .collect()
+        })
         .unwrap_or_default();
 
     Some(RelayPacket {
@@ -1880,7 +1888,7 @@ pub async fn relay_voice_as(
     timestamp_us: u64,
     end_of_stream: bool,
 ) {
-    let room_memberships = state.snapshot_room_memberships().await;
+    let (room_memberships, deafened) = state.snapshot_voice_routing().await;
     let Some(room) = room_memberships
         .iter()
         .find_map(|(rid, users)| users.contains(&sender_id).then_some(*rid))
@@ -1898,9 +1906,17 @@ pub async fn relay_voice_as(
     };
     let bytes = dgram.encode_to_vec();
 
+    // Exclude the sender and any self-deafened recipient: deaf is enforced
+    // server-side, not by client courtesy.
     let recipients: Vec<u64> = room_memberships
         .get(&room)
-        .map(|members| members.iter().copied().filter(|&id| id != sender_id).collect())
+        .map(|members| {
+            members
+                .iter()
+                .copied()
+                .filter(|&id| id != sender_id && !deafened.contains(&id))
+                .collect()
+        })
         .unwrap_or_default();
     let targets = dedup_delivery_targets(&recipients, |id| state.delivery_client(id).map(|c| c.user_id));
     for delivery_id in targets {
@@ -2768,6 +2784,37 @@ mod tests {
 
         let got: HashSet<u64> = packet.recipients.iter().copied().collect();
         assert_eq!(got, HashSet::from([2, 3]), "recipients must be room-A peers only");
+    }
+
+    /// A self-deafened peer is excluded from the recipient set: deaf is
+    /// enforced server-side, not left to client courtesy. The sender keeps
+    /// transmitting to everyone else in the room.
+    #[tokio::test]
+    async fn relay_excludes_deafened_recipients() {
+        let state = ServerState::new();
+        let room_a = state.create_room("A".to_string()).await;
+
+        for uid in [1, 2, 3] {
+            state.register_participant(participant(uid));
+            state.set_user_room(uid, room_a).await;
+        }
+        // Peer 2 deafens itself; peer 3 stays listening.
+        state
+            .set_user_status(
+                2,
+                UserStatus {
+                    is_deafened: true,
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        let packet = build_relay_packet(&state, 1, client_dgram(7), 40)
+            .await
+            .expect("sender is in a room and not muted");
+
+        let got: HashSet<u64> = packet.recipients.iter().copied().collect();
+        assert_eq!(got, HashSet::from([3]), "deafened peer 2 must not receive voice");
     }
 
     /// The server overwrites the client-supplied `sender_id`/`room_id` with the

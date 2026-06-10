@@ -1022,6 +1022,34 @@ impl ServerState {
         map
     }
 
+    /// Snapshot room memberships **and** the set of self-deafened users under a
+    /// single lock acquisition — the voice relay needs both to route a datagram
+    /// (a room's members, minus the sender, minus any deafened recipient).
+    ///
+    /// Deaf is server-enforced: a deafened client receives no voice datagrams
+    /// regardless of client behavior, mirroring how mute is enforced on the
+    /// send side. (Text messages are *not* filtered — deaf suppresses audio
+    /// only — so they keep using [`Self::snapshot_room_memberships`].)
+    pub async fn snapshot_voice_routing(
+        &self,
+    ) -> (
+        std::collections::HashMap<Uuid, Vec<u64>>,
+        std::collections::HashSet<u64>,
+    ) {
+        let data = self.state_data.read().await;
+        let mut map = std::collections::HashMap::new();
+        for (uid, rid) in &data.memberships {
+            map.entry(*rid).or_insert_with(Vec::new).push(*uid);
+        }
+        let deafened = data
+            .user_statuses
+            .iter()
+            .filter(|(_, status)| status.is_deafened)
+            .map(|(uid, _)| *uid)
+            .collect();
+        (map, deafened)
+    }
+
     // =========================================================================
     // Voice Rate Limiting
     // =========================================================================
