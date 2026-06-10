@@ -37,6 +37,10 @@ pub struct WebState {
     pub state: Arc<ServerState>,
     pub persistence: Arc<Persistence>,
     pub sessions: Arc<Sessions>,
+    /// Per-IP login throttle (lockout after repeated failed sudo-password
+    /// attempts), so the deliberately-expensive bcrypt verify can't be abused
+    /// to brute-force the password or soak CPU.
+    pub login_throttle: Arc<auth::LoginThrottle>,
     /// One-time bootstrap token, valid only while no sudo password is set.
     pub setup_token: Arc<String>,
 }
@@ -65,6 +69,12 @@ impl ApiErrorResponse {
     }
     pub fn conflict(message: impl Into<String>) -> Self {
         Self::new(StatusCode::CONFLICT, message)
+    }
+    pub fn too_many_requests(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::TOO_MANY_REQUESTS, message)
+    }
+    pub fn internal(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::INTERNAL_SERVER_ERROR, message)
     }
 }
 
@@ -152,6 +162,7 @@ pub fn spawn(state: Arc<ServerState>, persistence: Arc<Persistence>, settings: W
         state,
         persistence,
         sessions: Arc::new(Sessions::new()),
+        login_throttle: Arc::new(auth::LoginThrottle::new()),
         setup_token: Arc::new(setup_token),
     };
 
@@ -167,7 +178,10 @@ pub fn spawn(state: Arc<ServerState>, persistence: Arc<Persistence>, settings: W
             }
         };
         info!("web admin listening on http://{bind}");
-        if let Err(e) = axum::serve(listener, app).await {
+        // Serve with connection info so the login handler can read the peer
+        // address for per-IP throttling.
+        let make_service = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
+        if let Err(e) = axum::serve(listener, make_service).await {
             warn!("web admin server error: {e}");
         }
     })

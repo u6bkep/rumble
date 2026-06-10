@@ -9,13 +9,16 @@
 use super::{ApiErrorResponse, ApiResult, WebState};
 use axum::{
     Json,
-    extract::{FromRequestParts, State},
+    extract::{ConnectInfo, FromRequestParts, State},
     http::{HeaderMap, header, request::Parts},
     response::{IntoResponse, Response},
 };
 use dashmap::DashMap;
 use rumble_web_types::{BootstrapRequest, LoginRequest, OkMessage, SessionInfo};
-use std::time::{Duration, Instant};
+use std::{
+    net::{IpAddr, SocketAddr},
+    time::{Duration, Instant},
+};
 
 /// Cookie name for the admin session token.
 const SESSION_COOKIE: &str = "rumble_admin_session";
@@ -58,6 +61,73 @@ impl Sessions {
 }
 
 impl Default for Sessions {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Consecutive failed logins from one IP before it is locked out.
+const MAX_LOGIN_FAILURES: u32 = 5;
+/// How long an IP is locked out once it trips [`MAX_LOGIN_FAILURES`].
+const LOGIN_LOCKOUT: Duration = Duration::from_secs(60);
+
+struct FailureState {
+    failures: u32,
+    locked_until: Option<Instant>,
+}
+
+/// Per-IP login throttle. After [`MAX_LOGIN_FAILURES`] consecutive failures an
+/// IP is locked out for [`LOGIN_LOCKOUT`], bounding how fast the sudo password
+/// can be guessed and how much bcrypt work an attacker can force. A successful
+/// login clears the IP's counter.
+///
+/// Note: behind a reverse proxy the peer address is the proxy, so all clients
+/// share one bucket — operators terminating TLS at a proxy should rate-limit
+/// there too. For a direct bind (the documented deployment) this keys on the
+/// real client.
+pub struct LoginThrottle {
+    by_ip: DashMap<IpAddr, FailureState>,
+}
+
+impl LoginThrottle {
+    pub fn new() -> Self {
+        Self { by_ip: DashMap::new() }
+    }
+
+    /// If `ip` is currently locked out, return the remaining lockout duration;
+    /// otherwise `None` (the attempt may proceed).
+    pub fn check(&self, ip: IpAddr) -> Option<Duration> {
+        let entry = self.by_ip.get(&ip)?;
+        let until = entry.locked_until?;
+        until.checked_duration_since(Instant::now())
+    }
+
+    /// Record a failed attempt, locking the IP out once it reaches the limit.
+    pub fn record_failure(&self, ip: IpAddr) {
+        let mut entry = self.by_ip.entry(ip).or_insert(FailureState {
+            failures: 0,
+            locked_until: None,
+        });
+        // A previously-expired lockout resets the window before we count again.
+        if let Some(until) = entry.locked_until
+            && until <= Instant::now()
+        {
+            entry.failures = 0;
+            entry.locked_until = None;
+        }
+        entry.failures += 1;
+        if entry.failures >= MAX_LOGIN_FAILURES {
+            entry.locked_until = Some(Instant::now() + LOGIN_LOCKOUT);
+        }
+    }
+
+    /// Clear an IP's failure record after a successful login.
+    pub fn record_success(&self, ip: IpAddr) {
+        self.by_ip.remove(&ip);
+    }
+}
+
+impl Default for LoginThrottle {
     fn default() -> Self {
         Self::new()
     }
@@ -120,24 +190,54 @@ pub async fn session_info(State(st): State<WebState>, headers: HeaderMap) -> Jso
 }
 
 /// `POST /api/login` — verify the sudo password and set a session cookie.
-pub async fn login(State(st): State<WebState>, Json(req): Json<LoginRequest>) -> Response {
+///
+/// bcrypt verification (cost 12, ~100–300 ms) runs on the blocking thread pool
+/// via `spawn_blocking`, so it never stalls the async workers that also relay
+/// voice. Per-IP throttling locks out an address after repeated failures so the
+/// expensive verify can't be used to brute-force the password or soak CPU.
+pub async fn login(
+    State(st): State<WebState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Json(req): Json<LoginRequest>,
+) -> Response {
+    let ip = peer.ip();
+    if let Some(retry_after) = st.login_throttle.check(ip) {
+        return ApiErrorResponse::too_many_requests(format!(
+            "Too many failed login attempts; try again in {}s",
+            retry_after.as_secs() + 1
+        ))
+        .into_response();
+    }
+
     let persist = &st.persistence;
     let Some(hash) = persist.get_sudo_password() else {
         return ApiErrorResponse::bad_request("Sudo password not configured; bootstrap required").into_response();
     };
-    match bcrypt::verify(&req.password, &hash) {
-        Ok(true) => {
-            let token = st.sessions.create();
-            let mut response = Json(OkMessage {
-                message: "Logged in".to_string(),
-            })
-            .into_response();
-            if let Ok(value) = header::HeaderValue::from_str(&set_cookie(&token)) {
-                response.headers_mut().insert(header::SET_COOKIE, value);
-            }
-            response
+
+    // bcrypt is CPU-bound and deliberately slow — run it off the async workers.
+    let password = req.password;
+    let verified = match tokio::task::spawn_blocking(move || bcrypt::verify(&password, &hash)).await {
+        Ok(Ok(ok)) => ok,
+        // A bcrypt error (malformed stored hash) or a join failure is a server
+        // fault, not a credential verdict — don't count it against the IP.
+        Ok(Err(e)) => return ApiErrorResponse::internal(format!("Password verification failed: {e}")).into_response(),
+        Err(e) => return ApiErrorResponse::internal(format!("Password verification task failed: {e}")).into_response(),
+    };
+
+    if verified {
+        st.login_throttle.record_success(ip);
+        let token = st.sessions.create();
+        let mut response = Json(OkMessage {
+            message: "Logged in".to_string(),
+        })
+        .into_response();
+        if let Ok(value) = header::HeaderValue::from_str(&set_cookie(&token)) {
+            response.headers_mut().insert(header::SET_COOKIE, value);
         }
-        _ => ApiErrorResponse::unauthorized().into_response(),
+        response
+    } else {
+        st.login_throttle.record_failure(ip);
+        ApiErrorResponse::unauthorized().into_response()
     }
 }
 
@@ -167,7 +267,11 @@ pub async fn bootstrap(State(st): State<WebState>, Json(req): Json<BootstrapRequ
         return Err(ApiErrorResponse::bad_request("Sudo password cannot be empty"));
     }
 
-    let hash = bcrypt::hash(&req.sudo_password, bcrypt::DEFAULT_COST)
+    // bcrypt hashing is CPU-bound and slow — keep it off the async workers.
+    let password = req.sudo_password.clone();
+    let hash = tokio::task::spawn_blocking(move || bcrypt::hash(&password, bcrypt::DEFAULT_COST))
+        .await
+        .map_err(|e| ApiErrorResponse::internal(format!("Hashing task failed: {e}")))?
         .map_err(|e| ApiErrorResponse::bad_request(format!("Failed to hash password: {e}")))?;
     persist
         .set_sudo_password(&hash)
@@ -191,4 +295,47 @@ pub async fn bootstrap(State(st): State<WebState>, Json(req): Json<BootstrapRequ
     Ok(Json(OkMessage {
         message: "Bootstrap complete".to_string(),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ip(n: u8) -> IpAddr {
+        IpAddr::from([127, 0, 0, n])
+    }
+
+    #[test]
+    fn locks_out_after_max_failures() {
+        let throttle = LoginThrottle::new();
+        let addr = ip(1);
+        for _ in 0..MAX_LOGIN_FAILURES - 1 {
+            throttle.record_failure(addr);
+            assert!(throttle.check(addr).is_none(), "not locked before the limit");
+        }
+        throttle.record_failure(addr); // reaches the limit
+        assert!(throttle.check(addr).is_some(), "locked out at the limit");
+    }
+
+    #[test]
+    fn success_clears_failures() {
+        let throttle = LoginThrottle::new();
+        let addr = ip(2);
+        for _ in 0..MAX_LOGIN_FAILURES {
+            throttle.record_failure(addr);
+        }
+        assert!(throttle.check(addr).is_some(), "locked after repeated failures");
+        throttle.record_success(addr);
+        assert!(throttle.check(addr).is_none(), "a successful login resets the lockout");
+    }
+
+    #[test]
+    fn failures_are_per_ip() {
+        let throttle = LoginThrottle::new();
+        for _ in 0..MAX_LOGIN_FAILURES {
+            throttle.record_failure(ip(3));
+        }
+        assert!(throttle.check(ip(3)).is_some(), "the offending ip is locked");
+        assert!(throttle.check(ip(4)).is_none(), "a different ip is unaffected");
+    }
 }
