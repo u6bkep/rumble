@@ -69,7 +69,7 @@ const POSTER_MAX_DIM: u32 = 1024;
 /// frame into a buffer sized to [`POSTER_MAX_DIM`]'s longest
 /// edge, then wrap the RGBA bytes in an `Image`.
 pub fn extract_thumbnail(path: &Path) -> Result<Image, VideoError> {
-    let player = MpvPlayer::new()?;
+    let (player, render) = MpvPlayer::new()?;
     // Headless / fast-path config: no audio device, no hardware
     // decode (slower decode but no GPU contention with the host
     // wgpu device), paused so the decoder doesn't race ahead.
@@ -77,7 +77,7 @@ pub fn extract_thumbnail(path: &Path) -> Result<Image, VideoError> {
     player.set_option_string("hwdec", "no")?;
     player.set_option_string("pause", "yes")?;
 
-    player.load_file(path)?;
+    render.load_file(path)?;
     let (nat_w, nat_h) = player.dimensions()?;
 
     // Downsample at render time — libmpv handles the scaling for
@@ -93,10 +93,10 @@ pub fn extract_thumbnail(path: &Path) -> Result<Image, VideoError> {
     // that headroom without inviting a truly stuck decoder to
     // block forever — the pump retries on failure now, so a
     // tighter cap doesn't buy us much.
-    if !player.wait_for_frame(Duration::from_secs(15))? {
+    if !render.wait_for_frame(Duration::from_secs(15))? {
         return Err(VideoError::Timeout("first frame for thumbnail"));
     }
-    player.render_sw(&mut buf, w, h, stride)?;
+    render.render_sw(&mut buf, w, h, stride)?;
 
     Ok(Image::from_rgba8(w, h, buf))
 }

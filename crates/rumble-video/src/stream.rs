@@ -4,11 +4,12 @@
 //! thread needs to drive playback.
 //!
 //! Threading model:
-//! - The worker thread is the **only** caller of
-//!   `MpvPlayer::wait_for_frame` and `MpvPlayer::render_sw`. libmpv
-//!   tolerates calls from multiple threads but renders are single-
-//!   threaded; the discipline is enforced by exposing only
-//!   property/command setters on `VideoStream` itself.
+//! - The thread-confined half of the player ([`MpvRender`]) moves
+//!   into the worker thread, which is therefore the only possible
+//!   caller of `wait_for_frame` / `render_sw` — the type system
+//!   (`MpvRender: Send + !Sync`) enforces libmpv's single-threaded
+//!   render/event contract. The UI-side [`VideoStream`] keeps only
+//!   the `Send + Sync` command/property half ([`MpvPlayer`]).
 //! - The UI thread reads the latest decoded frame via
 //!   [`VideoStream::with_latest_frame`]. Latest-frame storage is a
 //!   single `Mutex<FrameBuffer>` swapped under the lock. Stride and
@@ -33,7 +34,7 @@ use std::{
     time::Duration,
 };
 
-use crate::{Error, MpvPlayer};
+use crate::{Error, MpvPlayer, MpvRender};
 
 /// Decoded RGBA frame in CPU memory. Bytes are laid out
 /// `R, G, B, 0xff` per pixel — `Rgba8UnormSrgb`-ready, no further
@@ -66,9 +67,10 @@ struct StreamInner {
 /// and the CPU-side frame mailbox. Drop-clean: terminates the
 /// worker, then libmpv.
 pub struct VideoStream {
-    /// Shared with the worker so we can issue pause/resume/seek
-    /// from the UI thread while the worker is mid-`wait_for_frame`.
-    player: Arc<MpvPlayer>,
+    /// Command/property half of the player. The render/event half
+    /// (`MpvRender`) lives in the worker thread, so pause/resume/
+    /// seek from the UI thread can never race a mid-flight render.
+    player: MpvPlayer,
     inner: Arc<StreamInner>,
     /// `Option` so `Drop` can `take()` and `join()` without leaving
     /// an invalid `JoinHandle` behind.
@@ -85,7 +87,7 @@ impl VideoStream {
     /// restarts at end-of-stream — useful for the integration tests
     /// and "preview" UX, less so for one-shot lightbox playback.
     pub fn open(path: &Path, looped: bool) -> Result<Self, Error> {
-        let player = MpvPlayer::new()?;
+        let (player, render) = MpvPlayer::new()?;
         // Audio: let libmpv pick the platform-native output. The
         // player constructor already disables terminal/input/config
         // so we don't need any further audio plumbing.
@@ -93,7 +95,7 @@ impl VideoStream {
             player.set_option_string("loop-file", "inf")?;
         }
 
-        player.load_file(path)?;
+        render.load_file(path)?;
         let (width, height) = player.dimensions()?;
         let stride = (width as usize) * 4;
         let frame = FrameBuffer {
@@ -108,13 +110,10 @@ impl VideoStream {
             seq: AtomicU64::new(0),
             shutdown: AtomicBool::new(false),
         });
-        let player = Arc::new(player);
-
-        let worker_player = Arc::clone(&player);
         let worker_inner = Arc::clone(&inner);
         let worker = std::thread::Builder::new()
             .name("rumble-video::decode".into())
-            .spawn(move || worker_loop(worker_player, worker_inner, width, height, stride))
+            .spawn(move || worker_loop(render, worker_inner, width, height, stride))
             .expect("rumble-video: failed to spawn decode worker");
 
         Ok(Self {
@@ -198,21 +197,22 @@ impl Drop for VideoStream {
         if let Some(w) = self.worker.take() {
             let _ = w.join();
         }
-        // Player Arc drops here; mpv_terminate_destroy fires from
-        // MpvPlayer::drop once the worker is no longer holding
-        // its clone.
+        // The worker dropped its `MpvRender` on exit (freeing the
+        // render context); `self.player` drops here, releasing the
+        // last `Arc<Handle>` clone and firing
+        // `mpv_terminate_destroy` in the correct order.
     }
 }
 
 /// Body of the decode worker. Loops until `shutdown`, blocks up to
 /// 50ms in `wait_for_frame`, renders into a back buffer, swaps it
 /// into the shared mailbox, bumps the seq counter, repeats.
-fn worker_loop(player: Arc<MpvPlayer>, inner: Arc<StreamInner>, width: u32, height: u32, stride: usize) {
+fn worker_loop(render: MpvRender, inner: Arc<StreamInner>, width: u32, height: u32, stride: usize) {
     let mut back = vec![0u8; stride * height as usize];
     while !inner.shutdown.load(Ordering::Acquire) {
-        match player.wait_for_frame(Duration::from_millis(50)) {
+        match render.wait_for_frame(Duration::from_millis(50)) {
             Ok(true) => {
-                if let Err(e) = player.render_sw(&mut back, width, height, stride) {
+                if let Err(e) = render.render_sw(&mut back, width, height, stride) {
                     tracing::warn!(error = %e, "video: render_sw failed");
                     continue;
                 }
