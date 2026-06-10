@@ -1301,8 +1301,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Identity / SettingsStore both want a config dir to write to.
     // Fixtures don't actually mutate either, but the constructors
-    // create files, so use a process-local scratch dir.
-    let scratch = std::env::temp_dir().join("rumble_damascene_dump_bundles");
+    // create files, so use a process-local scratch dir. The path is
+    // pinned (not `env::temp_dir()`) because it renders into the
+    // connection scenes' draw ops — a TMPDIR-dependent path would make
+    // the goldens differ between shells.
+    let scratch = PathBuf::from("/tmp").join("rumble_damascene_dump_bundles");
     std::fs::create_dir_all(&scratch)?;
 
     // First positional arg may select a mode; the rest are scene names.

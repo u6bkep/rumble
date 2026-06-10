@@ -62,6 +62,11 @@ const SERVER_PERMS: &[(Permissions, &str, &str)] = &[
         "Edit groups, members, and the Admin tab",
     ),
     (Permissions::SUDO, "Sudo", "Elevate past the ACL system"),
+    (
+        Permissions::MANAGE_PARTICIPANTS,
+        "Manage participants",
+        "Register as a controller for proxied participants (bridges, bots)",
+    ),
 ];
 
 // ============================================================
@@ -1032,6 +1037,7 @@ const SUMMARY_FLAGS: &[(Permissions, &str)] = &[
     (Permissions::SELF_REGISTER, "Self register"),
     (Permissions::MANAGE_ACL, "Manage ACL"),
     (Permissions::SUDO, "Sudo"),
+    (Permissions::MANAGE_PARTICIPANTS, "Manage participants"),
 ];
 
 /// Short permission summary used in the accordion header. Renders

@@ -916,13 +916,11 @@ pub fn handle_event(
         return RoomAclOutcome::Handled;
     }
 
-    // Per-entry events.
-    if let Some((idx, action, payload)) = parse_entry_route(route) {
-        return handle_entry_event(state, idx, action, payload);
-    }
-
-    // Scope tab switching uses tabs_list's own routing — fall through
-    // to the apply_event helper for each open entry.
+    // Scope-tab events (room_acl:e:{i}:scope:tab:{slug}) must be
+    // dispatched before the generic entry-route parser, which would
+    // otherwise absorb them as action="scope" and discard without
+    // mutating anything. apply_event only matches its own key prefix,
+    // so no other entry route can be shadowed here.
     for (i, entry) in state.entries.iter_mut().enumerate() {
         if damascene_core::widgets::tabs::apply_event(
             &mut entry.scope,
@@ -932,6 +930,11 @@ pub fn handle_event(
         ) {
             return RoomAclOutcome::Handled;
         }
+    }
+
+    // Per-entry events.
+    if let Some((idx, action, payload)) = parse_entry_route(route) {
+        return handle_entry_event(state, idx, action, payload);
     }
 
     let _ = app_state;
@@ -986,8 +989,8 @@ fn handle_entry_event(
             RoomAclOutcome::Handled
         }
         "scope" => {
-            // Scope tabs are handled via tabs::apply_event above; this
-            // branch just keeps the outer match exhaustive.
+            // A bare :scope route (no :tab: suffix) was not claimed by
+            // the tabs::apply_event loop; nothing to do.
             RoomAclOutcome::Handled
         }
         _ => RoomAclOutcome::Ignored,
@@ -1009,4 +1012,79 @@ pub fn can_edit_acl(app_state: &State, room_id: Uuid) -> bool {
         .copied()
         .unwrap_or(app_state.effective_permissions);
     Permissions::from_bits_truncate(bits).contains(Permissions::WRITE)
+}
+
+// ============================================================
+// Tests
+// ============================================================
+
+#[cfg(test)]
+mod tests {
+    use damascene_core::{event::UiEvent, selection::Selection};
+    use rumble_client::State;
+    use uuid::Uuid;
+
+    use super::*;
+
+    fn minimal_modal(scope: AclScope) -> RoomAclModalState {
+        RoomAclModalState {
+            room_id: Uuid::nil(),
+            room_name: String::new(),
+            path: vec![(Uuid::nil(), String::new())],
+            inherit_acl: true,
+            entries: vec![AclEditEntry {
+                group: "default".to_string(),
+                grant: 0,
+                deny: 0,
+                scope,
+            }],
+            expanded_entry: Some(0),
+            inherited_open: false,
+            add_rule_query: None,
+        }
+    }
+
+    /// Scope-tab clicks must mutate the entry's scope. Previously the
+    /// generic entry-route parser absorbed them as action="scope" before
+    /// tabs::apply_event could run, leaving apply_here/apply_subs frozen.
+    #[test]
+    fn scope_tab_both_to_here() {
+        let mut modal = minimal_modal(AclScope::Both);
+        let event = UiEvent::synthetic_click("room_acl:e:0:scope:tab:here");
+        let outcome = handle_event(&mut modal, &event, &State::default(), &mut Selection::default());
+        assert!(matches!(outcome, RoomAclOutcome::Handled), "event must be consumed");
+        assert_eq!(
+            modal.entries[0].scope,
+            AclScope::Here,
+            "scope was not updated — route collision regression"
+        );
+    }
+
+    #[test]
+    fn scope_tab_both_to_subtree() {
+        let mut modal = minimal_modal(AclScope::Both);
+        let event = UiEvent::synthetic_click("room_acl:e:0:scope:tab:subtree");
+        handle_event(&mut modal, &event, &State::default(), &mut Selection::default());
+        assert_eq!(modal.entries[0].scope, AclScope::Subtree);
+    }
+
+    #[test]
+    fn scope_tab_here_to_both() {
+        let mut modal = minimal_modal(AclScope::Here);
+        let event = UiEvent::synthetic_click("room_acl:e:0:scope:tab:both");
+        handle_event(&mut modal, &event, &State::default(), &mut Selection::default());
+        assert_eq!(modal.entries[0].scope, AclScope::Both);
+    }
+
+    /// A non-scope entry-route event (e.g. perm cell toggle) must still
+    /// work after the reorder.
+    #[test]
+    fn perm_cell_toggle_still_dispatches() {
+        let mut modal = minimal_modal(AclScope::Both);
+        // Simulate clicking the "allow" cell for TRAVERSE (0x00000001).
+        let event = UiEvent::synthetic_click("room_acl:e:0:p:00000001:allow");
+        let outcome = handle_event(&mut modal, &event, &State::default(), &mut Selection::default());
+        assert!(matches!(outcome, RoomAclOutcome::Handled));
+        assert_ne!(modal.entries[0].grant & 0x1, 0, "TRAVERSE grant bit not set");
+    }
 }
