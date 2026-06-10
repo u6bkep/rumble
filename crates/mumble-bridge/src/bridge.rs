@@ -240,11 +240,21 @@ pub async fn run_bridge(
             }
 
             BridgeEvent::MumbleVoice { session, data } => {
-                // Look up the virtual user ID for this Mumble session
-                let virtual_user_id = {
+                // Look up the virtual user ID and self-mute state for this session
+                let (virtual_user_id, sender_muted) = {
                     let state = read_bridge(&bridge_state);
-                    state.virtual_user_map.get(&session).copied()
+                    (
+                        state.virtual_user_map.get(&session).copied(),
+                        state.mumble_clients.get(&session).is_some_and(|c| c.is_muted),
+                    )
                 };
+
+                // Drop voice from self-muted senders, as murmur does. The
+                // Rumble server also drops them once SetParticipantStatus has
+                // synced; this covers the window before that.
+                if sender_muted {
+                    continue;
+                }
 
                 // Drop voice if the virtual user hasn't been registered yet
                 let virtual_user_id = match virtual_user_id {
@@ -420,14 +430,17 @@ pub async fn run_bridge(
                     warn!(error = %e, vid, "Failed to send SetParticipantStatus");
                 }
 
-                // Broadcast the enforced mute/deaf state to other Mumble clients
+                // Broadcast the enforced mute/deaf state to all Mumble clients,
+                // including the actor: a Mumble client only updates its own
+                // mute/deaf flags from the server's UserState echo.
                 let user_state = mumble::UserState {
                     session: Some(session),
+                    actor: Some(session),
                     self_mute: Some(final_muted),
                     self_deaf: Some(final_deafened),
                     ..Default::default()
                 };
-                broadcast_to_mumble_except(client_senders, session, MessageType::UserState, &user_state);
+                broadcast_to_all_mumble(client_senders, MessageType::UserState, &user_state);
             }
 
             BridgeEvent::RumbleEnvelope(env) => {
@@ -529,8 +542,15 @@ fn handle_rumble_envelope(
 
                         for user in &ss.users {
                             let rumble_id = user.user_id.as_ref().map(|id| id.value).unwrap_or(0);
+                            // Skip our own virtual users, including ones whose
+                            // registration is still in flight — otherwise they
+                            // get a proxy session and show up as duplicates.
                             if Some(rumble_id) != state.bridge_user_id
                                 && !state.reverse_virtual_user_map.contains_key(&rumble_id)
+                                && !state
+                                    .pending_registrations
+                                    .iter()
+                                    .any(|(name, _)| name == &user.username)
                             {
                                 state.users.get_or_insert(rumble_id);
                             }
@@ -961,14 +981,19 @@ fn handle_rumble_voice(
         None => return,
     };
 
-    // Increment per-sender outbound sequence
+    // Increment per-sender outbound sequence. Mumble sequence numbers count
+    // 10 ms frames (the client's jitter buffer timestamps packets at
+    // sequence * 10 ms), and each relayed packet carries one 20 ms Opus
+    // frame, so advance by 2 per packet.
     let seq = outbound_seq.entry(sender_id).or_insert(0);
-    *seq += 1;
+    *seq += 2;
     let current_seq = *seq;
 
     let voice_data =
         mumble_voice::encode_voice_packet(session, current_seq, &datagram.opus_data, datagram.end_of_stream);
 
+    // Deafen is server-enforced in Mumble: clients do not gate playback on
+    // their own self-deaf state, the server simply stops sending them audio.
     if let Some(target_channel) = target_channel {
         // Only relay to Mumble clients in the matching channel, skipping the
         // original sender's Mumble session to prevent echo
@@ -977,16 +1002,20 @@ fn handle_rumble_voice(
             if exclude_session == Some(client_session) {
                 continue;
             }
-            let client_channel = state.mumble_clients.get(&client_session).map(|c| c.channel_id);
-            if client_channel == Some(target_channel) {
+            let client = state.mumble_clients.get(&client_session);
+            if client.is_some_and(|c| !c.is_deafened && c.channel_id == target_channel) {
                 let _ = sender.tx.send(MumbleOutbound::Voice(voice_data.clone()));
             }
         }
     } else {
         // No room_id on the datagram — fall back to broadcasting to all clients,
         // skipping the original sender's Mumble session to prevent echo
+        let state = read_bridge(bridge_state);
         for (&client_session, sender) in client_senders {
             if exclude_session == Some(client_session) {
+                continue;
+            }
+            if state.mumble_clients.get(&client_session).is_some_and(|c| c.is_deafened) {
                 continue;
             }
             let _ = sender.tx.send(MumbleOutbound::Voice(voice_data.clone()));

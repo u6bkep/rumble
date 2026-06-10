@@ -201,13 +201,19 @@ async fn mumble_auth_handshake(
         users = build_user_states(&state, session);
     }
 
-    // Send server Version
+    // Send server Version.
+    //
+    // Advertise the 1.4 protocol: clients >= 1.5 switch their UDP *and*
+    // TCP-tunnel voice codecs to the protobuf MumbleUDP format when the
+    // server reports >= 1.5.0, which this bridge does not speak. Keeping the
+    // advertised version below 1.5.0 pins every client to the legacy voice
+    // framing implemented in `mumble_voice`.
     let version = mumble::Version {
-        version_v2: Some(0x00010500), // 1.5.0
+        version_v1: Some(0x00010400), // 1.4.0
+        version_v2: None,
         release: Some("Rumble Mumble Bridge 0.1.0".to_string()),
         os: Some(std::env::consts::OS.to_string()),
         os_version: Some(String::new()),
-        version_v1: None,
     };
     write_message(writer, MessageType::Version, &version).await?;
 
