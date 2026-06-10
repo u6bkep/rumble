@@ -99,6 +99,17 @@ struct TransferEntry {
     last_sample_bytes: u64,
     /// Wall-clock instant of the last speed sample.
     last_sample_at: Instant,
+    /// Destination path being written by an active or completed download.
+    /// Set by the fetch task before the first byte is written, so
+    /// `run_fetch` can delete any partial file on any non-success exit
+    /// (including task cancellation). Always `None` for uploads.
+    dest_path: Option<PathBuf>,
+    /// Instructs the fetch task to remove `dest_path` even on a
+    /// successful download completion. Set by `cancel(delete_files = true)`
+    /// so the task — the sole writer of downloaded files — can honor the
+    /// deletion request without racing the on-disk write. Always `false`
+    /// for uploads.
+    delete_on_complete: bool,
 }
 
 impl TransferEntry {
@@ -246,6 +257,32 @@ async fn write_file_relay_header(send: &mut dyn BiSendStream) -> Result<()> {
     header.write_to(send).await
 }
 
+/// Validates byte counts during a relay fetch.
+///
+/// Returns `Err` if either:
+/// - `file_size` exceeds [`rumble_client_traits::MAX_UPLOAD_BYTES`] (the
+///   absolute download ceiling, which mirrors the server relay cap of 256 MiB).
+///   A server that declares a larger file size is lying or misconfigured; we
+///   refuse before writing a single byte.
+/// - `received` exceeds `file_size` (protocol violation: the server streamed
+///   more data than it declared).
+///
+/// Call once before the fetch loop with `received = 0` to fast-fail oversized
+/// declarations, then again inside the loop after each `received += n`.
+fn validate_fetch_progress(received: u64, file_size: u64) -> anyhow::Result<()> {
+    if file_size > rumble_client_traits::MAX_UPLOAD_BYTES {
+        anyhow::bail!(
+            "server-declared file size ({file_size} bytes) exceeds the maximum allowed {} bytes (mirrors the server \
+             relay cap); refusing download",
+            rumble_client_traits::MAX_UPLOAD_BYTES,
+        );
+    }
+    if received > file_size {
+        anyhow::bail!("server sent more data than declared ({received} > {file_size} bytes): protocol violation");
+    }
+    Ok(())
+}
+
 /// Upload a file to the server's relay cache.
 #[allow(clippy::too_many_arguments)]
 async fn run_upload(
@@ -271,6 +308,14 @@ async fn run_upload(
     let Some(entry) = t.get_mut(&transfer_id) else {
         return;
     };
+    // Terminal stages are sticky: once set externally (e.g., cancel() or
+    // set_room_id()), the task must not overwrite them. This prevents
+    // `Failed{"room changed"}` from being clobbered by `Failed{"cancelled"}`
+    // and stops a long-completed task from reviving a Done/Failed entry.
+    let already_terminal = entry.stage.is_terminal();
+    if already_terminal {
+        return;
+    }
     match result {
         Ok(()) => {
             entry.stage = TransferStage::Done {
@@ -393,18 +438,64 @@ async fn run_fetch(
         _ = cancel.cancelled() => Err(anyhow::anyhow!("cancelled")),
         r = do_fetch(&opener, &transfer_id, &downloads_dir, &transfers) => r,
     };
+    // By the time we reach here the do_fetch future (and any BufWriter/File
+    // it held) has either returned or been dropped by the select. The file
+    // handle is closed before any remove_file call below.
 
     let mut t = transfers.lock();
+
+    // Read cleanup fields under the lock so cancel() cannot race our read.
+    let (partial_path, delete_on_complete) = t
+        .get(&transfer_id)
+        .map(|e| (e.dest_path.clone(), e.delete_on_complete))
+        .unwrap_or((None, false));
+
     let Some(entry) = t.get_mut(&transfer_id) else {
+        // Entry was removed concurrently (shouldn't happen in practice).
+        drop(t);
+        if let Some(path) = partial_path {
+            let _ = std::fs::remove_file(&path);
+        }
         return;
     };
+
+    // Terminal stages are sticky: once set externally (e.g., cancel()),
+    // the task must not overwrite them. The file must still be cleaned up.
+    let already_terminal = entry.stage.is_terminal();
+    if already_terminal {
+        drop(t);
+        // task won the I/O race but cancel() won the stage race.
+        // For errors the partial file is always removed; for an Ok result
+        // the caller's delete_on_complete preference governs.
+        let should_delete = match &result {
+            Ok(_) => delete_on_complete,
+            Err(_) => true,
+        };
+        if should_delete && let Some(path) = partial_path {
+            let _ = std::fs::remove_file(&path);
+        }
+        return;
+    }
+
     match result {
         Ok(dest) => {
-            entry.stage = TransferStage::Done {
-                local_path: dest.clone(),
-            };
-            emit_stage(event_sink.as_ref(), entry);
-            info!(transfer_id, dest = %dest.display(), "relay fetch complete");
+            if delete_on_complete {
+                // cancel(delete_files=true) was called concurrently and the
+                // stage hadn't gone terminal yet; honour the deletion request.
+                entry.stage = TransferStage::Failed {
+                    reason: "cancelled".to_owned(),
+                };
+                emit_stage(event_sink.as_ref(), entry);
+                drop(t);
+                let _ = std::fs::remove_file(&dest);
+            } else {
+                entry.stage = TransferStage::Done {
+                    local_path: dest.clone(),
+                };
+                emit_stage(event_sink.as_ref(), entry);
+                drop(t);
+                info!(transfer_id, dest = %dest.display(), "relay fetch complete");
+            }
         }
         Err(e) => {
             let msg = e.to_string();
@@ -419,6 +510,11 @@ async fn run_fetch(
                     PluginNotificationLevel::Error,
                     format!("Download failed: {msg}"),
                 );
+            }
+            // Always remove partial/failed downloads — a partial file has no
+            // value and would confuse the user.
+            if let Some(path) = partial_path {
+                let _ = std::fs::remove_file(&path);
             }
         }
     }
@@ -460,20 +556,30 @@ async fn do_fetch(
         .unwrap_or_else(|| "download".to_owned());
     let file_size = resp.file_size;
 
-    // Update transfer metadata from server response.
-    {
-        let mut t = transfers.lock();
-        if let Some(entry) = t.get_mut(transfer_id) {
-            entry.name = file_name.clone();
-            entry.size = file_size;
-        }
-    }
+    // Reject the transfer immediately if the server declares a file size
+    // that exceeds the absolute ceiling. This catches both misconfigured
+    // servers and hostile peers before any disk space is consumed.
+    validate_fetch_progress(0, file_size)?;
 
     // Write to downloads directory. Auto-rename on collision so a
     // re-download of the same name doesn't silently overwrite an
     // earlier copy the user might still want.
     std::fs::create_dir_all(downloads_dir)?;
     let dest = unique_dest_path(downloads_dir, &file_name);
+
+    // Update transfer metadata and record the destination path under one
+    // lock. dest_path must be set before File::create so that run_fetch
+    // can clean up any partial file if the task is cancelled after this
+    // point.
+    {
+        let mut t = transfers.lock();
+        if let Some(entry) = t.get_mut(transfer_id) {
+            entry.name = file_name.clone();
+            entry.size = file_size;
+            entry.dest_path = Some(dest.clone());
+        }
+    }
+
     let file = tokio::fs::File::create(&dest).await?;
     let mut writer = tokio::io::BufWriter::new(file);
     let mut buf = vec![0u8; 64 * 1024];
@@ -484,6 +590,12 @@ async fn do_fetch(
             Ok(Some(n)) if n > 0 => {
                 tokio::io::AsyncWriteExt::write_all(&mut writer, &buf[..n]).await?;
                 received += n as u64;
+
+                // Enforce size cap inside the loop. Catches a server that
+                // streams past its declared size (exact overrun = protocol
+                // violation) and guards against a declared-size lie via the
+                // absolute ceiling checked in validate_fetch_progress.
+                validate_fetch_progress(received, file_size)?;
 
                 let mut t = transfers.lock();
                 if let Some(entry) = t.get_mut(transfer_id) {
@@ -603,6 +715,8 @@ impl FileTransferPlugin for FileTransferRelayPlugin {
                 cancel: CancellationToken::new(),
                 last_sample_bytes: 0,
                 last_sample_at: Instant::now(),
+                dest_path: None,
+                delete_on_complete: false,
             };
             {
                 let mut t = self.transfers.lock();
@@ -677,6 +791,8 @@ impl FileTransferPlugin for FileTransferRelayPlugin {
             cancel: cancel.clone(),
             last_sample_bytes: 0,
             last_sample_at: Instant::now(),
+            dest_path: None,
+            delete_on_complete: false,
         };
 
         {
@@ -735,6 +851,8 @@ impl FileTransferPlugin for FileTransferRelayPlugin {
             cancel: cancel.clone(),
             last_sample_bytes: 0,
             last_sample_at: Instant::now(),
+            dest_path: None,
+            delete_on_complete: false,
         };
 
         {
@@ -766,11 +884,60 @@ impl FileTransferPlugin for FileTransferRelayPlugin {
         anyhow::bail!("relay transfers cannot be resumed")
     }
 
-    fn cancel(&self, id: &TransferId, _delete_files: bool) -> Result<()> {
-        let t = self.transfers.lock();
-        if let Some(entry) = t.get(&id.0) {
-            entry.cancel.cancel();
+    /// Cancel a transfer.
+    ///
+    /// `delete_files` semantics per direction:
+    ///
+    /// - **Active download**: the running task always removes the partial
+    ///   destination file regardless of `delete_files` — partial files have
+    ///   no value. `delete_files = true` additionally causes the task to
+    ///   delete the file even if it finished successfully during the
+    ///   cancellation race window.
+    /// - **Completed download** (`Done`): if `delete_files = true`, the
+    ///   destination file is removed immediately (transfer is already
+    ///   terminal, no task is running).
+    /// - **Upload (any stage)**: the task is cancelled; no local file is
+    ///   ever deleted. The source file being uploaded is the user's own
+    ///   file and must not be touched.
+    fn cancel(&self, id: &TransferId, delete_files: bool) -> Result<()> {
+        let mut t = self.transfers.lock();
+        let Some(entry) = t.get_mut(&id.0) else {
+            return Ok(());
+        };
+
+        if entry.stage.is_terminal() {
+            // Transfer already finished. The only remaining action is
+            // removing a completed download's file if requested.
+            if delete_files
+                && entry.direction == TransferDirection::Download
+                && let TransferStage::Done { local_path } = &entry.stage
+            {
+                let path = local_path.clone();
+                drop(t);
+                let _ = std::fs::remove_file(&path);
+            }
+            return Ok(());
         }
+
+        // Fire the cancellation token so the running task exits at its
+        // next checkpoint.
+        entry.cancel.cancel();
+
+        // For downloads, record the deletion preference so the task can
+        // honor it even if it finishes between now and when the token fires.
+        if delete_files && entry.direction == TransferDirection::Download {
+            entry.delete_on_complete = true;
+        }
+
+        // Set the stage to terminal now. This guarantees the entry can
+        // never stay Active if the task has already exited between its last
+        // select arm and the token check. The task's terminal block checks
+        // is_terminal() before writing; a concurrent write is a no-op.
+        entry.stage = TransferStage::Failed {
+            reason: "cancelled".to_owned(),
+        };
+        emit_stage(self.event_sink.as_ref(), entry);
+
         Ok(())
     }
 
@@ -851,5 +1018,59 @@ mod tests {
         touch(&dir.path().join("readme"));
         let p = unique_dest_path(dir.path(), "readme");
         assert_eq!(p, dir.path().join("readme (2)"));
+    }
+
+    // --- validate_fetch_progress ---
+
+    #[test]
+    fn validate_fetch_progress_accepts_zero_received() {
+        // A zero-byte received count with a valid file_size is always OK.
+        assert!(validate_fetch_progress(0, 0).is_ok());
+        assert!(validate_fetch_progress(0, 1024).is_ok());
+        assert!(
+            validate_fetch_progress(0, rumble_client_traits::MAX_UPLOAD_BYTES).is_ok(),
+            "exactly at ceiling should be accepted"
+        );
+    }
+
+    #[test]
+    fn validate_fetch_progress_rejects_oversized_declaration() {
+        // Server-declared file_size above the ceiling must be rejected before
+        // any bytes are written.
+        let result = validate_fetch_progress(0, rumble_client_traits::MAX_UPLOAD_BYTES + 1);
+        assert!(result.is_err(), "file_size one byte over ceiling must fail");
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("exceeds"), "error message should mention ceiling: {msg}");
+    }
+
+    #[test]
+    fn validate_fetch_progress_rejects_received_equal_to_ceiling_plus_one() {
+        // Even when declared size equals the ceiling, receiving one more byte
+        // is a protocol violation.
+        let ceiling = rumble_client_traits::MAX_UPLOAD_BYTES;
+        let result = validate_fetch_progress(ceiling + 1, ceiling);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("protocol violation"),
+            "overrun error must say protocol violation: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_fetch_progress_accepts_partial_and_exact_receive() {
+        // Receiving up to and including file_size is normal progress.
+        assert!(validate_fetch_progress(100, 200).is_ok());
+        assert!(validate_fetch_progress(200, 200).is_ok(), "exact receive is OK");
+    }
+
+    #[test]
+    fn validate_fetch_progress_rejects_overrun() {
+        // Receiving more than declared is always a protocol violation.
+        assert!(validate_fetch_progress(201, 200).is_err());
+        assert!(
+            validate_fetch_progress(1, 0).is_err(),
+            "any bytes when size=0 is an overrun"
+        );
     }
 }
