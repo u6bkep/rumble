@@ -877,6 +877,37 @@ impl ServerState {
         false
     }
 
+    /// Whether a room with this UUID exists. Root always exists.
+    pub async fn room_exists(&self, room_uuid: Uuid) -> bool {
+        if room_uuid == ROOT_ROOM_UUID {
+            return true;
+        }
+        let data = self.state_data.read().await;
+        data.rooms
+            .iter()
+            .any(|r| uuid_from_room_id(r.id.as_ref().unwrap_or(&root_room_id())) == Some(room_uuid))
+    }
+
+    /// Return `(parent, direct_children)` for `room_uuid`: the room's own parent
+    /// (`None` = directly under Root) and the UUIDs of rooms whose `parent_id`
+    /// points at this room. Returns `None` if the room doesn't exist. Used by
+    /// the delete path to heal the tree (reparent children before removal).
+    pub async fn room_parent_and_children(&self, room_uuid: Uuid) -> Option<(Option<Uuid>, Vec<Uuid>)> {
+        let data = self.state_data.read().await;
+        let parent = data
+            .rooms
+            .iter()
+            .find(|r| uuid_from_room_id(r.id.as_ref().unwrap_or(&root_room_id())) == Some(room_uuid))
+            .map(|r| r.parent_id.as_ref().and_then(uuid_from_room_id))?;
+        let children = data
+            .rooms
+            .iter()
+            .filter(|r| r.parent_id.as_ref().and_then(uuid_from_room_id) == Some(room_uuid))
+            .filter_map(|r| uuid_from_room_id(r.id.as_ref().unwrap_or(&root_room_id())))
+            .collect();
+        Some((parent, children))
+    }
+
     /// Move a room to a new parent. Returns true if the room was found and moved.
     pub async fn move_room(&self, room_uuid: Uuid, new_parent_uuid: Uuid) -> bool {
         let mut data = self.state_data.write().await;

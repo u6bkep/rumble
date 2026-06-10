@@ -257,6 +257,15 @@ pub(crate) async fn apply_create_room(
 ) -> Result<Uuid, String> {
     info!("CreateRoom: {}", name);
 
+    // Reject an unknown parent: creating a room under a non-existent parent
+    // would persist an unreachable orphan (invisible to any parent-walking
+    // room tree and with a truncated ACL chain).
+    if let Some(parent) = parent_uuid
+        && !state.room_exists(parent).await
+    {
+        return Err("Parent room does not exist".to_string());
+    }
+
     let room_uuid = state
         .create_room_with_parent_desc(name.clone(), parent_uuid, description.clone())
         .await;
@@ -313,6 +322,37 @@ pub(crate) async fn apply_delete_room(
         .unwrap_or_else(|| "room".to_string());
 
     info!("DeleteRoom: {}", room_uuid);
+
+    // Heal the tree before removing the room: reparent its direct children to
+    // the deleted room's own parent (Root if it had none), so no subtree is
+    // orphaned with a dangling parent_id. Each child is reparented as its own
+    // move+persist+broadcast step — mirroring the MoveRoom handler — so the
+    // per-step incremental state hash stays correct.
+    if let Some((parent, children)) = state.room_parent_and_children(room_uuid).await {
+        let new_parent = parent.unwrap_or(rumble_protocol::ROOT_ROOM_UUID);
+        for child in children {
+            state.move_room(child, new_parent).await;
+
+            let child_bytes = child.into_bytes();
+            if let Some(mut room) = persistence.get_room(&child_bytes) {
+                room.parent = Some(new_parent.into_bytes());
+                if let Err(e) = persistence.save_room(&child_bytes, &room) {
+                    warn!("Failed to persist child reparent for {child}: {e}");
+                }
+            }
+
+            broadcast_state_update(
+                state,
+                proto::state_update::Update::RoomMoved(proto::RoomMoved {
+                    room_id: Some(room_id_from_uuid(child)),
+                    new_parent_id: Some(room_id_from_uuid(new_parent)),
+                }),
+            )
+            .await
+            .map_err(|e| format!("Failed to broadcast child reparent: {e}"))?;
+        }
+    }
+
     if !state.delete_room(room_uuid).await {
         return Err("Room not found".to_string());
     }
@@ -647,4 +687,82 @@ pub(crate) async fn apply_set_room_acl(
     }
 
     Ok("Room ACL updated".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rumble_protocol::ROOT_ROOM_UUID;
+    use uuid::Uuid;
+
+    fn test_env() -> (Arc<ServerState>, Arc<Persistence>) {
+        let state = Arc::new(ServerState::new());
+        let persist = Arc::new(Persistence::in_memory().expect("in-memory persistence"));
+        (state, persist)
+    }
+
+    /// Deleting a mid-tree room reparents its direct children to the deleted
+    /// room's own parent instead of orphaning them with a dangling parent_id
+    /// (#30). Persisted parent is updated too, so the heal survives restart.
+    #[tokio::test]
+    async fn delete_room_reparents_children_to_grandparent() {
+        let (state, persist) = test_env();
+        let parent = apply_create_room(&state, &persist, "parent".into(), None, None)
+            .await
+            .unwrap();
+        let mid = apply_create_room(&state, &persist, "mid".into(), Some(parent), None)
+            .await
+            .unwrap();
+        let child = apply_create_room(&state, &persist, "child".into(), Some(mid), None)
+            .await
+            .unwrap();
+
+        apply_delete_room(&state, &persist, mid).await.unwrap();
+
+        assert!(!state.room_exists(mid).await, "deleted room is gone");
+        let (child_parent, _) = state.room_parent_and_children(child).await.unwrap();
+        assert_eq!(
+            child_parent,
+            Some(parent),
+            "child must be reparented to the grandparent, not orphaned under the deleted room"
+        );
+
+        let persisted = persist.get_room(&child.into_bytes()).expect("child still persisted");
+        assert_eq!(
+            persisted.parent,
+            Some(parent.into_bytes()),
+            "reparent must be persisted so it survives restart"
+        );
+    }
+
+    /// A top-level room's children fall back to Root when it is deleted.
+    #[tokio::test]
+    async fn delete_top_level_room_reparents_children_to_root() {
+        let (state, persist) = test_env();
+        let top = apply_create_room(&state, &persist, "top".into(), None, None)
+            .await
+            .unwrap();
+        let child = apply_create_room(&state, &persist, "child".into(), Some(top), None)
+            .await
+            .unwrap();
+
+        apply_delete_room(&state, &persist, top).await.unwrap();
+
+        let (child_parent, _) = state.room_parent_and_children(child).await.unwrap();
+        assert_eq!(child_parent, Some(ROOT_ROOM_UUID), "child falls back to Root");
+    }
+
+    /// Creating a room under a non-existent parent is rejected, not persisted as
+    /// an unreachable orphan (#30).
+    #[tokio::test]
+    async fn create_room_rejects_unknown_parent() {
+        let (state, persist) = test_env();
+        let ghost = Uuid::new_v4();
+
+        let err = apply_create_room(&state, &persist, "orphan".into(), Some(ghost), None)
+            .await
+            .unwrap_err();
+        assert!(err.contains("Parent room does not exist"), "got: {err}");
+        assert_eq!(state.get_rooms().await.len(), 1, "nothing created besides Root");
+    }
 }
