@@ -239,8 +239,10 @@ impl<B: UiBackend> RumbleApp<B> {
         register_builtin_processors(&mut processor_registry);
 
         // Push the initial TX pipeline at boot — either the user's
-        // persisted config (merged against the current defaults so
-        // newly-added processors slot in), or a fresh default chain.
+        // persisted config (fixed up only as needed to execute: stale
+        // types dropped, new settings keys backfilled; newly-shipped
+        // processors are NOT added to an existing config), or a fresh
+        // default chain for first-run users.
         let initial_pipeline = match settings.settings().audio.tx_pipeline.as_ref() {
             Some(persisted) => merge_with_default_tx_pipeline(persisted, &processor_registry),
             None => build_default_tx_pipeline(&processor_registry),

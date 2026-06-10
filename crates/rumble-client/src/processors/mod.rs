@@ -76,17 +76,21 @@ pub fn build_default_tx_pipeline(registry: &ProcessorRegistry) -> PipelineConfig
     }
 }
 
-/// Merge a persisted pipeline config with the registry to ensure it can
-/// still be executed, while preserving any runtime composition the user
-/// has done (add / remove / reorder).
+/// Make a persisted pipeline config executable against the current
+/// registry, while preserving the user's composition (add / remove /
+/// reorder) untouched.
 ///
-/// The persisted order is authoritative — this function never reorders
-/// the user's pipeline. It handles schema evolution along three axes:
+/// A persisted config is the user's: this function never adds, removes
+/// (beyond unregistered types), reorders, or re-enables stages. In
+/// particular, built-ins shipped after the config was saved are NOT
+/// appended — they stay discoverable through the settings UI's add-stage
+/// menu, and only brand-new users (no persisted pipeline at all, see
+/// [`build_default_tx_pipeline`]) get them by default. An empty persisted
+/// list means the user removed every stage; it stays empty.
+///
+/// What it does fix up is the minimum needed for execution:
 /// - Processor types no longer registered are dropped (otherwise
 ///   `AudioPipeline::from_config` would fail outright).
-/// - Built-in defaults that the user has never seen are appended to the
-///   end so a newly-shipped processor still surfaces (in its disabled
-///   default state for migrations, enabled state for fresh users).
 /// - Per-processor settings fields added since are backfilled from each
 ///   processor's schema defaults, so every downstream reader (audio
 ///   task, UI display, UI event handlers) sees the same fully populated
@@ -94,7 +98,7 @@ pub fn build_default_tx_pipeline(registry: &ProcessorRegistry) -> PipelineConfig
 ///
 /// Existing values are preserved; only missing keys are filled.
 pub fn merge_with_default_tx_pipeline(persisted: &PipelineConfig, registry: &ProcessorRegistry) -> PipelineConfig {
-    let mut processors: Vec<ProcessorConfig> = persisted
+    let processors: Vec<ProcessorConfig> = persisted
         .processors
         .iter()
         .filter(|p| registry.has(&p.type_id))
@@ -104,20 +108,6 @@ pub fn merge_with_default_tx_pipeline(persisted: &PipelineConfig, registry: &Pro
             config
         })
         .collect();
-
-    // Append any built-in processor the user hasn't seen yet. Migration
-    // semantics: the new processor lands at the end of the chain in its
-    // documented default-enabled state — it's then up to the user to
-    // reorder if they want it earlier.
-    for (type_id, default_enabled) in DEFAULT_TX_PIPELINE {
-        if processors.iter().any(|p| p.type_id == *type_id) {
-            continue;
-        }
-        if let Some(mut config) = registry.default_config(type_id) {
-            config.enabled = *default_enabled;
-            processors.push(config);
-        }
-    }
 
     PipelineConfig {
         processors,
@@ -136,18 +126,22 @@ pub mod type_ids {
 mod merge_tests {
     //! Regression coverage for `merge_with_default_tx_pipeline`.
     //!
-    //! The function exists to handle two evolutions: a new built-in
-    //! processor was added since the user last saved their config (it
-    //! must surface), and a previously-shipped processor was removed
-    //! from the registry (its persisted entry must not stall the
-    //! pipeline). User intent — order, duplicates, custom settings —
-    //! is authoritative and must round-trip unchanged.
+    //! The contract: a persisted config belongs to the user and is
+    //! touched as little as possible on upgrade. Only two fix-ups are
+    //! allowed, both execution necessities: dropping processor types
+    //! the registry no longer knows (they'd stall pipeline build) and
+    //! backfilling settings keys added since (so all downstream readers
+    //! agree on values). Everything else — order, duplicates, enabled
+    //! flags, custom settings, and crucially the *set* of stages — must
+    //! round-trip unchanged.
     //!
-    //! These tests lock those contracts in. Earlier versions of this
-    //! function used a `HashMap<type_id, &ProcessorConfig>` keyed merge
-    //! that silently rewrote the user's pipeline to the default order
-    //! and dropped any non-default processors; if you regress here,
-    //! that's the shape of the bug.
+    //! Two historical bug shapes to not regress into: a
+    //! `HashMap<type_id, &ProcessorConfig>` keyed merge that silently
+    //! rewrote the user's pipeline to the default order and dropped
+    //! non-default processors; and an append step that added newly
+    //! shipped built-ins to existing configs *enabled*, silently
+    //! changing upgrading users' audio processing and transmission
+    //! gating (issue #45).
     use super::*;
     use rumble_audio::{PipelineConfig, ProcessorConfig};
     use serde_json::json;
@@ -166,10 +160,13 @@ mod merge_tests {
         }
     }
 
-    /// An empty persisted config means "first run after upgrade" — the
-    /// default pipeline must materialize.
+    /// An empty persisted list is a deliberate user state ("I removed
+    /// every stage") and must stay empty. Fresh users are distinguished
+    /// upstream by the *absence* of a persisted config
+    /// (`settings.audio.tx_pipeline == None` → `build_default_tx_pipeline`),
+    /// never by an empty list.
     #[test]
-    fn empty_persisted_yields_default_pipeline() {
+    fn empty_persisted_stays_empty() {
         let registry = registry_with_builtins();
         let persisted = PipelineConfig {
             processors: vec![],
@@ -178,10 +175,10 @@ mod merge_tests {
 
         let merged = merge_with_default_tx_pipeline(&persisted, &registry);
 
-        let ids: Vec<&str> = merged.processors.iter().map(|p| p.type_id.as_str()).collect();
-        assert_eq!(ids, [type_ids::GAIN, type_ids::DENOISE, type_ids::VAD]);
-        let enabled: Vec<bool> = merged.processors.iter().map(|p| p.enabled).collect();
-        assert_eq!(enabled, [true, true, false], "matches DEFAULT_TX_PIPELINE flags");
+        assert!(
+            merged.processors.is_empty(),
+            "a user who removed all stages must not have the defaults re-seeded"
+        );
     }
 
     /// User reorder must survive a load. This is the original
@@ -255,11 +252,14 @@ mod merge_tests {
         assert_eq!(merged.processors[1].type_id, type_ids::DENOISE);
     }
 
-    /// A built-in processor that was added after the user's persisted
-    /// config was written must appear in the merged result, appended to
-    /// the end (so it doesn't disturb any reorder the user has done).
+    /// A built-in processor that shipped after the user's persisted
+    /// config was written must NOT be added to their pipeline — doing
+    /// so silently changed upgrading users' audio processing (and, for
+    /// gating stages like denoise, their transmission behavior). New
+    /// stages are discoverable via the settings UI's add-stage menu
+    /// instead (issue #45).
     #[test]
-    fn missing_default_is_appended() {
+    fn missing_default_is_not_added() {
         let registry = registry_with_builtins();
         // Persist only gain — denoise + vad are "new" relative to this
         // config.
@@ -271,9 +271,7 @@ mod merge_tests {
         let merged = merge_with_default_tx_pipeline(&persisted, &registry);
 
         let ids: Vec<&str> = merged.processors.iter().map(|p| p.type_id.as_str()).collect();
-        assert_eq!(ids[0], type_ids::GAIN, "user's existing entry stays first");
-        assert!(ids[1..].contains(&type_ids::DENOISE));
-        assert!(ids[1..].contains(&type_ids::VAD));
+        assert_eq!(ids, [type_ids::GAIN], "exactly the user's stages, nothing appended");
     }
 
     /// Settings keys missing from the persisted config must be filled
