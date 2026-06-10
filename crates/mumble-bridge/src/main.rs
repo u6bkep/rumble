@@ -53,6 +53,13 @@ struct Cli {
     /// the controller authorization survives restarts.
     #[arg(long, value_name = "PATH", default_value = "bridge-identity.key")]
     identity_file: std::path::PathBuf,
+
+    /// Path to the persistent TLS certificate + key (PEM) presented to Mumble
+    /// clients. Generated self-signed on first run (0600 on Unix). Mumble
+    /// clients remember the cert and warn when it changes, so it must stay
+    /// stable across restarts.
+    #[arg(long, value_name = "PATH", default_value = "bridge-mumble-tls.pem")]
+    mumble_tls_file: std::path::PathBuf,
 }
 
 /// Parse a hex SHA-256 fingerprint (colons/whitespace allowed) into 32 bytes.
@@ -176,8 +183,9 @@ async fn main() -> Result<()> {
         let _ = shutdown_tx.send(true);
     });
 
-    // Set up TLS for Mumble server (shared across reconnects)
-    let tls_acceptor = mumble_tls::make_tls_acceptor()?;
+    // Set up TLS for Mumble server (shared across reconnects, persisted so
+    // Mumble clients don't get cert-changed warnings after each restart)
+    let tls_acceptor = mumble_tls::make_tls_acceptor(&cli.mumble_tls_file)?;
 
     // Bridge state persists across reconnects so Mumble clients stay connected
     let bridge_state = Arc::new(RwLock::new(BridgeState::new()));
@@ -330,11 +338,14 @@ async fn main() -> Result<()> {
                 tokio::select! {
                     result = rumble_recv.recv() => {
                         match result {
-                            Ok(Some(frame)) => {
-                                if let Ok(env) = prost::Message::decode(&*frame) {
+                            Ok(Some(frame)) => match prost::Message::decode(&*frame) {
+                                Ok(env) => {
                                     let _ = rumble_bridge_tx.send(BridgeEvent::RumbleEnvelope(env));
                                 }
-                            }
+                                Err(e) => {
+                                    warn!(error = %e, "Failed to decode Rumble envelope, skipping frame");
+                                }
+                            },
                             Ok(None) => {
                                 error!("Rumble connection closed");
                                 break;
@@ -347,11 +358,15 @@ async fn main() -> Result<()> {
                     }
                     result = rumble_conn_for_dgram.read_datagram() => {
                         match result {
-                            Ok(data) => {
-                                if let Ok(datagram) = rumble_protocol::proto::VoiceDatagram::decode(&*data) {
+                            Ok(data) => match rumble_protocol::proto::VoiceDatagram::decode(&*data) {
+                                Ok(datagram) => {
                                     let _ = rumble_bridge_tx.send(BridgeEvent::RumbleVoice(datagram));
                                 }
-                            }
+                                Err(e) => {
+                                    // Voice path: log quietly, a corrupt datagram is droppable
+                                    tracing::debug!(error = %e, "Failed to decode Rumble voice datagram");
+                                }
+                            },
                             Err(e) => {
                                 error!(error = %e, "Rumble datagram error");
                                 break;

@@ -264,6 +264,31 @@ pub async fn run_bridge(
 
                 // Parse the Mumble voice packet and forward to Rumble as datagram
                 if let Some(voice) = mumble_voice::parse_voice_packet(&data) {
+                    // Target 31 = server loopback (the client's echo test):
+                    // echo straight back to the sender and nothing else.
+                    if voice.target == 31 {
+                        if let Some(client) = client_senders.get(&session) {
+                            let echo = mumble_voice::encode_voice_packet(
+                                session,
+                                voice.sequence,
+                                &voice.opus_data,
+                                voice.is_last,
+                            );
+                            let _ = client.tx.send(MumbleOutbound::Voice(echo));
+                        }
+                        continue;
+                    }
+                    // Other non-zero targets are whispers/shouts, which the
+                    // bridge doesn't support. Drop them rather than leaking a
+                    // whisper to the whole room as normal speech.
+                    if voice.target != 0 {
+                        debug!(
+                            session,
+                            target = voice.target,
+                            "Dropping unsupported whisper-target voice"
+                        );
+                        continue;
+                    }
                     // Use bridge-owned sequence counter instead of Mumble's sequence.
                     // Mumble sequences increment by iFramesPerPacket (e.g. 2) per packet,
                     // but Rumble's jitter buffer expects consecutive per-packet sequences.
@@ -302,24 +327,33 @@ pub async fn run_bridge(
 
                 if !target_sessions.is_empty() {
                     // Private message targeting specific sessions.
-                    // Resolve Mumble session to Rumble user ID while holding the lock,
-                    // then drop the lock before the async send.
-                    let target_rumble_id = {
+                    // Resolve Mumble sessions to Rumble user IDs while holding the
+                    // lock, then drop the lock before the async sends. All routing
+                    // (including to Mumble clients on this bridge) goes through the
+                    // server, which delivers back via DirectMessageReceived —
+                    // private messages must never hit the local broadcast below.
+                    let target_rumble_ids: Vec<u64> = {
                         let state = read_bridge(&bridge_state);
-                        target_sessions.iter().find_map(|&ts| {
-                            state
-                                .virtual_user_map
-                                .get(&ts)
-                                .copied()
-                                .or_else(|| state.users.get_rumble_id(ts))
-                        })
+                        target_sessions
+                            .iter()
+                            .filter_map(|&ts| {
+                                state
+                                    .virtual_user_map
+                                    .get(&ts)
+                                    .copied()
+                                    .or_else(|| state.users.get_rumble_id(ts))
+                            })
+                            .collect()
                     };
-                    if let Some(target_id) = target_rumble_id
-                        && let Err(e) = rumble_client::send_direct_message(rumble_send, target_id, &message).await
-                    {
-                        warn!(error = %e, "Failed to send DM to Rumble");
+                    for target_id in target_rumble_ids {
+                        if let Err(e) = rumble_client::send_direct_message(rumble_send, target_id, &message).await {
+                            warn!(error = %e, target_id, "Failed to send DM to Rumble");
+                        }
                     }
-                } else if !target_tree_ids.is_empty() {
+                    continue;
+                }
+
+                if !target_tree_ids.is_empty() {
                     // Tree message - send as tree chat to Rumble
                     let sender_name = {
                         let state = read_bridge(&bridge_state);
@@ -353,7 +387,10 @@ pub async fn run_bridge(
                     }
                 }
 
-                // Also broadcast to other Mumble clients
+                // Also deliver locally to other Mumble clients (the server never
+                // echoes a participant's chat back to its own controller). Tree
+                // messages go to everyone; plain channel messages only to clients
+                // in the sender's channel, matching murmur's room scoping.
                 let sender_channel_id = {
                     let state = read_bridge(&bridge_state);
                     state.mumble_clients.get(&session).map(|c| c.channel_id).unwrap_or(0)
@@ -364,7 +401,27 @@ pub async fn run_bridge(
                     message: Some(message),
                     ..Default::default()
                 };
-                broadcast_to_mumble_except(client_senders, session, MessageType::TextMessage, &text_msg);
+                if !target_tree_ids.is_empty() {
+                    broadcast_to_mumble_except(client_senders, session, MessageType::TextMessage, &text_msg);
+                } else {
+                    let payload = text_msg.encode_to_vec();
+                    let state = read_bridge(&bridge_state);
+                    for (&client_session, sender) in client_senders.iter() {
+                        if client_session == session {
+                            continue;
+                        }
+                        let in_channel = state
+                            .mumble_clients
+                            .get(&client_session)
+                            .is_some_and(|c| c.channel_id == sender_channel_id);
+                        if in_channel {
+                            let _ = sender.tx.send(MumbleOutbound::Protobuf {
+                                msg_type: MessageType::TextMessage as u16,
+                                payload: payload.clone(),
+                            });
+                        }
+                    }
+                }
             }
 
             BridgeEvent::MumbleChannelChange { session, channel_id } => {
@@ -670,7 +727,14 @@ fn handle_rumble_envelope(
             }
         }
         Some(Payload::CommandResult(cr)) => {
-            debug!(success = cr.success, message = %cr.message, "Rumble command result");
+            if cr.success {
+                debug!(command = %cr.command, message = %cr.message, "Rumble command result");
+            } else {
+                // Failures here are the bridge's only feedback channel for the
+                // controller protocol (e.g. ControllerHello rejected because the
+                // bridge key lacks MANAGE_PARTICIPANTS) — never swallow them.
+                warn!(command = %cr.command, message = %cr.message, "Rumble command failed");
+            }
         }
         _ => {}
     }
@@ -771,6 +835,15 @@ fn handle_state_update(
             if state.reverse_virtual_user_map.contains_key(&rumble_id) {
                 return;
             }
+            // Keep the cached roster current so late-joining Mumble clients
+            // (build_user_states) see the user's actual room.
+            if let Some(user) = state
+                .rumble_users
+                .iter_mut()
+                .find(|u| u.user_id.as_ref().map(|id| id.value) == Some(rumble_id))
+            {
+                user.current_room = um.to_room_id.clone();
+            }
             let session = state.users.get_mumble_session(rumble_id);
             let channel_id = um
                 .to_room_id
@@ -791,10 +864,20 @@ fn handle_state_update(
 
         Some(proto::state_update::Update::UserStatusChanged(usc)) => {
             let rumble_id = usc.user_id.as_ref().map(|id| id.value).unwrap_or(0);
-            let state = read_bridge(bridge_state);
+            let mut state = write_bridge(bridge_state);
             // Skip events for our own virtual users
             if state.reverse_virtual_user_map.contains_key(&rumble_id) {
                 return;
+            }
+            // Keep the cached roster current so late-joining Mumble clients
+            // (build_user_states) see the user's actual mute/deaf state.
+            if let Some(user) = state
+                .rumble_users
+                .iter_mut()
+                .find(|u| u.user_id.as_ref().map(|id| id.value) == Some(rumble_id))
+            {
+                user.is_muted = usc.is_muted;
+                user.is_deafened = usc.is_deafened;
             }
             let session = state.users.get_mumble_session(rumble_id);
 

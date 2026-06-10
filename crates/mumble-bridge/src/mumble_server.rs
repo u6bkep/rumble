@@ -73,8 +73,14 @@ async fn handle_mumble_client(
     let (reader, mut writer) = tokio::io::split(tls_stream);
     let mut reader = reader;
 
-    // Phase 1: Authentication handshake
-    let (username, session) = mumble_auth_handshake(&mut reader, &mut writer, &bridge_state, &config).await?;
+    // Phase 1: Authentication handshake. Bounded so a connection that never
+    // authenticates can't pin a handler task forever.
+    let (username, session) = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        mumble_auth_handshake(&mut reader, &mut writer, &bridge_state, &config),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("Mumble auth handshake timed out"))??;
     info!(session, %username, "Mumble client authenticated");
 
     // Register with bridge
@@ -178,28 +184,46 @@ async fn mumble_auth_handshake(
         }
     };
 
-    // Allocate session and register client
-    let session;
-    let channels;
-    let users;
-    {
+    // Allocate session and register client. Checking the name and inserting
+    // happen under one lock so two simultaneous connections can't both claim
+    // the same username; the Reject is sent after the guard is released.
+    let registration = {
         let mut state = write_bridge(bridge_state);
-        session = state.allocate_mumble_session();
-        state.mumble_clients.insert(
-            session,
-            MumbleClient {
-                session,
-                username: username.clone(),
-                channel_id: 0, // Start in root channel
-                is_muted: false,
-                is_deafened: false,
-            },
-        );
 
-        // Snapshot current state for sending to the client
-        channels = build_channel_states(&mut state);
-        users = build_user_states(&state, session);
-    }
+        // Mumble requires unique usernames (murmur rejects with UsernameInUse).
+        // Allowing duplicates would also break the bridge's username-keyed
+        // registration matching and chat attribution.
+        let name_taken = state.mumble_clients.values().any(|c| c.username == username)
+            || state.rumble_users.iter().any(|u| u.username == username);
+        if name_taken {
+            None
+        } else {
+            let session = state.allocate_mumble_session();
+            state.mumble_clients.insert(
+                session,
+                MumbleClient {
+                    session,
+                    username: username.clone(),
+                    channel_id: 0, // Start in root channel
+                    is_muted: false,
+                    is_deafened: false,
+                },
+            );
+
+            // Snapshot current state for sending to the client
+            let channels = build_channel_states(&mut state);
+            let users = build_user_states(&state, session);
+            Some((session, channels, users))
+        }
+    };
+    let Some((session, channels, users)) = registration else {
+        let reject = mumble::Reject {
+            r#type: Some(mumble::reject::RejectType::UsernameInUse.into()),
+            reason: Some(format!("Username \"{username}\" is already in use")),
+        };
+        write_message(writer, MessageType::Reject, &reject).await?;
+        anyhow::bail!("Rejected: username {username:?} in use");
+    };
 
     // Send server Version.
     //
