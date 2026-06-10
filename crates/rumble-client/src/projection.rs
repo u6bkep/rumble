@@ -515,6 +515,13 @@ fn apply_connection(state: &Arc<RwLock<State>>, ev: ConnectionEvent, repaint: &A
     match ev {
         ConnectionEvent::ConnectStarted { server_addr } => {
             s.connection = crate::events::ConnectionState::Connecting { server_addr };
+            // A new connection attempt starts a fresh chat log. Messages
+            // from the previous server must not interleave with the new
+            // one's — in particular file-offer cards, whose share ids are
+            // only meaningful on the server that issued them. A transient
+            // drop (ConnectionLost / Disconnected) keeps the log visible;
+            // only an explicit connect wipes it.
+            s.chat_messages.clear();
         }
         ConnectionEvent::CertificatePending { cert_info } => {
             s.connection = crate::events::ConnectionState::CertificatePending { cert_info };
@@ -558,7 +565,10 @@ fn apply_connection(state: &Arc<RwLock<State>>, ev: ConnectionEvent, repaint: &A
             s.kicked = Some(reason);
         }
         ConnectionEvent::PermissionDenied { message } => {
-            s.permission_denied = Some(message);
+            // No `State` mutation: the user-facing surface is the
+            // `BackendEvent::Toast` the receiver task emits alongside this
+            // event. The variant stays on the bus for typed subscribers.
+            let _ = message;
         }
         ConnectionEvent::ElevatedChanged { .. } => {
             // The is_elevated bit lives on the matching `User` entry,
@@ -946,9 +956,23 @@ fn build_room_chain(
     use rumble_protocol::permissions::{AclEntry, Permissions, RoomAclData};
 
     let mut path = Vec::new();
+    // Guards the parent walk against cycles in the rooms map. The server
+    // is supposed to reject cyclic moves, but a malicious or buggy server
+    // can still deliver one, and the projection task — the sole `State`
+    // writer — must never spin on it. A revisited room terminates the
+    // walk as if the root had been reached.
+    let mut visited = std::collections::HashSet::new();
     let mut current = target;
 
     loop {
+        if !visited.insert(current) {
+            tracing::warn!(
+                target: "rumble_client::projection",
+                room = %current,
+                "room parent cycle detected; truncating ancestor chain"
+            );
+            break;
+        }
         path.push(current);
         if current == rumble_protocol::ROOT_ROOM_UUID {
             break;
@@ -1032,6 +1056,14 @@ mod tests {
         }
     }
 
+    fn room_with_parent(uuid: u128, parent: u128, name: &str) -> RoomInfo {
+        let mut r = room(uuid, name, 0);
+        r.parent_id = Some(RoomId {
+            uuid: parent.to_be_bytes().to_vec(),
+        });
+        r
+    }
+
     fn user(id: u64, name: &str) -> User {
         User {
             user_id: Some(UserId { value: id }),
@@ -1107,5 +1139,35 @@ mod tests {
             compute_server_state_hash(&server_input),
             "a missing user must change the hash"
         );
+    }
+
+    /// A 2-node parent cycle (A → B → A) that never reaches the root
+    /// must terminate with a finite chain. The projection task is the
+    /// sole `State` writer, so an unbounded walk here would freeze the
+    /// whole client.
+    #[test]
+    fn build_room_chain_terminates_on_parent_cycle() {
+        let rooms = vec![room_with_parent(1, 2, "A"), room_with_parent(2, 1, "B")];
+
+        let chain = build_room_chain(&rooms, Uuid::from_u128(1));
+
+        let ids: Vec<Uuid> = chain.iter().map(|(id, _)| *id).collect();
+        assert_eq!(
+            ids,
+            vec![rumble_protocol::ROOT_ROOM_UUID, Uuid::from_u128(2), Uuid::from_u128(1)],
+            "cycle walk must cut at the revisit and anchor at the root"
+        );
+    }
+
+    /// A room that is its own parent must terminate immediately rather
+    /// than walking forever.
+    #[test]
+    fn build_room_chain_terminates_on_self_parent() {
+        let rooms = vec![room_with_parent(1, 1, "A")];
+
+        let chain = build_room_chain(&rooms, Uuid::from_u128(1));
+
+        let ids: Vec<Uuid> = chain.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, vec![rumble_protocol::ROOT_ROOM_UUID, Uuid::from_u128(1)]);
     }
 }

@@ -198,10 +198,16 @@ impl RoomTree {
     }
 
     /// Iterate over all ancestors of a room, from parent to root.
+    ///
+    /// Bounded: a server-delivered parent cycle must not hang the UI
+    /// thread, so the walk yields at most `len()` ancestors — any valid
+    /// chain fits within that, and a cycle is cut off once every node
+    /// has been visited.
     pub fn ancestors(&self, uuid: Uuid) -> impl Iterator<Item = Uuid> + '_ {
         AncestorIterator {
             tree: self,
             current: self.nodes.get(&uuid).and_then(|n| n.parent_id),
+            remaining: self.nodes.len(),
         }
     }
 
@@ -217,15 +223,24 @@ impl RoomTree {
 }
 
 /// Iterator over ancestors of a room.
+///
+/// `remaining` caps the walk at the tree's node count: an acyclic chain
+/// can never be longer than that, so hitting zero means the parent links
+/// contain a cycle and the iterator terminates instead of looping.
 struct AncestorIterator<'a> {
     tree: &'a RoomTree,
     current: Option<Uuid>,
+    remaining: usize,
 }
 
 impl<'a> Iterator for AncestorIterator<'a> {
     type Item = Uuid;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+        self.remaining -= 1;
         let current = self.current?;
         self.current = self.tree.nodes.get(&current).and_then(|n| n.parent_id);
         Some(current)
@@ -1087,8 +1102,6 @@ pub struct State {
     /// Per-room effective permissions (room UUID -> permission bitmask).
     /// Populated from server-computed values in ServerState and updated on ACL changes.
     pub per_room_permissions: HashMap<Uuid, u32>,
-    /// Last permission denied message (for UI toast display). Cleared after reading.
-    pub permission_denied: Option<String>,
     /// Kick reason if we were kicked (for disconnect dialog). Cleared after reading.
     pub kicked: Option<String>,
     /// Server-defined permission group definitions (synced from ServerState).
@@ -1653,7 +1666,6 @@ mod tests {
             room_tree: RoomTree::default(),
             effective_permissions: 0,
             per_room_permissions: HashMap::new(),
-            permission_denied: None,
             kicked: None,
             group_definitions: vec![],
             slash_commands: vec![],
@@ -1665,6 +1677,47 @@ mod tests {
         let users_in_room2 = state.users_in_room(room2_uuid);
         assert_eq!(users_in_room2.len(), 1);
         assert_eq!(users_in_room2[0].username, "user3");
+    }
+
+    fn tree_room(uuid: Uuid, parent: Option<Uuid>, name: &str) -> RoomInfo {
+        RoomInfo {
+            id: Some(room_id_from_uuid(uuid)),
+            name: name.to_string(),
+            parent_id: parent.map(room_id_from_uuid),
+            description: None,
+            inherit_acl: true,
+            acls: vec![],
+            effective_permissions: 0,
+        }
+    }
+
+    /// A server-delivered parent cycle (A → B → A) must not hang the
+    /// ancestor walk — `ancestors`, `depth`, and `is_ancestor` all run
+    /// on the UI thread.
+    #[test]
+    fn ancestors_terminates_on_parent_cycle() {
+        let a = Uuid::from_u128(1);
+        let b = Uuid::from_u128(2);
+        let mut tree = RoomTree::new();
+        tree.rebuild(&[tree_room(a, Some(b), "A"), tree_room(b, Some(a), "B")]);
+
+        // The walk is capped at the node count, so the chain is finite.
+        assert!(tree.ancestors(a).count() <= tree.len());
+        assert!(tree.depth(b) <= tree.len());
+        // In a 2-cycle each node is reachable from the other.
+        assert!(tree.is_ancestor(a, b));
+        assert!(tree.is_ancestor(b, a));
+    }
+
+    /// A self-parent room must yield a finite ancestor chain.
+    #[test]
+    fn ancestors_terminates_on_self_parent() {
+        let a = Uuid::from_u128(1);
+        let mut tree = RoomTree::new();
+        tree.rebuild(&[tree_room(a, Some(a), "A")]);
+
+        assert_eq!(tree.ancestors(a).count(), 1);
+        assert_eq!(tree.depth(a), 1);
     }
 
     #[test]

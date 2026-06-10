@@ -303,7 +303,6 @@ impl<P: Platform> BackendHandle<P> {
             room_tree: Default::default(),
             effective_permissions: 0,
             per_room_permissions: HashMap::new(),
-            permission_denied: None,
             kicked: None,
             group_definitions: vec![],
             slash_commands: vec![],
@@ -928,7 +927,7 @@ async fn run_connection_task<P: Platform>(
     mut command_rx: mpsc::UnboundedReceiver<Command>,
     command_tx: mpsc::UnboundedSender<Command>,
     state: Arc<RwLock<State>>,
-    config: ConnectConfig,
+    mut config: ConnectConfig,
     key_signer: Arc<dyn KeySigning>,
     audio_task: AudioTaskHandle,
     file_transfer_slot: Arc<RwLock<Option<Arc<dyn FileTransferPlugin>>>>,
@@ -1208,8 +1207,9 @@ async fn run_connection_task<P: Platform>(
                                 let command_tx_clone = command_tx.clone();
                                 let ft_slot_for_recv = file_transfer_slot.clone();
                                 let bus_for_recv = bus.clone();
+                                let events_for_recv = events.clone();
                                 tokio::spawn(async move {
-                                    run_receiver_task(recv_stream, state_clone, audio_task_clone, command_tx_clone, ft_slot_for_recv, bus_for_recv, close_flag, teardown_tx_clone, generation).await;
+                                    run_receiver_task(recv_stream, state_clone, audio_task_clone, command_tx_clone, ft_slot_for_recv, bus_for_recv, events_for_recv, close_flag, teardown_tx_clone, generation).await;
                                 });
 
                                 // Spawn stream dispatch task for server-initiated bi-directional streams
@@ -1271,9 +1271,15 @@ async fn run_connection_task<P: Platform>(
                                 });
                             }
 
-                            // Create a new config with the certificate added
-                            let mut new_config = config.clone();
-                            new_config.accepted_certs.push(pending.certificate_der.clone());
+                            // Merge the accepted certificate into the task's
+                            // persistent config: trust is session-scoped, so
+                            // every later Connect in this run (manual
+                            // reconnect, server switch and back) must honor
+                            // it without re-prompting. Cross-run persistence
+                            // is the shell's job — it stores accepted certs
+                            // in settings and seeds `accepted_certs` at
+                            // handle construction.
+                            config.accepted_certs.push(pending.certificate_der.clone());
 
                             // Create a new captured cert holder (shouldn't capture again since cert is now trusted)
                             let captured_cert = new_captured_cert();
@@ -1289,7 +1295,7 @@ async fn run_connection_task<P: Platform>(
                                     &pending.public_key,
                                     key_signer.as_ref(),
                                     pending.password.as_deref(),
-                                    &new_config,
+                                    &config,
                                     captured_cert,
                                 ),
                             ).await {
@@ -1385,8 +1391,9 @@ async fn run_connection_task<P: Platform>(
                                     let command_tx_clone = command_tx.clone();
                                     let ft_slot_for_recv = file_transfer_slot.clone();
                                     let bus_for_recv = bus.clone();
+                                    let events_for_recv = events.clone();
                                     tokio::spawn(async move {
-                                        run_receiver_task(recv_stream, state_clone, audio_task_clone, command_tx_clone, ft_slot_for_recv, bus_for_recv, close_flag, teardown_tx_clone, generation).await;
+                                        run_receiver_task(recv_stream, state_clone, audio_task_clone, command_tx_clone, ft_slot_for_recv, bus_for_recv, events_for_recv, close_flag, teardown_tx_clone, generation).await;
                                     });
 
                                     // Spawn stream dispatch task for server-initiated bi-directional streams
@@ -2231,6 +2238,10 @@ async fn run_receiver_task(
     command_tx: mpsc::UnboundedSender<Command>,
     file_transfer_slot: Arc<RwLock<Option<Arc<dyn FileTransferPlugin>>>>,
     bus: crate::projection::EventBus,
+    // UI notification path for server messages that demand user-visible
+    // feedback (e.g. PermissionDenied → toast); the bus only feeds the
+    // projection and external subscribers, neither of which renders.
+    events: EventSink,
     // Set by the connection task when *it* tears the transport down
     // (Disconnect/Shutdown). When set, the close we observe below is
     // intentional, so we must not emit `ConnectionLost`.
@@ -2247,7 +2258,7 @@ async fn run_receiver_task(
         match tokio::time::timeout(RECV_TIMEOUT, recv.recv()).await {
             Ok(Ok(Some(frame))) => {
                 if let Ok(env) = proto::Envelope::decode(&*frame) {
-                    handle_server_message(env, &state, &command_tx, &bus);
+                    handle_server_message(env, &state, &command_tx, &bus, &events);
                 }
             }
             Ok(Ok(None)) => {
@@ -2466,6 +2477,7 @@ fn handle_server_message(
     state: &Arc<RwLock<State>>,
     command_tx: &mpsc::UnboundedSender<Command>,
     bus: &crate::projection::EventBus,
+    events: &EventSink,
 ) {
     match env.payload {
         Some(Payload::CommandResult(cr)) => {
@@ -2603,6 +2615,13 @@ fn handle_server_message(
         }
         Some(Payload::PermissionDenied(pd)) => {
             warn!("Permission denied: {}", pd.message);
+            // The toast is the user-facing surface for a denial — a
+            // rejected join/create/kick/ACL action must produce visible
+            // feedback. The bus event remains for typed subscribers.
+            events.send(BackendEvent::Toast {
+                level: NotificationLevel::Warn,
+                text: pd.message.clone(),
+            });
             let _ = bus
                 .connection
                 .send(crate::ConnectionEvent::PermissionDenied { message: pd.message });

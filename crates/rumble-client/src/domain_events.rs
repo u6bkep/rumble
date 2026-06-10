@@ -226,8 +226,9 @@ pub enum ConnectionEvent {
     Kicked { reason: String },
 
     /// Server denied a command we issued (insufficient permission).
-    /// Projection sets `state.permission_denied = Some(message)` so
-    /// the UI can surface a toast on next frame.
+    /// Not folded into `State`; the receiver task surfaces it to the
+    /// user via `BackendEvent::Toast`. This variant exists for typed
+    /// bus subscribers.
     PermissionDenied { message: String },
 
     /// Superuser elevation transitioned. `is_elevated` mirrors the
