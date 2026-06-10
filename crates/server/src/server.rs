@@ -310,6 +310,12 @@ fn build_quic_server_config(
     ));
     transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
     transport_config.datagram_receive_buffer_size(Some(65536));
+    // Cap concurrent bidi streams per connection (quinn defaults to 100). A
+    // client needs the long-lived control stream plus a handful of short-lived
+    // plugin streams (e.g. file transfers); 32 is far more than legitimate use
+    // and bounds per-connection stream state against abuse. Voice uses
+    // datagrams, not streams, so this does not affect it.
+    transport_config.max_concurrent_bidi_streams(32u32.into());
     server_config.transport_config(Arc::new(transport_config));
 
     Ok(server_config)

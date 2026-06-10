@@ -75,6 +75,40 @@ struct CachedFile {
     created_at: Instant,
 }
 
+/// RAII reservation against the relay's total-bytes quota.
+///
+/// Taken (via [`FileTransferRelayPlugin::try_reserve`]) *before* an upload body
+/// is read, so concurrent uploads can't each pass a stale total and
+/// collectively buffer far more than `max_total_size`. Refunds the reservation
+/// on drop — i.e. on any early return — unless [`Self::commit`] is called once
+/// the file is actually stored.
+struct QuotaGuard {
+    total: Arc<AtomicU64>,
+    amount: u64,
+    committed: bool,
+}
+
+impl QuotaGuard {
+    /// Keep the reserved bytes counted (the file was stored).
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for QuotaGuard {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.total.fetch_sub(self.amount, Ordering::AcqRel);
+        }
+    }
+}
+
+/// Per-read inactivity timeout while streaming an upload body. A stream that
+/// makes no progress for this long is aborted (and its quota refunded), so a
+/// stalled upload can't pin a reservation indefinitely. Generous enough that a
+/// slow-but-steady transfer never trips it.
+const UPLOAD_STALL_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Configuration for the relay cache.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct RelayCacheConfig {
@@ -153,6 +187,35 @@ impl FileTransferRelayPlugin {
         }
     }
 
+    /// Atomically reserve `amount` bytes against the total-size quota, returning
+    /// a [`QuotaGuard`] that refunds on drop. Returns `None` if the reservation
+    /// would exceed `max_total_size`. Because the reservation is atomic and
+    /// happens before the body is read, concurrent uploads see each other's
+    /// reservations and can't collectively overcommit memory.
+    fn try_reserve(&self, amount: u64) -> Option<QuotaGuard> {
+        let max = self.config.max_total_size.as_u64();
+        let mut current = self.total_cached.load(Ordering::Acquire);
+        loop {
+            let next = current.checked_add(amount)?;
+            if next > max {
+                return None;
+            }
+            match self
+                .total_cached
+                .compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => {
+                    return Some(QuotaGuard {
+                        total: self.total_cached.clone(),
+                        amount,
+                        committed: false,
+                    });
+                }
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
     /// Handle an upload stream.
     async fn handle_upload(
         &self,
@@ -189,13 +252,6 @@ impl FileTransferRelayPlugin {
             return Ok(());
         }
 
-        let current_total = self.total_cached.load(Ordering::Relaxed);
-        if current_total + upload.file_size > self.config.max_total_size.as_u64() {
-            info!(transfer_id = %transfer_id, "rejecting upload: cache full");
-            reject_plugin_stream(&mut send, &mut recv, REJECT_CODE_CACHE_FULL, "server cache full").await?;
-            return Ok(());
-        }
-
         // Overwrites are refused outright: a transfer_id is claimed once. (The
         // insert below re-checks atomically to close the concurrent-upload race;
         // this early check just avoids reading a body we will reject.)
@@ -228,6 +284,17 @@ impl FileTransferRelayPlugin {
             return Ok(());
         }
 
+        // Reserve quota for the declared size *before* reading the body. This is
+        // the real memory bound: without it, concurrent uploads each pass a
+        // stale total and collectively buffer far more than max_total_size. The
+        // guard refunds on any early return below and is committed only once the
+        // file is stored.
+        let Some(quota) = self.try_reserve(upload.file_size) else {
+            info!(transfer_id = %transfer_id, "rejecting upload: cache full");
+            reject_plugin_stream(&mut send, &mut recv, REJECT_CODE_CACHE_FULL, "server cache full").await?;
+            return Ok(());
+        };
+
         // Admit. The client waits for this ack before sending body bytes.
         send_plugin_ack_ok(&mut send).await?;
 
@@ -240,7 +307,22 @@ impl FileTransferRelayPlugin {
 
         while remaining > 0 {
             let to_read = remaining.min(buf.len());
-            match recv.read(&mut buf[..to_read]).await {
+            // Bound how long a stalled stream can hold its quota reservation: a
+            // read making no progress within the timeout aborts the upload (the
+            // `quota` guard refunds on the early return).
+            let read = match tokio::time::timeout(UPLOAD_STALL_TIMEOUT, recv.read(&mut buf[..to_read])).await {
+                Ok(r) => r,
+                Err(_) => {
+                    warn!(transfer_id = %transfer_id, "upload stalled; aborting");
+                    let resp = proto::RelayUploadResponse {
+                        status: proto::RelayResult::Error.into(),
+                        error: format!("upload stalled after {} of {} bytes", data.len(), file_size),
+                    };
+                    write_length_prefixed(&mut send, &resp.encode_to_vec()).await?;
+                    return Ok(());
+                }
+            };
+            match read {
                 Ok(Some(n)) if n > 0 => {
                     data.extend_from_slice(&buf[..n]);
                     remaining -= n;
@@ -287,7 +369,9 @@ impl FileTransferRelayPlugin {
                 });
             }
         }
-        self.total_cached.fetch_add(actual_size, Ordering::Relaxed);
+        // Stored: keep the reserved bytes counted. (actual_size == the reserved
+        // declared size — the read loop above consumes exactly file_size bytes.)
+        quota.commit();
 
         info!(
             transfer_id = %transfer_id,
@@ -563,5 +647,63 @@ impl crate::plugin::PluginFactory for FileTransferRelayFactory {
             None => RelayCacheConfig::default(),
         };
         Ok(Box::new(FileTransferRelayPlugin::with_config(config)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plugin_with_total(max_bytes: u64) -> FileTransferRelayPlugin {
+        let config = RelayCacheConfig {
+            max_total_size: bytesize::ByteSize::b(max_bytes),
+            ..RelayCacheConfig::default()
+        };
+        FileTransferRelayPlugin::with_config(config)
+    }
+
+    // The core of the #25 fix: reservations are atomic and bound the total, so
+    // concurrent uploads can't each pass a stale total and overcommit memory.
+    #[test]
+    fn reservations_bound_total_and_refund_on_drop() {
+        let plugin = plugin_with_total(100);
+
+        let a = plugin.try_reserve(60).expect("first reservation fits");
+        // A second concurrent reservation sees the first and is bounded.
+        assert!(plugin.try_reserve(60).is_none(), "second 60 must not exceed 100");
+        let b = plugin.try_reserve(40).expect("40 fits alongside 60");
+        assert!(plugin.try_reserve(1).is_none(), "no room left at the cap");
+
+        // Dropping `a` refunds its 60.
+        drop(a);
+        assert_eq!(plugin.total_cached.load(Ordering::Acquire), 40);
+        let c = plugin.try_reserve(60).expect("room freed after refund");
+
+        drop(b);
+        drop(c);
+        assert_eq!(
+            plugin.total_cached.load(Ordering::Acquire),
+            0,
+            "all reservations refunded"
+        );
+    }
+
+    #[test]
+    fn committed_reservation_is_kept() {
+        let plugin = plugin_with_total(100);
+        let g = plugin.try_reserve(50).expect("fits");
+        g.commit();
+        assert_eq!(
+            plugin.total_cached.load(Ordering::Acquire),
+            50,
+            "committed bytes stay counted (no refund on drop)"
+        );
+    }
+
+    #[test]
+    fn reservation_guards_against_u64_overflow() {
+        let plugin = plugin_with_total(u64::MAX);
+        let _g = plugin.try_reserve(u64::MAX - 10).expect("fits under MAX");
+        assert!(plugin.try_reserve(100).is_none(), "addition would overflow u64");
     }
 }
