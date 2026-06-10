@@ -7,9 +7,10 @@
 //!
 //! 1. Client opens a `"file-relay"` stream, writes type discriminator `0x01`,
 //!    then a length-prefixed [`proto::RelayUpload`] with the file metadata.
-//! 2. Server validates size limits, quota, and room membership, then sends a
-//!    length-prefixed [`proto::PluginStreamAck`]. On rejection the server
-//!    also calls `recv.stop` so the client does not stream the body.
+//! 2. Server validates size limits, quota, that the `transfer_id` is unused,
+//!    and that the uploader holds `TEXT_MESSAGE` in the claimed room, then
+//!    sends a length-prefixed [`proto::PluginStreamAck`]. On rejection the
+//!    server also calls `recv.stop` so the client does not stream the body.
 //! 3. On `Ok` ack, the client streams the raw file bytes and finishes the
 //!    send side.
 //! 4. Server stores in the room-scoped cache and writes a length-prefixed
@@ -21,7 +22,13 @@
 //! 2. Sends type discriminator `0x02`, then length-prefixed
 //!    [`proto::RelayFetch`].
 //! 3. Server responds with length-prefixed [`proto::RelayFetchResponse`],
-//!    then raw file bytes (if found).
+//!    then raw file bytes — but only if the caller holds `ENTER` in the file's
+//!    room. A caller who lacks permission gets the same `NotFound` response as
+//!    a missing id, so the relay never reveals files in rooms they can't see.
+//!
+//! Both flows require the connection to be authenticated (the auth gate in
+//! `dispatch_secondary_stream` rejects plugin streams from unauthenticated
+//! connections before they reach this plugin).
 
 use std::{
     sync::{
@@ -34,9 +41,10 @@ use std::{
 use anyhow::Result;
 use dashmap::DashMap;
 use prost::Message;
-use rumble_protocol::proto;
+use rumble_protocol::{permissions::Permissions, proto};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
+use uuid::Uuid;
 
 use crate::{
     plugin::{
@@ -49,7 +57,13 @@ use crate::{
 /// Plugin-specific ack rejection codes for the file relay.
 const REJECT_CODE_TOO_LARGE: u32 = 1;
 const REJECT_CODE_CACHE_FULL: u32 = 2;
-const REJECT_CODE_ROOM_MISMATCH: u32 = 3;
+// 3 (room mismatch) retired: room authorization is now an ACL check folded into
+// REJECT_CODE_FORBIDDEN.
+/// Caller lacks permission to upload to the claimed room (no `TEXT_MESSAGE`),
+/// or the room id is missing/unparseable.
+const REJECT_CODE_FORBIDDEN: u32 = 4;
+/// A file is already cached under this `transfer_id`; overwrites are refused.
+const REJECT_CODE_DUPLICATE_ID: u32 = 5;
 
 /// A cached file entry.
 struct CachedFile {
@@ -182,14 +196,36 @@ impl FileTransferRelayPlugin {
             return Ok(());
         }
 
-        if let Some(actual_room) = ctx.get_user_room(user_id) {
-            let actual_room_str = actual_room.to_string();
-            if actual_room_str != upload.room_id {
-                let reason = format!("room mismatch: you are in {actual_room_str}, not {}", upload.room_id);
-                info!(transfer_id = %transfer_id, "{reason}");
-                reject_plugin_stream(&mut send, &mut recv, REJECT_CODE_ROOM_MISMATCH, reason).await?;
-                return Ok(());
-            }
+        // Overwrites are refused outright: a transfer_id is claimed once. (The
+        // insert below re-checks atomically to close the concurrent-upload race;
+        // this early check just avoids reading a body we will reject.)
+        if self.cache.contains_key(&transfer_id) {
+            info!(transfer_id = %transfer_id, "rejecting upload: transfer id already in use");
+            reject_plugin_stream(
+                &mut send,
+                &mut recv,
+                REJECT_CODE_DUPLICATE_ID,
+                "transfer id already in use",
+            )
+            .await?;
+            return Ok(());
+        }
+
+        // Authorization: the uploader must hold TEXT_MESSAGE in the claimed room
+        // (a file is an attachment to a chat post). Fail closed if the room id is
+        // missing or unparseable — never trust an unverified room.
+        let Ok(room_uuid) = Uuid::parse_str(&upload.room_id) else {
+            let reason = format!("invalid room id: {}", upload.room_id);
+            info!(transfer_id = %transfer_id, "{reason}");
+            reject_plugin_stream(&mut send, &mut recv, REJECT_CODE_FORBIDDEN, reason).await?;
+            return Ok(());
+        };
+        let perms = ctx.user_room_permissions(sender, room_uuid).await;
+        if !perms.contains(Permissions::TEXT_MESSAGE) {
+            let reason = format!("not permitted to upload to room {}", upload.room_id);
+            info!(user_id, transfer_id = %transfer_id, "{reason}");
+            reject_plugin_stream(&mut send, &mut recv, REJECT_CODE_FORBIDDEN, reason).await?;
+            return Ok(());
         }
 
         // Admit. The client waits for this ack before sending body bytes.
@@ -225,22 +261,32 @@ impl FileTransferRelayPlugin {
             }
         }
 
-        // Store in cache.
+        // Store in cache via the entry API: a concurrent upload that claimed the
+        // same id between our early check and here is rejected, never
+        // overwritten. (Because ids are never overwritten, total_cached also
+        // can't underflow.)
         let actual_size = data.len() as u64;
-        if let Some(old) = self.cache.get(&transfer_id) {
-            self.total_cached.fetch_sub(old.file_size, Ordering::Relaxed);
+        match self.cache.entry(transfer_id.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(_) => {
+                info!(transfer_id = %transfer_id, "rejecting upload: transfer id claimed concurrently");
+                let resp = proto::RelayUploadResponse {
+                    status: proto::RelayResult::Error.into(),
+                    error: "transfer id already in use".to_string(),
+                };
+                write_length_prefixed(&mut send, &resp.encode_to_vec()).await?;
+                return Ok(());
+            }
+            dashmap::mapref::entry::Entry::Vacant(v) => {
+                v.insert(CachedFile {
+                    room_id: upload.room_id.clone(),
+                    file_name: upload.file_name.clone(),
+                    file_size: actual_size,
+                    mime: upload.mime.clone(),
+                    data,
+                    created_at: Instant::now(),
+                });
+            }
         }
-        self.cache.insert(
-            transfer_id.clone(),
-            CachedFile {
-                room_id: upload.room_id.clone(),
-                file_name: upload.file_name.clone(),
-                file_size: actual_size,
-                mime: upload.mime.clone(),
-                data,
-                created_at: Instant::now(),
-            },
-        );
         self.total_cached.fetch_add(actual_size, Ordering::Relaxed);
 
         info!(
@@ -260,7 +306,13 @@ impl FileTransferRelayPlugin {
     }
 
     /// Handle a fetch stream.
-    async fn handle_fetch(&self, mut send: quinn::SendStream, mut recv: quinn::RecvStream) -> Result<()> {
+    async fn handle_fetch(
+        &self,
+        mut send: quinn::SendStream,
+        mut recv: quinn::RecvStream,
+        sender: &Arc<ClientHandle>,
+        ctx: &ServerCtx,
+    ) -> Result<()> {
         let msg_buf = read_length_prefixed(&mut recv).await?;
         let fetch = proto::RelayFetch::decode(&msg_buf[..])?;
 
@@ -268,8 +320,26 @@ impl FileTransferRelayPlugin {
 
         debug!(transfer_id = %transfer_id, "file relay fetch request");
 
-        // Look up in cache.
-        let entry = self.cache.get(&transfer_id);
+        // Authorization: the fetcher must be permitted into the file's room
+        // (ENTER) — the same gate as seeing that room's chat, where the
+        // transfer_id was distributed. Look up the room without holding the map
+        // guard across the permission evaluation. A caller who lacks permission
+        // gets the same NotFound response as a missing id, so the relay never
+        // reveals that an id exists in a room they can't see.
+        let room_id_str = self.cache.get(&transfer_id).map(|c| c.room_id.clone());
+        let authorized = match room_id_str {
+            Some(room_id_str) => match Uuid::parse_str(&room_id_str) {
+                Ok(room_uuid) => ctx
+                    .user_room_permissions(sender, room_uuid)
+                    .await
+                    .contains(Permissions::ENTER),
+                Err(_) => false,
+            },
+            None => false,
+        };
+
+        // Re-look-up after the await (the entry may have expired meanwhile).
+        let entry = if authorized { self.cache.get(&transfer_id) } else { None };
         match entry {
             Some(cached) => {
                 let resp = proto::RelayFetchResponse {
@@ -386,7 +456,7 @@ impl ServerPlugin for FileTransferRelayPlugin {
                     _ = child_cancel.cancelled() => {
                         debug!("fetch stream cancelled by shutdown");
                     }
-                    result = self.handle_fetch(send, recv) => {
+                    result = self.handle_fetch(send, recv, sender, ctx) => {
                         if let Err(e) = result {
                             warn!(user_id = sender.user_id, "fetch error: {e}");
                         }

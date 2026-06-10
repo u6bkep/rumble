@@ -236,6 +236,18 @@ impl ServerCtx {
         &self.state
     }
 
+    /// Evaluate a client's effective permissions in `room`, for plugins that
+    /// authorize room-scoped actions (e.g. the file relay gating upload/fetch on
+    /// the file's room). Encapsulates ACL evaluation so plugins don't depend on
+    /// the `acl` module directly.
+    pub async fn user_room_permissions(
+        &self,
+        sender: &ClientHandle,
+        room: Uuid,
+    ) -> rumble_protocol::permissions::Permissions {
+        crate::acl::evaluate_user_permissions(&self.state, sender, room, &self.persistence).await
+    }
+
     /// Post a chat message authored by `author_id` (a participant or client)
     /// into a specific `room`, regardless of the author's own room. Subject to
     /// the author's `TEXT_MESSAGE` ACL in `room`.

@@ -1848,3 +1848,287 @@ async fn test_rooms_persist_across_restart() {
         client.close();
     }
 }
+
+// ===========================================================================
+// File transfer relay — authorization tests (issue #24)
+//
+// These exercise the server's "file-relay" plugin stream directly over QUIC:
+// the auth gate in dispatch_secondary_stream, the ACL checks in the relay, and
+// the overwrite-rejection. Both `TestClient` and `RawConnection` own a
+// `quinn::Connection`, so the helpers below speak the relay wire protocol
+// (u16 plugin-name header -> 1 type byte -> u32-length-prefixed protos).
+// ===========================================================================
+
+const FILE_RELAY_PLUGIN: &str = "file-relay";
+
+fn relay_stream_header() -> Vec<u8> {
+    let name = FILE_RELAY_PLUGIN.as_bytes();
+    let mut buf = Vec::with_capacity(2 + name.len());
+    buf.extend_from_slice(&(name.len() as u16).to_be_bytes());
+    buf.extend_from_slice(name);
+    buf
+}
+
+async fn relay_write_frame(send: &mut quinn::SendStream, data: &[u8]) -> Result<()> {
+    send.write_all(&(data.len() as u32).to_be_bytes()).await?;
+    send.write_all(data).await?;
+    Ok(())
+}
+
+async fn relay_read_frame(recv: &mut quinn::RecvStream) -> Result<Vec<u8>> {
+    let mut len = [0u8; 4];
+    recv.read_exact(&mut len).await?;
+    let n = u32::from_be_bytes(len) as usize;
+    let mut buf = vec![0u8; n];
+    recv.read_exact(&mut buf).await?;
+    Ok(buf)
+}
+
+fn root_room_id_string() -> String {
+    rumble_protocol::ROOT_ROOM_UUID.to_string()
+}
+
+#[derive(Debug)]
+enum UploadOutcome {
+    Stored,
+    Rejected {
+        code: u32,
+        error: String,
+    },
+    /// Server closed the stream without acking (e.g. the unauthenticated gate).
+    Closed,
+}
+
+async fn relay_upload(
+    conn: &quinn::Connection,
+    transfer_id: &str,
+    room_id: &str,
+    data: &[u8],
+) -> Result<UploadOutcome> {
+    let req = proto::RelayUpload {
+        transfer_id: transfer_id.to_string(),
+        room_id: room_id.to_string(),
+        file_name: "test.bin".to_string(),
+        file_size: data.len() as u64,
+        mime: "application/octet-stream".to_string(),
+    };
+
+    let (mut send, mut recv) = conn.open_bi().await?;
+    // Writes can fail if the server reset the stream (auth gate) — treat as Closed.
+    let wrote = async {
+        send.write_all(&relay_stream_header()).await?;
+        send.write_all(&[0x01]).await?; // upload discriminator
+        relay_write_frame(&mut send, &req.encode_to_vec()).await?;
+        anyhow::Ok(())
+    }
+    .await;
+    if wrote.is_err() {
+        return Ok(UploadOutcome::Closed);
+    }
+
+    let ack = match relay_read_frame(&mut recv).await {
+        Ok(b) => proto::PluginStreamAck::decode(&b[..])?,
+        Err(_) => return Ok(UploadOutcome::Closed),
+    };
+    if ack.status != proto::PluginAckStatus::Ok as i32 {
+        return Ok(UploadOutcome::Rejected {
+            code: ack.code,
+            error: ack.error,
+        });
+    }
+
+    // Accepted: stream the body, then read the completion response.
+    send.write_all(data).await?;
+    send.finish()?;
+    let resp = proto::RelayUploadResponse::decode(&relay_read_frame(&mut recv).await?[..])?;
+    if resp.status == proto::RelayResult::Ok as i32 {
+        Ok(UploadOutcome::Stored)
+    } else {
+        Ok(UploadOutcome::Rejected {
+            code: 0,
+            error: resp.error,
+        })
+    }
+}
+
+#[derive(Debug)]
+enum FetchOutcome {
+    Found(Vec<u8>),
+    NotFound,
+    /// Server closed the stream without a response (e.g. the unauthenticated gate).
+    Closed,
+}
+
+async fn relay_fetch(conn: &quinn::Connection, transfer_id: &str) -> Result<FetchOutcome> {
+    let req = proto::RelayFetch {
+        transfer_id: transfer_id.to_string(),
+    };
+
+    let (mut send, mut recv) = conn.open_bi().await?;
+    let wrote = async {
+        send.write_all(&relay_stream_header()).await?;
+        send.write_all(&[0x02]).await?; // fetch discriminator
+        relay_write_frame(&mut send, &req.encode_to_vec()).await?;
+        send.finish()?;
+        anyhow::Ok(())
+    }
+    .await;
+    if wrote.is_err() {
+        return Ok(FetchOutcome::Closed);
+    }
+
+    let resp = match relay_read_frame(&mut recv).await {
+        Ok(b) => proto::RelayFetchResponse::decode(&b[..])?,
+        Err(_) => return Ok(FetchOutcome::Closed),
+    };
+    if resp.status == proto::RelayResult::Ok as i32 {
+        let mut data = vec![0u8; resp.file_size as usize];
+        recv.read_exact(&mut data).await?;
+        Ok(FetchOutcome::Found(data))
+    } else {
+        Ok(FetchOutcome::NotFound)
+    }
+}
+
+/// Happy path: an authenticated client uploads a file in its room and another
+/// authenticated client in the same room fetches it back byte-for-byte.
+#[tokio::test]
+async fn file_relay_upload_then_fetch_roundtrip() {
+    let port = next_test_port();
+    let server = start_server(port);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let addr = format!("127.0.0.1:{}", port);
+
+    let uploader = TestClient::connect(&addr, "uploader", &server.cert_path)
+        .await
+        .expect("uploader connects");
+    let fetcher = TestClient::connect(&addr, "fetcher", &server.cert_path)
+        .await
+        .expect("fetcher connects");
+
+    let payload = b"hello file relay".to_vec();
+    let up = relay_upload(&uploader.conn, "roundtrip-1", &root_room_id_string(), &payload)
+        .await
+        .unwrap();
+    assert!(matches!(up, UploadOutcome::Stored), "upload should store, got {up:?}");
+
+    let got = relay_fetch(&fetcher.conn, "roundtrip-1").await.unwrap();
+    match got {
+        FetchOutcome::Found(data) => assert_eq!(data, payload, "fetched bytes must match uploaded"),
+        other => panic!("expected the file, got {other:?}"),
+    }
+}
+
+/// Auth gate: a connection that completed TLS + ClientHello but never sent
+/// Authenticate must not reach the relay plugin at all — its streams are
+/// dropped, distinct from an authenticated-but-missing fetch (NotFound).
+#[tokio::test]
+async fn file_relay_rejects_unauthenticated_stream() {
+    let port = next_test_port();
+    let server = start_server(port);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let addr = format!("127.0.0.1:{}", port);
+
+    let key = random_signing_key();
+    let raw = RawConnection::connect_no_auth(
+        &addr,
+        "lurker",
+        &key.verifying_key().to_bytes(),
+        None,
+        &server.cert_path,
+    )
+    .await
+    .expect("no-auth connect reaches ServerHello");
+
+    let fetched = relay_fetch(&raw.conn, "anything").await.unwrap();
+    assert!(
+        matches!(fetched, FetchOutcome::Closed),
+        "unauthenticated fetch must be refused by the gate, got {fetched:?}"
+    );
+
+    let uploaded = relay_upload(&raw.conn, "x", &root_room_id_string(), b"data")
+        .await
+        .unwrap();
+    assert!(
+        matches!(uploaded, UploadOutcome::Closed),
+        "unauthenticated upload must be refused by the gate, got {uploaded:?}"
+    );
+}
+
+/// Overwrites are refused outright: a second upload under an existing
+/// transfer_id is rejected and the original content is preserved.
+#[tokio::test]
+async fn file_relay_rejects_duplicate_transfer_id() {
+    let port = next_test_port();
+    let server = start_server(port);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let addr = format!("127.0.0.1:{}", port);
+
+    let client = TestClient::connect(&addr, "dup", &server.cert_path).await.unwrap();
+
+    let first = relay_upload(&client.conn, "dup-id", &root_room_id_string(), b"first")
+        .await
+        .unwrap();
+    assert!(
+        matches!(first, UploadOutcome::Stored),
+        "first upload stores, got {first:?}"
+    );
+
+    let second = relay_upload(&client.conn, "dup-id", &root_room_id_string(), b"second")
+        .await
+        .unwrap();
+    match second {
+        UploadOutcome::Rejected { code, error } => {
+            assert_eq!(code, 5, "duplicate should reject with DUPLICATE_ID(5)");
+            assert!(!error.is_empty(), "rejection should carry a reason");
+        }
+        other => panic!("expected duplicate rejection, got {other:?}"),
+    }
+
+    let got = relay_fetch(&client.conn, "dup-id").await.unwrap();
+    match got {
+        FetchOutcome::Found(data) => assert_eq!(data, b"first", "original file must not be overwritten"),
+        other => panic!("expected the original file, got {other:?}"),
+    }
+}
+
+/// Fail closed: an upload whose room id is missing/unparseable is refused
+/// (FORBIDDEN) rather than trusted.
+#[tokio::test]
+async fn file_relay_rejects_upload_to_invalid_room() {
+    let port = next_test_port();
+    let server = start_server(port);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let addr = format!("127.0.0.1:{}", port);
+
+    let client = TestClient::connect(&addr, "bad-room", &server.cert_path).await.unwrap();
+
+    let up = relay_upload(&client.conn, "badroom-1", "not-a-uuid", b"data")
+        .await
+        .unwrap();
+    match up {
+        UploadOutcome::Rejected { code, error } => {
+            assert_eq!(code, 4, "invalid room should reject with FORBIDDEN(4)");
+            assert!(!error.is_empty(), "rejection should carry a reason");
+        }
+        other => panic!("expected forbidden rejection, got {other:?}"),
+    }
+}
+
+/// Baseline: an authenticated fetch of a missing id is NotFound — the same
+/// response a permission-denied fetch returns, so existence isn't revealed.
+#[tokio::test]
+async fn file_relay_fetch_unknown_id_returns_not_found() {
+    let port = next_test_port();
+    let server = start_server(port);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let addr = format!("127.0.0.1:{}", port);
+
+    let client = TestClient::connect(&addr, "seeker", &server.cert_path).await.unwrap();
+
+    let outcome = relay_fetch(&client.conn, "does-not-exist").await.unwrap();
+    assert!(
+        matches!(outcome, FetchOutcome::NotFound),
+        "unknown id should be NotFound, got {outcome:?}"
+    );
+}

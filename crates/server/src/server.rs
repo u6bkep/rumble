@@ -19,7 +19,10 @@ use rumble_protocol::{
 use std::{
     net::SocketAddr,
     path::PathBuf,
-    sync::{Arc, atomic::AtomicBool},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::RwLock;
@@ -639,6 +642,19 @@ async fn dispatch_secondary_stream(
         if let Ok(plugin_name) = std::str::from_utf8(&name_buf)
             && let Some(plugin) = plugins.iter().find(|p| p.name() == plugin_name)
         {
+            // Gate: plugin streams require the connection to have completed the
+            // Ed25519 auth handshake (on the primary control stream). Plugins
+            // like the file relay assume an identified caller for their own
+            // authorization (room ACLs); a connection that only did the TLS
+            // handshake must not reach them. Auth itself never happens over a
+            // plugin stream, so there is no legitimate pre-auth case.
+            if !authenticated.load(Ordering::SeqCst) {
+                warn!(
+                    plugin = plugin_name,
+                    user_id, "rejecting plugin stream from unauthenticated connection"
+                );
+                return;
+            }
             // It's a plugin stream -- build header and dispatch
             info!(plugin = plugin_name, "routing secondary stream to plugin");
             let header = StreamHeader {
