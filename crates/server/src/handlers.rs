@@ -30,7 +30,7 @@ use rumble_protocol::{
 };
 use std::{
     sync::{Arc, atomic::Ordering},
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -1530,18 +1530,74 @@ async fn send_server_state_to_client(
     Ok(())
 }
 
+/// How long a single client's control-stream write may block before the server
+/// gives up on it. [`ClientHandle::send_frame`] does `write_all`, which parks on
+/// the QUIC flow-control window; a client that stops reading its control stream
+/// would otherwise pin that send indefinitely.
+const BROADCAST_SEND_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Send one already-encoded control `frame` to every client concurrently and
+/// time-bounded, so a single slow or stuck consumer can't head-of-line-block
+/// delivery to everyone else (#27).
+///
+/// A client whose write doesn't finish within [`BROADCAST_SEND_TIMEOUT`] has its
+/// connection closed: cancelling a partial `write_all` would desync that
+/// stream's framing, so a stalled client is dropped rather than left
+/// half-written. All sends are awaited before returning, so successive
+/// broadcasts stay ordered per client.
+async fn broadcast_frame(clients: Vec<Arc<ClientHandle>>, frame: Arc<[u8]>) {
+    let mut tasks = tokio::task::JoinSet::new();
+    for h in clients {
+        let frame = frame.clone();
+        tasks.spawn(async move {
+            match tokio::time::timeout(BROADCAST_SEND_TIMEOUT, h.send_frame(&frame)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => debug!(user_id = h.user_id, "broadcast send failed: {e}"),
+                Err(_) => {
+                    warn!(user_id = h.user_id, "broadcast send timed out; closing slow client");
+                    h.conn.close(0u32.into(), b"control stream stalled");
+                }
+            }
+        });
+    }
+    while tasks.join_next().await.is_some() {}
+}
+
 /// Broadcast current server state to all connected clients.
 ///
 /// Unlike `send_server_state_to_client`, this sends to every client.
 /// Each client receives per-room effective permissions computed for them.
+///
+/// Per-client work runs concurrently and time-bounded (each client computes its
+/// own effective permissions and then sends) so one slow consumer can't stall
+/// delivery to everyone else; a client that times out is dropped (see
+/// [`broadcast_frame`]).
 pub async fn broadcast_server_state(state: &Arc<ServerState>, persistence: &Arc<Persistence>) -> Result<()> {
-    // Send per-client state (with per-room effective permissions) to each client
     let clients = state.snapshot_clients();
+    let mut tasks = tokio::task::JoinSet::new();
     for client in clients {
-        if let Err(e) = send_server_state_to_client(&client, state, persistence).await {
-            debug!(user_id = client.user_id, "failed to send server state: {e:?}");
-        }
+        let state = state.clone();
+        let persistence = persistence.clone();
+        tasks.spawn(async move {
+            match tokio::time::timeout(
+                BROADCAST_SEND_TIMEOUT,
+                send_server_state_to_client(&client, &state, &persistence),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => debug!(user_id = client.user_id, "failed to send server state: {e:?}"),
+                Err(_) => {
+                    warn!(
+                        user_id = client.user_id,
+                        "server-state send timed out; closing slow client"
+                    );
+                    client.conn.close(0u32.into(), b"control stream stalled");
+                }
+            }
+        });
     }
+    while tasks.join_next().await.is_some() {}
     Ok(())
 }
 
@@ -1576,15 +1632,14 @@ pub async fn broadcast_state_update(state: &Arc<ServerState>, update: proto::sta
             kind: Some(proto::server_event::Kind::StateUpdate(state_update)),
         })),
     };
-    let frame = encode_frame(&env);
+    let frame: Arc<[u8]> = encode_frame(&env).into();
 
     debug!("server: broadcasting incremental StateUpdate");
 
-    // Snapshot clients, then send without holding state locks
+    // Snapshot clients, then send concurrently without holding state locks so a
+    // single stuck consumer can't stall the update for everyone (#27).
     let clients = state.snapshot_clients();
-    for h in clients {
-        let _ = h.send_frame(&frame).await;
-    }
+    broadcast_frame(clients, frame).await;
 
     Ok(())
 }
