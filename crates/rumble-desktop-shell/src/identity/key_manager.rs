@@ -89,6 +89,22 @@ fn backup_corrupt_identity_file(path: &std::path::Path) {
     }
 }
 
+/// Pinned Argon2 cost parameters, stored on disk alongside the ciphertext
+/// (format v2+). Storing them in the file means a future `argon2` crate
+/// default-params change can never silently break decryption.
+///
+/// The algorithm itself is pinned by the format, not stored: v2 is always
+/// Argon2id, version 0x13 (19), 32-byte output, over the *raw* salt bytes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct KdfParams {
+    /// Argon2 memory cost in KiB.
+    pub m_cost: u32,
+    /// Argon2 iteration count.
+    pub t_cost: u32,
+    /// Argon2 degree of parallelism.
+    pub p_cost: u32,
+}
+
 /// How the key is stored.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum KeySource {
@@ -103,6 +119,14 @@ pub enum KeySource {
         encrypted_data: String,
         salt_hex: String,
         nonce_hex: String,
+        /// Format discriminator + pinned KDF cost parameters.
+        ///
+        /// `None` = legacy (v1) file written before params were stored:
+        /// Argon2id v19 with the crate-0.5 defaults (m=19456 KiB, t=2,
+        /// p=1), keyed over the salt's *hex string* bytes. `Some` = v2:
+        /// the stored params, keyed over the raw salt bytes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kdf: Option<KdfParams>,
     },
     /// Key is stored in SSH agent; we remember the public key to find
     /// it again. Requires the `ssh-agent` feature.
@@ -227,17 +251,18 @@ impl KeyManager {
     pub fn generate_local_key(&mut self, password: Option<&str>) -> anyhow::Result<KeyInfo> {
         let signing_key = SigningKey::from_bytes(&rand::random());
         let public_key = signing_key.verifying_key().to_bytes();
-        let private_key = signing_key.to_bytes();
+        let private_key = zeroize::Zeroizing::new(signing_key.to_bytes());
 
         let source = match password {
             Some(pw) if !pw.is_empty() => {
                 #[cfg(feature = "encrypted-keys")]
                 {
-                    let (encrypted, salt, nonce) = encrypt_key(&private_key, pw)?;
+                    let (encrypted, salt, nonce, kdf) = encrypt_key(&private_key, pw)?;
                     KeySource::LocalEncrypted {
                         encrypted_data: encrypted,
                         salt_hex: salt,
                         nonce_hex: nonce,
+                        kdf: Some(kdf),
                     }
                 }
                 #[cfg(not(feature = "encrypted-keys"))]
@@ -247,7 +272,9 @@ impl KeyManager {
                 }
             }
             _ => KeySource::LocalPlaintext {
-                private_key_hex: hex::encode(private_key),
+                // `.as_slice()` (not `*private_key`): avoid copying the key
+                // out of its `Zeroizing` wrapper.
+                private_key_hex: hex::encode(private_key.as_slice()),
             },
         };
 
@@ -275,9 +302,10 @@ impl KeyManager {
             encrypted_data,
             salt_hex,
             nonce_hex,
+            kdf,
         } = &config.source
         {
-            let private_key = decrypt_key(encrypted_data, salt_hex, nonce_hex, password)?;
+            let private_key = decrypt_key(encrypted_data, salt_hex, nonce_hex, kdf.as_ref(), password)?;
             let signing_key = SigningKey::from_bytes(&private_key);
             self.cached_signing_key = Some(signing_key);
             Ok(())
@@ -303,11 +331,13 @@ impl KeyManager {
     /// Import a raw `SigningKey` and persist it as plaintext.
     pub fn import_signing_key(&mut self, signing_key: SigningKey) -> anyhow::Result<()> {
         let public_key = signing_key.verifying_key().to_bytes();
-        let private_key = signing_key.to_bytes();
+        let private_key = zeroize::Zeroizing::new(signing_key.to_bytes());
 
         let config = KeyConfig {
             source: KeySource::LocalPlaintext {
-                private_key_hex: hex::encode(private_key),
+                // `.as_slice()` (not `*private_key`): avoid copying the key
+                // out of its `Zeroizing` wrapper.
+                private_key_hex: hex::encode(private_key.as_slice()),
             },
             public_key_hex: hex::encode(public_key),
         };
@@ -393,11 +423,13 @@ pub fn compute_fingerprint(public_key: &[u8; 32]) -> String {
 }
 
 pub fn parse_signing_key(hex_key: &str) -> Option<SigningKey> {
-    let bytes = hex::decode(hex_key).ok()?;
+    use zeroize::Zeroizing;
+
+    let bytes = Zeroizing::new(hex::decode(hex_key).ok()?);
     if bytes.len() != 32 {
         return None;
     }
-    let mut arr = [0u8; 32];
+    let mut arr = Zeroizing::new([0u8; 32]);
     arr.copy_from_slice(&bytes);
     Some(SigningKey::from_bytes(&arr))
 }
@@ -438,6 +470,8 @@ impl KeySigning for KeyManagerSigner {
         match source {
             KeySource::LocalPlaintext { private_key_hex } => {
                 use ed25519_dalek::Signer;
+                // This is a clone of the config's hex string; wipe it on drop.
+                let private_key_hex = zeroize::Zeroizing::new(private_key_hex);
                 let signing_key =
                     parse_signing_key(&private_key_hex).ok_or_else(|| anyhow::anyhow!("Invalid stored private key"))?;
                 Ok(signing_key.sign(payload).to_bytes())
@@ -462,9 +496,53 @@ impl KeySigning for KeyManagerSigner {
 // Encrypted key helpers
 // =============================================================================
 
+/// Cost parameters for *newly written* (v2) identity files.
+///
+/// 64 MiB / t=3 / p=1 — comfortably above the argon2-0.5 defaults
+/// (19 MiB / t=2) for an interactive desktop unlock. Stored in the file,
+/// so this constant can be raised later without breaking existing files.
 #[cfg(feature = "encrypted-keys")]
-fn encrypt_key(key: &[u8; 32], password: &str) -> anyhow::Result<(String, String, String)> {
-    use argon2::Argon2;
+const KDF_PARAMS_V2: KdfParams = KdfParams {
+    m_cost: 64 * 1024,
+    t_cost: 3,
+    p_cost: 1,
+};
+
+/// Pinned copy of the argon2-0.5.x default cost parameters, used for legacy
+/// (v1) files that carry no params. Verified against argon2 0.5.3
+/// (`Params::DEFAULT_{M,T,P}_COST`); pinning them here means a future crate
+/// bump that changes the defaults cannot break old files.
+#[cfg(feature = "encrypted-keys")]
+const KDF_PARAMS_LEGACY: KdfParams = KdfParams {
+    m_cost: 19 * 1024,
+    t_cost: 2,
+    p_cost: 1,
+};
+
+/// Derive a 32-byte key with Argon2id v19 (0x13) and explicit, pinned cost
+/// parameters. Never uses `Argon2::default()`, so crate-default changes
+/// cannot alter the KDF.
+#[cfg(feature = "encrypted-keys")]
+fn derive_key(password: &str, salt: &[u8], params: &KdfParams) -> anyhow::Result<zeroize::Zeroizing<[u8; 32]>> {
+    use argon2::{Algorithm, Argon2, Params, Version};
+
+    let argon_params = Params::new(params.m_cost, params.t_cost, params.p_cost, Some(32))
+        .map_err(|e| anyhow::anyhow!("Invalid KDF parameters: {}", e))?;
+    let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, argon_params);
+
+    let mut derived_key = zeroize::Zeroizing::new([0u8; 32]);
+    argon
+        .hash_password_into(password.as_bytes(), salt, derived_key.as_mut())
+        .map_err(|e| anyhow::anyhow!("Key derivation failed: {}", e))?;
+    Ok(derived_key)
+}
+
+/// Encrypt a private key with a password, producing a v2 record:
+/// `(encrypted_hex, salt_hex, nonce_hex, kdf_params)`. The KDF runs over the
+/// raw salt bytes with [`KDF_PARAMS_V2`]; the returned params must be stored
+/// alongside the ciphertext.
+#[cfg(feature = "encrypted-keys")]
+fn encrypt_key(key: &[u8; 32], password: &str) -> anyhow::Result<(String, String, String, KdfParams)> {
     use chacha20poly1305::{
         ChaCha20Poly1305, Nonce,
         aead::{Aead, KeyInit},
@@ -475,30 +553,41 @@ fn encrypt_key(key: &[u8; 32], password: &str) -> anyhow::Result<(String, String
     getrandom::fill(&mut salt_bytes).map_err(|e| anyhow::anyhow!("Failed to generate random salt: {}", e))?;
     getrandom::fill(&mut nonce_bytes).map_err(|e| anyhow::anyhow!("Failed to generate random nonce: {}", e))?;
 
-    let salt_hex = hex::encode(salt_bytes);
-
-    let mut derived_key = [0u8; 32];
-    Argon2::default()
-        .hash_password_into(password.as_bytes(), salt_hex.as_bytes(), &mut derived_key)
-        .map_err(|e| anyhow::anyhow!("Key derivation failed: {}", e))?;
+    let kdf = KDF_PARAMS_V2;
+    let derived_key = derive_key(password, &salt_bytes, &kdf)?;
 
     let cipher =
-        ChaCha20Poly1305::new_from_slice(&derived_key).map_err(|e| anyhow::anyhow!("Cipher init failed: {}", e))?;
+        ChaCha20Poly1305::new_from_slice(&*derived_key).map_err(|e| anyhow::anyhow!("Cipher init failed: {}", e))?;
     let nonce = Nonce::from_slice(&nonce_bytes);
     let ciphertext = cipher
         .encrypt(nonce, key.as_slice())
         .map_err(|e| anyhow::anyhow!("Encryption failed: {}", e))?;
 
-    Ok((hex::encode(ciphertext), salt_hex, hex::encode(nonce_bytes)))
+    Ok((
+        hex::encode(ciphertext),
+        hex::encode(salt_bytes),
+        hex::encode(nonce_bytes),
+        kdf,
+    ))
 }
 
+/// Decrypt a private key. `kdf = Some(params)` selects the v2 path (stored
+/// params, raw salt bytes); `kdf = None` selects the legacy path (pinned
+/// argon2-0.5 default params over the salt's hex-string bytes), keeping
+/// pre-versioning identity files decryptable.
 #[cfg(feature = "encrypted-keys")]
-fn decrypt_key(encrypted_hex: &str, salt: &str, nonce_hex: &str, password: &str) -> anyhow::Result<[u8; 32]> {
-    use argon2::Argon2;
+fn decrypt_key(
+    encrypted_hex: &str,
+    salt_hex: &str,
+    nonce_hex: &str,
+    kdf: Option<&KdfParams>,
+    password: &str,
+) -> anyhow::Result<zeroize::Zeroizing<[u8; 32]>> {
     use chacha20poly1305::{
         ChaCha20Poly1305, Nonce,
         aead::{Aead, KeyInit},
     };
+    use zeroize::Zeroizing;
 
     let ciphertext = hex::decode(encrypted_hex)?;
     let nonce_bytes = hex::decode(nonce_hex)?;
@@ -506,23 +595,32 @@ fn decrypt_key(encrypted_hex: &str, salt: &str, nonce_hex: &str, password: &str)
         return Err(anyhow::anyhow!("Invalid nonce length"));
     }
 
-    let mut derived_key = [0u8; 32];
-    Argon2::default()
-        .hash_password_into(password.as_bytes(), salt.as_bytes(), &mut derived_key)
-        .map_err(|e| anyhow::anyhow!("Key derivation failed: {}", e))?;
+    let derived_key = match kdf {
+        // v2: KDF over the raw salt bytes with the params stored in the file.
+        Some(params) => {
+            let salt_bytes = hex::decode(salt_hex)?;
+            derive_key(password, &salt_bytes, params)?
+        }
+        // Legacy (v1): the original code fed the 32-char hex *string* of the
+        // salt to the KDF with the crate's then-default params. Preserved
+        // verbatim so old files keep decrypting.
+        None => derive_key(password, salt_hex.as_bytes(), &KDF_PARAMS_LEGACY)?,
+    };
 
     let cipher =
-        ChaCha20Poly1305::new_from_slice(&derived_key).map_err(|e| anyhow::anyhow!("Cipher init failed: {}", e))?;
+        ChaCha20Poly1305::new_from_slice(&*derived_key).map_err(|e| anyhow::anyhow!("Cipher init failed: {}", e))?;
     let nonce = Nonce::from_slice(&nonce_bytes);
-    let plaintext = cipher
-        .decrypt(nonce, ciphertext.as_slice())
-        .map_err(|_| anyhow::anyhow!("Decryption failed - wrong password?"))?;
+    let plaintext = Zeroizing::new(
+        cipher
+            .decrypt(nonce, ciphertext.as_slice())
+            .map_err(|_| anyhow::anyhow!("Decryption failed - wrong password?"))?,
+    );
 
     if plaintext.len() != 32 {
         return Err(anyhow::anyhow!("Invalid decrypted key length"));
     }
 
-    let mut key = [0u8; 32];
+    let mut key = Zeroizing::new([0u8; 32]);
     key.copy_from_slice(&plaintext);
     Ok(key)
 }
@@ -673,7 +771,7 @@ impl SshAgentClient {
         };
 
         let public_key_bytes = signing_key.verifying_key().to_bytes();
-        let private_key_bytes = signing_key.to_bytes();
+        let private_key_bytes = zeroize::Zeroizing::new(signing_key.to_bytes());
 
         let ed25519_keypair = Ed25519Keypair {
             public: Ed25519PublicKey(public_key_bytes),
@@ -752,19 +850,147 @@ mod tests {
 
     #[cfg(feature = "encrypted-keys")]
     #[test]
-    fn encrypt_decrypt_roundtrip() {
+    fn encrypt_decrypt_roundtrip_v2() {
         let key = [42u8; 32];
-        let (encrypted, salt, nonce) = encrypt_key(&key, "test_password").unwrap();
-        let decrypted = decrypt_key(&encrypted, &salt, &nonce, "test_password").unwrap();
-        assert_eq!(key, decrypted);
+        let (encrypted, salt, nonce, kdf) = encrypt_key(&key, "test_password").unwrap();
+        assert_eq!(kdf, KDF_PARAMS_V2, "new files must carry the v2 cost params");
+        let decrypted = decrypt_key(&encrypted, &salt, &nonce, Some(&kdf), "test_password").unwrap();
+        assert_eq!(key, *decrypted);
     }
 
     #[cfg(feature = "encrypted-keys")]
     #[test]
     fn decrypt_wrong_password() {
         let key = [42u8; 32];
-        let (encrypted, salt, nonce) = encrypt_key(&key, "correct").unwrap();
-        assert!(decrypt_key(&encrypted, &salt, &nonce, "wrong").is_err());
+        let (encrypted, salt, nonce, kdf) = encrypt_key(&key, "correct").unwrap();
+        assert!(decrypt_key(&encrypted, &salt, &nonce, Some(&kdf), "wrong").is_err());
+    }
+
+    /// Build a legacy (pre-versioning) encrypted record exactly the way the
+    /// old code did: `Argon2::default()` keyed over the salt's *hex string*
+    /// bytes. Returns `(encrypted_hex, salt_hex, nonce_hex)`.
+    #[cfg(feature = "encrypted-keys")]
+    fn encrypt_key_legacy(key: &[u8; 32], password: &str) -> (String, String, String) {
+        use argon2::Argon2;
+        use chacha20poly1305::{
+            ChaCha20Poly1305, Nonce,
+            aead::{Aead, KeyInit},
+        };
+
+        let mut salt_bytes = [0u8; 16];
+        let mut nonce_bytes = [0u8; 12];
+        getrandom::fill(&mut salt_bytes).unwrap();
+        getrandom::fill(&mut nonce_bytes).unwrap();
+
+        let salt_hex = hex::encode(salt_bytes);
+
+        let mut derived_key = [0u8; 32];
+        Argon2::default()
+            .hash_password_into(password.as_bytes(), salt_hex.as_bytes(), &mut derived_key)
+            .unwrap();
+
+        let cipher = ChaCha20Poly1305::new_from_slice(&derived_key).unwrap();
+        let ciphertext = cipher.encrypt(Nonce::from_slice(&nonce_bytes), key.as_slice()).unwrap();
+
+        (hex::encode(ciphertext), salt_hex, hex::encode(nonce_bytes))
+    }
+
+    /// A record written by the old code (crate-default Argon2 over the
+    /// hex-string salt, no stored params) must decrypt via the legacy path.
+    #[cfg(feature = "encrypted-keys")]
+    #[test]
+    fn decrypt_legacy_format() {
+        let key = [7u8; 32];
+        let (encrypted, salt, nonce) = encrypt_key_legacy(&key, "hunter2");
+        let decrypted = decrypt_key(&encrypted, &salt, &nonce, None, "hunter2").unwrap();
+        assert_eq!(key, *decrypted);
+        assert!(decrypt_key(&encrypted, &salt, &nonce, None, "wrong").is_err());
+    }
+
+    /// Canary: our pinned legacy params must equal the current argon2 crate
+    /// defaults (what `encrypt_key_legacy` above actually uses). If a crate
+    /// bump changes the defaults this fails — do NOT change
+    /// `KDF_PARAMS_LEGACY` (old files were written with these values);
+    /// instead make `encrypt_key_legacy` use explicit params and drop this
+    /// assertion.
+    #[cfg(feature = "encrypted-keys")]
+    #[test]
+    fn legacy_params_match_crate_defaults() {
+        let d = argon2::Params::default();
+        assert_eq!(
+            (d.m_cost(), d.t_cost(), d.p_cost()),
+            (
+                KDF_PARAMS_LEGACY.m_cost,
+                KDF_PARAMS_LEGACY.t_cost,
+                KDF_PARAMS_LEGACY.p_cost
+            ),
+        );
+        assert_eq!(argon2::Algorithm::default(), argon2::Algorithm::Argon2id);
+        assert_eq!(argon2::Version::default(), argon2::Version::V0x13);
+    }
+
+    /// A pre-versioning identity.json (no `kdf` field) must deserialize to
+    /// `kdf: None`, and the full unlock path must decrypt it.
+    #[cfg(feature = "encrypted-keys")]
+    #[test]
+    fn legacy_identity_json_unlocks() {
+        let signing_key = SigningKey::from_bytes(&rand::random());
+        let (encrypted, salt, nonce) = encrypt_key_legacy(&signing_key.to_bytes(), "pw");
+
+        // Field set exactly as written by the old code: no `kdf`.
+        let json = format!(
+            r#"{{
+                "source": {{
+                    "LocalEncrypted": {{
+                        "encrypted_data": "{encrypted}",
+                        "salt_hex": "{salt}",
+                        "nonce_hex": "{nonce}"
+                    }}
+                }},
+                "public_key_hex": "{}"
+            }}"#,
+            hex::encode(signing_key.verifying_key().to_bytes())
+        );
+
+        let dir = tempdir_for_test();
+        std::fs::write(dir.join("identity.json"), json).unwrap();
+
+        let mut km = KeyManager::new(dir);
+        match &km.config().unwrap().source {
+            KeySource::LocalEncrypted { kdf, .. } => assert!(kdf.is_none(), "legacy file must parse to kdf: None"),
+            other => panic!("unexpected source: {other:?}"),
+        }
+        assert!(km.needs_unlock());
+        assert!(km.unlock_local_key("wrong").is_err());
+        km.unlock_local_key("pw").unwrap();
+        assert_eq!(km.signing_key().unwrap().to_bytes(), signing_key.to_bytes());
+    }
+
+    /// New-format files round-trip through the full KeyManager
+    /// (generate → save → reload → unlock) and persist the KDF params.
+    #[cfg(feature = "encrypted-keys")]
+    #[test]
+    fn generate_save_reload_unlock_v2() {
+        let dir = tempdir_for_test();
+
+        let mut km = KeyManager::new(dir.clone());
+        let info = km.generate_local_key(Some("s3cret")).unwrap();
+
+        let mut km2 = KeyManager::new(dir);
+        match &km2.config().unwrap().source {
+            KeySource::LocalEncrypted { kdf, .. } => {
+                assert_eq!(kdf.as_ref(), Some(&KDF_PARAMS_V2), "new files must store the v2 params")
+            }
+            other => panic!("unexpected source: {other:?}"),
+        }
+        assert!(km2.needs_unlock());
+        km2.unlock_local_key("s3cret").unwrap();
+        assert_eq!(km2.public_key_bytes().unwrap(), info.public_key);
+        assert_eq!(
+            km2.signing_key().unwrap().verifying_key().to_bytes(),
+            info.public_key,
+            "unlocked key must match the generated identity"
+        );
     }
 
     #[test]
