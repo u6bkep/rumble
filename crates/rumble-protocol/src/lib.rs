@@ -174,6 +174,13 @@ pub fn compute_server_state_hash(server_state: &proto::ServerState) -> Vec<u8> {
     // gates incremental-update verification).
     canonical.slash_commands.clear();
 
+    // Groups are excluded for the same reason: only the *full* ServerState push
+    // carries the group list, while every incremental `StateUpdate` is built
+    // with `groups: vec![]` (the Update variants have no group field). Hashing
+    // groups would make the full-sync baseline diverge from every incremental
+    // hash for the same logical state, resync-looping a verifying client.
+    canonical.groups.clear();
+
     // Sort rooms by UUID bytes for deterministic ordering
     canonical.rooms.sort_by(|a, b| {
         let a_id = a.id.as_ref().map(|r| r.uuid.as_slice()).unwrap_or(&[]);
@@ -393,6 +400,41 @@ mod state_hash_tests {
             compute_server_state_hash(&forward),
             compute_server_state_hash(&reversed),
             "the state hash must not depend on room/user ordering"
+        );
+    }
+
+    /// The hash must ignore `groups`: the full-state push carries the real
+    /// group list, but every incremental `StateUpdate` is built with empty
+    /// groups, so including them would diverge the two producers for the same
+    /// logical state and resync-loop a verifying client.
+    #[test]
+    fn state_hash_ignores_groups() {
+        let base = proto::ServerState {
+            rooms: vec![room(1, "Root")],
+            users: vec![user(1, "alice")],
+            groups: vec![],
+            slash_commands: vec![],
+        };
+        let with_groups = proto::ServerState {
+            groups: vec![
+                proto::GroupInfo {
+                    name: "default".to_string(),
+                    is_builtin: true,
+                    permissions: 0x0f,
+                },
+                proto::GroupInfo {
+                    name: "admin".to_string(),
+                    is_builtin: true,
+                    permissions: 0xffff,
+                },
+            ],
+            ..base.clone()
+        };
+
+        assert_eq!(
+            compute_server_state_hash(&base),
+            compute_server_state_hash(&with_groups),
+            "group definitions must not influence the state hash"
         );
     }
 
