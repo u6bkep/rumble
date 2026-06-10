@@ -118,12 +118,23 @@ fn pick_config(
 }
 
 fn resample(input: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
+    let mut output = Vec::new();
+    resample_into(input, from_rate, to_rate, &mut output);
+    output
+}
+
+/// Linear-interpolation resample into a caller-owned buffer. Reusing the
+/// buffer keeps the real-time output callback allocation-free in steady state
+/// (the `Vec` only grows when the device block size does).
+fn resample_into(input: &[f32], from_rate: u32, to_rate: u32, output: &mut Vec<f32>) {
+    output.clear();
     if input.is_empty() || from_rate == to_rate {
-        return input.to_vec();
+        output.extend_from_slice(input);
+        return;
     }
     let ratio = from_rate as f64 / to_rate as f64;
     let out_len = ((input.len() as f64) / ratio).ceil() as usize;
-    let mut output = Vec::with_capacity(out_len);
+    output.reserve(out_len);
     for i in 0..out_len {
         let src_pos = i as f64 * ratio;
         let idx = src_pos as usize;
@@ -132,7 +143,6 @@ fn resample(input: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
         let b = input[(idx + 1).min(input.len() - 1)];
         output.push(a + (b - a) * frac as f32);
     }
-    output
 }
 
 struct InputProcessor {
@@ -344,6 +354,7 @@ impl AudioBackend for CpalAudioBackend {
         Ok(CpalCaptureStream {
             _stream: stream,
             is_active,
+            processor,
             alive,
         })
     }
@@ -376,7 +387,6 @@ impl AudioBackend for CpalAudioBackend {
             "audio: output config selected"
         );
 
-        let fill = Arc::new(Mutex::new(fill_buffer));
         // See `open_input`: cleared on a cpal stream error so the audio task
         // can re-open the output device.
         let alive = Arc::new(AtomicBool::new(true));
@@ -388,99 +398,59 @@ impl AudioBackend for CpalAudioBackend {
             }
         };
 
+        // Each match arm moves `fill_buffer` into its own `OutputWriter` —
+        // the arms are mutually exclusive, so exactly one closure owns it.
+        // No Mutex and no per-callback allocation in the real-time callback
+        // (see `OutputWriter`).
         let stream = match sample_format {
             SampleFormat::F32 => {
-                let fill = fill.clone();
-                let ch = actual_channels;
-                let rate = actual_rate;
+                let mut writer = OutputWriter::new(fill_buffer, actual_channels, actual_rate);
                 device.build_output_stream(
                     &stream_config,
-                    move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                        write_output_f32(data, &fill, ch, rate);
-                    },
+                    move |data: &mut [f32], _: &cpal::OutputCallbackInfo| writer.write_f32(data),
                     err_fn.clone(),
                     None,
                 )?
             }
             SampleFormat::I16 => {
-                let fill = fill.clone();
-                let ch = actual_channels;
-                let rate = actual_rate;
+                let mut writer = OutputWriter::new(fill_buffer, actual_channels, actual_rate);
                 device.build_output_stream(
                     &stream_config,
                     move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
-                        let mono_len = output_mono_len(data.len(), ch, rate);
-                        let mut mono = vec![0.0f32; mono_len];
-                        if let Ok(mut f) = fill.lock() {
-                            f(&mut mono);
-                        }
-                        let expanded = expand_output(&mono, ch, rate);
-                        for (out, &val) in data.iter_mut().zip(expanded.iter()) {
-                            *out = (val * i16::MAX as f32) as i16;
-                        }
+                        writer.write(data, |val| (val * i16::MAX as f32) as i16);
                     },
                     err_fn.clone(),
                     None,
                 )?
             }
             SampleFormat::U16 => {
-                let fill = fill.clone();
-                let ch = actual_channels;
-                let rate = actual_rate;
+                let mut writer = OutputWriter::new(fill_buffer, actual_channels, actual_rate);
                 device.build_output_stream(
                     &stream_config,
                     move |data: &mut [u16], _: &cpal::OutputCallbackInfo| {
-                        let mono_len = output_mono_len(data.len(), ch, rate);
-                        let mut mono = vec![0.0f32; mono_len];
-                        if let Ok(mut f) = fill.lock() {
-                            f(&mut mono);
-                        }
-                        let expanded = expand_output(&mono, ch, rate);
-                        for (out, &val) in data.iter_mut().zip(expanded.iter()) {
-                            *out = ((val + 1.0) / 2.0 * u16::MAX as f32) as u16;
-                        }
+                        writer.write(data, |val| ((val + 1.0) / 2.0 * u16::MAX as f32) as u16);
                     },
                     err_fn.clone(),
                     None,
                 )?
             }
             SampleFormat::I32 => {
-                let fill = fill.clone();
-                let ch = actual_channels;
-                let rate = actual_rate;
+                let mut writer = OutputWriter::new(fill_buffer, actual_channels, actual_rate);
                 device.build_output_stream(
                     &stream_config,
                     move |data: &mut [i32], _: &cpal::OutputCallbackInfo| {
-                        let mono_len = output_mono_len(data.len(), ch, rate);
-                        let mut mono = vec![0.0f32; mono_len];
-                        if let Ok(mut f) = fill.lock() {
-                            f(&mut mono);
-                        }
-                        let expanded = expand_output(&mono, ch, rate);
-                        for (out, &val) in data.iter_mut().zip(expanded.iter()) {
-                            *out = (val * i32::MAX as f32) as i32;
-                        }
+                        writer.write(data, |val| (val * i32::MAX as f32) as i32);
                     },
                     err_fn.clone(),
                     None,
                 )?
             }
             SampleFormat::U8 => {
-                let fill = fill.clone();
-                let ch = actual_channels;
-                let rate = actual_rate;
+                let mut writer = OutputWriter::new(fill_buffer, actual_channels, actual_rate);
                 device.build_output_stream(
                     &stream_config,
                     move |data: &mut [u8], _: &cpal::OutputCallbackInfo| {
-                        let mono_len = output_mono_len(data.len(), ch, rate);
-                        let mut mono = vec![0.0f32; mono_len];
-                        if let Ok(mut f) = fill.lock() {
-                            f(&mut mono);
-                        }
-                        let expanded = expand_output(&mono, ch, rate);
-                        for (out, &val) in data.iter_mut().zip(expanded.iter()) {
-                            *out = ((val * 128.0) + 128.0).clamp(0.0, 255.0) as u8;
-                        }
+                        writer.write(data, |val| ((val * 128.0) + 128.0).clamp(0.0, 255.0) as u8);
                     },
                     err_fn.clone(),
                     None,
@@ -521,44 +491,76 @@ fn output_mono_len(total_device_samples: usize, channels: u16, device_rate: u32)
     }
 }
 
-fn expand_output(mono: &[f32], channels: u16, device_rate: u32) -> Vec<f32> {
-    let resampled = if device_rate == SAMPLE_RATE {
-        mono.to_vec()
-    } else {
-        resample(mono, SAMPLE_RATE, device_rate)
-    };
-    if channels == 1 {
-        resampled
-    } else {
-        let ch = channels as usize;
-        let mut out = Vec::with_capacity(resampled.len() * ch);
-        for &s in &resampled {
-            for _ in 0..ch {
-                out.push(s);
-            }
-        }
-        out
-    }
+/// Per-output-stream state: the fill callback plus preallocated scratch
+/// buffers, owned by exactly one device-callback closure.
+///
+/// Keeps the real-time callback wait-free in steady state: no mutex (the
+/// closure owns the `FillBufferFn` outright) and no per-callback allocation —
+/// the scratch `Vec`s retain their capacity across callbacks and only
+/// (re)allocate in the rare event the device grows its block size. The
+/// previous code allocated `vec![0.0; …]` plus one or two more `Vec`s
+/// (resample + channel expansion) and locked a mutex inside every non-F32
+/// callback, every ~10–20 ms.
+struct OutputWriter {
+    fill: FillBufferFn,
+    channels: u16,
+    device_rate: u32,
+    /// 48 kHz mono samples pulled from `fill`.
+    mono: Vec<f32>,
+    /// Device-rate mono samples (used only when resampling is needed).
+    resampled: Vec<f32>,
 }
 
-fn write_output_f32(data: &mut [f32], fill: &Arc<Mutex<FillBufferFn>>, channels: u16, device_rate: u32) {
-    if channels == 1 && device_rate == SAMPLE_RATE {
-        if let Ok(mut f) = fill.lock() {
-            f(data);
+impl OutputWriter {
+    fn new(fill: FillBufferFn, channels: u16, device_rate: u32) -> Self {
+        Self {
+            fill,
+            channels,
+            device_rate,
+            mono: Vec::new(),
+            resampled: Vec::new(),
+        }
+    }
+
+    /// Pull enough 48 kHz mono audio for a device block of `device_len` total
+    /// interleaved samples and convert it to device-rate mono; returns one
+    /// sample per device frame (possibly one extra from resample rounding).
+    fn produce(&mut self, device_len: usize) -> &[f32] {
+        let mono_len = output_mono_len(device_len, self.channels, self.device_rate);
+        // resize() keeps capacity across callbacks; the fill callback writes
+        // every slot (real samples + zero tail), so no re-zeroing is needed.
+        self.mono.resize(mono_len, 0.0);
+        (self.fill)(&mut self.mono);
+        if self.device_rate == SAMPLE_RATE {
+            &self.mono
         } else {
-            data.fill(0.0);
+            resample_into(&self.mono, SAMPLE_RATE, self.device_rate, &mut self.resampled);
+            &self.resampled
         }
-    } else {
-        let mono_len = output_mono_len(data.len(), channels, device_rate);
-        let mut mono = vec![0.0f32; mono_len];
-        if let Ok(mut f) = fill.lock() {
-            f(&mut mono);
+    }
+
+    /// Fill a device block in the target sample format, fanning each mono
+    /// sample out to all channels.
+    fn write<T: Copy>(&mut self, data: &mut [T], convert: impl Fn(f32) -> T) {
+        let ch = self.channels as usize;
+        let src = self.produce(data.len());
+        // `produce` returns at least one sample per full frame; a trailing
+        // partial frame or rounding gap falls back to converted silence.
+        for (i, frame) in data.chunks_mut(ch).enumerate() {
+            let val = convert(src.get(i).copied().unwrap_or(0.0));
+            for s in frame.iter_mut() {
+                *s = val;
+            }
         }
-        let expanded = expand_output(&mono, channels, device_rate);
-        let copy_len = data.len().min(expanded.len());
-        data[..copy_len].copy_from_slice(&expanded[..copy_len]);
-        for s in &mut data[copy_len..] {
-            *s = 0.0;
+    }
+
+    /// F32 fast path: mono at the native rate hands the device buffer
+    /// directly to the fill callback (no copy at all).
+    fn write_f32(&mut self, data: &mut [f32]) {
+        if self.channels == 1 && self.device_rate == SAMPLE_RATE {
+            (self.fill)(data);
+        } else {
+            self.write(data, |val| val);
         }
     }
 }
@@ -566,11 +568,29 @@ fn write_output_f32(data: &mut [f32], fill: &Arc<Mutex<FillBufferFn>>, channels:
 pub struct CpalCaptureStream {
     _stream: cpal::Stream,
     is_active: Arc<AtomicBool>,
+    /// Shared with the input callback; held here so reactivation can drop any
+    /// partial frame buffered just before deactivation (see `set_active`).
+    processor: Arc<Mutex<InputProcessor>>,
     alive: Arc<AtomicBool>,
 }
 
 impl AudioCaptureStream for CpalCaptureStream {
     fn set_active(&self, active: bool) {
+        // Inactive→active edge: drop any partial frame accumulated just before
+        // deactivation. Up to frame_size−1 samples captured right before a
+        // mute/PTT release stay in the accumulator (the callback early-returns
+        // while inactive, so they are never flushed) and would otherwise head
+        // the first frame of the next spurt — ~20 ms of stale pre-mute audio.
+        // The `frames_to_discard` warm-up only covers stream creation, not
+        // reactivation. Ordering matters: clear while the callback still sees
+        // inactive, then arm, so a racing callback can't append between the
+        // clear and the store.
+        if active
+            && !self.is_active.load(Ordering::Relaxed)
+            && let Ok(mut proc) = self.processor.lock()
+        {
+            proc.buffer.clear();
+        }
         self.is_active.store(active, Ordering::Relaxed);
     }
 

@@ -273,6 +273,16 @@ pub struct UserAudioState<D: VoiceDecoderTrait> {
     /// Re-prime the (long-lived) decoder with a discarded PLC frame at the next
     /// spurt onset, smoothing the transition and avoiding an onset click.
     needs_prime: bool,
+    /// Sequence numbers of `EndOfStream` datagrams received ahead of the
+    /// playout cursor. EOS consumes a sender sequence number but carries no
+    /// media frame, so the loss-vs-silence classifier must discount these when
+    /// comparing sequence span to media span — otherwise an exactly-one-frame
+    /// VAD gap (voice at N, EOS at N+1, voice at N+2) reads as `seq_span ==
+    /// media_span` and is miscounted as packet loss, with FEC "recovering"
+    /// ~20 ms of stale pre-gap audio at the next onset. Pruned as frames play;
+    /// cleared on re-anchor. Capped at a handful of entries (more EOS than
+    /// that between two played frames cannot occur from a sane sender).
+    pending_eos_seqs: Vec<u32>,
     /// Consecutive packets dropped for arriving behind the playout cursor. A
     /// stray late/reorder/dup frame trips this briefly; a *sustained* run means
     /// the sender's media clock reset by less than `RESTART_BACKWARD_FRAMES`, and
@@ -352,6 +362,7 @@ impl<D: VoiceDecoderTrait> UserAudioState<D> {
             volume_db: 0.0,
             stream_ended: true,
             needs_prime: false,
+            pending_eos_seqs: Vec::new(),
             consecutive_late: 0,
         }
     }
@@ -397,6 +408,9 @@ impl<D: VoiceDecoderTrait> UserAudioState<D> {
         self.next_play_frame = frame;
         self.started = false;
         self.needs_prime = true;
+        // The gap this EOS bookkeeping was tracking has been resolved (and on
+        // a sender restart the sequence space may have reset entirely).
+        self.pending_eos_seqs.clear();
     }
 
     /// Insert a packet into the jitter buffer, keyed by its media frame index.
@@ -482,8 +496,18 @@ impl<D: VoiceDecoderTrait> UserAudioState<D> {
     /// Mark the sender's end-of-stream. Advisory: it stops PLC promptly once the
     /// buffer drains; a lost EOS is still covered by the stale-stream guard and
     /// by the silence classification at the next spurt.
-    pub fn mark_end_of_stream(&mut self) {
+    ///
+    /// `sequence` is the EOS datagram's sender sequence number; it consumed a
+    /// step of the sequence space without carrying a media frame, so it is
+    /// recorded for the loss-vs-silence classifier (see `pending_eos_seqs`).
+    pub fn mark_end_of_stream(&mut self, sequence: u32) {
         self.stream_ended = true;
+        if !self.pending_eos_seqs.contains(&sequence) {
+            if self.pending_eos_seqs.len() >= 8 {
+                self.pending_eos_seqs.remove(0);
+            }
+            self.pending_eos_seqs.push(sequence);
+        }
     }
 
     /// Check if we have enough buffered to start (or are already playing).
@@ -553,6 +577,13 @@ impl<D: VoiceDecoderTrait> UserAudioState<D> {
             self.last_played_seq = pkt.seq;
             self.last_played_frame = frame;
             self.next_play_frame += 1;
+            // EOS markers at or behind the playout cursor no longer matter for
+            // gap classification; keep only the ones still ahead.
+            let played_seq = pkt.seq;
+            self.pending_eos_seqs.retain(|&s| {
+                let d = s.wrapping_sub(played_seq);
+                d != 0 && d < u32::MAX / 2
+            });
             return match self.decoder.decode(&pkt.opus, out) {
                 Ok(n) => Some(n),
                 Err(e) => {
@@ -579,11 +610,22 @@ impl<D: VoiceDecoderTrait> UserAudioState<D> {
         // Classify loss vs silence over [last_played, next_frame]: if the
         // sequence advanced as many steps as the media clock, every frame was
         // sent and the gap is loss; if the media clock jumped further, the
-        // sender was silent → re-anchor to the new spurt.
+        // sender was silent → re-anchor to the new spurt. EOS datagrams inside
+        // the span consumed sequence numbers without carrying media frames, so
+        // discount them — otherwise an exactly-one-frame VAD gap (voice N, EOS
+        // N+1, voice N+2) reads as loss and FEC "recovers" stale pre-gap audio.
         if self.started {
             let media_span = next_frame - self.last_played_frame;
             let seq_span = next_seq.wrapping_sub(self.last_played_seq) as u64;
-            if seq_span < media_span {
+            let eos_in_span = self
+                .pending_eos_seqs
+                .iter()
+                .filter(|&&s| {
+                    let d = s.wrapping_sub(self.last_played_seq) as u64;
+                    d > 0 && d < seq_span
+                })
+                .count() as u64;
+            if seq_span.saturating_sub(eos_in_span) < media_span {
                 self.reanchor(next_frame);
                 return None;
             }
@@ -774,6 +816,16 @@ async fn run_audio_task<P: Platform>(
 
     // Per-user decoders and jitter buffers
     let mut user_audio: HashMap<u64, UserAudioState<Dec<P>>> = HashMap::new();
+
+    // Who is in our current room, per the membership commands (UserJoinedRoom /
+    // UserLeftRoom / RoomChanged / PeerLeft). `handle_voice_datagram` creates
+    // `user_audio` state for ANY relayed sender_id, so entries can exist for
+    // peers outside this set (a datagram racing in just after UserLeftRoom, or
+    // a misbehaving server inventing senders); the cleanup tick GCs those after
+    // a long idle TTL (see `gc_orphaned_users`). Members are never GC'd — their
+    // decoders must live for the whole session (see the decoder-lifetime
+    // invariant in the module docs).
+    let mut room_members: std::collections::HashSet<u64> = std::collections::HashSet::new();
 
     // Selected devices
     let mut selected_input: Option<String> = None;
@@ -1159,6 +1211,7 @@ async fn run_audio_task<P: Platform>(
 
                         // Clear per-user state
                         user_audio.clear();
+                        room_members.clear();
                     }
 
                     AudioCommand::SetInputDevice { device_id } => {
@@ -1572,6 +1625,9 @@ async fn run_audio_task<P: Platform>(
                     }
 
                     AudioCommand::UserJoinedRoom { user_id } => {
+                        if user_id != my_user_id {
+                            room_members.insert(user_id);
+                        }
                         // Proactively create decoder/pipeline for this user before packets arrive
                         // Skip if it's our own user ID
                         if user_id != my_user_id && !user_audio.contains_key(&user_id) {
@@ -1608,6 +1664,7 @@ async fn run_audio_task<P: Platform>(
                     }
 
                     AudioCommand::UserLeftRoom { user_id } => {
+                        room_members.remove(&user_id);
                         // Destroy decoder/pipeline for this user
                         if user_audio.remove(&user_id).is_some() {
                             debug!("Audio task: user {} left room, destroyed decoder", user_id);
@@ -1630,6 +1687,9 @@ async fn run_audio_task<P: Platform>(
                         for uid in prior_talkers {
                             let _ = bus.voice.send(VoiceEvent::UserStoppedTalking { user_id: uid });
                         }
+
+                        room_members.clear();
+                        room_members.extend(user_ids_in_room.iter().copied().filter(|&u| u != my_user_id));
 
                         // Create decoders for all users in the new room (except ourselves)
                         let jitter_delay = audio_settings.jitter_buffer_delay_packets;
@@ -1668,6 +1728,7 @@ async fn run_audio_task<P: Platform>(
 
                     AudioCommand::PeerLeft { user_id } => {
                         // Destroy decoder/pipeline for this user
+                        room_members.remove(&user_id);
                         user_audio.remove(&user_id);
                     }
 
@@ -1799,9 +1860,12 @@ async fn run_audio_task<P: Platform>(
                 );
             }
 
-            // Periodic cleanup of stale talking_users (does not destroy decoders)
+            // Periodic cleanup of stale talking_users (does not destroy
+            // decoders for room members), plus the long-TTL GC for decoder
+            // state belonging to senders outside the current room membership.
             _ = cleanup_interval.tick() => {
                 cleanup_stale_users(&user_audio, &state, &bus.voice);
+                gc_orphaned_users(&mut user_audio, &room_members, Instant::now());
             }
 
             // Detect a capture/playback device that died mid-session (unplug,
@@ -2380,10 +2444,12 @@ fn handle_voice_datagram<C: VoiceCodec>(
         audio_dumper.write_rx_opus(&opus_data);
     }
 
-    // Handle end-of-stream: mark the user's stream as ended (advisory).
+    // Handle end-of-stream: mark the user's stream as ended (advisory). The
+    // EOS sequence number is recorded so the loss-vs-silence classifier can
+    // discount the sequence step it consumed.
     if end_of_stream {
         if let Some(user_state) = user_audio.get_mut(&sender_id) {
-            user_state.mark_end_of_stream();
+            user_state.mark_end_of_stream(sequence);
             debug!("User {} stream ended at frame {}", sender_id, timestamp_us / FRAME_US);
         }
         return;
@@ -2438,27 +2504,11 @@ fn handle_voice_datagram<C: VoiceCodec>(
     }
 }
 
-/// Threshold below which the soft limiter is fully transparent.
-const SOFT_CLIP_THRESHOLD: f32 = 0.75;
-
-/// Soft-knee peak limiter for the summed mix. Transparent below
-/// `SOFT_CLIP_THRESHOLD` (so a single speaker, or any sum within range, is
-/// untouched), then smoothly compresses overshoot — the curve is C¹-continuous
-/// at the knee (unit slope) and asymptotes to ±1 without ever reaching it. This
-/// replaces the old per-sample hard clamp, which flattened loud overlapping
-/// speakers into a square wave (the multi-speaker crackle).
-#[inline]
-fn soft_clip(x: f32) -> f32 {
-    let a = x.abs();
-    if a <= SOFT_CLIP_THRESHOLD {
-        return x;
-    }
-    let over = a - SOFT_CLIP_THRESHOLD;
-    let headroom = 1.0 - SOFT_CLIP_THRESHOLD;
-    // over/(over+headroom) → 0 at the knee (slope 1) and → 1 as over → ∞.
-    let limited = SOFT_CLIP_THRESHOLD + headroom * (over / (over + headroom));
-    limited.copysign(x)
-}
+// The summed-mix soft limiter is `rumble_audio::soft_clip` — a soft-knee curve
+// shared with the gain processor, transparent within range, replacing the old
+// per-sample hard clamp that flattened loud overlapping speakers into a square
+// wave (the multi-speaker crackle).
+use rumble_audio::soft_clip;
 
 /// Decode, RX-process, volume-adjust, and sum one 20 ms frame from every peer
 /// that is ready to play. Returns the mixed frame (soft-limited to ±1), or
@@ -2621,6 +2671,8 @@ fn fill_playback_ring<D: VoiceDecoderTrait>(
 /// - User leaves the room (UserLeftRoom / PeerLeft commands)
 /// - We change rooms (RoomChanged command)
 /// - Connection is closed (ConnectionClosed command)
+/// - The long-TTL orphan GC fires for a sender outside the room membership
+///   ([`gc_orphaned_users`])
 fn cleanup_stale_users<D: VoiceDecoderTrait>(
     user_audio: &HashMap<u64, UserAudioState<D>>,
     state: &Arc<RwLock<State>>,
@@ -2649,6 +2701,38 @@ fn cleanup_stale_users<D: VoiceDecoderTrait>(
             let _ = voice_tx.send(VoiceEvent::UserStoppedTalking { user_id: *user_id });
         }
     }
+}
+
+/// How long a peer with no entry in the current room membership may sit idle
+/// (no datagrams) before its decoder/jitter state is garbage-collected.
+///
+/// Deliberately LONG (minutes, not seconds): the decoder-lifetime invariant
+/// requires per-peer Opus decoders to persist across talk spurts, and this GC
+/// is only a backstop for state that membership commands will never prune —
+/// a datagram racing in just after `UserLeftRoom` recreating the entry, or a
+/// misbehaving server relaying made-up sender ids (which would otherwise grow
+/// `user_audio` without bound). Room members are exempt entirely.
+const ORPHAN_DECODER_TTL: Duration = Duration::from_secs(300);
+
+/// Drop decoder/jitter state for senders that are not in the current room
+/// membership and have been idle past [`ORPHAN_DECODER_TTL`]. `now` is
+/// injectable for tests.
+fn gc_orphaned_users<D: VoiceDecoderTrait>(
+    user_audio: &mut HashMap<u64, UserAudioState<D>>,
+    room_members: &std::collections::HashSet<u64>,
+    now: Instant,
+) {
+    user_audio.retain(|user_id, audio| {
+        let keep =
+            room_members.contains(user_id) || now.saturating_duration_since(audio.last_arrival) <= ORPHAN_DECODER_TTL;
+        if !keep {
+            debug!(
+                "audio: GC'd decoder state for user {} (not in room, idle past TTL)",
+                user_id
+            );
+        }
+        keep
+    });
 }
 
 /// Publish an updated stats roll-up to the stats snapshot.
@@ -3047,13 +3131,14 @@ mod tests {
         }
         assert_eq!(drain_tags(&mut state, 3), vec![Some(0.0), Some(1.0), Some(2.0)]);
 
-        state.mark_end_of_stream();
+        // EOS consumes sender sequence 3 (it is a datagram like any other).
+        state.mark_end_of_stream(3);
 
-        // New spurt: sequence continues (3,4,5) but the media clock jumped to
+        // New spurt: sequence continues (4,5,6) but the media clock jumped to
         // frame 50 (≈1 s of silence elapsed).
-        feed(&mut state, epoch, 3, 50, 50);
-        feed(&mut state, epoch, 4, 51, 51);
-        feed(&mut state, epoch, 5, 52, 52);
+        feed(&mut state, epoch, 4, 50, 50);
+        feed(&mut state, epoch, 5, 51, 51);
+        feed(&mut state, epoch, 6, 52, 52);
         assert_eq!(
             drain_some(&mut state, 4),
             vec![50.0, 51.0, 52.0],
@@ -3061,6 +3146,78 @@ mod tests {
         );
         assert_eq!(state.packets_lost, 0, "the silence gap must not be counted as loss");
         assert_eq!(state.frames_concealed, 0);
+    }
+
+    /// Issue #46: an exactly-one-frame VAD gap. The sender emits voice at
+    /// frame N (seq S), an EOS at frame N+1 (consuming seq S+1), and resumes
+    /// at frame N+2 (seq S+2). Sequence span equals media span over the gap,
+    /// which used to read as packet loss — counting a phantom loss and
+    /// "recovering" ~20 ms of stale pre-gap audio from the next packet's FEC
+    /// at the onset. The classifier must discount the sequence number the
+    /// received EOS consumed and treat the gap as silence (re-anchor).
+    #[test]
+    fn jitter_one_frame_vad_gap_with_eos_is_silence_not_loss() {
+        let mut state = make_state(3);
+        let epoch = Instant::now();
+        for n in 0..3u8 {
+            feed_contig(&mut state, epoch, n);
+        }
+        assert_eq!(drain_tags(&mut state, 3), vec![Some(0.0), Some(1.0), Some(2.0)]);
+
+        // EOS at frame 3, consuming sequence 3.
+        state.mark_end_of_stream(3);
+
+        // Voice resumes one frame later: seq 4 at frame 4.
+        feed(&mut state, epoch, 4, 4, 4);
+        feed(&mut state, epoch, 5, 5, 5);
+        feed(&mut state, epoch, 6, 6, 6);
+
+        // 4 ticks: the re-anchor tick produces nothing, then the spurt plays.
+        assert_eq!(
+            drain_some(&mut state, 4),
+            vec![4.0, 5.0, 6.0],
+            "the spurt after a one-frame VAD gap plays from its start"
+        );
+        assert_eq!(state.packets_lost, 0, "a one-frame VAD gap must not count as loss");
+        assert_eq!(
+            state.packets_recovered_fec, 0,
+            "FEC must not 'recover' stale pre-gap audio for an intended silence"
+        );
+        assert_eq!(state.frames_concealed, 0);
+    }
+
+    /// Companion to the above: when that one-frame gap's EOS is LOST, the
+    /// receiver has no way to tell the gap from a single dropped packet, and
+    /// the conservative classification (loss → FEC recovery) is the pinned
+    /// fallback. This documents the deliberate limitation.
+    #[test]
+    fn jitter_one_frame_gap_without_eos_stays_conservative_loss() {
+        let mut state = make_state(3);
+        let epoch = Instant::now();
+        for n in 0..3u8 {
+            feed_contig(&mut state, epoch, n);
+        }
+        assert_eq!(drain_tags(&mut state, 3), vec![Some(0.0), Some(1.0), Some(2.0)]);
+
+        // EOS consumed seq 3 but never arrived; voice resumes at seq 4/frame 4.
+        feed(&mut state, epoch, 4, 4, 4);
+        feed(&mut state, epoch, 5, 5, 5);
+        feed(&mut state, epoch, 6, 6, 6);
+
+        assert_eq!(
+            drain_tags(&mut state, 4),
+            vec![
+                Some(FEC_TAG_BASE + 4.0), // frame 3 "recovered" from frame 4's FEC
+                Some(4.0),
+                Some(5.0),
+                Some(6.0)
+            ]
+        );
+        assert_eq!(
+            state.packets_lost, 1,
+            "without the EOS the gap is indistinguishable from loss"
+        );
+        assert_eq!(state.packets_recovered_fec, 1);
     }
 
     #[test]
@@ -3075,10 +3232,11 @@ mod tests {
         }
         assert_eq!(drain_tags(&mut state, 3), vec![Some(0.0), Some(1.0), Some(2.0)]);
 
-        // No mark_end_of_stream() — EOS was dropped. Sequence continues, clock jumps.
-        feed(&mut state, epoch, 3, 50, 50);
-        feed(&mut state, epoch, 4, 51, 51);
-        feed(&mut state, epoch, 5, 52, 52);
+        // No mark_end_of_stream() — the EOS (which consumed sequence 3) was
+        // dropped in transit. Sequence continues, clock jumps.
+        feed(&mut state, epoch, 4, 50, 50);
+        feed(&mut state, epoch, 5, 51, 51);
+        feed(&mut state, epoch, 6, 52, 52);
         assert_eq!(drain_some(&mut state, 4), vec![50.0, 51.0, 52.0]);
         assert_eq!(state.packets_lost, 0, "an intended silence gap is not loss");
         assert_eq!(
@@ -3217,8 +3375,8 @@ mod tests {
             state.decode_next_into(&mut scratch);
         }
 
-        // EOS exactly as handle_voice_datagram applies it.
-        state.mark_end_of_stream();
+        // EOS exactly as handle_voice_datagram applies it (consuming seq FRAMES).
+        state.mark_end_of_stream(FRAMES as u32);
 
         // Spurt 2: sequence continues, media clock jumps over the silence. The
         // first decode re-anchors (silence classification) and primes the decoder.
@@ -3226,7 +3384,7 @@ mod tests {
             feed_at(
                 &mut state,
                 epoch,
-                FRAMES as u32 + i as u32,
+                FRAMES as u32 + 1 + i as u32,
                 FRAMES as u64 + GAP + i as u64,
                 pkt.clone(),
             );
@@ -3307,14 +3465,15 @@ mod tests {
                 state.decode_next_into(&mut scratch);
             }
             if send_eos {
-                state.mark_end_of_stream();
+                state.mark_end_of_stream(FRAMES as u32);
             }
-            // Sequence continues; the media clock jumps over the silence.
+            // Sequence continues (the sender consumed seq FRAMES for the EOS
+            // whether or not it arrived); the media clock jumps over the silence.
             for (i, pkt) in spurt2.iter().enumerate() {
                 feed_at(
                     &mut state,
                     epoch,
-                    FRAMES as u32 + i as u32,
+                    FRAMES as u32 + 1 + i as u32,
                     FRAMES as u64 + GAP + i as u64,
                     pkt.clone(),
                 );
@@ -3775,6 +3934,40 @@ mod tests {
             !active.load(Ordering::Relaxed),
             "a stale never-ready stream must not hold the producer active"
         );
+    }
+
+    /// Issue #46: decoder state created by `handle_voice_datagram` for senders
+    /// outside the room membership must eventually be GC'd (it is otherwise
+    /// only pruned by membership commands, which never fire for such senders).
+    /// Members must NEVER be GC'd, however idle — the decoder-lifetime
+    /// invariant — and non-members are kept until the long TTL expires so
+    /// decoders still persist across ordinary talk spurts.
+    #[test]
+    fn gc_drops_only_idle_non_members() {
+        let mut peers: HashMap<u64, UserAudioState<MarkerDecoder>> = HashMap::new();
+        let epoch = Instant::now();
+
+        // Peer 1: room member, idle far past the TTL → kept.
+        let mut member = make_state(3);
+        member.insert_packet_at(0, 0, packet(0), epoch);
+        peers.insert(1, member);
+        // Peer 2: NOT a member, idle far past the TTL → dropped.
+        let mut orphan_idle = make_state(3);
+        orphan_idle.insert_packet_at(0, 0, packet(0), epoch);
+        peers.insert(2, orphan_idle);
+        // Peer 3: NOT a member, but seen recently → kept (decoders persist
+        // across talk spurts; the TTL is minutes, not seconds).
+        let recent = epoch + 2 * ORPHAN_DECODER_TTL;
+        let mut orphan_recent = make_state(3);
+        orphan_recent.insert_packet_at(0, 0, packet(0), recent);
+        peers.insert(3, orphan_recent);
+
+        let members: std::collections::HashSet<u64> = [1].into_iter().collect();
+        gc_orphaned_users(&mut peers, &members, recent + Duration::from_secs(1));
+
+        assert!(peers.contains_key(&1), "room members are never GC'd, however idle");
+        assert!(!peers.contains_key(&2), "idle non-member past the TTL is GC'd");
+        assert!(peers.contains_key(&3), "recently-active non-member is kept");
     }
 
     // ====================================================================
