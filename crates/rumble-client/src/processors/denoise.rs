@@ -197,17 +197,29 @@ impl AudioProcessor for DenoiseProcessor {
             }
         }
 
+        // A caller frame size that isn't a multiple of the 10 ms chunk leaves
+        // the output short by up to chunk−1 samples on some calls. Cover the
+        // shortfall by inserting silence ONCE at the FRONT of the stream —
+        // added pipeline latency — rather than zero-filling the tail of every
+        // call, which punched periodic gaps into continuous audio (the queued
+        // real samples then emitted late, after each gap). One chunk-multiple
+        // pad is sufficient forever: with pad P ≥ chunk, availability is
+        // P − input_remainder ≥ 1 at every later call boundary, since the
+        // un-chunked input remainder is at most chunk−1. For multiple-of-480
+        // frames (both real backends re-chunk to 960) production always
+        // matches demand and this never triggers — zero added latency.
+        let shortfall = samples.len().saturating_sub(self.output_buffer.len());
+        if shortfall > 0 {
+            let pad = shortfall.next_multiple_of(DENOISE_FRAME_SIZE);
+            self.output_buffer.splice(0..0, std::iter::repeat_n(0.0, pad));
+        }
+
         // Drain the denoised buffer back into the caller's slice. We always
         // do this so the buffer doesn't grow unboundedly; if the caller
         // wanted pass-through, we then overwrite with the original input.
-        let copy_len = samples.len().min(self.output_buffer.len());
-        if copy_len > 0 {
-            samples[..copy_len].copy_from_slice(&self.output_buffer[..copy_len]);
-            self.output_buffer.drain(..copy_len);
-        }
-        if copy_len < samples.len() {
-            samples[copy_len..].fill(0.0);
-        }
+        let copy_len = samples.len();
+        samples.copy_from_slice(&self.output_buffer[..copy_len]);
+        self.output_buffer.drain(..copy_len);
 
         if let Some(original) = original {
             // VAD-only mode: restore the unmodified input. Inference still
@@ -445,6 +457,39 @@ mod tests {
         // Input bytes unchanged.
         for (a, b) in original.iter().zip(samples.iter()) {
             assert!((a - b).abs() < f32::EPSILON);
+        }
+    }
+
+    /// Caller frame sizes that aren't a multiple of the 480-sample chunk must
+    /// be covered by a single up-front latency pad, not by zero-filling the
+    /// tail of every call (which punched periodic gaps into continuous audio
+    /// while the queued real samples emitted late). Pinned via the buffer
+    /// accounting: across the whole stream, everything emitted is either real
+    /// chunk output or part of exactly one 480-sample pad.
+    #[test]
+    fn test_non_multiple_frames_pad_latency_once() {
+        let mut processor = DenoiseProcessor::with_settings(DenoiseSettings {
+            denoise_enabled: true,
+            vad_enabled: false,
+            ..DenoiseSettings::default()
+        });
+
+        const FRAME: usize = 700; // not a multiple of 480
+        let mut input_total = 0usize;
+        let mut emitted_total = 0usize;
+        for _ in 0..50 {
+            let mut samples: Vec<f32> = (0..FRAME)
+                .map(|i| ((input_total + i) as f32 * 0.05).sin() * 0.5)
+                .collect();
+            processor.process(&mut samples, 48000);
+            input_total += FRAME;
+            emitted_total += FRAME;
+            let produced_total = (input_total / DENOISE_FRAME_SIZE) * DENOISE_FRAME_SIZE;
+            assert_eq!(
+                processor.output_buffer.len() + emitted_total,
+                produced_total + DENOISE_FRAME_SIZE,
+                "exactly one chunk-sized latency pad over the whole stream, no per-call tail gaps"
+            );
         }
     }
 

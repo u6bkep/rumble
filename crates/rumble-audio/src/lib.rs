@@ -691,6 +691,27 @@ pub fn calculate_peak_db(samples: &[f32]) -> f32 {
     linear_to_db(peak)
 }
 
+/// Threshold below which [`soft_clip`] is fully transparent.
+pub const SOFT_CLIP_THRESHOLD: f32 = 0.75;
+
+/// Soft-knee peak limiter. Transparent below [`SOFT_CLIP_THRESHOLD`] (so any
+/// in-range signal is untouched), then smoothly compresses overshoot — the
+/// curve is C¹-continuous at the knee (unit slope) and asymptotes to ±1
+/// without ever reaching it. Use this instead of a per-sample hard clamp,
+/// which flattens loud content into a square wave (audible crackle).
+#[inline]
+pub fn soft_clip(x: f32) -> f32 {
+    let a = x.abs();
+    if a <= SOFT_CLIP_THRESHOLD {
+        return x;
+    }
+    let over = a - SOFT_CLIP_THRESHOLD;
+    let headroom = 1.0 - SOFT_CLIP_THRESHOLD;
+    // over/(over+headroom) → 0 at the knee (slope 1) and → 1 as over → ∞.
+    let limited = SOFT_CLIP_THRESHOLD + headroom * (over / (over + headroom));
+    limited.copysign(x)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

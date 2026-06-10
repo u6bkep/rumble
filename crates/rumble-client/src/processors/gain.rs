@@ -4,7 +4,7 @@
 //! audio samples. It's commonly used for per-user volume control on the
 //! receive path.
 
-use rumble_audio::{AudioProcessor, ProcessorFactory, ProcessorResult, db_to_linear};
+use rumble_audio::{AudioProcessor, ProcessorFactory, ProcessorResult, db_to_linear, soft_clip};
 use serde::{Deserialize, Serialize};
 
 use super::type_ids;
@@ -68,11 +68,24 @@ impl Default for GainProcessor {
 
 impl AudioProcessor for GainProcessor {
     fn process(&mut self, samples: &mut [f32], _sample_rate: u32) -> ProcessorResult {
-        // Apply gain to all samples
+        // Unity gain (the default) is a true no-op.
+        if self.gain_linear == 1.0 {
+            return ProcessorResult::pass();
+        }
+
+        // Only a boost can push an in-range signal past full scale, so only
+        // boosts are limited. Soft-knee limit the boosted signal (transparent
+        // below the knee, smooth compression above): the old code hard-clamped
+        // to ±1.0 while claiming to soft clip, squaring off anything a
+        // positive gain drove past full scale (harsh distortion). Attenuation
+        // passes through unlimited — downstream (the playback mix limiter on
+        // RX; the float pipeline on TX) tolerates the rare >1.0 sample.
+        let limit = self.gain_linear > 1.0;
         for sample in samples.iter_mut() {
             *sample *= self.gain_linear;
-            // Soft clip to prevent harsh distortion
-            *sample = sample.clamp(-1.0, 1.0);
+            if limit {
+                *sample = soft_clip(*sample);
+            }
         }
 
         ProcessorResult::pass()
@@ -180,14 +193,30 @@ mod tests {
     }
 
     #[test]
-    fn test_gain_clipping() {
+    fn test_gain_soft_clips_overshoot() {
+        // New pinned behavior: a boost past full scale is SOFT-limited (the
+        // old code hard-clamped to exactly 1.0, despite its "soft clip"
+        // comment — a square-wave edge). The result must approach but never
+        // reach full scale, and must match the shared limiter curve.
         let mut processor = GainProcessor::new(20.0); // +20dB = 10x
         let mut samples = vec![0.5];
 
         processor.process(&mut samples, 48000);
 
-        // Should clip to 1.0
-        assert_eq!(samples[0], 1.0);
+        assert!((samples[0] - soft_clip(5.0)).abs() < 1e-6);
+        assert!(samples[0] < 1.0, "soft limiter must stay below full scale");
+        assert!(samples[0] > 0.9, "overshoot should still land near full scale");
+    }
+
+    #[test]
+    fn test_gain_attenuation_does_not_limit() {
+        // Attenuation can't overshoot; peaks above the limiter knee must pass
+        // through untouched rather than being compressed.
+        let mut processor = GainProcessor::new(-1.0);
+        let gain = db_to_linear(-1.0);
+        let mut samples = vec![0.95f32];
+        processor.process(&mut samples, 48000);
+        assert!((samples[0] - 0.95 * gain).abs() < 1e-6);
     }
 
     #[test]
