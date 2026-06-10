@@ -66,13 +66,36 @@ const REJECT_CODE_FORBIDDEN: u32 = 4;
 const REJECT_CODE_DUPLICATE_ID: u32 = 5;
 
 /// A cached file entry.
+///
+/// `data` is an `Arc` so a fetch can clone the handle (cheap) and drop the
+/// DashMap shard guard *before* streaming the bytes — otherwise a slow reader
+/// would pin the shard across a multi-megabyte flow-controlled write, blocking
+/// concurrent inserts/removes and the TTL sweep.
 struct CachedFile {
     room_id: String,
     file_name: String,
     file_size: u64,
     mime: String,
-    data: Vec<u8>,
+    data: Arc<Vec<u8>>,
     created_at: Instant,
+}
+
+/// Subtract `amount` from a byte counter, clamping at zero.
+///
+/// The no-overwrite invariant (a `transfer_id` is claimed once, never replaced)
+/// means a release should never underflow, but `AtomicU64::fetch_sub` *wraps* —
+/// a single stray double-release would leave the counter near `u64::MAX` and
+/// reject every subsequent upload as `CACHE_FULL` until restart. Clamping makes
+/// that failure mode impossible.
+fn release_quota(total: &AtomicU64, amount: u64) {
+    let mut current = total.load(Ordering::Acquire);
+    loop {
+        let next = current.saturating_sub(amount);
+        match total.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return,
+            Err(observed) => current = observed,
+        }
+    }
 }
 
 /// RAII reservation against the relay's total-bytes quota.
@@ -98,7 +121,7 @@ impl QuotaGuard {
 impl Drop for QuotaGuard {
     fn drop(&mut self) {
         if !self.committed {
-            self.total.fetch_sub(self.amount, Ordering::AcqRel);
+            release_quota(&self.total, self.amount);
         }
     }
 }
@@ -364,7 +387,7 @@ impl FileTransferRelayPlugin {
                     file_name: upload.file_name.clone(),
                     file_size: actual_size,
                     mime: upload.mime.clone(),
-                    data,
+                    data: Arc::new(data),
                     created_at: Instant::now(),
                 });
             }
@@ -423,25 +446,42 @@ impl FileTransferRelayPlugin {
         };
 
         // Re-look-up after the await (the entry may have expired meanwhile).
-        let entry = if authorized { self.cache.get(&transfer_id) } else { None };
+        // Clone out the metadata and an `Arc` handle to the bytes *inside* this
+        // map access, so the shard guard is dropped at the end of the closure —
+        // before the flow-controlled streaming write below. Holding the guard
+        // across `write_all` would let a slow/stalled reader pin the shard and
+        // block every concurrent insert/remove plus the TTL sweep.
+        let entry = if authorized {
+            self.cache.get(&transfer_id).map(|cached| {
+                (
+                    cached.file_name.clone(),
+                    cached.file_size,
+                    cached.mime.clone(),
+                    cached.data.clone(), // Arc clone — O(1), not a byte copy
+                )
+            })
+        } else {
+            None
+        };
         match entry {
-            Some(cached) => {
+            Some((file_name, file_size, mime, data)) => {
                 let resp = proto::RelayFetchResponse {
                     status: proto::RelayResult::Ok.into(),
-                    file_name: cached.file_name.clone(),
-                    file_size: cached.file_size,
-                    mime: cached.mime.clone(),
+                    file_name,
+                    file_size,
+                    mime,
                     error: String::new(),
                 };
                 write_length_prefixed(&mut send, &resp.encode_to_vec()).await?;
 
-                // Write raw file bytes.
-                send.write_all(&cached.data).await?;
+                // Write raw file bytes. The map guard is already dropped, so this
+                // (potentially slow) write blocks nothing in the cache.
+                send.write_all(&data).await?;
                 send.finish()?;
 
                 info!(
                     transfer_id = %transfer_id,
-                    bytes = cached.file_size,
+                    bytes = file_size,
                     "file served from cache"
                 );
             }
@@ -474,7 +514,7 @@ impl FileTransferRelayPlugin {
 
         for tid in &to_remove {
             if let Some((_, cached)) = self.cache.remove(tid) {
-                self.total_cached.fetch_sub(cached.file_size, Ordering::Relaxed);
+                release_quota(&self.total_cached, cached.file_size);
             }
         }
 
@@ -604,7 +644,7 @@ impl ServerPlugin for FileTransferRelayPlugin {
 
                         for tid in &expired {
                             if let Some((_, cached)) = cache.remove(tid) {
-                                total_cached.fetch_sub(cached.file_size, Ordering::Relaxed);
+                                release_quota(&total_cached, cached.file_size);
                             }
                         }
 
@@ -698,6 +738,19 @@ mod tests {
             50,
             "committed bytes stay counted (no refund on drop)"
         );
+    }
+
+    // The #33 underflow guard: a release larger than the counter clamps at zero
+    // instead of wrapping to ~u64::MAX (which would wedge the cache CACHE_FULL).
+    #[test]
+    fn release_quota_clamps_at_zero() {
+        let total = AtomicU64::new(30);
+        release_quota(&total, 100);
+        assert_eq!(total.load(Ordering::Acquire), 0, "over-release clamps, never wraps");
+
+        let total = AtomicU64::new(100);
+        release_quota(&total, 40);
+        assert_eq!(total.load(Ordering::Acquire), 60, "normal release subtracts exactly");
     }
 
     #[test]
