@@ -127,8 +127,13 @@ async fn main() -> Result<()> {
     // Load certificates
     let (certs, key) = server_config.load_certificates()?;
 
-    // Build server config
-    let data_dir = server_config.data_dir().ok().map(|p| p.to_string_lossy().to_string());
+    // Resolve the database location, failing closed: if a disk DB is requested
+    // and its directory can't be created, abort rather than silently run without
+    // persistence (which would grant all permissions and skip ban checks).
+    let persistence = match server_config.persistence {
+        server::config::PersistenceMode::Disk => server::PersistenceMode::Disk(server_config.data_dir()?),
+        server::config::PersistenceMode::Ephemeral => server::PersistenceMode::Ephemeral,
+    };
 
     if let Some(ref msg) = server_config.welcome_message {
         info!("Welcome message: {}", msg);
@@ -167,7 +172,7 @@ async fn main() -> Result<()> {
         certs,
         key,
         cert_dir: server_config.cert_dir.clone(),
-        data_dir,
+        persistence,
         welcome_message: server_config.welcome_message,
         plugins,
         web: server_config.web,

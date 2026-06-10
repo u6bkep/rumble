@@ -914,27 +914,26 @@ impl ServerState {
     /// Build the room list with ACL data populated from persistence.
     pub async fn build_room_list(
         &self,
-        persistence: &Option<std::sync::Arc<crate::persistence::Persistence>>,
+        persistence: &std::sync::Arc<crate::persistence::Persistence>,
     ) -> Vec<RoomInfo> {
         let mut rooms = self.get_rooms().await;
-        if let Some(persist) = persistence {
-            for room in &mut rooms {
-                if let Some(uuid) = room.id.as_ref().and_then(uuid_from_room_id)
-                    && let Some(acl) = persist.get_room_acl(uuid.as_bytes())
-                {
-                    room.inherit_acl = acl.inherit_acl;
-                    room.acls = acl
-                        .entries
-                        .iter()
-                        .map(|e| rumble_protocol::proto::RoomAclEntry {
-                            group: e.group.clone(),
-                            grant: e.grant,
-                            deny: e.deny,
-                            apply_here: e.apply_here,
-                            apply_subs: e.apply_subs,
-                        })
-                        .collect();
-                }
+        let persist = persistence;
+        for room in &mut rooms {
+            if let Some(uuid) = room.id.as_ref().and_then(uuid_from_room_id)
+                && let Some(acl) = persist.get_room_acl(uuid.as_bytes())
+            {
+                room.inherit_acl = acl.inherit_acl;
+                room.acls = acl
+                    .entries
+                    .iter()
+                    .map(|e| rumble_protocol::proto::RoomAclEntry {
+                        group: e.group.clone(),
+                        grant: e.grant,
+                        deny: e.deny,
+                        apply_here: e.apply_here,
+                        apply_subs: e.apply_subs,
+                    })
+                    .collect();
             }
         }
         rooms
@@ -1371,8 +1370,9 @@ mod tests {
                 .await;
         }
 
+        let persist = std::sync::Arc::new(crate::persistence::Persistence::in_memory().unwrap());
         let hash_now = || async {
-            let rooms = state.build_room_list(&None).await;
+            let rooms = state.build_room_list(&persist).await;
             let users = state.build_user_list().await;
             compute_server_state_hash(&rumble_protocol::proto::ServerState {
                 rooms,

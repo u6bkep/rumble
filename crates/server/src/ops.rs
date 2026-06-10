@@ -89,7 +89,7 @@ pub(crate) async fn apply_kick(
 /// `duration_seconds == 0` means a permanent ban.
 pub(crate) async fn apply_ban(
     state: &Arc<ServerState>,
-    persistence: Option<&Arc<Persistence>>,
+    persistence: &Arc<Persistence>,
     target_user_id: u64,
     duration_seconds: u64,
     reason: &str,
@@ -106,7 +106,7 @@ pub(crate) async fn apply_ban(
         return Err("Cannot ban a bridge connection".to_string());
     }
 
-    let persist = persistence.ok_or_else(|| "Persistence not enabled".to_string())?;
+    let persist = persistence;
 
     // Ensure "banned" group exists with the BANNED permission flag.
     if persist.get_group("banned").is_none() {
@@ -181,10 +181,10 @@ pub(crate) async fn apply_ban(
 /// Register the connected user `target_user_id` under their current username.
 pub(crate) async fn apply_register_user(
     state: &Arc<ServerState>,
-    persistence: Option<&Arc<Persistence>>,
+    persistence: &Arc<Persistence>,
     target_user_id: u64,
 ) -> Result<String, String> {
-    let persist = persistence.ok_or_else(|| "Registration not enabled".to_string())?;
+    let persist = persistence;
 
     let target_key = state
         .get_user_public_key(target_user_id)
@@ -222,10 +222,10 @@ pub(crate) async fn apply_register_user(
 /// Unregister the connected user `target_user_id`.
 pub(crate) async fn apply_unregister_user(
     state: &Arc<ServerState>,
-    persistence: Option<&Arc<Persistence>>,
+    persistence: &Arc<Persistence>,
     target_user_id: u64,
 ) -> Result<String, String> {
-    let persist = persistence.ok_or_else(|| "Registration not enabled".to_string())?;
+    let persist = persistence;
 
     let target_key = state
         .get_user_public_key(target_user_id)
@@ -250,7 +250,7 @@ pub(crate) async fn apply_unregister_user(
 /// Returns the new room's UUID.
 pub(crate) async fn apply_create_room(
     state: &Arc<ServerState>,
-    persistence: Option<&Arc<Persistence>>,
+    persistence: &Arc<Persistence>,
     name: String,
     parent_uuid: Option<Uuid>,
     description: Option<String>,
@@ -261,7 +261,8 @@ pub(crate) async fn apply_create_room(
         .create_room_with_parent_desc(name.clone(), parent_uuid, description.clone())
         .await;
 
-    if let Some(persist) = persistence {
+    {
+        let persist = persistence;
         let room = PersistedRoom {
             name: name.clone(),
             parent: parent_uuid.map(|u| *u.as_bytes()),
@@ -296,7 +297,7 @@ pub(crate) async fn apply_create_room(
 /// removal. Returns the deleted room's name.
 pub(crate) async fn apply_delete_room(
     state: &Arc<ServerState>,
-    persistence: Option<&Arc<Persistence>>,
+    persistence: &Arc<Persistence>,
     room_uuid: Uuid,
 ) -> Result<String, String> {
     if room_uuid == rumble_protocol::ROOT_ROOM_UUID {
@@ -316,7 +317,8 @@ pub(crate) async fn apply_delete_room(
         return Err("Room not found".to_string());
     }
 
-    if let Some(persist) = persistence {
+    {
+        let persist = persistence;
         if let Err(e) = persist.delete_room(&room_uuid.into_bytes()) {
             warn!("Failed to remove room from persistence: {e}");
         }
@@ -345,11 +347,11 @@ pub(crate) async fn apply_delete_room(
 /// Create a permission group and broadcast it.
 pub(crate) async fn apply_create_group(
     state: &Arc<ServerState>,
-    persistence: Option<&Arc<Persistence>>,
+    persistence: &Arc<Persistence>,
     name: String,
     permissions: u32,
 ) -> Result<String, String> {
-    let persist = persistence.ok_or_else(|| "Persistence not enabled".to_string())?;
+    let persist = persistence;
 
     if name.is_empty() {
         return Err("Group name cannot be empty".to_string());
@@ -392,10 +394,10 @@ pub(crate) async fn apply_create_group(
 /// every persisted user-group list, then broadcast the deletion.
 pub(crate) async fn apply_delete_group(
     state: &Arc<ServerState>,
-    persistence: Option<&Arc<Persistence>>,
+    persistence: &Arc<Persistence>,
     name: String,
 ) -> Result<String, String> {
-    let persist = persistence.ok_or_else(|| "Persistence not enabled".to_string())?;
+    let persist = persistence;
 
     if BUILTIN_GROUPS.contains(&name.as_str()) {
         return Err("Cannot delete built-in groups".to_string());
@@ -448,11 +450,11 @@ pub(crate) async fn apply_delete_group(
 /// Change a group's permission bits and broadcast the change.
 pub(crate) async fn apply_modify_group(
     state: &Arc<ServerState>,
-    persistence: Option<&Arc<Persistence>>,
+    persistence: &Arc<Persistence>,
     name: String,
     permissions: u32,
 ) -> Result<String, String> {
-    let persist = persistence.ok_or_else(|| "Persistence not enabled".to_string())?;
+    let persist = persistence;
 
     match persist.modify_group(&name, permissions) {
         Ok(false) => return Err("Group not found".to_string()),
@@ -484,7 +486,7 @@ pub(crate) async fn apply_modify_group(
 /// handler and the web by-id endpoint, both of which target a connected user.
 pub(crate) async fn apply_set_user_group(
     state: &Arc<ServerState>,
-    persistence: Option<&Arc<Persistence>>,
+    persistence: &Arc<Persistence>,
     target_user_id: u64,
     group: String,
     add: bool,
@@ -507,13 +509,13 @@ pub(crate) async fn apply_set_user_group(
 /// broadcast).
 pub(crate) async fn apply_set_user_group_by_key(
     state: &Arc<ServerState>,
-    persistence: Option<&Arc<Persistence>>,
+    persistence: &Arc<Persistence>,
     public_key: [u8; 32],
     group: String,
     add: bool,
     expires_at: u64,
 ) -> Result<String, String> {
-    let persist = persistence.ok_or_else(|| "Persistence not enabled".to_string())?;
+    let persist = persistence;
 
     if add {
         let _ = persist.add_user_to_group(&public_key, &group);
@@ -571,12 +573,12 @@ pub(crate) async fn apply_set_user_group_by_key(
 /// lost it, unmuting those who regained it unless manually muted).
 pub(crate) async fn apply_set_room_acl(
     state: &Arc<ServerState>,
-    persistence: Option<&Arc<Persistence>>,
+    persistence: &Arc<Persistence>,
     room_uuid: Uuid,
     inherit_acl: bool,
     entries: Vec<proto::RoomAclEntry>,
 ) -> Result<String, String> {
-    let persist = persistence.ok_or_else(|| "Persistence not enabled".to_string())?;
+    let persist = persistence;
 
     let persisted_acl = PersistedRoomAcl {
         inherit_acl,
@@ -618,12 +620,10 @@ pub(crate) async fn apply_set_room_acl(
     .map_err(|e| format!("Failed to broadcast ACL change: {e}"))?;
 
     // Re-evaluate SPEAK for everyone currently in the room.
-    let persistence_owned = persistence.cloned();
     let room_members = state.get_room_members(room_uuid).await;
     for member_id in room_members {
         if let Some(client) = state.get_client(member_id) {
-            let speak_perms =
-                crate::acl::evaluate_user_permissions(state, &client, room_uuid, &persistence_owned).await;
+            let speak_perms = crate::acl::evaluate_user_permissions(state, &client, room_uuid, persistence).await;
             let speak_denied = !speak_perms.contains(Permissions::SPEAK);
             let manually_muted = client.manually_server_muted.load(Ordering::Relaxed);
             let should_mute = speak_denied || manually_muted;

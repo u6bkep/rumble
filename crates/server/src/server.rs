@@ -8,7 +8,7 @@ use crate::{
     plugin::{ServerCtx, ServerPlugin, StreamHeader},
     state::{ClientHandle, Identity, ServerState},
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use bytes::BytesMut;
 use prost::Message;
 use quinn::{Endpoint, ServerConfig};
@@ -23,7 +23,16 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::RwLock;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
+
+/// Where a server instance keeps its database. Every instance always has one;
+/// see [`crate::config::PersistenceMode`].
+pub enum PersistenceMode {
+    /// On-disk sled database under this directory (`<dir>/rumble.db`).
+    Disk(PathBuf),
+    /// In-memory database, discarded when the process exits.
+    Ephemeral,
+}
 
 /// Configuration for the server.
 pub struct Config {
@@ -36,8 +45,8 @@ pub struct Config {
     /// Directory holding `fullchain.pem` / `privkey.pem`. Retained so a live
     /// reload (SIGHUP) can re-read the certs after a certbot renewal.
     pub cert_dir: PathBuf,
-    /// Optional path for the persistence database.
-    pub data_dir: Option<String>,
+    /// Where this instance stores its database (disk or ephemeral in-RAM).
+    pub persistence: PersistenceMode,
     /// Welcome message (MOTD) sent to clients after authentication.
     pub welcome_message: Option<String>,
     /// Server plugins (compile-time extensions).
@@ -54,7 +63,7 @@ pub struct Server {
     endpoint: Endpoint,
     cert_dir: PathBuf,
     state: Arc<ServerState>,
-    persistence: Option<Arc<Persistence>>,
+    persistence: Arc<Persistence>,
     plugins: Vec<Arc<dyn ServerPlugin>>,
     plugin_ctx: Arc<ServerCtx>,
     web: Option<crate::config::WebSettings>,
@@ -70,26 +79,29 @@ impl Server {
         let endpoint = make_server_endpoint(&config)?;
         let state = Arc::new(ServerState::with_cert_and_welcome(cert_der, config.welcome_message));
 
-        // Initialize persistence if data_dir is provided
-        let persistence = if let Some(ref data_dir) = config.data_dir {
-            let db_path = format!("{}/rumble.db", data_dir);
-            match Persistence::open(&db_path) {
-                Ok(p) => {
-                    info!("Opened persistence database at {}", db_path);
-                    // Ensure default permission groups exist
-                    if let Err(e) = p.ensure_default_groups() {
-                        error!("Failed to create default groups: {e}");
-                    }
-                    Some(Arc::new(p))
-                }
-                Err(e) => {
-                    error!("Failed to open persistence database: {e}");
-                    None
-                }
+        // Initialize persistence. A server instance always has a database — disk
+        // or in-memory; there is no "run without persistence" mode. Any failure
+        // here is fatal (fail closed): a server that can't load its ACL/ban data
+        // must refuse to start rather than run with permissions wide open.
+        let persistence = Arc::new(match config.persistence {
+            PersistenceMode::Disk(ref dir) => {
+                let db_path = format!("{}/rumble.db", dir.display());
+                let p = Persistence::open(&db_path)
+                    .with_context(|| format!("Failed to open persistence database at {db_path}"))?;
+                info!("Opened persistence database at {}", db_path);
+                p
             }
-        } else {
-            None
-        };
+            PersistenceMode::Ephemeral => {
+                let p = Persistence::in_memory().context("Failed to create in-memory database")?;
+                warn!("Persistence mode: EPHEMERAL — all server state is in-memory and lost on restart");
+                p
+            }
+        });
+        // Ensure default permission groups exist — also fatal if it fails, since
+        // a half-initialized DB (no default/admin groups) breaks ACL evaluation.
+        persistence
+            .ensure_default_groups()
+            .context("Failed to create default permission groups")?;
 
         // Create plugin context and wrap plugins in Arc
         let plugin_ctx = Arc::new(ServerCtx::new(state.clone(), persistence.clone()));
@@ -130,7 +142,8 @@ impl Server {
 
     /// Load persisted rooms into the server state.
     async fn load_persisted_rooms(&self) {
-        if let Some(ref persist) = self.persistence {
+        {
+            let persist = &self.persistence;
             let rooms = persist.get_all_rooms();
             let count = rooms.len();
             for (uuid_bytes, room) in rooms {
@@ -168,7 +181,8 @@ impl Server {
         self.load_persisted_rooms().await;
 
         // Spawn background task to sweep expired timed bans every 60 seconds.
-        if let Some(persist) = self.persistence.clone() {
+        {
+            let persist = self.persistence.clone();
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
                 loop {
@@ -337,7 +351,7 @@ fn make_server_endpoint(config: &Config) -> Result<Endpoint> {
 pub async fn handle_connection(
     conn: quinn::Connection,
     state: Arc<ServerState>,
-    persistence: Option<Arc<Persistence>>,
+    persistence: Arc<Persistence>,
     plugins: Vec<Arc<dyn ServerPlugin>>,
     plugin_ctx: Arc<ServerCtx>,
 ) -> Result<()> {
@@ -459,7 +473,7 @@ async fn run_envelope_stream(
     recv: quinn::RecvStream,
     handle: Arc<ClientHandle>,
     state: Arc<ServerState>,
-    persistence: Option<Arc<Persistence>>,
+    persistence: Arc<Persistence>,
     plugins: Vec<Arc<dyn ServerPlugin>>,
     ctx: Arc<ServerCtx>,
     is_primary: bool,
@@ -485,7 +499,7 @@ async fn run_envelope_stream_with_prefix(
     mut recv: quinn::RecvStream,
     handle: Arc<ClientHandle>,
     state: Arc<ServerState>,
-    persistence: Option<Arc<Persistence>>,
+    persistence: Arc<Persistence>,
     plugins: Vec<Arc<dyn ServerPlugin>>,
     ctx: Arc<ServerCtx>,
     is_primary: bool,
@@ -594,7 +608,7 @@ async fn dispatch_secondary_stream(
     authenticated: Arc<AtomicBool>,
     primary_handle: Arc<ClientHandle>,
     state: Arc<ServerState>,
-    persistence: Option<Arc<Persistence>>,
+    persistence: Arc<Persistence>,
     plugins: Vec<Arc<dyn ServerPlugin>>,
     ctx: Arc<ServerCtx>,
 ) {

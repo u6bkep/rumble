@@ -390,7 +390,7 @@ impl LinkCleanerPlugin {
         }
         let reply = render_reply(&cleaned);
         let state = ctx.state().clone();
-        let persistence = ctx.persistence().cloned();
+        let persistence = ctx.persistence().clone();
         tokio::spawn(async move {
             tokio::time::sleep(REPLY_DELAY).await;
             let Some(room) = state.get_user_room(author_id).await else {

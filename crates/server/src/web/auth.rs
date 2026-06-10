@@ -10,7 +10,7 @@ use super::{ApiErrorResponse, ApiResult, WebState};
 use axum::{
     Json,
     extract::{FromRequestParts, State},
-    http::{HeaderMap, StatusCode, header, request::Parts},
+    http::{HeaderMap, header, request::Parts},
     response::{IntoResponse, Response},
 };
 use dashmap::DashMap;
@@ -112,11 +112,7 @@ pub async fn session_info(State(st): State<WebState>, headers: HeaderMap) -> Jso
     let authenticated = session_cookie(&headers)
         .map(|t| st.sessions.validate(&t))
         .unwrap_or(false);
-    let needs_bootstrap = st
-        .persistence
-        .as_ref()
-        .map(|p| p.get_sudo_password().is_none())
-        .unwrap_or(false);
+    let needs_bootstrap = st.persistence.get_sudo_password().is_none();
     Json(SessionInfo {
         authenticated,
         needs_bootstrap,
@@ -125,9 +121,7 @@ pub async fn session_info(State(st): State<WebState>, headers: HeaderMap) -> Jso
 
 /// `POST /api/login` — verify the sudo password and set a session cookie.
 pub async fn login(State(st): State<WebState>, Json(req): Json<LoginRequest>) -> Response {
-    let Some(persist) = st.persistence.as_ref() else {
-        return ApiErrorResponse::new(StatusCode::SERVICE_UNAVAILABLE, "Persistence not enabled").into_response();
-    };
+    let persist = &st.persistence;
     let Some(hash) = persist.get_sudo_password() else {
         return ApiErrorResponse::bad_request("Sudo password not configured; bootstrap required").into_response();
     };
@@ -161,10 +155,7 @@ pub async fn logout(State(st): State<WebState>, headers: HeaderMap) -> Json<OkMe
 /// password is configured, and guarded by the one-time setup token. Sets the
 /// sudo password and optionally seeds an admin key.
 pub async fn bootstrap(State(st): State<WebState>, Json(req): Json<BootstrapRequest>) -> ApiResult<OkMessage> {
-    let persist = st
-        .persistence
-        .as_ref()
-        .ok_or_else(|| ApiErrorResponse::new(StatusCode::SERVICE_UNAVAILABLE, "Persistence not enabled"))?;
+    let persist = &st.persistence;
 
     if persist.get_sudo_password().is_some() {
         return Err(ApiErrorResponse::conflict("Already bootstrapped"));

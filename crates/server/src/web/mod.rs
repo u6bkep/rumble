@@ -35,7 +35,7 @@ pub use auth::Sessions;
 #[derive(Clone)]
 pub struct WebState {
     pub state: Arc<ServerState>,
-    pub persistence: Option<Arc<Persistence>>,
+    pub persistence: Arc<Persistence>,
     pub sessions: Arc<Sessions>,
     /// One-time bootstrap token, valid only while no sudo password is set.
     pub setup_token: Arc<String>,
@@ -107,7 +107,7 @@ fn write_token_file(path: &std::path::Path, token: &str) -> std::io::Result<()> 
 /// Generates a one-time setup token and, when the server still needs bootstrap
 /// (no sudo password configured), prints it to the log so an operator can
 /// complete first-run setup from the browser.
-pub fn spawn(state: Arc<ServerState>, persistence: Option<Arc<Persistence>>, settings: WebSettings) -> JoinHandle<()> {
+pub fn spawn(state: Arc<ServerState>, persistence: Arc<Persistence>, settings: WebSettings) -> JoinHandle<()> {
     // Operators can pin the one-time bootstrap token (e.g. for automated
     // provisioning) via RUMBLE_WEB_SETUP_TOKEN; otherwise it is random.
     let token_is_pinned = std::env::var("RUMBLE_WEB_SETUP_TOKEN")
@@ -119,10 +119,7 @@ pub fn spawn(state: Arc<ServerState>, persistence: Option<Arc<Persistence>>, set
         .filter(|t| !t.is_empty())
         .unwrap_or_else(auth::generate_token);
 
-    let needs_bootstrap = persistence
-        .as_ref()
-        .map(|p| p.get_sudo_password().is_none())
-        .unwrap_or(false);
+    let needs_bootstrap = persistence.get_sudo_password().is_none();
     if needs_bootstrap {
         // Never log the token itself — it grants first-run admin. When the
         // operator pinned it via env they already have it; otherwise write it to

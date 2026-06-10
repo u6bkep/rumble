@@ -37,15 +37,15 @@
 //! # Example
 //!
 //! ```no_run
-//! use server::{Server, Config, ServerConfig};
+//! use server::{Server, Config, PersistenceMode, ServerConfig};
 //!
 //! #[tokio::main]
 //! async fn main() -> anyhow::Result<()> {
 //!     let server_config = ServerConfig::load()?;
 //!     let (certs, key) = server_config.load_certificates()?;
-//!     let data_dir = server_config.data_dir().ok().map(|p| p.to_string_lossy().to_string());
+//!     let persistence = PersistenceMode::Disk(server_config.data_dir()?);
 //!     let cert_dir = server_config.cert_dir.clone();
-//!     let config = Config { bind: server_config.bind, certs, key, cert_dir, data_dir, welcome_message: None, plugins: vec![], web: None };
+//!     let config = Config { bind: server_config.bind, certs, key, cert_dir, persistence, welcome_message: None, plugins: vec![], web: None };
 //!     let server = Server::new(config)?;
 //!     server.run().await
 //! }
@@ -73,5 +73,5 @@ pub use plugin::{
     AudioSubscription, CommandSpec, ParticipantHandle, PluginFactory, ServerCtx, ServerPlugin, StreamHeader,
 };
 pub use relay_plugin::{FileTransferRelayFactory, FileTransferRelayPlugin};
-pub use server::{Config, Server};
+pub use server::{Config, PersistenceMode, Server};
 pub use state::{Binding, ClientHandle, Identity, Member, OwnerId, ServerState, StateData, VoiceFrame};

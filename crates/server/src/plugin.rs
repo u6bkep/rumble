@@ -133,12 +133,12 @@ impl StreamHeader {
 /// Plugins receive a reference to this during callbacks.
 pub struct ServerCtx {
     state: Arc<ServerState>,
-    persistence: Option<Arc<Persistence>>,
+    persistence: Arc<Persistence>,
 }
 
 impl ServerCtx {
     /// Create a new server context.
-    pub fn new(state: Arc<ServerState>, persistence: Option<Arc<Persistence>>) -> Self {
+    pub fn new(state: Arc<ServerState>, persistence: Arc<Persistence>) -> Self {
         Self { state, persistence }
     }
 
@@ -226,9 +226,9 @@ impl ServerCtx {
         self.state.get_user_room(user_id).await
     }
 
-    /// Access the persistence layer (if available).
-    pub fn persistence(&self) -> Option<&Arc<Persistence>> {
-        self.persistence.as_ref()
+    /// Access the persistence layer.
+    pub fn persistence(&self) -> &Arc<Persistence> {
+        &self.persistence
     }
 
     /// Access the shared server state.
@@ -301,7 +301,7 @@ impl ServerCtx {
 pub struct ParticipantHandle {
     user_id: u64,
     state: Arc<ServerState>,
-    persistence: Option<Arc<Persistence>>,
+    persistence: Arc<Persistence>,
 }
 
 impl ParticipantHandle {

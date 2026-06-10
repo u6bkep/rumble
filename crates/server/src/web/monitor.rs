@@ -51,18 +51,16 @@ pub async fn state_snapshot(_admin: Admin, State(st): State<WebState>) -> Json<S
         .map(room_dto)
         .collect();
 
-    let groups: Vec<GroupDto> = match st.persistence.as_ref() {
-        Some(p) => p
-            .list_groups()
-            .into_iter()
-            .map(|(name, g)| GroupDto {
-                is_builtin: BUILTIN_GROUPS.contains(&name.as_str()),
-                name,
-                permissions: g.permissions,
-            })
-            .collect(),
-        None => Vec::new(),
-    };
+    let groups: Vec<GroupDto> = st
+        .persistence
+        .list_groups()
+        .into_iter()
+        .map(|(name, g)| GroupDto {
+            is_builtin: BUILTIN_GROUPS.contains(&name.as_str()),
+            name,
+            permissions: g.permissions,
+        })
+        .collect();
 
     let mut users = Vec::new();
     for client in st.state.snapshot_clients() {
@@ -72,9 +70,9 @@ pub async fn state_snapshot(_admin: Admin, State(st): State<WebState>) -> Json<S
         let user_id = client.user_id;
         let status = st.state.get_user_status(user_id).await;
         let room_id = st.state.get_user_room(user_id).await.map(|u| u.to_string());
-        let is_registered = match (st.persistence.as_ref(), st.state.get_user_public_key(user_id)) {
-            (Some(p), Some(key)) => p.is_registered(&key),
-            _ => false,
+        let is_registered = match st.state.get_user_public_key(user_id) {
+            Some(key) => st.persistence.is_registered(&key),
+            None => false,
         };
         users.push(UserDto {
             user_id,
@@ -98,19 +96,17 @@ pub async fn state_snapshot(_admin: Admin, State(st): State<WebState>) -> Json<S
         .iter()
         .filter_map(|c| st.state.get_user_public_key(c.user_id))
         .collect();
-    let registered_users: Vec<RegisteredUserDto> = match st.persistence.as_ref() {
-        Some(p) => p
-            .list_registered_users()
-            .into_iter()
-            .map(|(key, user)| RegisteredUserDto {
-                public_key: base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, key),
-                username: user.username,
-                groups: p.get_user_groups(&key),
-                online: online_keys.contains(&key),
-            })
-            .collect(),
-        None => Vec::new(),
-    };
+    let registered_users: Vec<RegisteredUserDto> = st
+        .persistence
+        .list_registered_users()
+        .into_iter()
+        .map(|(key, user)| RegisteredUserDto {
+            public_key: base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, key),
+            username: user.username,
+            groups: st.persistence.get_user_groups(&key),
+            online: online_keys.contains(&key),
+        })
+        .collect();
 
     Json(StateSnapshot {
         client_count: st.state.client_count(),
@@ -123,18 +119,16 @@ pub async fn state_snapshot(_admin: Admin, State(st): State<WebState>) -> Json<S
 
 /// `GET /api/groups` — list permission groups.
 pub async fn list_groups(_admin: Admin, State(st): State<WebState>) -> ApiResult<Vec<GroupDto>> {
-    let groups = match st.persistence.as_ref() {
-        Some(p) => p
-            .list_groups()
-            .into_iter()
-            .map(|(name, g)| GroupDto {
-                is_builtin: BUILTIN_GROUPS.contains(&name.as_str()),
-                name,
-                permissions: g.permissions,
-            })
-            .collect(),
-        None => Vec::new(),
-    };
+    let groups: Vec<GroupDto> = st
+        .persistence
+        .list_groups()
+        .into_iter()
+        .map(|(name, g)| GroupDto {
+            is_builtin: BUILTIN_GROUPS.contains(&name.as_str()),
+            name,
+            permissions: g.permissions,
+        })
+        .collect();
     Ok(Json(groups))
 }
 

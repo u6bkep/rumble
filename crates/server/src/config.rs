@@ -50,6 +50,13 @@ log_level = "info"
 # Relative paths are resolved from the config file location.
 data_dir = "data"
 
+# Database persistence mode.
+#   - "disk"      - persist to data_dir/rumble.db; survives restart (default).
+#   - "ephemeral" - in-memory only; ALL state (rooms, groups, registrations,
+#                   bans, sudo password) is discarded on restart. For throwaway
+#                   instances and tests. Can be set via RUMBLE_PERSISTENCE.
+persistence = "disk"
+
 # Directory containing TLS certificates.
 # The server expects certbot-style PEM files:
 #   - fullchain.pem  - Certificate chain
@@ -184,6 +191,21 @@ pub enum Command {
     },
 }
 
+/// How the server stores its database.
+///
+/// A server instance *always* has a database — there is no "no persistence"
+/// mode. An ephemeral instance has an in-memory database, not a missing one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum PersistenceMode {
+    /// Persist to `data_dir/rumble.db`; survives restarts. The default.
+    #[default]
+    Disk,
+    /// In-memory only (sled temporary): discarded when the process exits.
+    /// Intended for throwaway instances and tests.
+    Ephemeral,
+}
+
 /// TOML configuration file structure.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileConfig {
@@ -198,6 +220,10 @@ pub struct FileConfig {
     /// Directory for server data.
     #[serde(default = "default_data_dir")]
     pub data_dir: PathBuf,
+
+    /// Database persistence mode: `"disk"` (default) or `"ephemeral"` (in-RAM).
+    #[serde(default)]
+    pub persistence: PersistenceMode,
 
     /// Directory containing TLS certificates.
     #[serde(default = "default_cert_dir")]
@@ -292,6 +318,7 @@ impl Default for FileConfig {
             bind: default_bind(),
             log_level: default_log_level(),
             data_dir: default_data_dir(),
+            persistence: PersistenceMode::default(),
             cert_dir: default_cert_dir(),
             domain: default_domain(),
             welcome_message: None,
@@ -312,6 +339,8 @@ pub struct ServerConfig {
     pub log_level: String,
     /// Directory for server data.
     pub data_dir: PathBuf,
+    /// Database persistence mode (disk vs ephemeral in-RAM).
+    pub persistence: PersistenceMode,
     /// Directory containing TLS certificates.
     pub cert_dir: PathBuf,
     /// Server domain name.
@@ -395,9 +424,23 @@ impl ServerConfig {
         let env_domain = std::env::var("RUMBLE_DOMAIN").ok();
         let env_welcome_message = std::env::var("RUMBLE_WELCOME_MESSAGE").ok();
 
+        // RUMBLE_PERSISTENCE=disk|ephemeral (also accepts memory/in-memory).
+        let env_persistence =
+            std::env::var("RUMBLE_PERSISTENCE")
+                .ok()
+                .and_then(|v| match v.to_ascii_lowercase().as_str() {
+                    "disk" => Some(PersistenceMode::Disk),
+                    "ephemeral" | "memory" | "in-memory" => Some(PersistenceMode::Ephemeral),
+                    other => {
+                        eprintln!("[config] ignoring unknown RUMBLE_PERSISTENCE='{other}' (expected disk|ephemeral)");
+                        None
+                    }
+                });
+
         let bind_str = args.bind.or(env_bind).unwrap_or(file_config.bind);
         let log_level = args.log_level.or(env_log_level).unwrap_or(file_config.log_level);
         let data_dir = args.data_dir.or(env_data_dir).unwrap_or(file_config.data_dir);
+        let persistence = env_persistence.unwrap_or(file_config.persistence);
         let cert_dir = args.cert_dir.or(env_cert_dir).unwrap_or(file_config.cert_dir);
         let domain = args.domain.or(env_domain).unwrap_or(file_config.domain);
         let welcome_message = env_welcome_message
@@ -434,6 +477,7 @@ impl ServerConfig {
             bind,
             log_level,
             data_dir,
+            persistence,
             cert_dir,
             domain,
             base_dir,

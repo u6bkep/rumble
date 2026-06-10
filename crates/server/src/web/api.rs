@@ -38,7 +38,7 @@ pub async fn create_group(
     State(st): State<WebState>,
     Json(req): Json<CreateGroupRequest>,
 ) -> ApiResult<OkMessage> {
-    let msg = map_op(ops::apply_create_group(&st.state, st.persistence.as_ref(), req.name, req.permissions).await)?;
+    let msg = map_op(ops::apply_create_group(&st.state, &st.persistence, req.name, req.permissions).await)?;
     ok(msg)
 }
 
@@ -48,12 +48,12 @@ pub async fn modify_group(
     Path(name): Path<String>,
     Json(req): Json<ModifyGroupRequest>,
 ) -> ApiResult<OkMessage> {
-    let msg = map_op(ops::apply_modify_group(&st.state, st.persistence.as_ref(), name, req.permissions).await)?;
+    let msg = map_op(ops::apply_modify_group(&st.state, &st.persistence, name, req.permissions).await)?;
     ok(msg)
 }
 
 pub async fn delete_group(_admin: Admin, State(st): State<WebState>, Path(name): Path<String>) -> ApiResult<OkMessage> {
-    let msg = map_op(ops::apply_delete_group(&st.state, st.persistence.as_ref(), name).await)?;
+    let msg = map_op(ops::apply_delete_group(&st.state, &st.persistence, name).await)?;
     ok(msg)
 }
 
@@ -68,22 +68,14 @@ pub async fn create_room(
         Some(p) => Some(parse_room_uuid(p)?),
         None => None,
     };
-    let uuid = map_op(
-        ops::apply_create_room(
-            &st.state,
-            st.persistence.as_ref(),
-            req.name,
-            parent_uuid,
-            req.description,
-        )
-        .await,
-    )?;
+    let uuid =
+        map_op(ops::apply_create_room(&st.state, &st.persistence, req.name, parent_uuid, req.description).await)?;
     ok(uuid.to_string())
 }
 
 pub async fn delete_room(_admin: Admin, State(st): State<WebState>, Path(uuid): Path<String>) -> ApiResult<OkMessage> {
     let room_uuid = parse_room_uuid(&uuid)?;
-    let name = map_op(ops::apply_delete_room(&st.state, st.persistence.as_ref(), room_uuid).await)?;
+    let name = map_op(ops::apply_delete_room(&st.state, &st.persistence, room_uuid).await)?;
     ok(format!("Deleted room '{}'", name))
 }
 
@@ -105,8 +97,7 @@ pub async fn set_room_acl(
             apply_subs: e.apply_subs,
         })
         .collect();
-    let msg =
-        map_op(ops::apply_set_room_acl(&st.state, st.persistence.as_ref(), room_uuid, req.inherit_acl, entries).await)?;
+    let msg = map_op(ops::apply_set_room_acl(&st.state, &st.persistence, room_uuid, req.inherit_acl, entries).await)?;
     ok(msg)
 }
 
@@ -131,7 +122,7 @@ pub async fn ban_user(
     let msg = map_op(
         ops::apply_ban(
             &st.state,
-            st.persistence.as_ref(),
+            &st.persistence,
             id,
             req.duration_seconds,
             &req.reason,
@@ -143,12 +134,12 @@ pub async fn ban_user(
 }
 
 pub async fn register_user(_admin: Admin, State(st): State<WebState>, Path(id): Path<u64>) -> ApiResult<OkMessage> {
-    let msg = map_op(ops::apply_register_user(&st.state, st.persistence.as_ref(), id).await)?;
+    let msg = map_op(ops::apply_register_user(&st.state, &st.persistence, id).await)?;
     ok(msg)
 }
 
 pub async fn unregister_user(_admin: Admin, State(st): State<WebState>, Path(id): Path<u64>) -> ApiResult<OkMessage> {
-    let msg = map_op(ops::apply_unregister_user(&st.state, st.persistence.as_ref(), id).await)?;
+    let msg = map_op(ops::apply_unregister_user(&st.state, &st.persistence, id).await)?;
     ok(msg)
 }
 
@@ -158,17 +149,8 @@ pub async fn set_user_group(
     Path(id): Path<u64>,
     Json(req): Json<SetUserGroupRequest>,
 ) -> ApiResult<OkMessage> {
-    let msg = map_op(
-        ops::apply_set_user_group(
-            &st.state,
-            st.persistence.as_ref(),
-            id,
-            req.group,
-            req.add,
-            req.expires_at,
-        )
-        .await,
-    )?;
+    let msg =
+        map_op(ops::apply_set_user_group(&st.state, &st.persistence, id, req.group, req.add, req.expires_at).await)?;
     ok(msg)
 }
 
@@ -183,15 +165,7 @@ pub async fn set_registered_user_group(
 ) -> ApiResult<OkMessage> {
     let key = decode_public_key(&key_b64)?;
     let msg = map_op(
-        ops::apply_set_user_group_by_key(
-            &st.state,
-            st.persistence.as_ref(),
-            key,
-            req.group,
-            req.add,
-            req.expires_at,
-        )
-        .await,
+        ops::apply_set_user_group_by_key(&st.state, &st.persistence, key, req.group, req.add, req.expires_at).await,
     )?;
     ok(msg)
 }

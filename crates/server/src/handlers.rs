@@ -80,7 +80,7 @@ pub async fn handle_envelope(
     env: proto::Envelope,
     sender: Arc<ClientHandle>,
     state: Arc<ServerState>,
-    persistence: Option<Arc<Persistence>>,
+    persistence: Arc<Persistence>,
     plugins: &[Arc<dyn ServerPlugin>],
     ctx: &ServerCtx,
 ) -> Result<()> {
@@ -305,7 +305,7 @@ async fn handle_client_hello(
     ch: proto::ClientHello,
     sender: Arc<ClientHandle>,
     state: Arc<ServerState>,
-    persistence: Option<Arc<Persistence>>,
+    persistence: Arc<Persistence>,
 ) -> Result<()> {
     info!("ClientHello from {}", ch.username);
 
@@ -315,20 +315,18 @@ async fn handle_client_hello(
     }
     let public_key: [u8; 32] = ch.public_key.try_into().unwrap();
 
-    // 2. Check registration constraints (if persistence is enabled)
-    if let Some(persist) = &persistence {
-        // Check if username is taken by a DIFFERENT key
-        // Note: If this key is registered, they can provide any name - we'll override it later
-        // with their registered name. We only block if they're trying to use someone ELSE's
-        // registered name.
-        if persist.is_username_taken(&ch.username, &public_key) {
-            return send_auth_failed(&sender, "Username is registered to a different key").await;
-        }
+    // 2. Check registration constraints.
+    // Check if username is taken by a DIFFERENT key.
+    // Note: If this key is registered, they can provide any name - we'll override it later
+    // with their registered name. We only block if they're trying to use someone ELSE's
+    // registered name.
+    if persistence.is_username_taken(&ch.username, &public_key) {
+        return send_auth_failed(&sender, "Username is registered to a different key").await;
     }
 
     // 3. Check password for unknown keys
-    if let Some(persist) = &persistence {
-        let is_known = persist.is_known_key(&public_key);
+    {
+        let is_known = persistence.is_known_key(&public_key);
         if !is_known
             && let Ok(required) = std::env::var("RUMBLE_SERVER_PASSWORD")
             && !required.is_empty()
@@ -338,16 +336,6 @@ async fn handle_client_hello(
                 _ => {
                     return send_auth_failed(&sender, "Password required for new users").await;
                 }
-            }
-        }
-    } else {
-        // No persistence - check password for everyone if set
-        if let Ok(required) = std::env::var("RUMBLE_SERVER_PASSWORD")
-            && !required.is_empty()
-        {
-            match &ch.password {
-                Some(pw) if pw == &required => { /* OK */ }
-                _ => return send_auth_failed(&sender, "Password required").await,
             }
         }
     }
@@ -394,7 +382,7 @@ async fn handle_authenticate(
     auth: proto::Authenticate,
     sender: Arc<ClientHandle>,
     state: Arc<ServerState>,
-    persistence: Option<Arc<Persistence>>,
+    persistence: Arc<Persistence>,
 ) -> Result<()> {
     // 1. Get pending auth state
     let pending = match state.take_pending_auth(sender.user_id) {
@@ -438,7 +426,8 @@ async fn handle_authenticate(
     }
 
     // 4b. Check BANNED permission via ACL evaluation, honouring ban expiry.
-    if let Some(persist) = &persistence {
+    {
+        let persist = &persistence;
         // If a timed ban record exists and has expired, lift it proactively so
         // the group check below sees a clean state.
         let now_secs = SystemTime::now()
@@ -537,10 +526,8 @@ async fn handle_authenticate(
     // 6. Authentication successful
     sender.authenticated.store(true, Ordering::SeqCst);
 
-    // 6b. Mark key as known (if persistence enabled)
-    if let Some(persist) = &persistence
-        && let Err(e) = persist.add_known_key(&pending.public_key)
-    {
+    // 6b. Mark key as known.
+    if let Err(e) = persistence.add_known_key(&pending.public_key) {
         warn!("Failed to mark key as known: {e}");
     }
 
@@ -549,7 +536,8 @@ async fn handle_authenticate(
     // groups here; ACL evaluation derives it from the verified identity name
     // (see acl::evaluate_identity_permissions), so members without a verified
     // identity never gain a username-keyed group.
-    let verified_username = if let Some(persist) = &persistence {
+    let verified_username = {
+        let persist = &persistence;
         let mut groups = vec!["default".to_string()];
         if let Some(user_groups_data) = persist.get_raw("user_groups", &pending.public_key)
             && let Ok(stored_groups) = bincode::deserialize::<Vec<String>>(&user_groups_data)
@@ -562,8 +550,6 @@ async fn handle_authenticate(
         }
         sender.identity.set_groups(groups).await;
         persist.get_registered_user(&pending.public_key).map(|r| r.username)
-    } else {
-        None
     };
     sender.identity.set_verified_username(verified_username.clone()).await;
 
@@ -578,7 +564,8 @@ async fn handle_authenticate(
     state.add_session(sender.user_id, session_entry);
 
     // 10. Determine initial room (restore last room if registered, otherwise Root)
-    let initial_room = if let Some(persist) = &persistence {
+    let initial_room = {
+        let persist = &persistence;
         if let Some(registered) = persist.get_registered_user(&pending.public_key) {
             if let Some(last_room_bytes) = registered.last_room {
                 let last_uuid = uuid::Uuid::from_bytes(last_room_bytes);
@@ -599,8 +586,6 @@ async fn handle_authenticate(
         } else {
             ROOT_ROOM_UUID
         }
-    } else {
-        ROOT_ROOM_UUID
     };
     state.set_user_room(sender.user_id, initial_room).await;
 
@@ -684,13 +669,8 @@ async fn handle_register_user(
     req: proto::RegisterUser,
     sender: Arc<ClientHandle>,
     state: Arc<ServerState>,
-    persistence: Option<Arc<Persistence>>,
+    persistence: Arc<Persistence>,
 ) -> Result<()> {
-    let persist = match persistence.as_ref() {
-        Some(p) => p.clone(),
-        None => return send_command_result(&sender, "RegisterUser", false, "Registration not enabled").await,
-    };
-
     // Extract user_id from the UserId message
     let target_user_id = req.user_id.map(|u| u.value).unwrap_or(0);
 
@@ -704,9 +684,8 @@ async fn handle_register_user(
         send_permission_denied(&sender, denied).await?;
         return Ok(());
     }
-    let _ = &persist; // persistence presence validated above; ops re-derives it.
 
-    match crate::ops::apply_register_user(&state, persistence.as_ref(), target_user_id).await {
+    match crate::ops::apply_register_user(&state, &persistence, target_user_id).await {
         Ok(msg) => send_command_result(&sender, "RegisterUser", true, &msg).await,
         Err(msg) => send_command_result(&sender, "RegisterUser", false, &msg).await,
     }
@@ -717,13 +696,8 @@ async fn handle_unregister_user(
     req: proto::UnregisterUser,
     sender: Arc<ClientHandle>,
     state: Arc<ServerState>,
-    persistence: Option<Arc<Persistence>>,
+    persistence: Arc<Persistence>,
 ) -> Result<()> {
-    let persist = match persistence.as_ref() {
-        Some(p) => p.clone(),
-        None => return send_command_result(&sender, "UnregisterUser", false, "Registration not enabled").await,
-    };
-
     // Extract user_id from the UserId message
     let target_user_id = req.user_id.map(|u| u.value).unwrap_or(0);
 
@@ -737,9 +711,8 @@ async fn handle_unregister_user(
         send_permission_denied(&sender, denied).await?;
         return Ok(());
     }
-    let _ = &persist; // persistence presence validated above; ops re-derives it.
 
-    match crate::ops::apply_unregister_user(&state, persistence.as_ref(), target_user_id).await {
+    match crate::ops::apply_unregister_user(&state, &persistence, target_user_id).await {
         Ok(msg) => send_command_result(&sender, "UnregisterUser", true, &msg).await,
         Err(msg) => send_command_result(&sender, "UnregisterUser", false, &msg).await,
     }
@@ -768,7 +741,7 @@ async fn handle_chat_message(
     msg: proto::ChatMessage,
     sender: Arc<ClientHandle>,
     state: Arc<ServerState>,
-    persistence: Option<Arc<Persistence>>,
+    persistence: Arc<Persistence>,
 ) -> Result<()> {
     let is_tree = msg.tree.unwrap_or(false);
     // Identity comes from the authenticated connection, NOT the client's
@@ -806,7 +779,7 @@ async fn handle_chat_message(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn broadcast_chat_as(
     state: &Arc<ServerState>,
-    persistence: &Option<Arc<Persistence>>,
+    persistence: &Arc<Persistence>,
     sender_id: u64,
     text: String,
     is_tree: bool,
@@ -847,7 +820,7 @@ pub(crate) async fn broadcast_chat_as(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn broadcast_chat_in_room(
     state: &Arc<ServerState>,
-    persistence: &Option<Arc<Persistence>>,
+    persistence: &Arc<Persistence>,
     sender_id: u64,
     room: Uuid,
     text: String,
@@ -1026,7 +999,7 @@ async fn handle_join_room(
     jr: proto::JoinRoom,
     sender: Arc<ClientHandle>,
     state: Arc<ServerState>,
-    persistence: Option<Arc<Persistence>>,
+    persistence: Arc<Persistence>,
 ) -> Result<()> {
     let new_room_uuid = jr
         .room_id
@@ -1079,10 +1052,9 @@ async fn handle_join_room(
     }
 
     // Save last room for registered users
-    if let Some(persist) = &persistence
-        && let Some(public_key) = state.get_user_public_key(sender.user_id)
-        && persist.is_registered(&public_key)
-        && let Err(e) = persist.update_user_last_room(&public_key, Some(new_room_uuid.into_bytes()))
+    if let Some(public_key) = state.get_user_public_key(sender.user_id)
+        && persistence.is_registered(&public_key)
+        && let Err(e) = persistence.update_user_last_room(&public_key, Some(new_room_uuid.into_bytes()))
     {
         warn!("Failed to save user's last room: {e}");
     }
@@ -1116,7 +1088,7 @@ async fn handle_create_room(
     cr: proto::CreateRoom,
     sender: Arc<ClientHandle>,
     state: Arc<ServerState>,
-    persistence: Option<Arc<Persistence>>,
+    persistence: Arc<Persistence>,
 ) -> Result<()> {
     info!("CreateRoom: {}", cr.name);
 
@@ -1132,7 +1104,7 @@ async fn handle_create_room(
     }
 
     let room_name = cr.name.clone();
-    match crate::ops::apply_create_room(&state, persistence.as_ref(), cr.name, parent_uuid, cr.description).await {
+    match crate::ops::apply_create_room(&state, &persistence, cr.name, parent_uuid, cr.description).await {
         Ok(_uuid) => {
             send_command_result(&sender, "CreateRoom", true, &format!("Created room '{}'", room_name)).await?;
         }
@@ -1148,7 +1120,7 @@ async fn handle_delete_room(
     dr: proto::DeleteRoom,
     sender: Arc<ClientHandle>,
     state: Arc<ServerState>,
-    persistence: Option<Arc<Persistence>>,
+    persistence: Arc<Persistence>,
 ) -> Result<()> {
     let room_uuid = dr
         .room_id
@@ -1163,7 +1135,7 @@ async fn handle_delete_room(
         return Ok(());
     }
 
-    match crate::ops::apply_delete_room(&state, persistence.as_ref(), room_uuid).await {
+    match crate::ops::apply_delete_room(&state, &persistence, room_uuid).await {
         Ok(room_name) => {
             send_command_result(&sender, "DeleteRoom", true, &format!("Deleted room '{}'", room_name)).await?;
         }
@@ -1179,7 +1151,7 @@ async fn handle_rename_room(
     rr: proto::RenameRoom,
     sender: Arc<ClientHandle>,
     state: Arc<ServerState>,
-    persistence: Option<Arc<Persistence>>,
+    persistence: Arc<Persistence>,
 ) -> Result<()> {
     let room_uuid = rr
         .room_id
@@ -1213,7 +1185,8 @@ async fn handle_rename_room(
     }
 
     // Persist the room rename
-    if let Some(persist) = &persistence {
+    {
+        let persist = &persistence;
         let room_uuid_bytes = room_uuid.into_bytes();
         if let Some(mut room) = persist.get_room(&room_uuid_bytes) {
             room.name = new_name.clone();
@@ -1249,7 +1222,7 @@ async fn handle_move_room(
     mr: proto::MoveRoom,
     sender: Arc<ClientHandle>,
     state: Arc<ServerState>,
-    persistence: Option<Arc<Persistence>>,
+    persistence: Arc<Persistence>,
 ) -> Result<()> {
     let room_uuid = mr
         .room_id
@@ -1335,7 +1308,8 @@ async fn handle_move_room(
     }
 
     // Persist the room move
-    if let Some(persist) = &persistence {
+    {
+        let persist = &persistence;
         let room_uuid_bytes = room_uuid.into_bytes();
         if let Some(mut room) = persist.get_room(&room_uuid_bytes) {
             room.parent = Some(new_parent_uuid.into_bytes());
@@ -1371,7 +1345,7 @@ async fn handle_set_room_description(
     srd: proto::SetRoomDescription,
     sender: Arc<ClientHandle>,
     state: Arc<ServerState>,
-    persistence: Option<Arc<Persistence>>,
+    persistence: Arc<Persistence>,
 ) -> Result<()> {
     let room_uuid = srd
         .room_id
@@ -1395,7 +1369,8 @@ async fn handle_set_room_description(
     }
 
     // Persist the description change
-    if let Some(persist) = &persistence {
+    {
+        let persist = &persistence;
         let room_uuid_bytes = room_uuid.into_bytes();
         if let Some(mut room) = persist.get_room(&room_uuid_bytes) {
             room.description = srd.description.clone();
@@ -1427,7 +1402,7 @@ async fn handle_request_state_sync(
     rss: proto::RequestStateSync,
     sender: Arc<ClientHandle>,
     state: Arc<ServerState>,
-    persistence: Option<Arc<Persistence>>,
+    persistence: Arc<Persistence>,
 ) -> Result<()> {
     info!(
         user_id = sender.user_id,
@@ -1494,15 +1469,15 @@ async fn handle_set_user_status(
 async fn send_server_state_to_client(
     client: &ClientHandle,
     state: &ServerState,
-    persistence: &Option<Arc<Persistence>>,
+    persistence: &Arc<Persistence>,
 ) -> Result<()> {
     let mut rooms = state.build_room_list(persistence).await;
     let users = state.build_user_list().await;
 
     // Build group definitions for client-side ACL evaluation
-    let groups = if let Some(persist) = &persistence {
+    let groups: Vec<proto::GroupInfo> = {
         let builtin = ["default", "admin"];
-        persist
+        persistence
             .list_groups()
             .into_iter()
             .map(|(name, pg)| proto::GroupInfo {
@@ -1511,8 +1486,6 @@ async fn send_server_state_to_client(
                 permissions: pg.permissions,
             })
             .collect()
-    } else {
-        vec![]
     };
 
     // Build the ServerState message (without per-client effective_permissions for hash)
@@ -1561,7 +1534,7 @@ async fn send_server_state_to_client(
 ///
 /// Unlike `send_server_state_to_client`, this sends to every client.
 /// Each client receives per-room effective permissions computed for them.
-pub async fn broadcast_server_state(state: &Arc<ServerState>, persistence: &Option<Arc<Persistence>>) -> Result<()> {
+pub async fn broadcast_server_state(state: &Arc<ServerState>, persistence: &Arc<Persistence>) -> Result<()> {
     // Send per-client state (with per-room effective permissions) to each client
     let clients = state.snapshot_clients();
     for client in clients {
@@ -1957,7 +1930,7 @@ async fn handle_kick_user(
     ku: proto::KickUser,
     sender: Arc<ClientHandle>,
     state: Arc<ServerState>,
-    persistence: Option<Arc<Persistence>>,
+    persistence: Arc<Persistence>,
 ) -> Result<()> {
     // Permission check: KICK at root
     if let Err(denied) = acl::check_permission(&state, &sender, Uuid::nil(), Permissions::KICK, &persistence).await {
@@ -1988,7 +1961,7 @@ async fn handle_ban_user(
     bu: proto::BanUser,
     sender: Arc<ClientHandle>,
     state: Arc<ServerState>,
-    persistence: Option<Arc<Persistence>>,
+    persistence: Arc<Persistence>,
 ) -> Result<()> {
     // Permission check: BAN at root
     if let Err(denied) = acl::check_permission(&state, &sender, Uuid::nil(), Permissions::BAN, &persistence).await {
@@ -2006,7 +1979,7 @@ async fn handle_ban_user(
     let banned_by = sender.get_username().await;
     match crate::ops::apply_ban(
         &state,
-        persistence.as_ref(),
+        &persistence,
         target_user_id,
         bu.duration_seconds,
         &bu.reason,
@@ -2024,7 +1997,7 @@ async fn handle_set_server_mute(
     ssm: proto::SetServerMute,
     sender: Arc<ClientHandle>,
     state: Arc<ServerState>,
-    persistence: Option<Arc<Persistence>>,
+    persistence: Arc<Persistence>,
 ) -> Result<()> {
     let target_user_id = ssm.target_user_id;
 
@@ -2101,7 +2074,7 @@ async fn handle_elevate(
     elev: proto::Elevate,
     sender: Arc<ClientHandle>,
     state: Arc<ServerState>,
-    persistence: Option<Arc<Persistence>>,
+    persistence: Arc<Persistence>,
 ) -> Result<()> {
     // Permission check: SUDO at root
     if let Err(denied) = acl::check_permission(&state, &sender, Uuid::nil(), Permissions::SUDO, &persistence).await {
@@ -2109,9 +2082,7 @@ async fn handle_elevate(
         return Ok(());
     }
 
-    let Some(persist) = &persistence else {
-        return send_command_result(&sender, "Elevate", false, "Persistence not enabled").await;
-    };
+    let persist = &persistence;
 
     // Load sudo password hash from persistence
     let sudo_hash = match persist.get_raw("sudo_password", b"sudo") {
@@ -2162,7 +2133,7 @@ async fn handle_create_group(
     cg: proto::CreateGroup,
     sender: Arc<ClientHandle>,
     state: Arc<ServerState>,
-    persistence: Option<Arc<Persistence>>,
+    persistence: Arc<Persistence>,
 ) -> Result<()> {
     // Permission check: MANAGE_ACL at root
     if let Err(denied) =
@@ -2172,7 +2143,7 @@ async fn handle_create_group(
         return Ok(());
     }
 
-    match crate::ops::apply_create_group(&state, persistence.as_ref(), cg.name, cg.permissions).await {
+    match crate::ops::apply_create_group(&state, &persistence, cg.name, cg.permissions).await {
         Ok(msg) => send_command_result(&sender, "CreateGroup", true, &msg).await,
         Err(msg) => send_command_result(&sender, "CreateGroup", false, &msg).await,
     }
@@ -2183,7 +2154,7 @@ async fn handle_delete_group(
     dg: proto::DeleteGroup,
     sender: Arc<ClientHandle>,
     state: Arc<ServerState>,
-    persistence: Option<Arc<Persistence>>,
+    persistence: Arc<Persistence>,
 ) -> Result<()> {
     // Permission check: MANAGE_ACL at root
     if let Err(denied) =
@@ -2193,7 +2164,7 @@ async fn handle_delete_group(
         return Ok(());
     }
 
-    match crate::ops::apply_delete_group(&state, persistence.as_ref(), dg.name).await {
+    match crate::ops::apply_delete_group(&state, &persistence, dg.name).await {
         Ok(msg) => send_command_result(&sender, "DeleteGroup", true, &msg).await,
         Err(msg) => send_command_result(&sender, "DeleteGroup", false, &msg).await,
     }
@@ -2204,7 +2175,7 @@ async fn handle_modify_group(
     mg: proto::ModifyGroup,
     sender: Arc<ClientHandle>,
     state: Arc<ServerState>,
-    persistence: Option<Arc<Persistence>>,
+    persistence: Arc<Persistence>,
 ) -> Result<()> {
     // Permission check: MANAGE_ACL at root
     if let Err(denied) =
@@ -2214,7 +2185,7 @@ async fn handle_modify_group(
         return Ok(());
     }
 
-    match crate::ops::apply_modify_group(&state, persistence.as_ref(), mg.name, mg.permissions).await {
+    match crate::ops::apply_modify_group(&state, &persistence, mg.name, mg.permissions).await {
         Ok(msg) => send_command_result(&sender, "ModifyGroup", true, &msg).await,
         Err(msg) => send_command_result(&sender, "ModifyGroup", false, &msg).await,
     }
@@ -2225,7 +2196,7 @@ async fn handle_set_user_group(
     sug: proto::SetUserGroup,
     sender: Arc<ClientHandle>,
     state: Arc<ServerState>,
-    persistence: Option<Arc<Persistence>>,
+    persistence: Arc<Persistence>,
 ) -> Result<()> {
     // Permission check: MANAGE_ACL at root
     if let Err(denied) =
@@ -2237,7 +2208,7 @@ async fn handle_set_user_group(
 
     match crate::ops::apply_set_user_group(
         &state,
-        persistence.as_ref(),
+        &persistence,
         sug.target_user_id,
         sug.group,
         sug.add,
@@ -2255,7 +2226,7 @@ async fn handle_set_room_acl(
     sra: proto::SetRoomAcl,
     sender: Arc<ClientHandle>,
     state: Arc<ServerState>,
-    persistence: Option<Arc<Persistence>>,
+    persistence: Arc<Persistence>,
 ) -> Result<()> {
     // Validate room_id — return error instead of silently falling back to root
     let room_uuid = if sra.room_id.len() == 16 {
@@ -2275,7 +2246,7 @@ async fn handle_set_room_acl(
         return Ok(());
     }
 
-    match crate::ops::apply_set_room_acl(&state, persistence.as_ref(), room_uuid, sra.inherit_acl, sra.entries).await {
+    match crate::ops::apply_set_room_acl(&state, &persistence, room_uuid, sra.inherit_acl, sra.entries).await {
         Ok(msg) => send_command_result(&sender, "SetRoomAcl", true, &msg).await,
         Err(msg) => send_command_result(&sender, "SetRoomAcl", false, &msg).await,
     }
@@ -2452,7 +2423,7 @@ async fn handle_controller_hello(
     ch: proto::ControllerHello,
     sender: Arc<ClientHandle>,
     state: Arc<ServerState>,
-    persistence: Option<Arc<Persistence>>,
+    persistence: Arc<Persistence>,
 ) -> Result<()> {
     if sender.is_controller.load(Ordering::SeqCst) {
         return send_command_result(&sender, "ControllerHello", false, "Already a controller").await;
@@ -2508,7 +2479,7 @@ async fn handle_register_participant(
     rp: proto::RegisterParticipant,
     sender: Arc<ClientHandle>,
     state: Arc<ServerState>,
-    persistence: Option<Arc<Persistence>>,
+    persistence: Arc<Persistence>,
 ) -> Result<()> {
     let owner = OwnerId::Connection(sender.user_id);
 
@@ -2519,9 +2490,9 @@ async fn handle_register_participant(
     // per-participant identity and ignored for now (always anonymous).
     let groups: Vec<String> = {
         let pubkey = *sender.public_key.read().await;
-        match (pubkey, persistence.as_ref()) {
-            (Some(pk), Some(persist)) => persist.get_participant_default_group(&pk).into_iter().collect(),
-            _ => Vec::new(),
+        match pubkey {
+            Some(pk) => persistence.get_participant_default_group(&pk).into_iter().collect(),
+            None => Vec::new(),
         }
     };
 
@@ -2596,7 +2567,7 @@ async fn handle_participant_chat(
     pc: proto::ParticipantChat,
     sender: Arc<ClientHandle>,
     state: Arc<ServerState>,
-    persistence: Option<Arc<Persistence>>,
+    persistence: Arc<Persistence>,
 ) -> Result<()> {
     if !state.is_participant_of(pc.user_id, OwnerId::Connection(sender.user_id)) {
         return send_command_result(&sender, "ParticipantChat", false, "Not your participant").await;

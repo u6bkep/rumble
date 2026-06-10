@@ -20,7 +20,7 @@ pub async fn check_permission(
     sender: &ClientHandle,
     room_uuid: Uuid,
     required: Permissions,
-    persistence: &Option<Arc<Persistence>>,
+    persistence: &Arc<Persistence>,
 ) -> Result<(), proto::PermissionDenied> {
     let effective = evaluate_user_permissions(state, sender, room_uuid, persistence).await;
     require(effective, required, room_uuid)
@@ -33,7 +33,7 @@ pub async fn check_member_permission(
     member: &Member,
     room_uuid: Uuid,
     required: Permissions,
-    persistence: &Option<Arc<Persistence>>,
+    persistence: &Arc<Persistence>,
 ) -> Result<(), proto::PermissionDenied> {
     let effective = evaluate_member_permissions(state, member, room_uuid, persistence).await;
     require(effective, required, room_uuid)
@@ -59,7 +59,7 @@ pub async fn evaluate_user_permissions(
     state: &ServerState,
     sender: &ClientHandle,
     room_uuid: Uuid,
-    persistence: &Option<Arc<Persistence>>,
+    persistence: &Arc<Persistence>,
 ) -> Permissions {
     let is_superuser = sender.is_superuser.load(std::sync::atomic::Ordering::Relaxed);
     evaluate_identity_permissions(state, is_superuser, &sender.identity, room_uuid, persistence).await
@@ -70,7 +70,7 @@ pub async fn evaluate_member_permissions(
     state: &ServerState,
     member: &Member,
     room_uuid: Uuid,
-    persistence: &Option<Arc<Persistence>>,
+    persistence: &Arc<Persistence>,
 ) -> Permissions {
     evaluate_identity_permissions(state, member.is_superuser(), &member.identity, room_uuid, persistence).await
 }
@@ -84,12 +84,9 @@ async fn evaluate_identity_permissions(
     is_superuser: bool,
     identity: &Identity,
     room_uuid: Uuid,
-    persistence: &Option<Arc<Persistence>>,
+    persistence: &Arc<Persistence>,
 ) -> Permissions {
-    let Some(persist) = persistence else {
-        // No persistence = no ACL data, grant all permissions
-        return Permissions::all();
-    };
+    let persist = persistence;
 
     // Build user's group list: always in "default" + their explicitly assigned
     // groups + their verified username as an implicit group (if verified).
@@ -254,7 +251,7 @@ mod tests {
         let persist = persistence_with_default();
         let m = member(1, "anon", None, &[]);
 
-        let perms = evaluate_member_permissions(&state, &m, ROOT_ROOM_UUID, &Some(persist)).await;
+        let perms = evaluate_member_permissions(&state, &m, ROOT_ROOM_UUID, &persist).await;
         assert_eq!(perms, DEFAULT_PERMISSIONS);
     }
 
@@ -267,12 +264,12 @@ mod tests {
 
         // alice, verified, picks the grant up via her implicit username-group.
         let alice = member(1, "alice", Some("alice"), &[]);
-        let aperms = evaluate_member_permissions(&state, &alice, ROOT_ROOM_UUID, &Some(persist.clone())).await;
+        let aperms = evaluate_member_permissions(&state, &alice, ROOT_ROOM_UUID, &persist).await;
         assert_eq!(aperms, DEFAULT_PERMISSIONS | Permissions::MUTE_DEAFEN);
 
         // bob, verified as someone else, does not.
         let bob = member(2, "bob", Some("bob"), &[]);
-        let bperms = evaluate_member_permissions(&state, &bob, ROOT_ROOM_UUID, &Some(persist)).await;
+        let bperms = evaluate_member_permissions(&state, &bob, ROOT_ROOM_UUID, &persist).await;
         assert_eq!(bperms, DEFAULT_PERMISSIONS);
     }
 
@@ -286,7 +283,7 @@ mod tests {
         grant_at_root(&persist, "alice", Permissions::MUTE_DEAFEN, false);
 
         let impostor = member(1, "alice", None, &[]);
-        let perms = evaluate_member_permissions(&state, &impostor, ROOT_ROOM_UUID, &Some(persist)).await;
+        let perms = evaluate_member_permissions(&state, &impostor, ROOT_ROOM_UUID, &persist).await;
         assert_eq!(
             perms, DEFAULT_PERMISSIONS,
             "an unverified display name must not mint an implicit group"
@@ -307,7 +304,7 @@ mod tests {
         let grandchild = state.create_room_with_parent("grandchild".into(), Some(child)).await;
 
         let m = member(1, "anon", None, &[]);
-        let perms = evaluate_member_permissions(&state, &m, grandchild, &Some(persist)).await;
+        let perms = evaluate_member_permissions(&state, &m, grandchild, &persist).await;
 
         // The room-scoped MUTE_DEAFEN grant is inherited down the chain; the
         // server-scoped SELF_REGISTER bit from the default group is stripped
@@ -329,18 +326,7 @@ mod tests {
             .unwrap();
 
         let m = member(1, "anon", None, &["moderators"]);
-        let perms = evaluate_member_permissions(&state, &m, ROOT_ROOM_UUID, &Some(persist)).await;
+        let perms = evaluate_member_permissions(&state, &m, ROOT_ROOM_UUID, &persist).await;
         assert_eq!(perms, DEFAULT_PERMISSIONS | Permissions::MUTE_DEAFEN);
-    }
-
-    #[tokio::test]
-    async fn no_persistence_grants_all_permissions() {
-        // Without a persistence layer there is no ACL data, so evaluation
-        // falls back to granting everything.
-        let state = ServerState::new();
-        let m = member(1, "anon", None, &[]);
-
-        let perms = evaluate_member_permissions(&state, &m, ROOT_ROOM_UUID, &None).await;
-        assert_eq!(perms, Permissions::all());
     }
 }
