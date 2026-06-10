@@ -40,6 +40,19 @@ const BUILTIN_GROUPS: [&str; 2] = ["default", "admin"];
 // User moderation
 // =============================================================================
 
+/// Explain why `target_user_id` has no moderatable client connection. A
+/// controller-driven participant (e.g. a bridged Mumble user) exists as a
+/// [`crate::state::Member`] but has no `ClientHandle` of its own, so direct
+/// `{action}` can't reach it — it must be moderated through its controller.
+/// Anything else is genuinely absent.
+fn not_a_client_reason(state: &Arc<ServerState>, target_user_id: u64, action: &str) -> String {
+    if state.get_member(target_user_id).is_some() {
+        format!("Cannot {action} a controller-driven participant directly; moderate it through its controller")
+    } else {
+        "User not found".to_string()
+    }
+}
+
 /// Kick a connected user: notify them, close their connection, and broadcast
 /// their departure. `actor` is the human-readable name recorded as the kicker.
 ///
@@ -53,7 +66,7 @@ pub(crate) async fn apply_kick(
 ) -> Result<String, String> {
     let target_client = state
         .get_client(target_user_id)
-        .ok_or_else(|| "User not found".to_string())?;
+        .ok_or_else(|| not_a_client_reason(state, target_user_id, "kick"))?;
 
     if target_client.is_superuser.load(Ordering::Relaxed) {
         return Err("Cannot kick a superuser".to_string());
@@ -97,7 +110,7 @@ pub(crate) async fn apply_ban(
 ) -> Result<String, String> {
     let target_client = state
         .get_client(target_user_id)
-        .ok_or_else(|| "User not found".to_string())?;
+        .ok_or_else(|| not_a_client_reason(state, target_user_id, "ban"))?;
 
     if target_client.is_superuser.load(Ordering::Relaxed) {
         return Err("Cannot ban a superuser".to_string());
@@ -353,6 +366,10 @@ pub(crate) async fn apply_delete_room(
         }
     }
 
+    // Capture who is in the room before deletion — delete_room moves them to
+    // Root, where their SPEAK (and thus auto server-mute) must be re-evaluated.
+    let displaced_members = state.get_room_members(room_uuid).await;
+
     if !state.delete_room(room_uuid).await {
         return Err("Room not found".to_string());
     }
@@ -376,6 +393,13 @@ pub(crate) async fn apply_delete_room(
     )
     .await
     .map_err(|e| format!("Failed to broadcast room deletion: {e}"))?;
+
+    // The displaced members are now in Root; re-evaluate their auto server-mute
+    // against Root's SPEAK so a mute inherited from the (SPEAK-denied) deleted
+    // room doesn't stick until they manually rejoin.
+    for member_id in displaced_members {
+        reevaluate_member_mute(state, persistence, member_id, rumble_protocol::ROOT_ROOM_UUID).await;
+    }
 
     Ok(room_name)
 }
@@ -683,33 +707,44 @@ pub(crate) async fn apply_set_room_acl(
     .map_err(|e| format!("Failed to broadcast ACL change: {e}"))?;
 
     // Re-evaluate SPEAK for everyone currently in the room.
-    let room_members = state.get_room_members(room_uuid).await;
-    for member_id in room_members {
-        if let Some(client) = state.get_client(member_id) {
-            let speak_perms = crate::acl::evaluate_user_permissions(state, &client, room_uuid, persistence).await;
-            let speak_denied = !speak_perms.contains(Permissions::SPEAK);
-            let manually_muted = client.manually_server_muted.load(Ordering::Relaxed);
-            let should_mute = speak_denied || manually_muted;
-            let was_muted = client.server_muted.load(Ordering::Relaxed);
-            if should_mute != was_muted {
-                client.server_muted.store(should_mute, Ordering::Relaxed);
-                let status = state.get_user_status(member_id).await;
-                let _ = broadcast_state_update(
-                    state,
-                    proto::state_update::Update::UserStatusChanged(proto::UserStatusChanged {
-                        user_id: Some(proto::UserId { value: member_id }),
-                        is_muted: status.is_muted,
-                        is_deafened: status.is_deafened,
-                        server_muted: should_mute,
-                        is_elevated: client.is_superuser.load(Ordering::Relaxed),
-                    }),
-                )
-                .await;
-            }
-        }
+    for member_id in state.get_room_members(room_uuid).await {
+        reevaluate_member_mute(state, persistence, member_id, room_uuid).await;
     }
 
     Ok("Room ACL updated".to_string())
+}
+
+/// Re-evaluate `member_id`'s `SPEAK` permission in `room` and update its
+/// `server_muted` state, broadcasting any change. Server-mutes a member that
+/// lacks SPEAK; unmutes one that regained it (unless manually muted). A no-op
+/// for participants with no live connection. Used whenever a member's effective
+/// SPEAK can change without a deliberate join: an ACL edit, or a forced move to
+/// Root when their room is deleted (so a stale auto-mute doesn't persist).
+async fn reevaluate_member_mute(state: &Arc<ServerState>, persistence: &Arc<Persistence>, member_id: u64, room: Uuid) {
+    let Some(client) = state.get_client(member_id) else {
+        return;
+    };
+    let speak_perms = crate::acl::evaluate_user_permissions(state, &client, room, persistence).await;
+    let speak_denied = !speak_perms.contains(Permissions::SPEAK);
+    let manually_muted = client.manually_server_muted.load(Ordering::Relaxed);
+    let should_mute = speak_denied || manually_muted;
+    let was_muted = client.server_muted.load(Ordering::Relaxed);
+    if should_mute == was_muted {
+        return;
+    }
+    client.server_muted.store(should_mute, Ordering::Relaxed);
+    let status = state.get_user_status(member_id).await;
+    let _ = broadcast_state_update(
+        state,
+        proto::state_update::Update::UserStatusChanged(proto::UserStatusChanged {
+            user_id: Some(proto::UserId { value: member_id }),
+            is_muted: status.is_muted,
+            is_deafened: status.is_deafened,
+            server_muted: should_mute,
+            is_elevated: client.is_superuser.load(Ordering::Relaxed),
+        }),
+    )
+    .await;
 }
 
 #[cfg(test)]

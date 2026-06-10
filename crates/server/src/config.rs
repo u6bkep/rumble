@@ -208,6 +208,7 @@ pub enum PersistenceMode {
 
 /// TOML configuration file structure.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FileConfig {
     /// Socket address to bind to.
     #[serde(default = "default_bind")]
@@ -249,6 +250,7 @@ pub struct FileConfig {
 
 /// `[web]` configuration section: the HTTP admin control-plane.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WebFileConfig {
     /// Enable the web admin server. Disabled by default — remote exposure is
     /// opt-in.
@@ -268,6 +270,17 @@ pub struct WebFileConfig {
 
 fn default_web_bind() -> String {
     "127.0.0.1:5001".to_string()
+}
+
+/// Parse a boolean-ish environment variable value. Returns `None` for anything
+/// not clearly truthy or falsy, so callers can fall back rather than guess.
+/// Case-insensitive; trims surrounding whitespace.
+fn parse_bool_env(v: &str) -> Option<bool> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
 }
 
 impl Default for WebFileConfig {
@@ -455,10 +468,22 @@ impl ServerConfig {
         let cert_dir = resolve_path(&base_dir, &cert_dir);
 
         // Resolve web admin settings (env override for enable/bind to ease ops).
-        let web_enabled = std::env::var("RUMBLE_WEB_ENABLED")
-            .ok()
-            .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
-            .unwrap_or(file_config.web.enabled);
+        // The override applies only when RUMBLE_WEB_ENABLED parses to a clear
+        // truthy/falsy value; an unrecognized value (e.g. "TRUE", "on", a typo)
+        // must NOT silently flip the file's setting either way.
+        let web_enabled = match std::env::var("RUMBLE_WEB_ENABLED") {
+            Ok(v) => match parse_bool_env(&v) {
+                Some(b) => b,
+                None => {
+                    eprintln!(
+                        "warning: RUMBLE_WEB_ENABLED='{v}' not recognized (use 1/true/yes/on or 0/false/no/off); \
+                         falling back to the config file's web.enabled"
+                    );
+                    file_config.web.enabled
+                }
+            },
+            Err(_) => file_config.web.enabled,
+        };
         let web = if web_enabled {
             let web_bind_str = std::env::var("RUMBLE_WEB_BIND").unwrap_or(file_config.web.bind);
             let web_bind = parse_bind_address(&web_bind_str)
@@ -676,6 +701,36 @@ mod tests {
             parse_bind_address("0.0.0.0").unwrap(),
             "0.0.0.0:5000".parse::<SocketAddr>().unwrap()
         );
+    }
+
+    #[test]
+    fn parse_bool_env_recognizes_truthy_and_falsy() {
+        for s in ["1", "true", "TRUE", "Yes", "on", " on "] {
+            assert_eq!(parse_bool_env(s), Some(true), "{s:?} should be truthy");
+        }
+        for s in ["0", "false", "FALSE", "no", "off"] {
+            assert_eq!(parse_bool_env(s), Some(false), "{s:?} should be falsy");
+        }
+        // Unrecognized values yield None so the caller falls back to the file.
+        for s in ["", "maybe", "enable", "2"] {
+            assert_eq!(parse_bool_env(s), None, "{s:?} should be unrecognized");
+        }
+    }
+
+    #[test]
+    fn unknown_config_key_is_rejected() {
+        // A misspelled top-level key (e.g. `enable` instead of `[web] enabled`)
+        // must error rather than silently keep the default.
+        let toml_src = "bind = \"0.0.0.0:5000\"\nenable = true\n";
+        let parsed: Result<FileConfig, _> = toml::from_str(toml_src);
+        assert!(parsed.is_err(), "unknown key must be rejected, got {parsed:?}");
+    }
+
+    #[test]
+    fn unknown_web_key_is_rejected() {
+        let toml_src = "[web]\nenable = true\n";
+        let parsed: Result<FileConfig, _> = toml::from_str(toml_src);
+        assert!(parsed.is_err(), "unknown [web] key must be rejected, got {parsed:?}");
     }
 
     #[test]

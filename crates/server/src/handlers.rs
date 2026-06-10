@@ -2113,7 +2113,15 @@ async fn handle_set_server_mute(
     let target_client = match state.get_client(target_user_id) {
         Some(c) => c,
         None => {
-            return send_command_result(&sender, "SetServerMute", false, "User not found").await;
+            // A controller-driven participant has no client connection of its
+            // own, so server-mute can't reach it directly — it must be
+            // moderated through its controller.
+            let reason = if state.get_member(target_user_id).is_some() {
+                "Cannot mute a controller-driven participant directly; moderate it through its controller"
+            } else {
+                "User not found"
+            };
+            return send_command_result(&sender, "SetServerMute", false, reason).await;
         }
     };
 
