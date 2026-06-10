@@ -517,6 +517,17 @@ async fn run_envelope_stream_with_prefix(
             Ok(Ok(Some(n))) => {
                 info!(bytes = n, "server: received bytes on stream");
                 buf.extend_from_slice(&chunk[..n]);
+                // Bound memory: refuse to keep buffering for an oversized frame.
+                // A complete frame is always decoded once enough bytes arrive, so
+                // exceeding the cap means a peer declared a huge (or never-
+                // completing) length — drop the connection rather than OOM.
+                if buf.len() > rumble_protocol::MAX_FRAME_LEN {
+                    error!(
+                        "control frame exceeds MAX_FRAME_LEN ({} bytes buffered); closing stream",
+                        buf.len()
+                    );
+                    break;
+                }
                 while let Some(frame) = try_decode_frame(&mut buf) {
                     match Envelope::decode(&*frame) {
                         Ok(env) => {

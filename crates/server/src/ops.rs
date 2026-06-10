@@ -198,6 +198,14 @@ pub(crate) async fn apply_register_user(
         return Err("User already registered".to_string());
     }
 
+    // Username-as-group invariant: a username becomes an implicit ACL group, so
+    // it must not collide with an existing permission group (builtin or custom).
+    // Otherwise registering as e.g. "admin" would silently grant that group's
+    // permissions. Symmetric to the check in apply_create_group.
+    if BUILTIN_GROUPS.contains(&username.as_str()) || persist.get_group(&username).is_some() {
+        return Err("Username conflicts with an existing permission group".to_string());
+    }
+
     persist
         .register_user(
             &target_key,
@@ -584,12 +592,17 @@ pub(crate) async fn apply_set_room_acl(
             .collect(),
     };
 
+    // Apply in-memory first; set_room_acl returns false if the room doesn't
+    // exist. Bail before persisting/broadcasting so we don't leave a garbage
+    // sled ACL record and announce an ACL for a room no client has.
+    if !state.set_room_acl(room_uuid, inherit_acl, entries.clone()).await {
+        return Err("Room not found".to_string());
+    }
+
     if let Err(e) = persist.set_room_acl(room_uuid.as_bytes(), &persisted_acl) {
         error!(room = %room_uuid, "Failed to persist room ACL: {e:?}");
         return Err("Failed to persist ACL".to_string());
     }
-
-    state.set_room_acl(room_uuid, inherit_acl, entries.clone()).await;
 
     info!(room = %room_uuid, entries = entries.len(), "SetRoomAcl");
 

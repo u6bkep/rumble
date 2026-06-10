@@ -402,9 +402,11 @@ async fn handle_authenticate(
         None => return send_auth_failed(&sender, "No pending authentication").await,
     };
 
-    // 2. Check timestamp (±5 minutes)
+    // 2. Check timestamp (±5 minutes). Use saturating arithmetic: timestamp_ms
+    // is an attacker-controlled i64, and a raw subtraction (or .abs() on
+    // i64::MIN) would overflow and panic in debug builds.
     let now_ms = now_ms();
-    let diff_ms = (now_ms - auth.timestamp_ms).abs();
+    let diff_ms = now_ms.saturating_sub(auth.timestamp_ms).saturating_abs();
     if diff_ms > 5 * 60 * 1000 {
         return send_auth_failed(&sender, "Timestamp out of range").await;
     }
@@ -468,9 +470,13 @@ async fn handle_authenticate(
         // Build group permissions map
         let mut group_perms = std::collections::HashMap::new();
         for (name, pg) in persist.list_groups() {
-            if let Some(perms) = rumble_protocol::permissions::Permissions::from_bits(pg.permissions) {
-                group_perms.insert(name, perms);
-            }
+            // Truncate undefined bits rather than dropping the whole group, so a
+            // stray unknown bit can't silently nullify the "banned" group and
+            // let banned users through this auth-time check.
+            group_perms.insert(
+                name,
+                rumble_protocol::permissions::Permissions::from_bits_truncate(pg.permissions),
+            );
         }
         // Evaluate at root - if BANNED flag is present, reject
         let root_chain = vec![(ROOT_ROOM_UUID, None)];
@@ -1287,6 +1293,38 @@ async fn handle_move_room(
         .find(|r| r.id.as_ref().and_then(uuid_from_room_id) == Some(new_parent_uuid))
         .map(|r| r.name.clone())
         .unwrap_or_else(|| "Root".to_string());
+
+    // Reject moves that would create a parent cycle (a room becoming its own
+    // ancestor). A cycle makes the parent-walk in ACL evaluation and descendant
+    // collection loop forever, and it gets persisted — bricking the server.
+    if new_parent_uuid == room_uuid {
+        return send_command_result(&sender, "MoveRoom", false, "Cannot move a room into itself").await;
+    }
+    {
+        let rooms = state.get_rooms().await;
+        let parent_of = |uuid: Uuid| -> Option<Uuid> {
+            rooms
+                .iter()
+                .find(|r| r.id.as_ref().and_then(uuid_from_room_id) == Some(uuid))
+                .and_then(|r| r.parent_id.as_ref().and_then(uuid_from_room_id))
+        };
+        // Walk up from the new parent; if we reach the room being moved, the
+        // move would close a cycle. Bound the walk by room count as a guard
+        // against any pre-existing cycle in the stored tree.
+        let mut cursor = Some(new_parent_uuid);
+        let mut steps = 0;
+        while let Some(c) = cursor {
+            if c == room_uuid {
+                return send_command_result(&sender, "MoveRoom", false, "Cannot move a room into its own descendant")
+                    .await;
+            }
+            steps += 1;
+            if steps > rooms.len() {
+                break;
+            }
+            cursor = parent_of(c);
+        }
+    }
 
     info!("MoveRoom: {} -> parent {}", room_uuid, new_parent_uuid);
 

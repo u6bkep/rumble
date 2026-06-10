@@ -110,9 +110,10 @@ async fn evaluate_identity_permissions(
     // Build group permissions map from persistence
     let mut group_perms: HashMap<String, Permissions> = HashMap::new();
     for (name, pg) in persist.list_groups() {
-        if let Some(p) = Permissions::from_bits(pg.permissions) {
-            group_perms.insert(name, p);
-        }
+        // Truncate undefined bits rather than dropping the whole group: with
+        // from_bits a single unknown bit would silently zero a group's perms
+        // (e.g. un-banning everyone in "banned"). Matches the ACL-entry path.
+        group_perms.insert(name, Permissions::from_bits_truncate(pg.permissions));
     }
 
     // Build room chain from root to target room

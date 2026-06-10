@@ -571,7 +571,7 @@ pub fn generate_self_signed_cert(
 
     fs::write(&fullchain_path, &cert_pem)
         .with_context(|| format!("Failed to write certificate: {}", fullchain_path.display()))?;
-    fs::write(&privkey_path, &key_pem)
+    write_private_key(&privkey_path, &key_pem)
         .with_context(|| format!("Failed to write private key: {}", privkey_path.display()))?;
 
     info!(
@@ -582,6 +582,29 @@ pub fn generate_self_signed_cert(
 
     // Parse the generated PEM files
     load_pem_certificates(&fullchain_path, &privkey_path)
+}
+
+/// Write a PEM private key with owner-only (0600) permissions on Unix, so the
+/// generated self-signed key isn't left world-readable under the default umask.
+fn write_private_key(path: &std::path::Path, key_pem: &str) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::{io::Write, os::unix::fs::OpenOptionsExt};
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        // Re-assert mode in case the file pre-existed with looser perms.
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        file.write_all(key_pem.as_bytes())
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(path, key_pem)
+    }
 }
 
 #[cfg(test)]

@@ -122,10 +122,21 @@ pub fn encode_frame_raw(data: &[u8]) -> Vec<u8> {
     buf
 }
 
+/// Maximum size of a single length-prefixed control frame (envelope).
+///
+/// Control messages are small (chat, state sync); bulk data goes over separate
+/// plugin streams, not envelopes. A reader fed from an untrusted socket should
+/// refuse to buffer more than this so a peer can't declare a huge length and
+/// exhaust memory by trickling bytes for a frame that never completes.
+pub const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
+
 /// Attempt to read a single length-prefixed frame from the buffer.
 ///
 /// Returns `Some(frame_bytes)` when a full frame is available, leaving any
 /// remaining bytes in `src`. Returns `None` if not enough data is present yet.
+///
+/// Note: this does not itself enforce [`MAX_FRAME_LEN`] — a reader fed from an
+/// untrusted socket must cap its accumulation buffer (see the server read loop).
 pub fn try_decode_frame(src: &mut BytesMut) -> Option<Vec<u8>> {
     // Peek at the length delimiter
     let mut peek_buf = src.clone();
