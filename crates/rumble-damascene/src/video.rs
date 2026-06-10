@@ -395,6 +395,48 @@ pub fn render_lightbox(active: &ActiveVideo) -> El {
     overlay([scrim(KEY_LIGHTBOX_DISMISS), centered])
 }
 
+/// Build the "opening…" overlay shown between clicking Play and
+/// `VideoStream::open` completing (libmpv's load deadline is 10s, so
+/// this can be visible for a while on a slow file). Reuses the
+/// lightbox dismiss/close keys so the standard close paths — Cancel
+/// button, scrim click, Escape — abort the in-flight open.
+pub fn render_pending_lightbox(name: &str) -> El {
+    let header = row([
+        text(name.to_string()).semibold().ellipsis(),
+        spacer().width(Size::Fill(1.0)),
+        button("Cancel").key(KEY_LIGHTBOX_CLOSE).ghost(),
+    ])
+    .gap(tokens::SPACE_2)
+    .align(Align::Center)
+    .width(Size::Fill(1.0));
+
+    let body = column([text("Opening video…").muted()])
+        .align(Align::Center)
+        .justify(Justify::Center)
+        .clip()
+        .fill(tokens::CARD)
+        .radius(tokens::RADIUS_MD)
+        .width(Size::Fill(1.0))
+        .height(Size::Fill(1.0));
+
+    let panel = column([header, body])
+        .style_profile(StyleProfile::Surface)
+        .surface_role(SurfaceRole::Popover)
+        .fill(tokens::POPOVER)
+        .stroke(tokens::BORDER)
+        .stroke_width(1.0)
+        .radius(tokens::RADIUS_LG)
+        .padding(Sides::all(tokens::SPACE_4))
+        .gap(tokens::SPACE_3)
+        .width(Size::Fill(1.0))
+        .height(Size::Fill(1.0))
+        .block_pointer();
+
+    let centered = stack([panel]).fill_size().padding(Sides::all(tokens::SPACE_7));
+
+    overlay([scrim(KEY_LIGHTBOX_DISMISS), centered])
+}
+
 fn lightbox_header(active: &ActiveVideo) -> El {
     row([
         text(active.name.clone()).semibold().ellipsis(),

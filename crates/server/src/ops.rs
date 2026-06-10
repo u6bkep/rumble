@@ -420,6 +420,12 @@ pub(crate) async fn apply_create_group(
     if name.is_empty() {
         return Err("Group name cannot be empty".to_string());
     }
+    // `:` is reserved: admin clients embed group names in `:`-separated
+    // routing keys, where a colon inside the name silently corrupts
+    // per-group operations.
+    if name.contains(':') {
+        return Err("Group name cannot contain ':'".to_string());
+    }
     if BUILTIN_GROUPS.contains(&name.as_str()) {
         return Err("Cannot create built-in groups".to_string());
     }

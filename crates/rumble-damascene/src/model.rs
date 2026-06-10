@@ -135,6 +135,12 @@ fn load_stl(path: &Path) -> Result<LoadedModel, ModelError> {
     // `0 0 0` and expect the consumer to derive it).
     let mut vertices = Vec::with_capacity(mesh.faces.len() * 3);
     for face in &mesh.faces {
+        // Defensive bounds check: these files arrive from remote peers,
+        // so an index pointing past the vertex table must reject the
+        // mesh instead of panicking the parse task.
+        if face.vertices.iter().any(|&i| i >= mesh.vertices.len()) {
+            return Err(ModelError::Parse("face vertex index out of bounds".into()));
+        }
         let pos = |i: usize| {
             let v = mesh.vertices[face.vertices[i]];
             Vec3::new(v[0], v[1], v[2])
@@ -239,6 +245,18 @@ fn load_ply(path: &Path) -> Result<LoadedModel, ModelError> {
         .collect();
 
     let faces = ply.payload.get("face").map(|fs| collect_faces(fs)).unwrap_or_default();
+
+    // Face indices come straight from the (possibly hostile) file —
+    // validate them against the vertex count before anything indexes
+    // with them (`smooth_normals` here, the GPU index buffer later).
+    // Negative `ListInt` indices wrap to huge u32s and are caught too.
+    if faces
+        .iter()
+        .flat_map(|t| t.iter())
+        .any(|&i| i as usize >= positions.len())
+    {
+        return Err(ModelError::Parse("face vertex index out of bounds".into()));
+    }
 
     if !faces.is_empty() {
         // Mesh path: prefer file-supplied per-vertex normals; otherwise
@@ -583,6 +601,46 @@ mod tests {
         assert_eq!(parse_open_model_key(&k), Some("abc-123"));
         assert_eq!(parse_open_model_key("model:open:"), Some(""));
         assert_eq!(parse_open_model_key("other:xyz"), None);
+    }
+
+    #[test]
+    fn ply_with_out_of_bounds_face_index_is_rejected() {
+        // 3 vertices, one face referencing vertex 99 — must come back
+        // as a parse error, not a panic in smooth_normals.
+        let ply = "ply\nformat ascii 1.0\nelement vertex 3\nproperty float x\nproperty float y\nproperty float \
+                   z\nelement face 1\nproperty list uchar int vertex_indices\nend_header\n0 0 0\n1 0 0\n0 1 0\n3 0 1 \
+                   99\n";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("hostile.ply");
+        std::fs::write(&path, ply).expect("write ply");
+        let err = match load_model(&path) {
+            Err(e) => e,
+            Ok(_) => panic!("hostile indices must be rejected"),
+        };
+        assert!(
+            matches!(err, ModelError::Parse(ref m) if m.contains("out of bounds")),
+            "expected out-of-bounds parse error, got {err}"
+        );
+    }
+
+    #[test]
+    fn ply_with_negative_face_index_is_rejected() {
+        // Negative ListInt indices wrap to huge u32s — caught by the
+        // same bounds check.
+        let ply = "ply\nformat ascii 1.0\nelement vertex 3\nproperty float x\nproperty float y\nproperty float \
+                   z\nelement face 1\nproperty list uchar int vertex_indices\nend_header\n0 0 0\n1 0 0\n0 1 0\n3 0 1 \
+                   -1\n";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("hostile_neg.ply");
+        std::fs::write(&path, ply).expect("write ply");
+        let err = match load_model(&path) {
+            Err(e) => e,
+            Ok(_) => panic!("negative indices must be rejected"),
+        };
+        assert!(
+            matches!(err, ModelError::Parse(ref m) if m.contains("out of bounds")),
+            "expected out-of-bounds parse error, got {err}"
+        );
     }
 
     #[test]

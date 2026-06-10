@@ -509,7 +509,7 @@ impl Scene {
             Scene::AddServerModal => {
                 app.set_recent_servers_for_test(demo_recent_servers());
                 app.set_server_form_for_test(rumble_damascene::ServerForm {
-                    editing_index: None,
+                    editing_addr: None,
                     addr: "rumble.new-org.example:5000".to_string(),
                     label: "New org".to_string(),
                     username: "alice".to_string(),
@@ -519,7 +519,7 @@ impl Scene {
             Scene::EditServerModal => {
                 app.set_recent_servers_for_test(demo_recent_servers());
                 app.set_server_form_for_test(rumble_damascene::ServerForm {
-                    editing_index: Some(0),
+                    editing_addr: Some("127.0.0.1:5000".to_string()),
                     addr: "127.0.0.1:5000".to_string(),
                     label: "Local dev".to_string(),
                     username: "alice".to_string(),
