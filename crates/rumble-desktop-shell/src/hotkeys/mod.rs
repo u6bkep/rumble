@@ -343,6 +343,12 @@ pub struct HotkeyManager {
     /// Set when the underlying global-hotkey manager refused to init
     /// for reasons other than "we're on Wayland". Surfaces in the UI.
     init_failed: bool,
+    /// Tracks whether global hotkeys are currently enabled per user
+    /// settings. Updated at the top of every `register_from_settings`
+    /// call; gates portal event dispatch in `poll_events` to cover the
+    /// async window between `release_all` spawning and the action map
+    /// being cleared inside the spawned task.
+    global_hotkeys_enabled: bool,
     #[cfg(all(target_os = "linux", feature = "wayland-portal"))]
     portal_backend: Option<PortalHotkeyBackend>,
 }
@@ -366,6 +372,7 @@ impl HotkeyManager {
                 registration_status: HashMap::new(),
                 is_wayland: true,
                 init_failed: false,
+                global_hotkeys_enabled: true,
                 #[cfg(all(target_os = "linux", feature = "wayland-portal"))]
                 portal_backend: None,
             };
@@ -383,6 +390,7 @@ impl HotkeyManager {
                         registration_status: HashMap::new(),
                         is_wayland: false,
                         init_failed: false,
+                        global_hotkeys_enabled: true,
                         #[cfg(all(target_os = "linux", feature = "wayland-portal"))]
                         portal_backend: None,
                     }
@@ -396,6 +404,7 @@ impl HotkeyManager {
                         registration_status: HashMap::new(),
                         is_wayland: false,
                         init_failed: true,
+                        global_hotkeys_enabled: true,
                         #[cfg(all(target_os = "linux", feature = "wayland-portal"))]
                         portal_backend: None,
                     }
@@ -408,6 +417,7 @@ impl HotkeyManager {
             registration_status: HashMap::new(),
             is_wayland: false,
             init_failed: false,
+            global_hotkeys_enabled: true,
             #[cfg(all(target_os = "linux", feature = "wayland-portal"))]
             portal_backend: None,
         }
@@ -567,17 +577,29 @@ impl HotkeyManager {
                 .insert(entry.id.clone(), HotkeyRegistrationStatus::NotConfigured);
         }
 
+        // Track enabled state before the portal block so that
+        // poll_events gates correctly the moment this function returns,
+        // even before the async release task has cleared the action map.
+        self.global_hotkeys_enabled = settings.global_hotkeys_enabled;
+
         #[cfg(all(target_os = "linux", feature = "wayland-portal"))]
         if let Some(ref mut portal) = self.portal_backend {
-            portal.set_shortcuts(&settings.shortcuts);
-            for entry in &settings.shortcuts {
-                // Portal-backed registration: the compositor owns key
-                // assignment, so we don't know yet whether a trigger
-                // exists. Treat the entry as Registered (i.e. the
-                // portal knows about it); the UI surfaces the actual
-                // trigger string separately.
-                self.registration_status
-                    .insert(entry.id.clone(), HotkeyRegistrationStatus::Registered);
+            if settings.global_hotkeys_enabled {
+                portal.set_shortcuts(&settings.shortcuts);
+                for entry in &settings.shortcuts {
+                    // Portal-backed registration: the compositor owns key
+                    // assignment, so we don't know yet whether a trigger
+                    // exists. Treat the entry as Registered (i.e. the
+                    // portal knows about it); the UI surfaces the actual
+                    // trigger string separately.
+                    self.registration_status
+                        .insert(entry.id.clone(), HotkeyRegistrationStatus::Registered);
+                }
+            } else {
+                // Release compositor-side grabs without closing the
+                // session so that re-enabling can rebind on the same
+                // session via a subsequent set_shortcuts call.
+                portal.release_all();
             }
         }
 
@@ -650,7 +672,15 @@ impl HotkeyManager {
 
         #[cfg(all(target_os = "linux", feature = "wayland-portal"))]
         if let Some(ref mut portal) = self.portal_backend {
-            events.extend(portal.poll_events());
+            let portal_events = portal.poll_events();
+            // Always drain to prevent channel build-up; only dispatch
+            // when the feature is active. This closes the async window
+            // between release_all spawning and the action map clearing —
+            // any compositor signals that slip through during that window
+            // are silently discarded here rather than delivered to callers.
+            if self.global_hotkeys_enabled {
+                events.extend(portal_events);
+            }
         }
 
         #[cfg(feature = "global-hotkeys")]

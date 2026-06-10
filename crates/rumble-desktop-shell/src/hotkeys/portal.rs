@@ -294,6 +294,44 @@ impl PortalHotkeyBackend {
         std::ops::ControlFlow::Continue(())
     }
 
+    /// Release all compositor-side shortcut bindings without closing the
+    /// session.
+    ///
+    /// Clears the action map immediately so the listener task stops
+    /// translating Activated/Deactivated signals into events, then sends
+    /// `BindShortcuts([])` to tell the compositor to release its key grabs
+    /// for this session. The session remains open; a subsequent
+    /// `set_shortcuts` call rebinds shortcuts on the same session without
+    /// any async session-recreation overhead.
+    ///
+    /// Called from the synchronous `register_from_settings` path, so the
+    /// D-Bus call is dispatched onto the runtime handle rather than
+    /// blocking the caller. The action-map clear happens inside the spawned
+    /// task under the write lock, so it is ordered with any concurrent
+    /// `set_shortcuts` task: whichever acquires the lock last wins.
+    pub fn release_all(&mut self) {
+        self.has_bound = false;
+        let shortcuts = Arc::clone(&self.shortcuts);
+        let session = Arc::clone(&self.session);
+        let state = Arc::clone(&self.state);
+        self.runtime_handle.spawn(async move {
+            {
+                let mut guard = state.write().await;
+                guard.actions.clear();
+                guard.triggers.clear();
+            }
+            // BindShortcuts([]) is the canonical signal to the compositor
+            // that this session no longer holds any shortcuts. The call
+            // is best-effort — the action map was already cleared above,
+            // so no events will be dispatched regardless of compositor
+            // behaviour or call failure.
+            match shortcuts.bind_shortcuts(&session, &[], None, Default::default()).await {
+                Ok(_) => tracing::debug!("BindShortcuts([]): compositor shortcuts released"),
+                Err(e) => tracing::warn!("release_all: BindShortcuts([]) failed: {e}"),
+            }
+        });
+    }
+
     pub fn is_available(&self) -> bool {
         self.has_bound
     }
