@@ -121,7 +121,7 @@ pub async fn handle_envelope(
                 warn!(user_id = sender.user_id, "unauthenticated client tried to send chat");
                 return Ok(());
             }
-            handle_chat_message(msg, sender, state, persistence.clone()).await?;
+            handle_chat_message(msg, sender, state, persistence.clone(), plugins, ctx).await?;
         }
         Some(Payload::DirectMessage(dm)) => {
             if !sender.authenticated.load(Ordering::SeqCst) {
@@ -228,7 +228,7 @@ pub async fn handle_envelope(
             if !sender.authenticated.load(Ordering::SeqCst) || !sender.is_controller.load(Ordering::SeqCst) {
                 return Ok(());
             }
-            handle_participant_chat(pc, sender, state, persistence).await?;
+            handle_participant_chat(pc, sender, state, persistence, plugins, ctx).await?;
         }
         // ACL messages (80-90)
         Some(Payload::KickUser(ku)) => {
@@ -742,6 +742,8 @@ async fn handle_chat_message(
     sender: Arc<ClientHandle>,
     state: Arc<ServerState>,
     persistence: Arc<Persistence>,
+    plugins: &[Arc<dyn ServerPlugin>],
+    ctx: &ServerCtx,
 ) -> Result<()> {
     let is_tree = msg.tree.unwrap_or(false);
     // Identity comes from the authenticated connection, NOT the client's
@@ -760,7 +762,9 @@ async fn handle_chat_message(
         now_ms()
     };
 
-    broadcast_chat_as(
+    // Keep a copy for plugins; the original is moved into the broadcast.
+    let text_for_plugins = msg.text.clone();
+    let accepted_room = broadcast_chat_as(
         &state,
         &persistence,
         sender.user_id,
@@ -770,7 +774,29 @@ async fn handle_chat_message(
         timestamp_ms,
         msg.attachment,
     )
-    .await
+    .await?;
+
+    // Notify chat-reactive plugins only after the message was accepted
+    // (authenticated + TEXT_MESSAGE-permitted), with the server-authoritative
+    // author and room — never the client-claimed sender. See issue #32.
+    if let Some(room) = accepted_room {
+        notify_chat_accepted(plugins, sender.user_id, room, &text_for_plugins, ctx).await;
+    }
+
+    Ok(())
+}
+
+/// Deliver an accepted chat message to every plugin's `on_chat_accepted` hook.
+async fn notify_chat_accepted(
+    plugins: &[Arc<dyn ServerPlugin>],
+    author_id: u64,
+    room: Uuid,
+    text: &str,
+    ctx: &ServerCtx,
+) {
+    for plugin in plugins {
+        plugin.on_chat_accepted(author_id, room, text, ctx).await;
+    }
 }
 
 /// Broadcast a chat message authored by `sender_id` (a real client *or* a
@@ -786,9 +812,9 @@ pub(crate) async fn broadcast_chat_as(
     id: Vec<u8>,
     timestamp_ms: i64,
     attachment: Option<proto::ChatAttachment>,
-) -> Result<()> {
+) -> Result<Option<Uuid>> {
     let sender_room = state.get_user_room(sender_id).await.unwrap_or(ROOT_ROOM_UUID);
-    broadcast_chat_in_room(
+    let accepted = broadcast_chat_in_room(
         state,
         persistence,
         sender_id,
@@ -799,7 +825,8 @@ pub(crate) async fn broadcast_chat_as(
         timestamp_ms,
         attachment,
     )
-    .await
+    .await?;
+    Ok(accepted.then_some(sender_room))
 }
 
 /// Broadcast a chat message authored by `sender_id` into an explicit `room`
@@ -828,9 +855,9 @@ pub(crate) async fn broadcast_chat_in_room(
     id: Vec<u8>,
     timestamp_ms: i64,
     attachment: Option<proto::ChatAttachment>,
-) -> Result<()> {
+) -> Result<bool> {
     let Some(member) = state.get_member(sender_id) else {
-        return Ok(());
+        return Ok(false);
     };
 
     // Permission check: TEXT_MESSAGE in the target room.
@@ -842,7 +869,7 @@ pub(crate) async fn broadcast_chat_in_room(
         if let Some(client) = member.client() {
             send_permission_denied(client, denied).await?;
         }
-        return Ok(());
+        return Ok(false);
     }
 
     let broadcast = proto::Envelope {
@@ -892,7 +919,7 @@ pub(crate) async fn broadcast_chat_in_room(
         }
     }
 
-    Ok(())
+    Ok(true)
 }
 
 /// Collect a room and all its descendants from the room hierarchy.
@@ -2639,12 +2666,22 @@ async fn handle_participant_chat(
     sender: Arc<ClientHandle>,
     state: Arc<ServerState>,
     persistence: Arc<Persistence>,
+    plugins: &[Arc<dyn ServerPlugin>],
+    ctx: &ServerCtx,
 ) -> Result<()> {
+    // Ownership: the controller may only speak for participants it owns. This
+    // gate runs *before* any plugin sees the chat (see issue #32) — the
+    // client-supplied pc.user_id is not trusted until it passes here.
     if !state.is_participant_of(pc.user_id, OwnerId::Connection(sender.user_id)) {
         return send_command_result(&sender, "ParticipantChat", false, "Not your participant").await;
     }
     let id = uuid::Uuid::new_v4().into_bytes().to_vec();
-    broadcast_chat_as(&state, &persistence, pc.user_id, pc.text, false, id, now_ms(), None).await
+    let text_for_plugins = pc.text.clone();
+    let accepted_room = broadcast_chat_as(&state, &persistence, pc.user_id, pc.text, false, id, now_ms(), None).await?;
+    if let Some(room) = accepted_room {
+        notify_chat_accepted(plugins, pc.user_id, room, &text_for_plugins, ctx).await;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2665,6 +2702,36 @@ mod tests {
                 owner: OwnerId::Plugin(1),
             },
         })
+    }
+
+    /// A chat message whose author is not a validated member (e.g. a spoofed
+    /// `user_id` from an attacker) is never *accepted*, so `broadcast_chat_as`
+    /// reports no room and chat-reactive plugins are never notified. This is the
+    /// core of the #32 fix: plugins observe chat only via `on_chat_accepted`,
+    /// which fires solely on the post-validation acceptance signal.
+    #[tokio::test]
+    async fn chat_from_unknown_member_is_not_accepted() {
+        let state = Arc::new(ServerState::new());
+        let persist = Arc::new(Persistence::in_memory().expect("in-memory persistence"));
+
+        // user 999 was never registered as a member of this server.
+        let accepted = broadcast_chat_as(
+            &state,
+            &persist,
+            999,
+            "look https://example.com/?utm_source=spam".to_string(),
+            false,
+            vec![0u8; 16],
+            0,
+            None,
+        )
+        .await
+        .expect("broadcast does not error");
+
+        assert_eq!(
+            accepted, None,
+            "chat from a non-member must not be accepted, so plugins are never notified"
+        );
     }
 
     /// A client-sent datagram. `sender_id`/`room_id` are left unset (or spoofed

@@ -31,9 +31,10 @@ use std::{
 };
 
 use anyhow::Result;
-use rumble_protocol::proto::{self, envelope::Payload};
+use rumble_protocol::proto;
 use tracing::{info, warn};
 use url::Url;
+use uuid::Uuid;
 
 use crate::{
     plugin::{ParticipantHandle, PluginFactory, ServerCtx, ServerPlugin},
@@ -412,19 +413,23 @@ impl ServerPlugin for LinkCleanerPlugin {
 
     async fn on_message(
         &self,
-        envelope: &proto::Envelope,
-        sender: &Arc<ClientHandle>,
-        ctx: &ServerCtx,
+        _envelope: &proto::Envelope,
+        _sender: &Arc<ClientHandle>,
+        _ctx: &ServerCtx,
     ) -> Result<bool> {
-        match &envelope.payload {
-            // Native client chat.
-            Some(Payload::ChatMessage(msg)) => self.react(sender.user_id, &msg.text, ctx),
-            // Controller-driven participants (e.g. bridged Mumble users).
-            Some(Payload::ParticipantChat(pc)) => self.react(pc.user_id, &pc.text, ctx),
-            _ => {}
-        }
-        // Never consume — the original message must still be delivered.
+        // Chat reactions are handled in `on_chat_accepted`, which fires only
+        // after auth/ownership/ACL validation accepts the message — reacting
+        // here (pre-validation) would let any client spoof a cleaned-link reply
+        // into another user's room or bypass a chat-mute (issue #32). Nothing
+        // else for this plugin to do on the raw control stream.
         Ok(false)
+    }
+
+    async fn on_chat_accepted(&self, author_id: u64, _room: Uuid, text: &str, ctx: &ServerCtx) {
+        // `author_id` is server-authoritative and the message has passed the
+        // TEXT_MESSAGE ACL. `react` re-resolves the author's current room when
+        // it posts (after a short delay), matching the prior behavior.
+        self.react(author_id, text, ctx);
     }
 
     async fn start(&self, ctx: &ServerCtx) -> Result<()> {

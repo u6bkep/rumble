@@ -273,6 +273,7 @@ impl ServerCtx {
             None,
         )
         .await
+        .map(|_accepted| ())
     }
 
     /// Mint a *hidden* participant driven by this plugin — a roster member with
@@ -340,7 +341,9 @@ impl ParticipantHandle {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
-        handlers::broadcast_chat_as(&self.state, &self.persistence, self.user_id, text, false, id, ts, None).await
+        handlers::broadcast_chat_as(&self.state, &self.persistence, self.user_id, text, false, id, ts, None)
+            .await
+            .map(|_accepted_room| ())
     }
 
     /// Subscribe to the voice of `room`, receiving each relayed [`VoiceFrame`]
@@ -482,7 +485,25 @@ pub trait ServerPlugin: Send + Sync + 'static {
 
     /// Handle a proto envelope on the control stream.
     /// Return `Ok(true)` if handled, `Ok(false)` to pass to next handler.
+    ///
+    /// **This fires before authentication and per-payload validation.** The
+    /// `sender` may be unauthenticated and the envelope's content (claimed
+    /// participant ids, room, etc.) is unverified and unauthorized at this
+    /// point. Do **not** react to chat here — a spoofed or chat-muted message
+    /// would be observed as if accepted (see issue #32). Use
+    /// [`Self::on_chat_accepted`] for chat-reactive behavior.
     async fn on_message(&self, envelope: &Envelope, sender: &Arc<ClientHandle>, ctx: &ServerCtx) -> Result<bool>;
+
+    /// A chat message has been **accepted** — it passed authentication,
+    /// ownership (for controller-driven participants), and the `TEXT_MESSAGE`
+    /// ACL in `room` — and broadcast. `author_id` is the server-authoritative
+    /// author (never the client-supplied sender field). This is the safe place
+    /// for chat-reactive plugins (e.g. link cleaning): unlike
+    /// [`Self::on_message`] it never fires for spoofed, unauthorized, or
+    /// chat-muted messages. Default: no-op.
+    async fn on_chat_accepted(&self, author_id: u64, room: Uuid, text: &str, ctx: &ServerCtx) {
+        let _ = (author_id, room, text, ctx);
+    }
 
     /// A client opened a new QUIC stream addressed to this plugin.
     async fn on_stream(
