@@ -215,6 +215,13 @@ pub struct RumbleApp<B: UiBackend = crate::backend::NativeUiBackend> {
     /// Entries expire after 3 seconds so a stray click doesn't leave
     /// the button stuck on "Cancel?".
     pending_cancel_confirm: HashMap<String, Instant>,
+
+    /// True when the previous frame's connection state was `Connected`.
+    /// Used in `before_build` to detect the transition out of Connected so
+    /// per-session transient UI (context menus, confirmation modals, elevate
+    /// prompt, voice-mode dropdown) is reset before it can act on stale ids
+    /// from the old server session.
+    prev_was_connected: bool,
 }
 
 impl<B: UiBackend> RumbleApp<B> {
@@ -314,6 +321,7 @@ impl<B: UiBackend> RumbleApp<B> {
             pending_toasts: Vec::new(),
             pending_link_opens: Vec::new(),
             pending_cancel_confirm: HashMap::new(),
+            prev_was_connected: false,
         }
     }
 }
@@ -379,6 +387,28 @@ impl<B: UiBackend> App for RumbleApp<B> {
         // Compute new messages once, shared by auto-download and sfx so both
         // operate on the same per-frame diff rather than diffing independently.
         let snapshot = self.backend.state();
+
+        // Detect transition out of Connected. On the frame that sees the
+        // drop, clear every piece of per-session transient UI before it has
+        // a chance to render: context menus hold room/user ids from the old
+        // server; the room-ACL editor and elevate prompt are scoped to the
+        // current session; and the voice-mode dropdown is only valid while
+        // connected. Cert-pending prompt, server-picker, wizard, settings,
+        // chat composer, and toasts are intentionally preserved — they all
+        // outlive the session.
+        let now_connected = snapshot.connection.is_connected();
+        if self.prev_was_connected && !now_connected {
+            self.room_tree = RoomTreeState::default();
+            self.room_acl_modal = None;
+            self.elevate = None;
+            self.voice_mode_menu_open = false;
+            // Re-arm chat seeding: the next connect clears chat_messages and
+            // delivers the new server's history, which must be absorbed as
+            // backlog (no sounds/auto-downloads), not detected as new ids.
+            self.seen_chat_ids = None;
+        }
+        self.prev_was_connected = now_connected;
+
         let was_seeded = self.seen_chat_ids.is_some();
         let (new_messages, new_seen) = diff_new_chat_messages(&snapshot.chat_messages, &self.seen_chat_ids);
         // True only on the frame that absorbs the initial backlog — used to
@@ -1332,11 +1362,16 @@ impl<B: UiBackend> RumbleApp<B> {
             // multiple dialogs on top of each other.
             return;
         }
-        let handle = self.runtime.spawn(async {
-            rfd::AsyncFileDialog::new()
+        let wake = self.backend.repaint_arc();
+        let handle = self.runtime.spawn(async move {
+            let result = rfd::AsyncFileDialog::new()
                 .pick_file()
                 .await
-                .map(|f| f.path().to_path_buf())
+                .map(|f| f.path().to_path_buf());
+            // Wake the frame scheduler so poll_file_dialog runs
+            // immediately rather than stalling until user input.
+            wake();
+            result
         });
         self.pending_file_dialog = Some(handle);
     }
@@ -1453,12 +1488,15 @@ impl<B: UiBackend> RumbleApp<B> {
             .as_ref()
             .and_then(|p| p.download_dir.clone())
             .or_else(|| self.settings.settings().file_transfer.download_dir.clone());
+        let wake = self.backend.repaint_arc();
         let handle = self.runtime.spawn(async move {
             let mut dialog = rfd::AsyncFileDialog::new();
             if let Some(start) = initial {
                 dialog = dialog.set_directory(start);
             }
-            dialog.pick_folder().await.map(|f| f.path().to_path_buf())
+            let result = dialog.pick_folder().await.map(|f| f.path().to_path_buf());
+            wake();
+            result
         });
         self.pending_pick_download_dir = Some(handle);
     }
@@ -1590,12 +1628,15 @@ impl<B: UiBackend> RumbleApp<B> {
             return;
         }
         let name = menu.name.clone();
+        let wake = self.backend.repaint_arc();
         let handle = self.runtime.spawn(async move {
-            rfd::AsyncFileDialog::new()
+            let result = rfd::AsyncFileDialog::new()
                 .set_file_name(&name)
                 .save_file()
                 .await
-                .map(|f| f.path().to_path_buf())
+                .map(|f| f.path().to_path_buf());
+            wake();
+            result
         });
         self.pending_save_as = Some((src, handle));
     }
@@ -1749,12 +1790,16 @@ impl<B: UiBackend> RumbleApp<B> {
             prev.abort();
         }
 
+        let wake = self.backend.repaint_arc();
         self.lightboxes.pending_video_open = Some(self.runtime.spawn_blocking(move || {
             // Open looped so the lightbox doesn't freeze the
             // moment a short clip ends — matches the "preview"
             // expectation users have for chat-attachment video.
-            let stream = rumble_video::VideoStream::open(&path, true)?;
-            Ok((id, name, stream))
+            let result = rumble_video::VideoStream::open(&path, true).map(|stream| (id, name, stream));
+            // Wake on both success and error so poll_video_open runs
+            // promptly without requiring user input.
+            wake();
+            result
         }));
     }
 
@@ -2202,6 +2247,17 @@ impl<B: UiBackend> RumbleApp<B> {
         self.backend.send(Command::LocalMessage { text: msg });
     }
 
+    /// Re-register hotkeys from the persisted store. Called whenever
+    /// Settings is closed without saving so live-preview binding changes
+    /// (applied incrementally via [`SettingsOutcome::RegisterHotkeys`] on
+    /// each edit) do not outlast the dialog — cancelled edits to PTT
+    /// rows, rebindings, and the enable toggle are all rolled back.
+    fn restore_hotkeys_from_persisted(&mut self) {
+        if let Err(e) = self.hotkeys.register_from_settings(&self.settings.settings().keyboard) {
+            tracing::warn!("hotkey restore after settings close failed: {e}");
+        }
+    }
+
     /// Route a [`SettingsOutcome`] back into the App. Returns `true`
     /// when the outcome consumed the originating event, so the parent
     /// handler can short-circuit.
@@ -2211,10 +2267,16 @@ impl<B: UiBackend> RumbleApp<B> {
             SettingsOutcome::Handled => true,
             SettingsOutcome::Close => {
                 self.settings_state.close();
+                // Roll back any live-preview binding changes that
+                // accumulated via RegisterHotkeys without being saved.
+                self.restore_hotkeys_from_persisted();
                 true
             }
             SettingsOutcome::OpenIdentityWizard => {
                 self.settings_state.close();
+                // Same rollback as Close — user exited settings via the
+                // wizard launcher without pressing Save.
+                self.restore_hotkeys_from_persisted();
                 self.wizard = WizardState::SelectMethod;
                 true
             }
@@ -2225,12 +2287,16 @@ impl<B: UiBackend> RumbleApp<B> {
                 // via `select_agent_key`, which non-destructively
                 // rewrites identity.json to point at it.
                 self.settings_state.close();
+                // Same rollback as Close.
+                self.restore_hotkeys_from_persisted();
                 self.wizard = WizardState::ConnectingAgent;
                 self.spawn_connect_op();
                 true
             }
             SettingsOutcome::OpenElevate => {
                 self.settings_state.close();
+                // Same rollback as Close.
+                self.restore_hotkeys_from_persisted();
                 self.elevate = Some(ElevateState::default());
                 true
             }

@@ -3,6 +3,8 @@
 //! Same shape as `rumble-next`'s `UiBackend`: the renderer reads `State`
 //! snapshots and pushes `Command`s; tests can swap a mock in.
 
+use std::sync::Arc;
+
 use rumble_client::{AudioStats, BackendEvent, Command, MeterSnapshot, OutputFrame, State, handle::BackendHandle};
 use rumble_client_traits::file_transfer::TransferStatus;
 use tokio::sync::mpsc;
@@ -10,6 +12,15 @@ use tokio::sync::mpsc;
 pub trait UiBackend: 'static {
     fn state(&self) -> State;
     fn send(&self, command: Command);
+    /// Return a clonable callback that schedules a frame when invoked.
+    /// Spawn sites call this before `runtime.spawn` and move the clone
+    /// into the async closure, so completing a picker or video-open task
+    /// immediately wakes the host's frame scheduler without waiting for
+    /// user input.  The default no-op is safe for mock/test backends
+    /// that have no event loop to poke.
+    fn repaint_arc(&self) -> Arc<dyn Fn() + Send + Sync> {
+        Arc::new(|| {})
+    }
     /// Live audio meter snapshot. Defaults to `Unmeasured` so test
     /// backends without a running audio task compile without extra
     /// plumbing; fixtures that want a representative meter override
@@ -44,14 +55,19 @@ pub trait UiBackend: 'static {
 pub struct NativeUiBackend {
     inner: BackendHandle<rumble_desktop::NativePlatform>,
     event_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<BackendEvent>>>,
+    /// Repaint callback shared with `BackendHandle` — poking it schedules
+    /// a new frame from any thread.  Stored here so spawn sites can move
+    /// a clone into async tasks and wake the host on completion.
+    repaint: Arc<dyn Fn() + Send + Sync>,
 }
 
 impl NativeUiBackend {
-    pub fn new(inner: BackendHandle<rumble_desktop::NativePlatform>) -> Self {
+    pub fn new(inner: BackendHandle<rumble_desktop::NativePlatform>, repaint: Arc<dyn Fn() + Send + Sync>) -> Self {
         let event_rx = inner.take_event_receiver();
         Self {
             inner,
             event_rx: std::sync::Mutex::new(event_rx),
+            repaint,
         }
     }
 
@@ -67,6 +83,10 @@ impl UiBackend for NativeUiBackend {
 
     fn send(&self, command: Command) {
         self.inner.send(command);
+    }
+
+    fn repaint_arc(&self) -> Arc<dyn Fn() + Send + Sync> {
+        self.repaint.clone()
     }
 
     fn meter(&self) -> MeterSnapshot {

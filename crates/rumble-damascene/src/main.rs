@@ -33,18 +33,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `with_external_wakeup` below; pre-loop state changes are harmless
     // (the initial frame reads current state anyway).
     //
+    // The same callback is also shared with `NativeUiBackend` so spawn
+    // sites (rfd pickers, video open) can move a clone into async tasks
+    // and wake the scheduler when they complete — without waiting for the
+    // next input event to trigger a frame.
+    //
     // Continuous visuals that aren't state changes drive their own frames
     // via `redraw_within`: animated images (chat + lightbox), the video
     // surface, and the live audio meters in the Settings dialog. Damascene
     // widgets like spinners self-tick through the runtime's animation path.
     let wakeup: Arc<OnceLock<Wakeup>> = Arc::new(OnceLock::new());
-    let wakeup_for_repaint = wakeup.clone();
-    let signer = identity.signer();
-    let backend = BackendHandle::<rumble_desktop::NativePlatform>::with_config(
-        move || {
-            if let Some(w) = wakeup_for_repaint.get() {
+    let repaint: Arc<dyn Fn() + Send + Sync> = {
+        let wakeup = wakeup.clone();
+        Arc::new(move || {
+            if let Some(w) = wakeup.get() {
                 w.wake();
             }
+        })
+    };
+    let signer = identity.signer();
+    let backend = BackendHandle::<rumble_desktop::NativePlatform>::with_config(
+        {
+            let repaint = repaint.clone();
+            move || repaint()
         },
         connect_config,
         signer,
@@ -72,7 +83,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => None,
     };
 
-    let backend = NativeUiBackend::new(backend);
+    let backend = NativeUiBackend::new(backend, repaint);
 
     // Owned tokio runtime for ssh-agent ops fired from the wizard. Kept
     // separate from the BackendHandle's internal runtime so the App can
