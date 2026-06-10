@@ -6,9 +6,8 @@
 //! doesn't dump a flurry of beeps.
 //!
 //! Owns only the previous-frame snapshot it needs to tell a change from
-//! a steady state. The message watermark (`prev_chat_count`) stays on
-//! the App because it is shared with chat autoscroll and auto-download;
-//! the App passes the post-watermark message slice into [`SfxEngine::detect`].
+//! a steady state. New-message detection is id-set-based (see `crate::app`);
+//! the App passes the genuinely-new message slice into [`SfxEngine::detect`].
 
 use std::collections::HashSet;
 
@@ -32,18 +31,17 @@ pub struct SfxEngine {
 }
 
 impl SfxEngine {
-    /// `new_messages` is the chat-message slice that arrived since the
-    /// previous frame — the caller passes an EMPTY slice on the seeding
-    /// frame (when `prev_chat_count == 0`) so the historical backlog
-    /// replayed on first connect doesn't beep.
-    pub fn detect(&mut self, snapshot: &State, new_messages: &[ChatMessage]) -> Vec<SfxKind> {
+    /// `new_messages` contains only messages that arrived since the previous
+    /// frame. The seeding frame (`seen_chat_ids` was `None`) passes an empty
+    /// slice so the historical backlog replayed on first connect doesn't beep.
+    pub fn detect(&mut self, snapshot: &State, new_messages: &[&ChatMessage]) -> Vec<SfxKind> {
         let mut sounds = Vec::new();
 
         // New remote chat messages. Direct messages get a distinct cue.
         if !new_messages.is_empty() {
             let mut had_dm = false;
             let mut had_room = false;
-            for m in new_messages.iter().filter(|m| {
+            for m in new_messages.iter().copied().filter(|m| {
                 !matches!(
                     m.visibility,
                     ChatMessageVisibility::System | ChatMessageVisibility::SenderMirror

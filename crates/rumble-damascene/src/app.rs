@@ -19,8 +19,8 @@ use damascene_core::{
 use damascene_winit_wgpu::WinitWgpuApp;
 
 use rumble_client::{
-    AudioSettings, Command, ConnectionState, PendingCertificate, ProcessorRegistry, SfxKind, State, VoiceMode,
-    build_default_tx_pipeline, merge_with_default_tx_pipeline, register_builtin_processors,
+    AudioSettings, ChatMessage, Command, ConnectionState, PendingCertificate, ProcessorRegistry, SfxKind, State,
+    VoiceMode, build_default_tx_pipeline, merge_with_default_tx_pipeline, register_builtin_processors,
 };
 use rumble_desktop_shell::{
     AcceptedCertificate, RecentServer, SettingsStore,
@@ -128,9 +128,13 @@ pub struct RumbleApp<B: UiBackend = crate::backend::NativeUiBackend> {
     /// drag-and-drop, confirmation modals). See [`crate::room_tree`].
     room_tree: RoomTreeState,
 
-    /// `state.chat_messages.len()` at the previous frame. Used to detect
-    /// new arrivals so we can fire `SfxKind::Message` once per batch.
-    prev_chat_count: usize,
+    /// Id set of every chat message observed on the previous frame.
+    /// `None` until the first non-empty observation, which seeds the set
+    /// silently so the connect-time backlog isn't treated as new arrivals.
+    /// After seeding, held as `Some` so id-based diffing can detect new
+    /// messages even when the 100-entry sliding window caps the list length.
+    /// See [`diff_new_chat_messages`].
+    seen_chat_ids: Option<HashSet<[u8; 16]>>,
 
     /// Row key the chat-history virtual list should stick to bottom on next
     /// `drain_scroll_requests`. Set when the backlog grows (new message, initial
@@ -294,7 +298,7 @@ impl<B: UiBackend> RumbleApp<B> {
             chat_row_w: Cell::new(0.0),
             processor_registry,
             room_tree: RoomTreeState::default(),
-            prev_chat_count: 0,
+            seen_chat_ids: None,
             pending_scroll_to_bottom: None,
             sfx: crate::sfx::SfxEngine::default(),
             pending_file_dialog: None,
@@ -327,6 +331,32 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+/// Compute the subset of `messages` not yet present in `seen`, preserving
+/// their order in the slice. Also returns the id set to carry into the next
+/// frame (`None` = still unseeded).
+///
+/// Seeding: while `seen` is `None` and the list is empty, stay unseeded — at
+/// that point there is no way to tell whether the next batch will be a
+/// connect-time history replay or a live message, and the backlog must not
+/// fire sound cues or auto-downloads. The first non-empty observation seeds
+/// the set silently (absorbing the initial backlog); every later arrival is
+/// diffed by id, which survives the 100-entry sliding window and
+/// HistoryMerged re-sorts. Known cost: on a server with no history at all,
+/// the first live batch is absorbed as if it were backlog.
+fn diff_new_chat_messages<'a>(
+    messages: &'a [ChatMessage],
+    seen: &Option<HashSet<[u8; 16]>>,
+) -> (Vec<&'a ChatMessage>, Option<HashSet<[u8; 16]>>) {
+    match seen {
+        None if messages.is_empty() => (Vec::new(), None),
+        None => (Vec::new(), Some(messages.iter().map(|m| m.id).collect())),
+        Some(prev_ids) => {
+            let new = messages.iter().filter(|m| !prev_ids.contains(&m.id)).collect();
+            (new, Some(messages.iter().map(|m| m.id).collect()))
+        }
+    }
+}
+
 impl<B: UiBackend> Drop for RumbleApp<B> {
     fn drop(&mut self) {
         // Close the XDG GlobalShortcuts portal's D-Bus session while the
@@ -346,8 +376,18 @@ impl<B: UiBackend> App for RumbleApp<B> {
         self.poll_file_dialog();
         self.poll_save_as();
         self.poll_pick_download_dir();
-        self.pump_auto_download();
-        self.pump_sfx();
+        // Compute new messages once, shared by auto-download and sfx so both
+        // operate on the same per-frame diff rather than diffing independently.
+        let snapshot = self.backend.state();
+        let was_seeded = self.seen_chat_ids.is_some();
+        let (new_messages, new_seen) = diff_new_chat_messages(&snapshot.chat_messages, &self.seen_chat_ids);
+        // True only on the frame that absorbs the initial backlog — used to
+        // scroll the freshly-loaded history to the bottom without treating
+        // it as new arrivals.
+        let seeded_now = !was_seeded && new_seen.is_some();
+        self.pump_auto_download(&snapshot, &new_messages);
+        self.pump_sfx(&snapshot, &new_messages, seeded_now);
+        self.seen_chat_ids = new_seen;
         // Drain backend events FIRST so any TransferStageChanged
         // lands on the media cache before its drain_pending +
         // playback advance run for this frame. The order is what
@@ -1799,15 +1839,11 @@ impl<B: UiBackend> RumbleApp<B> {
     }
 
     /// Scan newly-arrived chat messages and auto-download any `FileOffer`
-    /// attachments that pass the user's auto-download rules. Called before
-    /// `pump_sfx` so `prev_chat_count` still points at the previous frame's
-    /// watermark.
-    fn pump_auto_download(&mut self) {
-        let prev = self.prev_chat_count;
-        let snapshot = self.backend.state();
-        let count = snapshot.chat_messages.len();
-        // Cold-connect gate: skip the historical backlog replayed on first connect.
-        if prev == 0 || count <= prev {
+    /// attachments that pass the user's auto-download rules. Receives the
+    /// per-frame new-message slice already computed in `before_build`; an
+    /// empty slice (seeding frame or no arrivals) is a no-op.
+    fn pump_auto_download(&mut self, snapshot: &State, new_messages: &[&ChatMessage]) {
+        if new_messages.is_empty() {
             return;
         }
         let settings = self.settings.settings().file_transfer.clone();
@@ -1820,7 +1856,7 @@ impl<B: UiBackend> RumbleApp<B> {
             .and_then(|id| snapshot.get_user(id))
             .map(|u| u.username.clone());
 
-        for msg in &snapshot.chat_messages[prev..] {
+        for msg in new_messages {
             // System notices have no payload; SenderMirror twins are own
             // shares already accounted for by their SenderDraft. The
             // is_from_self check below further excludes SenderDrafts.
@@ -1858,21 +1894,19 @@ impl<B: UiBackend> RumbleApp<B> {
         }
     }
 
-    /// Diff per-frame `State` against the previous frame to fire event
-    /// sounds once per change: new remote chat messages (`Message`),
-    /// connect/disconnect transitions (`Connect`/`Disconnect`), and
-    /// remote users entering/leaving our room (`UserJoin`/`UserLeave`).
-    /// The first observation of each tracked value seeds the baseline
-    /// without firing, so connecting to a populated server doesn't dump
-    /// a flurry of beeps.
-    fn pump_sfx(&mut self) {
-        let snapshot = self.backend.state();
-        let count = snapshot.chat_messages.len();
-
-        // Backlog grew (initial load or a new message) → stick the virtual chat
-        // history to the newest renderable row on the next layout. Replaces the
-        // old `scroll().pin_end()`, which virtual lists don't carry.
-        if count > self.prev_chat_count
+    /// Fire per-frame event sounds for new chat messages, connect/disconnect
+    /// transitions, and remote users entering/leaving our room. Receives the
+    /// per-frame new-message slice already computed in `before_build`; the
+    /// seeding frame passes an empty slice (with `seeding` set) so the
+    /// historical backlog on first connect doesn't beep.
+    fn pump_sfx(&mut self, snapshot: &State, new_messages: &[&ChatMessage], seeding: bool) {
+        // Autoscroll: stick to the newest renderable row whenever any
+        // genuinely-new renderable message arrived — and on the seeding
+        // frame, so the initial history load lands scrolled to the bottom
+        // even though it produces no "new" messages. The target is the last
+        // renderable row across the full snapshot — virtual lists don't
+        // auto-pin, so we drive it explicitly.
+        if (seeding || new_messages.iter().any(|m| m.visibility.renders_locally()))
             && let Some(last) = snapshot
                 .chat_messages
                 .iter()
@@ -1882,15 +1916,7 @@ impl<B: UiBackend> RumbleApp<B> {
             self.pending_scroll_to_bottom = Some(chat::chat_row_key(last));
         }
 
-        // Cold-connect gate: only feed the engine message cues once a
-        // baseline exists, so the historical backlog doesn't beep.
-        let new_messages: &[_] = if self.prev_chat_count > 0 && count > self.prev_chat_count {
-            &snapshot.chat_messages[self.prev_chat_count..]
-        } else {
-            &[]
-        };
-        let sounds = self.sfx.detect(&snapshot, new_messages);
-        self.prev_chat_count = count;
+        let sounds = self.sfx.detect(snapshot, new_messages);
         for kind in sounds {
             self.play_sfx(kind);
         }
@@ -2861,5 +2887,118 @@ fn open_path(path: &Path) {
 
     if let Err(e) = std::process::Command::new(bin).args(args).spawn() {
         tracing::error!("open_path {:?}: {e}", path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::SystemTime;
+
+    use rumble_client::{ChatMessage, ChatMessageKind, ChatMessageVisibility};
+
+    use super::*;
+
+    fn make_msg(id: [u8; 16]) -> ChatMessage {
+        ChatMessage {
+            id,
+            sender: String::new(),
+            sender_id: None,
+            text: String::new(),
+            timestamp: SystemTime::UNIX_EPOCH,
+            kind: ChatMessageKind::default(),
+            attachment: None,
+            visibility: ChatMessageVisibility::Normal,
+        }
+    }
+
+    // First non-empty observation seeds silently: the connect-time backlog
+    // must not produce new messages.
+    #[test]
+    fn first_observation_populated_seeds_without_new() {
+        let msgs = [make_msg([1u8; 16]), make_msg([2u8; 16])];
+        let (new, seen) = diff_new_chat_messages(&msgs, &None);
+        assert!(new.is_empty(), "seeding must not produce new messages");
+        let seen = seen.expect("non-empty observation must seed");
+        assert_eq!(seen.len(), 2);
+        assert!(seen.contains(&[1u8; 16]));
+        assert!(seen.contains(&[2u8; 16]));
+    }
+
+    // Empty observations stay unseeded, so the eventual backlog (which may
+    // arrive many frames after app start) is still absorbed silently; only
+    // arrivals after that first batch are detected as new.
+    #[test]
+    fn empty_observation_stays_unseeded_until_backlog() {
+        let (new_seed, seen_seed) = diff_new_chat_messages(&[], &None);
+        assert!(new_seed.is_empty());
+        assert!(seen_seed.is_none(), "empty observation must not seed");
+
+        // Many frames later: the connect-time backlog lands — absorbed.
+        let backlog = [make_msg([1u8; 16]), make_msg([2u8; 16])];
+        let (new, seen) = diff_new_chat_messages(&backlog, &seen_seed);
+        assert!(new.is_empty(), "backlog must be absorbed, not treated as new");
+        let seen = seen.expect("backlog must seed");
+
+        // A genuinely-live arrival after seeding is detected.
+        let msgs = [make_msg([1u8; 16]), make_msg([2u8; 16]), make_msg([3u8; 16])];
+        let (new, _) = diff_new_chat_messages(&msgs, &Some(seen));
+        assert_eq!(new.len(), 1);
+        assert_eq!(new[0].id, [3u8; 16]);
+    }
+
+    // Window-slide: when the 100-entry cap drains old ids from the front, newly
+    // appended ids at the tail are detected while evicted ids are not re-fired.
+    #[test]
+    fn window_slide_drops_old_ids_detects_new_tail() {
+        // Ids 0–99 are in the seen set (previous snapshot).
+        let prev_seen: HashSet<[u8; 16]> = (0u8..100)
+            .map(|i| {
+                let mut id = [0u8; 16];
+                id[0] = i;
+                id
+            })
+            .collect();
+
+        // Snapshot now holds ids 1–100 (id 0 slid out, id 100 is new).
+        let msgs: Vec<ChatMessage> = (1u8..=100)
+            .map(|i| {
+                let mut id = [0u8; 16];
+                id[0] = i;
+                make_msg(id)
+            })
+            .collect();
+
+        let (new, updated) = diff_new_chat_messages(&msgs, &Some(prev_seen));
+        assert_eq!(new.len(), 1, "only id 100 must be new");
+        assert_eq!(new[0].id[0], 100);
+
+        // Updated set reflects the snapshot, not the old seen set.
+        let updated = updated.expect("diff against a seeded set stays seeded");
+        assert_eq!(updated.len(), 100);
+        let evicted = {
+            let mut id = [0u8; 16];
+            id[0] = 0;
+            id
+        };
+        assert!(!updated.contains(&evicted), "evicted id must not be in updated set");
+    }
+
+    // Re-sorted order: a HistoryMerged can insert a message anywhere in the list.
+    // The new id must be detected regardless of its position.
+    #[test]
+    fn resorted_middle_insertion_is_detected() {
+        let prev_seen: HashSet<[u8; 16]> = [[1u8; 16], [3u8; 16]].into_iter().collect();
+
+        let middle_id = {
+            let mut id = [0u8; 16];
+            id[0] = 2;
+            id
+        };
+        // Timestamp-sorted order: id 1, id 2, id 3.
+        let msgs = [make_msg([1u8; 16]), make_msg(middle_id), make_msg([3u8; 16])];
+
+        let (new, _) = diff_new_chat_messages(&msgs, &Some(prev_seen));
+        assert_eq!(new.len(), 1);
+        assert_eq!(new[0].id, middle_id);
     }
 }
