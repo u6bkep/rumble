@@ -62,6 +62,11 @@ type PlayStream<P> = <<P as Platform>::AudioBackend as AudioBackend>::PlaybackSt
 /// Maximum playback buffer size in samples before dropping old samples.
 const MAX_PLAYBACK_BUFFER_SAMPLES: usize = 9600;
 
+/// Maximum SFX queue depth in samples (~2 seconds at 48 kHz). Guards against
+/// unbounded growth when the playback producer is stalled. Samples beyond this
+/// limit are dropped from the front (oldest first) so recent effects play.
+const MAX_SFX_QUEUE_SAMPLES: usize = 96_000;
+
 /// Audio-task command channel.
 pub enum AudioCommand {
     /// A QUIC connection was established - start datagram handling.
@@ -838,7 +843,16 @@ async fn run_audio_task<P: Platform>(
     // Whether the capture callback should process samples or discard them.
     // This is a local bool because the callback uses AudioCaptureStream::set_active()
     // to be gated, rather than checking a shared atomic flag.
+    // Invariant: capture_is_active == true implies audio_input.is_some().
     let mut capture_is_active = false;
+
+    // Persistent recovery flags: set when a device dies and a re-open has
+    // already failed at least once. The health tick uses them to keep retrying
+    // even after the stream local is None (where the normal is_healthy() guard
+    // would never fire again). Cleared on successful re-open or deliberate
+    // teardown so recovery doesn't fight an intentional device change.
+    let mut input_recovering = false;
+    let mut output_recovering = false;
 
     // Edge-tracking baseline for the VAD-gated "transmitting" UI light, shared
     // with the capture callback (which owns the per-frame on/off edges). The
@@ -916,22 +930,30 @@ async fn run_audio_task<P: Platform>(
 
             match capture_transition(want, capture_is_active) {
                 CaptureTransition::Activate => {
-                    capture_is_active = true;
-                    // Fast-forward the media clock past the silence we were not
-                    // capturing (mute / PTT up), so the resumed stream's
-                    // timestamp reflects the real gap and the receiver re-anchors
-                    // it as a new spurt. `fetch_max` keeps it monotonic.
-                    let elapsed_frames = (capture_epoch.elapsed().as_micros() as u64) / FRAME_US;
-                    capture_frame_index.fetch_max(elapsed_frames, Ordering::Relaxed);
+                    // Activation is only meaningful when the capture stream
+                    // exists. When audio_input is None the transition is
+                    // deferred: capture_is_active stays false so the next
+                    // sync_transmission! after a successful start_transmission
+                    // will re-evaluate and arm the newly-opened stream.
+                    // Invariant: capture_is_active == true implies audio_input.is_some().
                     if let Some(stream) = audio_input.as_ref() {
+                        capture_is_active = true;
+                        // Fast-forward the media clock past the silence we were
+                        // not capturing (mute / PTT up), so the resumed stream's
+                        // timestamp reflects the real gap and the receiver
+                        // re-anchors it as a new spurt. `fetch_max` keeps it
+                        // monotonic.
+                        let elapsed_frames = (capture_epoch.elapsed().as_micros() as u64) / FRAME_US;
+                        capture_frame_index.fetch_max(elapsed_frames, Ordering::Relaxed);
                         stream.set_active(true);
+                        // Don't light the transmitting indicator here: arming
+                        // capture (e.g. unmuting) is not the same as
+                        // transmitting. The capture callback drives the
+                        // VAD-gated edge from a clean `false` baseline (reset
+                        // on the matching deactivate), so the light turns on
+                        // only once we actually speak.
+                        info!("Capture activated (samples will be processed)");
                     }
-                    // Don't light the transmitting indicator here: arming capture
-                    // (e.g. unmuting) is not the same as transmitting. The capture
-                    // callback drives the VAD-gated edge from a clean `false`
-                    // baseline (reset on the matching deactivate), so the light
-                    // turns on only once we actually speak.
-                    info!("Capture activated (samples will be processed)");
                 }
                 CaptureTransition::Deactivate => {
                     // Send end-of-stream before deactivating
@@ -1039,6 +1061,10 @@ async fn run_audio_task<P: Platform>(
 
                         // Destroy connection-scoped audio input stream
                         stop_transmission::<P>(&mut audio_input);
+                        // Capture is connection-scoped; ConnectionEstablished
+                        // will re-open on reconnect. Stop the recovery loop
+                        // so the health tick doesn't spin while disconnected.
+                        input_recovering = false;
 
                         // Destroy connection-scoped encoder
                         if let Ok(mut guard) = encoder.lock() {
@@ -1065,7 +1091,28 @@ async fn run_audio_task<P: Platform>(
                     }
 
                     AudioCommand::SetInputDevice { device_id } => {
+                        // When the device selection hasn't changed AND the
+                        // stream is actually open, skip the teardown/rebuild
+                        // cycle that would cause a ~200 ms transmission
+                        // dropout. A missing stream (earlier open failure)
+                        // must fall through so re-applying the same device
+                        // retries the open. Still emit SelectedDeviceChanged
+                        // so the projection can clear any device-fault state
+                        // it may be holding.
+                        if device_id == selected_input && audio_input.is_some() {
+                            let _ = bus.voice.send(VoiceEvent::SelectedDeviceChanged {
+                                kind: DeviceKind::Input,
+                                id: device_id,
+                            });
+                            // sync state in case mute/PTT changed while the
+                            // device was being confirmed
+                            sync_transmission!();
+                        } else {
                         selected_input = device_id.clone();
+                        // A deliberate device switch cancels any in-progress
+                        // recovery loop; the new start_transmission below is
+                        // the authoritative open attempt.
+                        input_recovering = false;
 
                         // Tear down the current stream so we always re-open
                         // against the new device.
@@ -1121,10 +1168,15 @@ async fn run_audio_task<P: Platform>(
                             });
                         }
                         sync_transmission!();
+                        } // end else (device actually changed)
                     }
 
                     AudioCommand::SetOutputDevice { device_id } => {
                         selected_output = device_id.clone();
+                        // A deliberate device switch cancels any in-progress
+                        // recovery loop; open_playback! below is the
+                        // authoritative attempt on the new device.
+                        output_recovering = false;
 
                         // Restart output (always, even when disconnected — SFX need it)
                         playback_stream = None;
@@ -1198,6 +1250,13 @@ async fn run_audio_task<P: Platform>(
                         if deafened {
                             playback_stream = None;
                             playback_producer = None;
+                            // Deliberate teardown: stop the recovery loop so
+                            // the health tick doesn't try to re-open an output
+                            // the user intentionally silenced.
+                            output_recovering = false;
+                            // SFX queued while deafened are ephemeral — discard
+                            // them so they don't play back as a burst on undeafen.
+                            sfx_queue.clear();
                             // Snapshot talkers and emit stop transitions before
                             // we wipe local decoder state.
                             let snapshot = read_state(&state).audio.talking_users.clone();
@@ -1247,6 +1306,14 @@ async fn run_audio_task<P: Platform>(
                     }
 
                     AudioCommand::UpdateSettings { settings } => {
+                        // When the incoming settings are identical to what the
+                        // task already holds, skip the teardown/rebuild cycle
+                        // that would otherwise cause a ~200 ms transmission
+                        // dropout every time the user opens the settings dialog
+                        // and clicks Apply without changing anything.
+                        if settings == audio_settings {
+                            // settings are already in effect — nothing to do
+                        } else {
                         info!("Audio task: updating settings");
                         audio_settings = settings.clone();
                         let _ = bus.voice.send(VoiceEvent::AudioSettingsChanged {
@@ -1283,6 +1350,7 @@ async fn run_audio_task<P: Platform>(
                             });
                         }
                         sync_transmission!();
+                        } // end else (settings actually changed)
                     }
 
                     AudioCommand::ResetStats => {
@@ -1307,6 +1375,11 @@ async fn run_audio_task<P: Platform>(
                     }
 
                     AudioCommand::UpdateTxPipeline { config } => {
+                        // Skip teardown/rebuild when the pipeline config
+                        // hasn't changed (e.g. repeated Apply presses).
+                        if config == tx_pipeline_config {
+                            // config already in effect — nothing to do
+                        } else {
                         info!("Audio task: updating TX pipeline config");
                         tx_pipeline_config = config.clone();
                         let _ = bus.voice.send(VoiceEvent::TxPipelineChanged {
@@ -1343,6 +1416,7 @@ async fn run_audio_task<P: Platform>(
                             });
                         }
                         sync_transmission!();
+                        } // end else (config actually changed)
                     }
 
                     AudioCommand::UpdateRxPipelineDefaults { config } => {
@@ -1520,7 +1594,18 @@ async fn run_audio_task<P: Platform>(
                     }
 
                     AudioCommand::PlaySfx { samples } => {
-                        sfx_queue.extend(samples.iter());
+                        // SFX are ephemeral event cues — drop them when
+                        // playback is unavailable rather than queuing a
+                        // backlog that would replay later as a stale burst.
+                        if playback_producer.is_some() {
+                            sfx_queue.extend(samples.iter());
+                            // Backstop: drop the oldest samples if the queue
+                            // has grown past the cap (stalled producer).
+                            let excess = sfx_queue.len().saturating_sub(MAX_SFX_QUEUE_SAMPLES);
+                            if excess > 0 {
+                                sfx_queue.drain(..excess);
+                            }
+                        }
                     }
 
                     AudioCommand::Shutdown => {
@@ -1636,17 +1721,32 @@ async fn run_audio_task<P: Platform>(
             // sound-server crash) and try to recover it. Without this the IO
             // thread/callback just stops and the UI keeps showing "connected"
             // with no audio.
+            //
+            // Recovery uses two persistent flags (`input_recovering`,
+            // `output_recovering`). Once a stream dies, the flag is set and
+            // remains set across ticks until either re-open succeeds or a
+            // deliberate teardown cancels recovery. This is what allows the
+            // health tick to keep retrying after the stream local is None:
+            // without the flag, `is_healthy()` can never fire on a None stream.
             _ = device_health_interval.tick() => {
                 // --- Capture (input) ---
-                if let Some(stream) = audio_input.as_ref()
-                    && !stream.is_healthy()
-                {
-                    warn!("audio: capture device died, attempting re-open");
-                    stop_transmission::<P>(&mut audio_input);
-                    capture_is_active = false;
+                // Trigger on: live stream that just died, OR a prior failed
+                // re-open (stream already None, input_recovering set).
+                let input_needs_recovery =
+                    audio_input.as_ref().is_some_and(|s| !s.is_healthy())
+                    || (audio_input.is_none() && input_recovering);
+
+                if input_needs_recovery {
+                    if audio_input.is_some() {
+                        warn!("audio: capture device died, attempting re-open");
+                        stop_transmission::<P>(&mut audio_input);
+                        capture_is_active = false;
+                    }
+                    input_recovering = true;
+
                     // Capture is connection-scoped — only meaningful to re-open
                     // while connected. (If disconnected, ConnectionEstablished
-                    // re-opens it.)
+                    // re-opens it and sets input_recovering = false there.)
                     if connection.is_some() {
                         match start_transmission::<P>(
                             &audio_backend,
@@ -1666,6 +1766,7 @@ async fn run_audio_task<P: Platform>(
                         ) {
                             Ok(()) => {
                                 info!("audio: capture device re-opened");
+                                input_recovering = false;
                                 // Re-confirm the now-working selection; the
                                 // projection clears the input fault on this.
                                 let _ = bus.voice.send(VoiceEvent::SelectedDeviceChanged {
@@ -1676,8 +1777,8 @@ async fn run_audio_task<P: Platform>(
                                 sync_transmission!();
                             }
                             Err(e) => {
-                                // Still gone — report we're recovering and retry
-                                // next tick (audio_input stays None).
+                                // Still gone — keep recovering, retry next tick
+                                // (audio_input stays None, input_recovering stays true).
                                 let _ = bus.voice.send(VoiceEvent::DeviceError {
                                     kind: DeviceKind::Input,
                                     message: e.to_string(),
@@ -1686,6 +1787,9 @@ async fn run_audio_task<P: Platform>(
                             }
                         }
                     } else {
+                        // Disconnected while device was already dead. Clear the
+                        // flag: ConnectionEstablished will try a fresh open.
+                        input_recovering = false;
                         let _ = bus.voice.send(VoiceEvent::DeviceError {
                             kind: DeviceKind::Input,
                             message: "capture device lost".to_string(),
@@ -1697,16 +1801,23 @@ async fn run_audio_task<P: Platform>(
                 // --- Playback (output) ---
                 // Output runs even while disconnected (SFX), so recover whenever
                 // it's not intentionally torn down (deafened).
-                if let Some(stream) = playback_stream.as_ref()
-                    && !stream.is_healthy()
-                {
-                    warn!("audio: playback device died, attempting re-open");
-                    playback_stream = None;
-                    playback_producer = None;
+                let output_needs_recovery =
+                    playback_stream.as_ref().is_some_and(|s| !s.is_healthy())
+                    || (playback_stream.is_none() && output_recovering);
+
+                if output_needs_recovery {
+                    if playback_stream.is_some() {
+                        warn!("audio: playback device died, attempting re-open");
+                        playback_stream = None;
+                        playback_producer = None;
+                    }
+                    output_recovering = true;
+
                     if !self_deafened {
                         open_playback!();
                         if playback_stream.is_some() {
                             info!("audio: playback device re-opened");
+                            output_recovering = false;
                             // Re-confirm the now-working selection; the
                             // projection clears the output fault on this.
                             let _ = bus.voice.send(VoiceEvent::SelectedDeviceChanged {
@@ -1714,6 +1825,7 @@ async fn run_audio_task<P: Platform>(
                                 id: selected_output.clone(),
                             });
                         } else {
+                            // Still failing — keep recovering, retry next tick.
                             let _ = bus.voice.send(VoiceEvent::DeviceError {
                                 kind: DeviceKind::Output,
                                 message: format!(
@@ -1724,6 +1836,9 @@ async fn run_audio_task<P: Platform>(
                             });
                         }
                     } else {
+                        // Intentionally deafened — clear the flag so the
+                        // health tick doesn't spin; undeafen will re-open.
+                        output_recovering = false;
                         let _ = bus.voice.send(VoiceEvent::DeviceError {
                             kind: DeviceKind::Output,
                             message: "playback device lost".to_string(),
@@ -3602,5 +3717,100 @@ mod tests {
             capture_transition(want, /* active */ true),
             CaptureTransition::Deactivate
         );
+    }
+
+    // ====================================================================
+    // Bug-1 invariant: capture_is_active == true implies audio_input.is_some().
+    //
+    // The sync_transmission! Activate arm defers the flag assignment when
+    // audio_input is None, so a caller with a None stream that requests
+    // activation must see Activate again after the stream is opened —
+    // not a phantom-active flag with no stream backing it.
+    //
+    // These tests exercise the decision functions in isolation. The full
+    // task is required to verify set_active() is called, but the deferred-
+    // activation logic is captured here: consecutive Activate transitions
+    // must be returned until the caller supplies a stream and sets the flag.
+    // ====================================================================
+
+    #[test]
+    fn activate_transition_returned_when_stream_missing_flag_still_false() {
+        // Caller wants to activate but has no stream yet — the flag must stay
+        // false, and capture_transition must return Activate again next time
+        // so the caller gets another chance once the stream opens.
+        let want = should_capture(VoiceMode::Continuous, false, false, false, true);
+        // Before stream opens: active=false, want=true → Activate.
+        assert_eq!(capture_transition(want, false), CaptureTransition::Activate);
+        // Simulate the state after the caller deferred (stream still None,
+        // flag still false): the SAME transition must be returned again —
+        // not None — so activation retries on the next stream-open attempt.
+        assert_eq!(
+            capture_transition(want, false),
+            CaptureTransition::Activate,
+            "deferred activation must keep returning Activate until honoured"
+        );
+    }
+
+    #[test]
+    fn activate_then_deactivate_still_works_after_deferral() {
+        // If the caller deferred activation (flag=false, want=true) and then
+        // conditions change so the desired state becomes false, the transition
+        // must be None (not Deactivate) — there is nothing to deactivate.
+        let want_false = should_capture(VoiceMode::Continuous, /* self_muted */ true, false, false, true);
+        assert_eq!(
+            capture_transition(want_false, /* active */ false),
+            CaptureTransition::None,
+            "deactivating a never-activated stream is a no-op"
+        );
+    }
+
+    // ====================================================================
+    // Bug-4 SFX queue tests: cap and ephemeral-drop invariants (pure logic,
+    // no audio backend required).
+    // ====================================================================
+
+    #[test]
+    fn sfx_queue_cap_drops_oldest_samples() {
+        // Build a queue that exceeds MAX_SFX_QUEUE_SAMPLES and verify that
+        // the logic drops from the front, keeping the most recent samples.
+        let mut queue: VecDeque<f32> = VecDeque::new();
+        // Fill with MAX_SFX_QUEUE_SAMPLES + 100 distinct values. We use the
+        // index cast to f32 so we can identify which samples survive.
+        let total = MAX_SFX_QUEUE_SAMPLES + 100;
+        for i in 0..total {
+            queue.push_back(i as f32);
+        }
+        // Apply the same cap logic as the PlaySfx handler.
+        let excess = queue.len().saturating_sub(MAX_SFX_QUEUE_SAMPLES);
+        if excess > 0 {
+            queue.drain(..excess);
+        }
+        assert_eq!(queue.len(), MAX_SFX_QUEUE_SAMPLES, "queue trimmed to cap");
+        // The oldest 100 samples (indices 0..100) should have been dropped;
+        // the newest should start at index 100.
+        assert_eq!(
+            queue.front().copied(),
+            Some(100.0),
+            "oldest samples must be dropped, not newest"
+        );
+        assert_eq!(
+            queue.back().copied(),
+            Some((total - 1) as f32),
+            "newest sample must be preserved"
+        );
+    }
+
+    #[test]
+    fn sfx_queue_under_cap_is_unchanged() {
+        let mut queue: VecDeque<f32> = VecDeque::new();
+        for i in 0..10usize {
+            queue.push_back(i as f32);
+        }
+        let len_before = queue.len();
+        let excess = queue.len().saturating_sub(MAX_SFX_QUEUE_SAMPLES);
+        if excess > 0 {
+            queue.drain(..excess);
+        }
+        assert_eq!(queue.len(), len_before, "queue below cap must not be modified");
     }
 }
