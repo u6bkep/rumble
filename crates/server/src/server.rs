@@ -465,8 +465,12 @@ pub async fn handle_connection(
         }
     }
 
-    // Connection closed - ensure cleanup happens if primary stream is still active
-    if let Some(handle) = client_handle {
+    // Connection closed - ensure cleanup happens if the primary stream's read
+    // loop didn't already claim teardown. The CAS guard makes this exactly-once
+    // across both racing paths (see ClientHandle::begin_teardown).
+    if let Some(handle) = client_handle
+        && handle.begin_teardown()
+    {
         for plugin in &plugins {
             plugin.on_disconnect(&handle, &plugin_ctx).await;
         }
@@ -590,8 +594,10 @@ async fn run_envelope_stream_with_prefix(
         }
     }
 
-    // Only cleanup if this was the primary stream
-    if is_primary {
+    // Only cleanup if this was the primary stream, and only if we win the
+    // teardown CAS — the connection-level accept_bi loop races to tear the same
+    // handle down on close (see ClientHandle::begin_teardown).
+    if is_primary && handle.begin_teardown() {
         for plugin in &plugins {
             plugin.on_disconnect(&handle, &ctx).await;
         }

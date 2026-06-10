@@ -249,6 +249,11 @@ pub struct ClientHandle {
     pub server_muted: AtomicBool,
     /// Whether a moderator manually server-muted this user.
     pub manually_server_muted: AtomicBool,
+    /// Whether teardown (plugin `on_disconnect` + `cleanup_client`) has begun.
+    /// Two paths race to tear a connection down — the primary-stream read loop
+    /// ending and the `accept_bi` loop breaking on connection close — so this
+    /// CAS guard ensures cleanup runs exactly once. See [`Self::begin_teardown`].
+    pub torn_down: AtomicBool,
     /// Shared identity — the same `Arc<Identity>` held by this client's [`Member`].
     pub identity: Arc<Identity>,
 }
@@ -273,8 +278,20 @@ impl ClientHandle {
             is_superuser: AtomicBool::new(false),
             server_muted: AtomicBool::new(false),
             manually_server_muted: AtomicBool::new(false),
+            torn_down: AtomicBool::new(false),
             identity,
         }
+    }
+
+    /// Claim teardown for this connection. Returns `true` for the first caller
+    /// (which must then run plugin `on_disconnect` + `cleanup_client`) and
+    /// `false` for every later caller, so the non-idempotent parts of teardown
+    /// (the `UserLeft` broadcast, plugin disconnect callbacks) fire exactly once
+    /// even though both teardown paths run on a normal disconnect.
+    pub fn begin_teardown(&self) -> bool {
+        self.torn_down
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
     }
 
     /// Set the display name. Delegates to the shared identity.
