@@ -330,8 +330,9 @@ fn mime_pattern_matches(pattern: &str, mime: &str) -> bool {
 /// File-transfer preferences shared across desktop GUI clients.
 ///
 /// `auto_download_enabled` + `auto_download_rules` are consumed by
-/// the incoming-offer pump. The bandwidth caps are persisted UI state
-/// today and will feed the file-transfer plugin once that surface lands.
+/// the incoming-offer pump. The bandwidth caps seed the client's
+/// `ConnectConfig` at startup and are pushed live to the file-transfer
+/// plugin via `Command::SetFileTransferSpeedLimits` on settings save.
 /// `download_dir` overrides the platform default (system temp dir +
 /// `rumble_downloads`) for fetched files.
 #[derive(Debug, Clone, Serialize, Deserialize)]

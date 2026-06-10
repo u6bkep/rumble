@@ -68,6 +68,57 @@ pub enum PluginEvent {
 /// tasks (`run_upload`, `run_fetch`).
 pub type PluginEventSink = std::sync::Arc<dyn Fn(PluginEvent) + Send + Sync>;
 
+/// Live-updatable transfer speed limits shared between the host and a
+/// [`FileTransferPlugin`].
+///
+/// The host (e.g. `rumble-client`'s connection task) keeps one of these
+/// for the lifetime of the process and hands clones to each plugin it
+/// constructs; updating the limits through any clone is immediately
+/// visible to in-flight transfers, which re-read the values on every
+/// throttle tick.
+///
+/// Both limits are in **bytes per second**; `0` means unlimited.
+#[derive(Clone, Debug, Default)]
+pub struct TransferSpeedLimits {
+    inner: std::sync::Arc<SpeedLimitsInner>,
+}
+
+#[derive(Debug, Default)]
+struct SpeedLimitsInner {
+    download_bps: std::sync::atomic::AtomicU64,
+    upload_bps: std::sync::atomic::AtomicU64,
+}
+
+impl TransferSpeedLimits {
+    /// Create limits with initial values (bytes/sec; `0` = unlimited).
+    pub fn new(download_bps: u64, upload_bps: u64) -> Self {
+        let limits = Self::default();
+        limits.set(download_bps, upload_bps);
+        limits
+    }
+
+    /// Current download (receive) limit in bytes/sec; `0` = unlimited.
+    pub fn download_bps(&self) -> u64 {
+        self.inner.download_bps.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Current upload (send) limit in bytes/sec; `0` = unlimited.
+    pub fn upload_bps(&self) -> u64 {
+        self.inner.upload_bps.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Update both limits (bytes/sec; `0` = unlimited). Takes effect on
+    /// the next throttle tick of any in-flight transfer.
+    pub fn set(&self, download_bps: u64, upload_bps: u64) {
+        self.inner
+            .download_bps
+            .store(download_bps, std::sync::atomic::Ordering::Relaxed);
+        self.inner
+            .upload_bps
+            .store(upload_bps, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Unique identifier for a file transfer (typically a UUID string).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TransferId(pub String);

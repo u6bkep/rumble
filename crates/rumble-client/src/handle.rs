@@ -948,6 +948,12 @@ async fn run_connection_task<P: Platform>(
     let mut client_name = String::new();
     let mut _session_identity: Option<SessionIdentity> = None;
     let mut file_transfer: Option<Arc<dyn FileTransferPlugin>> = None;
+    // Live-updatable file-transfer bandwidth caps. One handle for the
+    // task's whole lifetime: every plugin we create gets a clone, so a
+    // `SetFileTransferSpeedLimits` command applies to in-flight transfers
+    // on the current connection *and* to future connections.
+    let ft_speed_limits =
+        rumble_client_traits::TransferSpeedLimits::new(config.download_speed_limit, config.upload_speed_limit);
     // Write the active plugin into the shared slot so the UI thread
     // can call `transfers()` / `cancel()` / `get_file_path()` directly
     // without going through the command channel.
@@ -1180,13 +1186,20 @@ async fn run_connection_task<P: Platform>(
                                     Arc::new(rumble_client_traits::BiStreamOpener::new(opener_handle));
                                 let event_sink = plugin_event_sink(events.clone(), bus.clone());
                                 let ft_arc: Option<Arc<dyn FileTransferPlugin>> =
-                                    P::create_file_transfer_plugin(opener, downloads_dir, Some(event_sink));
+                                    P::create_file_transfer_plugin(opener, downloads_dir, Some(event_sink), ft_speed_limits.clone());
 
-                                // Set the initial room ID on the relay plugin
-                                if let Some(ft) = &ft_arc
-                                    && let Some(room_uuid) = read_state(&state).my_room_id {
-                                        ft.set_room_id(room_uuid.to_string());
-                                    }
+                                // Seed the plugin's room id from the connect-time
+                                // computation above, NOT from `state.my_room_id`:
+                                // the projection applies `SelfMovedToRoom`
+                                // asynchronously, so a state read here can race
+                                // it and miss — leaving the plugin without a
+                                // room id until the next room change. Later
+                                // moves arrive via the receiver task (spawned
+                                // below, after `publish_ft`), so the projection
+                                // always finds the slot populated for them.
+                                if let Some(ft) = &ft_arc {
+                                    ft.set_room_id(my_room_uuid.to_string());
+                                }
 
                                 // Keep a reference for room-change updates,
                                 // and publish to the shared slot so UI threads
@@ -1364,13 +1377,15 @@ async fn run_connection_task<P: Platform>(
                                         Arc::new(rumble_client_traits::BiStreamOpener::new(opener_handle));
                                     let event_sink = plugin_event_sink(events.clone(), bus.clone());
                                     let ft_arc: Option<Arc<dyn FileTransferPlugin>> =
-                                        P::create_file_transfer_plugin(opener, downloads_dir, Some(event_sink));
+                                        P::create_file_transfer_plugin(opener, downloads_dir, Some(event_sink), ft_speed_limits.clone());
 
-                                    // Set the initial room ID on the relay plugin
-                                    if let Some(ft) = &ft_arc
-                                        && let Some(room_uuid) = read_state(&state).my_room_id {
-                                            ft.set_room_id(room_uuid.to_string());
-                                        }
+                                    // Seed the plugin's room id from the
+                                    // connect-time computation above, NOT from
+                                    // `state.my_room_id` — same race rationale
+                                    // as the Connect arm.
+                                    if let Some(ft) = &ft_arc {
+                                        ft.set_room_id(my_room_uuid.to_string());
+                                    }
 
                                     // Keep a reference for room-change updates,
                                     // and publish to the shared slot so UI threads
@@ -1840,6 +1855,17 @@ async fn run_connection_task<P: Platform>(
                                 });
                             }
                         }
+                    }
+
+                    Command::SetFileTransferSpeedLimits {
+                        download_bps,
+                        upload_bps,
+                    } => {
+                        // Shared handle: in-flight transfers re-read the
+                        // values on every chunk, and plugins created by
+                        // future connections get a clone of the same
+                        // handle, so this single store covers both.
+                        ft_speed_limits.set(download_bps, upload_bps);
                     }
 
                     Command::RequestChatHistory => {

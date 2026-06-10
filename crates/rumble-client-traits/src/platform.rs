@@ -4,7 +4,10 @@
 use std::{path::PathBuf, sync::Arc};
 
 use crate::{
-    FileTransferPlugin, StreamOpener, audio::AudioBackend, codec::VoiceCodec, file_transfer::PluginEventSink,
+    FileTransferPlugin, StreamOpener,
+    audio::AudioBackend,
+    codec::VoiceCodec,
+    file_transfer::{PluginEventSink, TransferSpeedLimits},
     transport::Transport,
 };
 
@@ -27,9 +30,15 @@ pub trait Platform: Send + Sync + 'static {
     /// `event_sink` is an opaque callback the plugin can use to surface
     /// user-visible toasts (e.g. relay rejection, dup-upload warning)
     /// without depending on `rumble-client`'s `BackendEvent` type.
+    ///
+    /// `speed_limits` is a shared, live-updatable handle to the user's
+    /// transfer bandwidth caps (bytes/sec, `0` = unlimited). The plugin
+    /// should re-read it during transfers so settings changes apply to
+    /// in-flight uploads/downloads.
     fn create_file_transfer_plugin(
         opener: Arc<dyn StreamOpener>,
         downloads_dir: PathBuf,
         event_sink: Option<PluginEventSink>,
+        speed_limits: TransferSpeedLimits,
     ) -> Option<Arc<dyn FileTransferPlugin>>;
 }

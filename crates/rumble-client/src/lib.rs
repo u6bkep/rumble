@@ -160,6 +160,14 @@ pub struct ConnectConfig {
     /// If true, always use relay mode for file transfers.
     /// This is useful when behind NAT or when you want to hide your IP.
     pub prefer_relay: bool,
+
+    /// Initial file-transfer download speed limit in bytes/sec; 0 = unlimited.
+    /// Live updates go through [`Command::SetFileTransferSpeedLimits`].
+    pub download_speed_limit: u64,
+
+    /// Initial file-transfer upload speed limit in bytes/sec; 0 = unlimited.
+    /// Live updates go through [`Command::SetFileTransferSpeedLimits`].
+    pub upload_speed_limit: u64,
 }
 
 impl ConnectConfig {
@@ -183,6 +191,13 @@ impl ConnectConfig {
     /// Enable relay mode for file transfers (useful behind NAT).
     pub fn with_prefer_relay(mut self, prefer: bool) -> Self {
         self.prefer_relay = prefer;
+        self
+    }
+
+    /// Set the initial file-transfer speed limits (bytes/sec; 0 = unlimited).
+    pub fn with_speed_limits(mut self, download_bps: u64, upload_bps: u64) -> Self {
+        self.download_speed_limit = download_bps;
+        self.upload_speed_limit = upload_bps;
         self
     }
 }

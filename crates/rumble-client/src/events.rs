@@ -1324,6 +1324,14 @@ pub enum Command {
     CancelTransfer {
         transfer_id: String,
     },
+    /// Update the file-transfer bandwidth caps (bytes/sec; 0 = unlimited).
+    /// Applies immediately to in-flight transfers and to plugins created
+    /// by future connections — the connection task owns one shared
+    /// `TransferSpeedLimits` handle for its whole lifetime.
+    SetFileTransferSpeedLimits {
+        download_bps: u64,
+        upload_bps: u64,
+    },
 
     // Sound Effects
     /// Play a sound effect.
@@ -1513,6 +1521,14 @@ impl std::fmt::Debug for Command {
             Command::CancelTransfer { transfer_id } => f
                 .debug_struct("CancelTransfer")
                 .field("transfer_id", transfer_id)
+                .finish(),
+            Command::SetFileTransferSpeedLimits {
+                download_bps,
+                upload_bps,
+            } => f
+                .debug_struct("SetFileTransferSpeedLimits")
+                .field("download_bps", download_bps)
+                .field("upload_bps", upload_bps)
                 .finish(),
             Command::PlaySfx { kind, volume } => f
                 .debug_struct("PlaySfx")
