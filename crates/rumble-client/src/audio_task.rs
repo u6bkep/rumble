@@ -723,6 +723,9 @@ pub fn spawn_audio_task<P: Platform>(config: AudioTaskConfig<P>) -> AudioTaskHan
 /// Determine if we should be processing captured audio based on current state.
 /// Note: VAD is a pipeline processor, not a voice mode. In Continuous mode
 /// with VAD enabled, the pipeline's suppress flag gates actual transmission.
+/// In PushToTalk mode the suppress flag is ignored (`vad_gate_bypass` in the
+/// capture callback): the held key is the voice-activity signal, so capture
+/// being active is the only transmit gate.
 #[inline]
 fn should_capture(
     voice_mode: VoiceMode,
@@ -941,6 +944,17 @@ async fn run_audio_task<P: Platform>(
     // baseline. "Capture armed" (unmute) is NOT itself "transmitting"; only the
     // callback's VAD decision lights the indicator.
     let was_transmitting = Arc::new(AtomicBool::new(false));
+
+    // True while the voice mode is PushToTalk. Shared with the capture
+    // callback, which uses it to bypass the pipeline's VAD suppress gate:
+    // the PTT keypress IS the voice-activity signal (the Mumble/Discord
+    // convention), so anything captured while the key is held — whisper,
+    // breath, an instrument — must transmit even if RNNoise scores it as
+    // non-voice. Denoise itself still runs; only the gate decision is
+    // overridden. In PTT mode the callback only sees frames while the key
+    // is held (capture is gated inactive otherwise), so "bypass in PTT
+    // mode" is exactly "bypass while held".
+    let vad_gate_bypass = Arc::new(AtomicBool::new(matches!(voice_mode, VoiceMode::PushToTalk)));
 
     // Pipeline handle for the current capture stream. Retained alongside the
     // capture stream so the sync_transmission! Activate arm can call reset()
@@ -1161,6 +1175,7 @@ async fn run_audio_task<P: Platform>(
                                 &output_writer,
                                 &capture_frame_index,
                                 &was_transmitting,
+                                &vad_gate_bypass,
                             )
                         {
                             capture_is_active = false;
@@ -1270,6 +1285,7 @@ async fn run_audio_task<P: Platform>(
                                 &output_writer,
                                 &capture_frame_index,
                                 &was_transmitting,
+                                &vad_gate_bypass,
                             ) {
                                 Ok(()) => {
                                     let _ = bus.voice.send(VoiceEvent::SelectedDeviceChanged {
@@ -1349,6 +1365,7 @@ async fn run_audio_task<P: Platform>(
 
                     AudioCommand::SetVoiceMode { mode } => {
                         voice_mode = mode;
+                        vad_gate_bypass.store(matches!(mode, VoiceMode::PushToTalk), Ordering::Relaxed);
                         let _ = bus.voice.send(VoiceEvent::VoiceModeChanged { mode });
                         sync_transmission!();
                     }
@@ -1470,6 +1487,7 @@ async fn run_audio_task<P: Platform>(
                                 &output_writer,
                                 &capture_frame_index,
                                 &was_transmitting,
+                                &vad_gate_bypass,
                             )
                         {
                             capture_is_active = false;
@@ -1538,6 +1556,7 @@ async fn run_audio_task<P: Platform>(
                                 &output_writer,
                                 &capture_frame_index,
                                 &was_transmitting,
+                                &vad_gate_bypass,
                             )
                         {
                             capture_is_active = false;
@@ -1919,6 +1938,7 @@ async fn run_audio_task<P: Platform>(
                             &output_writer,
                             &capture_frame_index,
                             &was_transmitting,
+                            &vad_gate_bypass,
                         ) {
                             Ok(()) => {
                                 info!("audio: capture device re-opened");
@@ -2043,6 +2063,7 @@ fn start_transmission<P: Platform>(
     output_writer: &crate::snapshot::SnapshotWriter<rumble_audio::OutputFrame>,
     capture_frame_index: &Arc<AtomicU64>,
     was_transmitting: &Arc<AtomicBool>,
+    vad_gate_bypass: &Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     if audio_input.is_some() {
         return Ok(()); // Stream already exists
@@ -2117,6 +2138,10 @@ fn start_transmission<P: Platform>(
     // deactivated so each (re)activation re-evaluates from a clean baseline.
     let was_transmitting_for_callback = Arc::clone(was_transmitting);
 
+    // Live "voice mode is PTT" flag — see its definition in `run_audio_task`
+    // for why PTT overrides the pipeline's VAD suppress decision.
+    let vad_gate_bypass_for_callback = Arc::clone(vad_gate_bypass);
+
     // Discard the first few frames to avoid stale samples from the hardware buffer.
     // When an audio stream starts, the hardware often delivers stale/garbage data
     // from its internal ring buffer. Discarding 2-3 frames (~40-60ms) fixes this.
@@ -2188,9 +2213,15 @@ fn start_transmission<P: Platform>(
             // removes every level-reporting stage.
             let post_level_db = rumble_audio::calculate_rms_db(&sample_scratch);
 
-            // Track previous transmitting state to detect changes
+            // Track previous transmitting state to detect changes.
+            // In PushToTalk mode the gate decision is overridden: the held key
+            // is the user's explicit transmit signal, so the VAD verdict must
+            // not block encoding (it still feeds the meters/lamp via the
+            // published stage outputs above).
+            let suppress =
+                pipeline_result.suppress && !vad_gate_bypass_for_callback.load(std::sync::atomic::Ordering::Relaxed);
             let was_tx = was_transmitting_for_callback.load(std::sync::atomic::Ordering::Relaxed);
-            let is_tx_now = !pipeline_result.suppress;
+            let is_tx_now = !suppress;
 
             // Publish a fresh meter snapshot for the UI. The writer
             // recycles its buffer, so in steady state this doesn't
@@ -2209,9 +2240,10 @@ fn start_transmission<P: Platform>(
                 let _ = voice_tx_for_callback.send(VoiceEvent::TransmittingChanged { active: is_tx_now });
             }
 
-            // Pipeline suppress flag gates actual transmission
-            // This allows VAD (or any other processor) to prevent encoding/sending
-            if pipeline_result.suppress {
+            // Pipeline suppress flag gates actual transmission (except in PTT
+            // mode, see above). This allows VAD (or any other processor) to
+            // prevent encoding/sending in Continuous mode.
+            if suppress {
                 // If we were transmitting and now we're suppressed, send end-of-stream
                 if was_tx {
                     was_transmitting_for_callback.store(false, std::sync::atomic::Ordering::Relaxed);
