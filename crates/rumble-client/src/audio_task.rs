@@ -262,6 +262,13 @@ pub struct UserAudioState<D: VoiceDecoderTrait> {
     /// Whether the sender has signaled end of stream. Advisory: it stops PLC
     /// promptly once the buffer drains, but a lost EOS is also covered by the
     /// stale-stream guard and by the silence classification at the next spurt.
+    ///
+    /// Starts `true`: a peer whose state was created proactively (room join /
+    /// room change) has not started a stream yet. The first voice datagram
+    /// flips it to `false` (`insert_packet`); an EOS datagram on a peer that
+    /// never transmitted correctly leaves it ended. Starting `false` kept
+    /// [`fill_playback_ring`]'s producer-active flag stuck on whenever any
+    /// silent peer shared the room, corrupting the underrun stat.
     stream_ended: bool,
     /// Re-prime the (long-lived) decoder with a discarded PLC frame at the next
     /// spurt onset, smoothing the transition and avoiding an onset click.
@@ -343,7 +350,7 @@ impl<D: VoiceDecoderTrait> UserAudioState<D> {
             bytes_received: 0,
             rx_pipeline: None,
             volume_db: 0.0,
-            stream_ended: false,
+            stream_ended: true,
             needs_prime: false,
             consecutive_late: 0,
         }
@@ -482,6 +489,26 @@ impl<D: VoiceDecoderTrait> UserAudioState<D> {
     /// Check if we have enough buffered to start (or are already playing).
     fn ready_to_play(&self) -> bool {
         self.started || self.depth() >= self.target_frames as usize
+    }
+
+    /// Whether this peer's stream should count as "live" for the playback
+    /// producer-active flag: it is mid-stream (packets flowing, neither ended
+    /// nor stale), or it still has buffered audio the mix will actually drain.
+    ///
+    /// The staleness test is applied here (read-only) and not just inside
+    /// [`decode_next_into`], because that guard is only reached for
+    /// `ready_to_play()` peers — a sub-target spurt followed by silence (or a
+    /// lost EOS before the buffer filled) would otherwise hold the producer
+    /// "active" forever. An ended/stale stream with leftovers below the playout
+    /// target is not live either: the mix skips non-ready peers, so those
+    /// frames can't drain until a new spurt arrives (which marks the stream
+    /// live again via `insert_packet`).
+    fn is_stream_live(&self) -> bool {
+        let stale = self.have_arrival && self.last_arrival.elapsed() > STREAM_STALE_THRESHOLD;
+        if !self.stream_ended && !stale {
+            return true;
+        }
+        self.ready_to_play() && !self.jitter_buffer.is_empty()
     }
 
     /// Decode the next frame to play into `out`, returning the number of valid
@@ -2537,10 +2564,7 @@ fn fill_playback_ring<D: VoiceDecoderTrait>(
     // produced this poll) so it stays stable across a spurt even on polls where
     // the ring was already full and nothing was produced — otherwise a
     // stall-induced underrun between polls could read a stale `false`.
-    let stream_active = !sfx_queue.is_empty()
-        || user_audio
-            .values()
-            .any(|u| !u.stream_ended || !u.jitter_buffer.is_empty());
+    let stream_active = !sfx_queue.is_empty() || user_audio.values().any(UserAudioState::is_stream_live);
     producer_active.store(stream_active, Ordering::Relaxed);
 
     let Some(producer) = producer else { return };
@@ -3660,6 +3684,66 @@ mod tests {
         assert!(
             active.load(Ordering::Relaxed),
             "a buffering (un-ended) stream is active"
+        );
+    }
+
+    /// Issue #43: a peer whose state was created proactively (room join) but
+    /// who never transmits must NOT hold the producer-active flag true — that
+    /// made the filler count an underrun on every expected post-spurt cushion
+    /// drain (corrupting the stat) and gated off the sub-prime SFX flush, for
+    /// as long as any silent peer shared the room.
+    #[test]
+    fn silent_proactive_peer_does_not_mark_producer_active() {
+        let mut peers: HashMap<u64, UserAudioState<MarkerDecoder>> = HashMap::new();
+        // Proactively-created peer (UserJoinedRoom path): never sent a packet.
+        peers.insert(1, make_state(3));
+
+        let mut sfx: VecDeque<f32> = VecDeque::new();
+        let (mut producer, _consumer) = RingBuffer::<f32>::new(MAX_PLAYBACK_BUFFER_SAMPLES);
+        let overflows = AtomicU64::new(0);
+        let active = AtomicBool::new(true);
+        let dumper = AudioDumper::disabled();
+
+        fill_playback_ring(&mut peers, &mut sfx, Some(&mut producer), &dumper, &overflows, &active);
+        assert!(
+            !active.load(Ordering::Relaxed),
+            "a peer that never started a stream must not mark the producer active"
+        );
+
+        // Their first datagram makes the stream live.
+        feed_contig(peers.get_mut(&1).unwrap(), Instant::now(), 0);
+        fill_playback_ring(&mut peers, &mut sfx, Some(&mut producer), &dumper, &overflows, &active);
+        assert!(
+            active.load(Ordering::Relaxed),
+            "the first voice datagram marks the stream live"
+        );
+    }
+
+    /// Issue #43 (companion case): a sub-target spurt followed by silence
+    /// (e.g. a lost EOS before the buffer ever reached the playout target).
+    /// The in-decode stale guard never runs for a peer that isn't ready to
+    /// play, so liveness itself must apply the staleness test — otherwise the
+    /// stranded 1–2 buffered frames hold the producer active forever.
+    #[test]
+    fn stale_sub_target_spurt_does_not_mark_producer_active() {
+        let mut peers: HashMap<u64, UserAudioState<MarkerDecoder>> = HashMap::new();
+        let mut s = make_state(3);
+        // One packet (below the 3-frame target), which arrived well past the
+        // stale threshold — the sender went silent and the EOS was lost.
+        let past = Instant::now() - (STREAM_STALE_THRESHOLD + Duration::from_millis(100));
+        s.insert_packet_at(0, 0, packet(0), past);
+        peers.insert(1, s);
+
+        let mut sfx: VecDeque<f32> = VecDeque::new();
+        let (mut producer, _consumer) = RingBuffer::<f32>::new(MAX_PLAYBACK_BUFFER_SAMPLES);
+        let overflows = AtomicU64::new(0);
+        let active = AtomicBool::new(true);
+        let dumper = AudioDumper::disabled();
+
+        fill_playback_ring(&mut peers, &mut sfx, Some(&mut producer), &dumper, &overflows, &active);
+        assert!(
+            !active.load(Ordering::Relaxed),
+            "a stale never-ready stream must not hold the producer active"
         );
     }
 
