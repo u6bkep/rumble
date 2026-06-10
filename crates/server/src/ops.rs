@@ -557,10 +557,33 @@ pub(crate) async fn apply_set_user_group_by_key(
 ) -> Result<String, String> {
     let persist = persistence;
 
+    // Validate the target group before mutating anything. Only the `add` path
+    // needs this: removal is idempotent cleanup (stripping a possibly-stale
+    // membership), but adding to a bogus group is a silent foot-gun.
     if add {
-        let _ = persist.add_user_to_group(&public_key, &group);
+        // A registered username is an *implicit* identity group, not a
+        // manageable one — granting it would hand the user every per-room ACL
+        // entry targeting that identity.
+        if persist.is_username_registered(&group) {
+            return Err(format!("'{group}' is a registered username, not a group"));
+        }
+        // Reject typos: the group must actually exist (builtin or persisted).
+        if !BUILTIN_GROUPS.contains(&group.as_str()) && persist.get_group(&group).is_none() {
+            return Err(format!("Group '{group}' does not exist"));
+        }
+    }
+
+    // Persist first and propagate failures: a swallowed write would leave only
+    // a session-only grant (mirrored below) that vanishes on reconnect/restart
+    // while the admin saw success.
+    if add {
+        persist
+            .add_user_to_group(&public_key, &group)
+            .map_err(|e| format!("Failed to persist group membership: {e}"))?;
     } else {
-        let _ = persist.remove_user_from_group(&public_key, &group);
+        persist
+            .remove_user_from_group(&public_key, &group)
+            .map_err(|e| format!("Failed to persist group membership: {e}"))?;
     }
 
     // Mirror onto any live connection(s) sharing this key, and broadcast the
@@ -764,5 +787,64 @@ mod tests {
             .unwrap_err();
         assert!(err.contains("Parent room does not exist"), "got: {err}");
         assert_eq!(state.get_rooms().await.len(), 1, "nothing created besides Root");
+    }
+
+    /// Adding a user to a typo'd / non-existent group is rejected instead of
+    /// silently "succeeding" (#35).
+    #[tokio::test]
+    async fn set_user_group_rejects_unknown_group() {
+        let (state, persist) = test_env();
+        persist.ensure_default_groups().unwrap();
+        let key = [7u8; 32];
+
+        let err = apply_set_user_group_by_key(&state, &persist, key, "admni".into(), true, 0)
+            .await
+            .unwrap_err();
+        assert!(err.contains("does not exist"), "got: {err}");
+        assert!(
+            persist.get_user_groups(&key).is_empty(),
+            "no membership should have been written"
+        );
+    }
+
+    /// A registered username is an implicit identity group and must not be
+    /// grantable as a managed group (#35).
+    #[tokio::test]
+    async fn set_user_group_rejects_username_as_group() {
+        let (state, persist) = test_env();
+        persist.ensure_default_groups().unwrap();
+        persist
+            .register_user(
+                &[1u8; 32],
+                crate::persistence::RegisteredUser {
+                    username: "alice".into(),
+                    last_room: None,
+                },
+            )
+            .unwrap();
+        let key = [7u8; 32];
+
+        let err = apply_set_user_group_by_key(&state, &persist, key, "alice".into(), true, 0)
+            .await
+            .unwrap_err();
+        assert!(err.contains("registered username"), "got: {err}");
+        assert!(persist.get_user_groups(&key).is_empty());
+    }
+
+    /// Adding an offline user to a real group persists the membership.
+    #[tokio::test]
+    async fn set_user_group_adds_existing_group() {
+        let (state, persist) = test_env();
+        persist.ensure_default_groups().unwrap();
+        let key = [7u8; 32];
+
+        apply_set_user_group_by_key(&state, &persist, key, "admin".into(), true, 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            persist.get_user_groups(&key),
+            vec!["admin".to_string()],
+            "membership persisted"
+        );
     }
 }
