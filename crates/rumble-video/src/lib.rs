@@ -40,51 +40,122 @@ use std::{
     os::raw::{c_char, c_void},
     path::Path,
     ptr,
+    sync::Arc,
     time::Duration,
 };
 
 use error::check;
 
-/// Owned libmpv player handle plus a SW render context attached to it.
-/// `Drop` tears both down in the correct order (render context first,
-/// then `mpv_terminate_destroy`).
-pub struct MpvPlayer {
-    /// `*mut mpv_handle`. Internally synchronised by libmpv — safe to
-    /// hand to multiple threads as long as no two methods are called
-    /// concurrently on the same `&mut`.
-    handle: *mut sys::mpv_handle,
-    render_ctx: *mut sys::mpv_render_context,
+/// Owned `*mut mpv_handle`, shared between the two public halves
+/// ([`MpvPlayer`] / [`MpvRender`]) via `Arc`. `Drop` runs
+/// `mpv_terminate_destroy`; the `Arc` guarantees that only happens
+/// once *both* halves are gone, which (combined with
+/// [`MpvRender`]'s `Drop` freeing the render context before its
+/// `Arc` clone releases) preserves libmpv's "free the render
+/// context before the core" teardown order.
+struct Handle(*mut sys::mpv_handle);
+
+// SAFETY: libmpv's core handle API is internally synchronised —
+// per the libmpv docs every `mpv_*` function we call through
+// `Handle` (`mpv_set_option_string`, `mpv_set_property_string`,
+// `mpv_get_property`, `mpv_command`) is thread-safe and may be
+// called from any thread, concurrently. The two functions that are
+// NOT (`mpv_wait_event`: one caller thread at a time; the render
+// context functions: externally synchronised) are only reachable
+// through `MpvRender`, which is deliberately `!Sync`.
+unsafe impl Send for Handle {}
+unsafe impl Sync for Handle {}
+
+impl Handle {
+    /// Issue a libmpv command. `args` is the same shape libmpv's
+    /// `mpv_command` expects: e.g. `&["loadfile", "/tmp/a.mp4"]`.
+    fn command(&self, args: &[&str]) -> Result<(), Error> {
+        // Allocate owned CStrings so the pointers stay valid for the
+        // duration of the call.
+        let owned: Vec<CString> = args
+            .iter()
+            .map(|a| CString::new(*a).map_err(|_| Error::InvalidArg("command arg contained NUL")))
+            .collect::<Result<_, _>>()?;
+        let mut argv: Vec<*const c_char> = owned.iter().map(|s| s.as_ptr()).collect();
+        argv.push(ptr::null()); // libmpv expects a NULL sentinel
+        let rc = unsafe { sys::mpv_command(self.0, argv.as_mut_ptr()) };
+        check(rc, "mpv_command")
+    }
+
+    fn set_option_string(&self, name: &str, value: &str) -> Result<(), Error> {
+        let name = CString::new(name).map_err(|_| Error::InvalidArg("option name contained NUL"))?;
+        let value = CString::new(value).map_err(|_| Error::InvalidArg("option value contained NUL"))?;
+        let rc = unsafe { sys::mpv_set_option_string(self.0, name.as_ptr(), value.as_ptr()) };
+        check(rc, "mpv_set_option_string")
+    }
 }
 
-// libmpv's handle is internally synchronised across threads — per
-// the docs, "most functions are thread-safe" and the ones we don't
-// need to call concurrently (mpv_render_context_render in
-// particular) we restrict to a single thread by usage discipline:
-// VideoStream's worker is the only caller of render_sw and
-// wait_for_frame, while the UI thread calls only the
-// command/property-setter methods.
-unsafe impl Send for MpvPlayer {}
-unsafe impl Sync for MpvPlayer {}
+impl Drop for Handle {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { sys::mpv_terminate_destroy(self.0) };
+        }
+    }
+}
+
+/// The thread-safe command/property half of a libmpv player.
+/// Created paired with its render/event half by
+/// [`MpvPlayer::new`]; share this one freely (it is `Send + Sync`
+/// through the inner `Arc<Handle>` — every method maps to a
+/// libmpv call that is documented thread-safe).
+///
+/// The operations libmpv confines to a single thread
+/// (`mpv_wait_event`, the render-context API) live on
+/// [`MpvRender`], which is `Send` but **not** `Sync`, so the
+/// threading contract is enforced by the type system rather than
+/// usage discipline.
+pub struct MpvPlayer {
+    handle: Arc<Handle>,
+}
+
+/// The thread-confined render/event half of a libmpv player:
+/// [`Self::load_file`] and [`Self::wait_for_frame`] pump
+/// `mpv_wait_event` (one caller thread at a time per libmpv), and
+/// [`Self::wait_for_frame`] / [`Self::render_sw`] drive the render
+/// context (externally synchronised per libmpv). `Send` so it can
+/// move into a decode worker thread; deliberately **not** `Sync`,
+/// so `&self` calls can never race from two threads.
+///
+/// Owns the SW render context; `Drop` frees it. The shared
+/// `Arc<Handle>` keeps the mpv core alive until both halves are
+/// gone, and `Drop` ordering (explicit body before field drops)
+/// guarantees the render context is freed before
+/// `mpv_terminate_destroy` can run.
+pub struct MpvRender {
+    render_ctx: *mut sys::mpv_render_context,
+    handle: Arc<Handle>,
+}
+
+// SAFETY: `MpvRender` owns the render context and is the only path
+// to `mpv_wait_event` / `mpv_render_context_*`. Those calls are
+// fine from any thread as long as they never run concurrently;
+// the absence of a `Sync` impl (the raw `render_ctx` pointer
+// suppresses the auto trait) means all `&self` access is confined
+// to whichever single thread currently owns the value, so moving
+// it between threads (`Send`) is sound.
+unsafe impl Send for MpvRender {}
 
 impl MpvPlayer {
-    /// Create a fresh player + SW render context. Sets a small set of
-    /// "library embedding" defaults (no terminal, no input handling,
-    /// no config file scanning) so libmpv behaves predictably inside a
-    /// host application instead of inheriting user mpv config from
-    /// `~/.config/mpv`.
-    pub fn new() -> Result<Self, Error> {
-        let handle = unsafe { sys::mpv_create() };
-        if handle.is_null() {
+    /// Create a fresh player + SW render context, returned as the
+    /// shareable command/property half ([`MpvPlayer`]) and the
+    /// thread-confined render/event half ([`MpvRender`]). Sets a
+    /// small set of "library embedding" defaults (no terminal, no
+    /// input handling, no config file scanning) so libmpv behaves
+    /// predictably inside a host application instead of inheriting
+    /// user mpv config from `~/.config/mpv`.
+    pub fn new() -> Result<(Self, MpvRender), Error> {
+        let raw = unsafe { sys::mpv_create() };
+        if raw.is_null() {
             return Err(Error::OutOfMemory);
         }
-
-        // Build a guard-then-fill struct so we don't leak the handle
-        // if any of the option/init calls fail before we attach the
-        // render context.
-        let mut player = Self {
-            handle,
-            render_ctx: ptr::null_mut(),
-        };
+        // Wrap immediately so early-return error paths below tear
+        // the handle down instead of leaking it.
+        let handle = Arc::new(Handle(raw));
 
         // Embedding-friendly defaults. Set before mpv_initialize per
         // the libmpv contract for these specific options.
@@ -99,15 +170,16 @@ impl MpvPlayer {
             // own window, which is not what we want.
             ("vo", "libmpv"),
         ] {
-            player.set_option_string(k, v)?;
+            handle.set_option_string(k, v)?;
         }
 
-        let rc = unsafe { sys::mpv_initialize(player.handle) };
+        let rc = unsafe { sys::mpv_initialize(handle.0) };
         check(rc, "mpv_initialize")?;
 
         // Attach the SW render context. Phase 1 doesn't use the
         // update callback (we poll `mpv_render_context_update`
         // explicitly in `wait_for_frame`).
+        let mut render_ctx: *mut sys::mpv_render_context = ptr::null_mut();
         let mut params = [
             sys::mpv_render_param {
                 type_: sys::MPV_RENDER_PARAM_API_TYPE,
@@ -118,19 +190,20 @@ impl MpvPlayer {
                 data: ptr::null_mut(),
             },
         ];
-        let rc = unsafe { sys::mpv_render_context_create(&mut player.render_ctx, player.handle, params.as_mut_ptr()) };
+        let rc = unsafe { sys::mpv_render_context_create(&mut render_ctx, handle.0, params.as_mut_ptr()) };
         check(rc, "mpv_render_context_create")?;
 
-        Ok(player)
+        let render = MpvRender {
+            render_ctx,
+            handle: Arc::clone(&handle),
+        };
+        Ok((Self { handle }, render))
     }
 
     /// Set a libmpv option (pre-init style). Most useful before
     /// playback starts; afterwards prefer [`Self::set_property_string`].
     pub fn set_option_string(&self, name: &str, value: &str) -> Result<(), Error> {
-        let name = CString::new(name).map_err(|_| Error::InvalidArg("option name contained NUL"))?;
-        let value = CString::new(value).map_err(|_| Error::InvalidArg("option value contained NUL"))?;
-        let rc = unsafe { sys::mpv_set_option_string(self.handle, name.as_ptr(), value.as_ptr()) };
-        check(rc, "mpv_set_option_string")
+        self.handle.set_option_string(name, value)
     }
 
     /// Set a libmpv property at runtime (e.g. `pause = "yes"`,
@@ -139,7 +212,7 @@ impl MpvPlayer {
     pub fn set_property_string(&self, name: &str, value: &str) -> Result<(), Error> {
         let name = CString::new(name).map_err(|_| Error::InvalidArg("property name contained NUL"))?;
         let value = CString::new(value).map_err(|_| Error::InvalidArg("property value contained NUL"))?;
-        let rc = unsafe { sys::mpv_set_property_string(self.handle, name.as_ptr(), value.as_ptr()) };
+        let rc = unsafe { sys::mpv_set_property_string(self.handle.0, name.as_ptr(), value.as_ptr()) };
         check(rc, "mpv_set_property_string")
     }
 
@@ -152,7 +225,7 @@ impl MpvPlayer {
         let mut out: i64 = 0;
         let rc = unsafe {
             sys::mpv_get_property(
-                self.handle,
+                self.handle.0,
                 name.as_ptr(),
                 sys::MPV_FORMAT_INT64,
                 &mut out as *mut i64 as *mut c_void,
@@ -171,7 +244,7 @@ impl MpvPlayer {
         let mut out: f64 = 0.0;
         let rc = unsafe {
             sys::mpv_get_property(
-                self.handle,
+                self.handle.0,
                 cname.as_ptr(),
                 sys::MPV_FORMAT_DOUBLE,
                 &mut out as *mut f64 as *mut c_void,
@@ -190,22 +263,37 @@ impl MpvPlayer {
     /// Issue a libmpv command. `args` is the same shape libmpv's
     /// `mpv_command` expects: e.g. `&["loadfile", "/tmp/a.mp4"]`.
     pub fn command(&self, args: &[&str]) -> Result<(), Error> {
-        // Allocate owned CStrings so the pointers stay valid for the
-        // duration of the call.
-        let owned: Vec<CString> = args
-            .iter()
-            .map(|a| CString::new(*a).map_err(|_| Error::InvalidArg("command arg contained NUL")))
-            .collect::<Result<_, _>>()?;
-        let mut argv: Vec<*const c_char> = owned.iter().map(|s| s.as_ptr()).collect();
-        argv.push(ptr::null()); // libmpv expects a NULL sentinel
-        let rc = unsafe { sys::mpv_command(self.handle, argv.as_mut_ptr()) };
-        check(rc, "mpv_command")
+        self.handle.command(args)
     }
 
+    /// Decoded video size in pixels (post-aspect-correction): the
+    /// `(dwidth, dheight)` libmpv properties. Only valid after
+    /// [`MpvRender::load_file`] has returned successfully.
+    pub fn dimensions(&self) -> Result<(u32, u32), Error> {
+        let w = self.get_property_i64("dwidth")?;
+        let h = self.get_property_i64("dheight")?;
+        if w <= 0 || h <= 0 {
+            return Err(Error::InvalidArg("dwidth/dheight not yet available"));
+        }
+        Ok((w as u32, h as u32))
+    }
+
+    /// Borrow libmpv's static error string for a code, for ad-hoc
+    /// diagnostics in callers that already hold an error code from
+    /// another call site.
+    pub fn error_string(code: i32) -> &'static str {
+        unsafe { CStr::from_ptr(sys::mpv_error_string(code)) }
+            .to_str()
+            .unwrap_or("invalid utf-8 in mpv error string")
+    }
+}
+
+impl MpvRender {
     /// Load a file and block until libmpv has both opened it
     /// (`MPV_EVENT_FILE_LOADED`) and reported the video stream's
     /// configuration (`MPV_EVENT_VIDEO_RECONFIG`). Querying
-    /// [`Self::dimensions`] is safe immediately after this returns.
+    /// [`MpvPlayer::dimensions`] is safe immediately after this
+    /// returns.
     ///
     /// Returns `LoadFailed` if libmpv reports `END_FILE` at any
     /// point (decoder couldn't open the container, codec
@@ -215,7 +303,7 @@ impl MpvPlayer {
     /// actually expect libmpv to handle.
     pub fn load_file(&self, path: &Path) -> Result<(), Error> {
         let path_str = path.to_str().ok_or(Error::InvalidArg("path is not valid UTF-8"))?;
-        self.command(&["loadfile", path_str])?;
+        self.handle.command(&["loadfile", path_str])?;
 
         // Drain events until both FILE_LOADED (file opens) and
         // VIDEO_RECONFIG (video stream's resolution is known) have
@@ -230,7 +318,7 @@ impl MpvPlayer {
                 return Err(Error::Timeout("FILE_LOADED + VIDEO_RECONFIG"));
             }
             let timeout = remaining.as_secs_f64().min(1.0);
-            let ev = unsafe { &*sys::mpv_wait_event(self.handle, timeout) };
+            let ev = unsafe { &*sys::mpv_wait_event(self.handle.0, timeout) };
             match ev.event_id {
                 sys::MPV_EVENT_FILE_LOADED => file_loaded = true,
                 sys::MPV_EVENT_VIDEO_RECONFIG => video_ready = true,
@@ -270,7 +358,7 @@ impl MpvPlayer {
             // update flag promptly if libmpv signals frame-ready
             // without pushing an event we recognise.
             let step = remaining.as_secs_f64().min(0.05);
-            let ev = unsafe { &*sys::mpv_wait_event(self.handle, step) };
+            let ev = unsafe { &*sys::mpv_wait_event(self.handle.0, step) };
             if ev.event_id == sys::MPV_EVENT_SHUTDOWN {
                 return Err(Error::Shutdown);
             }
@@ -332,39 +420,36 @@ impl MpvPlayer {
         }
         Ok(())
     }
-
-    /// Decoded video size in pixels (post-aspect-correction): the
-    /// `(dwidth, dheight)` libmpv properties. Only valid after
-    /// [`Self::load_file`] has returned successfully.
-    pub fn dimensions(&self) -> Result<(u32, u32), Error> {
-        let w = self.get_property_i64("dwidth")?;
-        let h = self.get_property_i64("dheight")?;
-        if w <= 0 || h <= 0 {
-            return Err(Error::InvalidArg("dwidth/dheight not yet available"));
-        }
-        Ok((w as u32, h as u32))
-    }
-
-    /// Borrow libmpv's static error string for a code, for ad-hoc
-    /// diagnostics in callers that already hold an error code from
-    /// another call site.
-    pub fn error_string(code: i32) -> &'static str {
-        unsafe { CStr::from_ptr(sys::mpv_error_string(code)) }
-            .to_str()
-            .unwrap_or("invalid utf-8 in mpv error string")
-    }
 }
 
-impl Drop for MpvPlayer {
+impl Drop for MpvRender {
     fn drop(&mut self) {
         // Render context must be freed *before* the handle, per the
         // libmpv docs ("you must free the context before the mpv
-        // core is destroyed").
+        // core is destroyed"). This body runs before the `handle`
+        // field's `Arc` clone drops, so even when this is the last
+        // reference, `mpv_terminate_destroy` (in `Handle::drop`)
+        // strictly follows the free below.
         if !self.render_ctx.is_null() {
             unsafe { sys::mpv_render_context_free(self.render_ctx) };
         }
-        if !self.handle.is_null() {
-            unsafe { sys::mpv_terminate_destroy(self.handle) };
-        }
+    }
+}
+
+#[cfg(test)]
+mod thread_contract {
+    use super::*;
+
+    /// Compile-time checks of the split-type threading contract:
+    /// the command/property half is shareable, the render/event
+    /// half is movable. (`MpvRender: !Sync` is upheld by the raw
+    /// `render_ctx` pointer suppressing the auto trait — adding a
+    /// `Sync` impl would be an unsoundness regression.)
+    #[test]
+    fn split_halves_have_expected_auto_traits() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        fn assert_send<T: Send>() {}
+        assert_send_sync::<MpvPlayer>();
+        assert_send::<MpvRender>();
     }
 }

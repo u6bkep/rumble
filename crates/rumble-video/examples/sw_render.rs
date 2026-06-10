@@ -21,7 +21,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let input = PathBuf::from(args.next().ok_or("usage: sw_render <input> <output.png>")?);
     let output = PathBuf::from(args.next().ok_or("usage: sw_render <input> <output.png>")?);
 
-    let player = MpvPlayer::new()?;
+    let (player, render) = MpvPlayer::new()?;
     // Smoke test wants software-only behaviour and no audio so we
     // can run headless on CI without an audio device or GPU.
     player.set_option_string("hwdec", "no")?;
@@ -29,18 +29,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Pause at the first frame so the decoder doesn't race ahead.
     player.set_option_string("pause", "yes")?;
 
-    player.load_file(&input)?;
+    render.load_file(&input)?;
     let (w, h) = player.dimensions()?;
     tracing::info!(width = w, height = h, "loaded {}", input.display());
 
-    let frame_ready = player.wait_for_frame(Duration::from_secs(5))?;
+    let frame_ready = render.wait_for_frame(Duration::from_secs(5))?;
     if !frame_ready {
         return Err("timed out waiting for first frame".into());
     }
 
     let stride = (w as usize) * 4;
     let mut buf = vec![0u8; stride * h as usize];
-    player.render_sw(&mut buf, w, h, stride)?;
+    render.render_sw(&mut buf, w, h, stride)?;
 
     image::save_buffer(&output, &buf, w, h, image::ColorType::Rgba8)?;
     tracing::info!("wrote {} ({}x{})", output.display(), w, h);
