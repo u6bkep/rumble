@@ -15,7 +15,12 @@
 //!    that opens a `"file-relay"` stream and requests the file from the server.
 //! 2. The fetched data is written to the downloads directory.
 
-use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Instant};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -23,7 +28,7 @@ use prost::Message;
 use rumble_client_traits::{
     file_transfer::{
         FileOffer, FileTransferPlugin, PluginEvent, PluginEventSink, PluginNotificationLevel, TransferDirection,
-        TransferId, TransferStage, TransferStatus,
+        TransferId, TransferSpeedLimits, TransferStage, TransferStatus,
     },
     transport::{
         BiRecvStream, BiSendStream, PluginAck, StreamOpener, read_length_prefixed, read_plugin_ack,
@@ -186,6 +191,66 @@ fn update_active_progress(entry: &mut TransferEntry, bytes_so_far: u64, total_si
 
 type TransferMap = Arc<parking_lot::Mutex<HashMap<String, TransferEntry>>>;
 
+/// Token-bucket throttle for the transfer loops.
+///
+/// One bucket per transfer task, fed by the live limit from
+/// [`TransferSpeedLimits`] on every call — so a settings change applies
+/// to in-flight transfers at their next chunk. The balance may go
+/// negative ("debt") when a chunk exceeds the remaining budget; the
+/// caller then sleeps until the debt is repaid, which means chunks
+/// larger than the bucket capacity still make progress instead of
+/// stalling forever. Burst budget is capped at ~1 second of allowance.
+struct TokenBucket {
+    /// Token balance in bytes. Negative = debt to sleep off.
+    tokens: f64,
+    /// Instant of the last refill computation.
+    last_refill: Instant,
+}
+
+impl TokenBucket {
+    fn new() -> Self {
+        Self {
+            tokens: 0.0,
+            last_refill: Instant::now(),
+        }
+    }
+
+    /// Account for `bytes` just transferred under `limit_bps` and return
+    /// how long the caller should sleep before moving the next chunk.
+    /// `limit_bps == 0` means unlimited: no sleep, and the bucket state
+    /// is reset so a limit applied mid-transfer starts from a clean
+    /// baseline instead of a stale balance.
+    fn consume(&mut self, bytes: u64, limit_bps: u64, now: Instant) -> Duration {
+        if limit_bps == 0 {
+            self.tokens = 0.0;
+            self.last_refill = now;
+            return Duration::ZERO;
+        }
+        let limit = limit_bps as f64;
+        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
+        // Refill at the limit rate, capping the burst budget at ~1s of
+        // allowance so a long idle gap can't bank unlimited credit.
+        self.tokens = (self.tokens + elapsed * limit).min(limit);
+        self.last_refill = now;
+        self.tokens -= bytes as f64;
+        if self.tokens >= 0.0 {
+            Duration::ZERO
+        } else {
+            Duration::from_secs_f64(-self.tokens / limit)
+        }
+    }
+
+    /// Async wrapper: consume and sleep off any debt. Cancellation-safe —
+    /// callers run inside a `tokio::select!` with the transfer's
+    /// cancellation token, which aborts the sleep along with the I/O.
+    async fn throttle(&mut self, bytes: u64, limit_bps: u64) {
+        let wait = self.consume(bytes, limit_bps, Instant::now());
+        if !wait.is_zero() {
+            tokio::time::sleep(wait).await;
+        }
+    }
+}
+
 /// Relay-based [`FileTransferPlugin`] using the server's store-and-serve cache.
 ///
 /// Construct with [`FileTransferRelayPlugin::new`], passing a [`StreamOpener`]
@@ -200,6 +265,10 @@ pub struct FileTransferRelayPlugin {
     /// duplicate share, room-change cancel, etc.). Set to `None` for
     /// tests or environments without a UI.
     event_sink: Option<PluginEventSink>,
+    /// Shared, live-updatable bandwidth caps (bytes/sec, 0 = unlimited).
+    /// Upload/fetch loops re-read these on every chunk, so settings
+    /// changes apply to in-flight transfers.
+    speed_limits: TransferSpeedLimits,
 }
 
 impl FileTransferRelayPlugin {
@@ -208,13 +277,21 @@ impl FileTransferRelayPlugin {
     /// - `opener`: Transport-agnostic stream opener for opening streams to the server.
     /// - `downloads_dir`: Directory where fetched files are saved.
     /// - `event_sink`: Optional callback for user-visible toast events.
-    pub fn new(opener: Arc<dyn StreamOpener>, downloads_dir: PathBuf, event_sink: Option<PluginEventSink>) -> Self {
+    /// - `speed_limits`: Live-updatable bandwidth caps enforced by the
+    ///   upload/fetch loops (bytes/sec, 0 = unlimited).
+    pub fn new(
+        opener: Arc<dyn StreamOpener>,
+        downloads_dir: PathBuf,
+        event_sink: Option<PluginEventSink>,
+        speed_limits: TransferSpeedLimits,
+    ) -> Self {
         Self {
             opener,
             downloads_dir,
             transfers: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             room_id: parking_lot::Mutex::new(String::new()),
             event_sink,
+            speed_limits,
         }
     }
 
@@ -296,11 +373,12 @@ async fn run_upload(
     transfers: TransferMap,
     cancel: CancellationToken,
     event_sink: Option<PluginEventSink>,
+    speed_limits: TransferSpeedLimits,
 ) {
     let result = tokio::select! {
         _ = cancel.cancelled() => Err(anyhow::anyhow!("cancelled")),
         r = do_upload(
-            &opener, &transfer_id, &room_id, &file_name, file_size, &mime, &path, &transfers,
+            &opener, &transfer_id, &room_id, &file_name, file_size, &mime, &path, &transfers, &speed_limits,
         ) => r,
     };
 
@@ -355,6 +433,7 @@ async fn do_upload(
     mime: &str,
     path: &std::path::Path,
     transfers: &TransferMap,
+    speed_limits: &TransferSpeedLimits,
 ) -> Result<()> {
     let (mut send, mut recv) = opener.open_bi().await?;
 
@@ -392,6 +471,7 @@ async fn do_upload(
     let mut reader = tokio::io::BufReader::new(file);
     let mut buf = vec![0u8; 64 * 1024];
     let mut sent: u64 = 0;
+    let mut bucket = TokenBucket::new();
 
     loop {
         let n = tokio::io::AsyncReadExt::read(&mut reader, &mut buf).await?;
@@ -408,6 +488,10 @@ async fn do_upload(
                 update_active_progress(entry, sent, file_size);
             }
         }
+
+        // Enforce the user's upload cap. Re-reads the live limit each
+        // chunk so a settings change applies mid-transfer; 0 = unlimited.
+        bucket.throttle(n as u64, speed_limits.upload_bps()).await;
     }
 
     // Signal end of upload data.
@@ -426,6 +510,7 @@ async fn do_upload(
 }
 
 /// Fetch a file from the server's relay cache.
+#[allow(clippy::too_many_arguments)]
 async fn run_fetch(
     opener: Arc<dyn StreamOpener>,
     transfer_id: String,
@@ -433,10 +518,11 @@ async fn run_fetch(
     transfers: TransferMap,
     cancel: CancellationToken,
     event_sink: Option<PluginEventSink>,
+    speed_limits: TransferSpeedLimits,
 ) {
     let result = tokio::select! {
         _ = cancel.cancelled() => Err(anyhow::anyhow!("cancelled")),
-        r = do_fetch(&opener, &transfer_id, &downloads_dir, &transfers) => r,
+        r = do_fetch(&opener, &transfer_id, &downloads_dir, &transfers, &speed_limits) => r,
     };
     // By the time we reach here the do_fetch future (and any BufWriter/File
     // it held) has either returned or been dropped by the select. The file
@@ -525,6 +611,7 @@ async fn do_fetch(
     transfer_id: &str,
     downloads_dir: &std::path::Path,
     transfers: &TransferMap,
+    speed_limits: &TransferSpeedLimits,
 ) -> Result<PathBuf> {
     let (mut send, mut recv) = opener.open_bi().await?;
 
@@ -584,6 +671,7 @@ async fn do_fetch(
     let mut writer = tokio::io::BufWriter::new(file);
     let mut buf = vec![0u8; 64 * 1024];
     let mut received: u64 = 0;
+    let mut bucket = TokenBucket::new();
 
     loop {
         match recv.read(&mut buf).await {
@@ -597,10 +685,17 @@ async fn do_fetch(
                 // absolute ceiling checked in validate_fetch_progress.
                 validate_fetch_progress(received, file_size)?;
 
-                let mut t = transfers.lock();
-                if let Some(entry) = t.get_mut(transfer_id) {
-                    update_active_progress(entry, received, file_size);
+                {
+                    let mut t = transfers.lock();
+                    if let Some(entry) = t.get_mut(transfer_id) {
+                        update_active_progress(entry, received, file_size);
+                    }
                 }
+
+                // Enforce the user's download cap by pacing our reads —
+                // QUIC stream flow control pushes the backpressure to the
+                // server. Re-reads the live limit each chunk; 0 = unlimited.
+                bucket.throttle(n as u64, speed_limits.download_bps()).await;
             }
             Ok(Some(_)) => continue, // zero-length read
             Ok(None) => break,       // stream closed
@@ -817,6 +912,7 @@ impl FileTransferPlugin for FileTransferRelayPlugin {
             transfers,
             cancel,
             sink,
+            self.speed_limits.clone(),
         ));
 
         Ok(FileOffer {
@@ -867,7 +963,15 @@ impl FileTransferPlugin for FileTransferRelayPlugin {
         let transfers = self.transfers.clone();
         let tid = transfer_id.clone();
         let sink = self.event_sink.clone();
-        tokio::spawn(run_fetch(opener, tid, downloads_dir, transfers, cancel, sink));
+        tokio::spawn(run_fetch(
+            opener,
+            tid,
+            downloads_dir,
+            transfers,
+            cancel,
+            sink,
+            self.speed_limits.clone(),
+        ));
 
         Ok(TransferId(transfer_id))
     }
@@ -1071,6 +1175,92 @@ mod tests {
         assert!(
             validate_fetch_progress(1, 0).is_err(),
             "any bytes when size=0 is an overrun"
+        );
+    }
+
+    // --- TokenBucket ---
+
+    #[test]
+    fn token_bucket_unlimited_never_sleeps() {
+        let mut bucket = TokenBucket::new();
+        let now = Instant::now();
+        for i in 0..10 {
+            let wait = bucket.consume(10 * 1024 * 1024, 0, now + Duration::from_millis(i));
+            assert_eq!(wait, Duration::ZERO, "limit 0 must never throttle");
+        }
+    }
+
+    #[test]
+    fn token_bucket_throttles_at_limit() {
+        // 100 KiB/s limit, fresh bucket (zero balance): a 100 KiB chunk
+        // puts us 100 KiB in debt → ~1s sleep.
+        let mut bucket = TokenBucket::new();
+        let now = Instant::now();
+        let wait = bucket.consume(100 * 1024, 100 * 1024, now);
+        assert!(
+            (wait.as_secs_f64() - 1.0).abs() < 0.01,
+            "expected ~1s wait, got {wait:?}"
+        );
+    }
+
+    #[test]
+    fn token_bucket_refills_over_time() {
+        let mut bucket = TokenBucket::new();
+        let limit = 100 * 1024u64; // 100 KiB/s
+        let t0 = Instant::now();
+        // Consume a full second of budget at t0 → debt = limit.
+        let wait = bucket.consume(limit, limit, t0);
+        assert!(wait > Duration::ZERO);
+        // One second later the refill has repaid the debt (balance back
+        // to 0), so a tiny chunk owes only its own negligible cost.
+        let wait = bucket.consume(1, limit, t0 + Duration::from_secs(1));
+        assert!(
+            wait < Duration::from_millis(1),
+            "debt should be repaid after 1s, got {wait:?}"
+        );
+    }
+
+    #[test]
+    fn token_bucket_caps_burst_to_one_second() {
+        let mut bucket = TokenBucket::new();
+        let limit = 100 * 1024u64;
+        let t0 = Instant::now();
+        bucket.consume(0, limit, t0);
+        // After a long idle gap the bucket holds at most 1s of budget:
+        // consuming 2s worth must leave ~1s of debt.
+        let wait = bucket.consume(2 * limit, limit, t0 + Duration::from_secs(60));
+        assert!(
+            (wait.as_secs_f64() - 1.0).abs() < 0.01,
+            "burst must be capped at ~1s of budget, got {wait:?}"
+        );
+    }
+
+    #[test]
+    fn token_bucket_oversized_chunk_makes_progress() {
+        // A chunk larger than the whole bucket capacity goes into debt
+        // proportional to its size rather than blocking forever.
+        let mut bucket = TokenBucket::new();
+        let limit = 1024u64; // 1 KiB/s
+        let now = Instant::now();
+        let wait = bucket.consume(10 * 1024, limit, now);
+        assert!(
+            (wait.as_secs_f64() - 10.0).abs() < 0.01,
+            "10 KiB at 1 KiB/s should owe ~10s, got {wait:?}"
+        );
+    }
+
+    #[test]
+    fn token_bucket_limit_change_applies_immediately() {
+        let mut bucket = TokenBucket::new();
+        let t0 = Instant::now();
+        // Unlimited: no wait, state stays reset.
+        assert_eq!(bucket.consume(1024 * 1024, 0, t0), Duration::ZERO);
+        // Limit switched on mid-transfer: next chunk is throttled from a
+        // clean baseline (no stale credit, no stale debt).
+        let wait = bucket.consume(2048, 1024, t0);
+        assert!(
+            (wait.as_secs_f64() - 2.0).abs() < 0.01,
+            "2 KiB at 1 KiB/s from empty bucket should owe ~2s, got {wait:?}"
         );
     }
 }

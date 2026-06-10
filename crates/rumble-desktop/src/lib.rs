@@ -62,11 +62,13 @@ impl Platform for NativePlatform {
         opener: Arc<dyn rumble_client_traits::StreamOpener>,
         downloads_dir: PathBuf,
         event_sink: Option<rumble_client_traits::PluginEventSink>,
+        speed_limits: rumble_client_traits::TransferSpeedLimits,
     ) -> Option<Arc<dyn rumble_client_traits::FileTransferPlugin>> {
         Some(Arc::new(crate::FileTransferRelayPlugin::new(
             opener,
             downloads_dir,
             event_sink,
+            speed_limits,
         )))
     }
 }

@@ -36,6 +36,7 @@ impl rumble_client_traits::Platform for TestPlatform {
         _opener: Arc<dyn rumble_client_traits::StreamOpener>,
         _downloads_dir: PathBuf,
         _event_sink: Option<rumble_client_traits::PluginEventSink>,
+        _speed_limits: rumble_client_traits::TransferSpeedLimits,
     ) -> Option<Arc<dyn rumble_client_traits::FileTransferPlugin>> {
         None
     }

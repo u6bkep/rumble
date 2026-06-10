@@ -2383,6 +2383,12 @@ impl<B: UiBackend> RumbleApp<B> {
         self.backend.send(Command::UpdateTxPipeline {
             config: pending.tx_pipeline.clone(),
         });
+        // File-transfer bandwidth caps: UI edits in KiB/s, backend takes
+        // bytes/sec (0 = unlimited). Applies live to in-flight transfers.
+        self.backend.send(Command::SetFileTransferSpeedLimits {
+            download_bps: (pending.download_speed_kbps as u64) * 1024,
+            upload_bps: (pending.upload_speed_kbps as u64) * 1024,
+        });
 
         // Shared shell store.
         self.settings.modify(|s| {

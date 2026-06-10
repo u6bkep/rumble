@@ -152,9 +152,13 @@ fn build_connect_config(settings: &SettingsStore) -> ConnectConfig {
             ),
         }
     }
-    if let Some(dir) = settings.settings().file_transfer.download_dir.clone() {
+    let ft = settings.settings().file_transfer.clone();
+    if let Some(dir) = ft.download_dir {
         config = config.with_download_dir(dir);
     }
+    // Initial bandwidth caps (bytes/sec; 0 = unlimited). Settings-save
+    // pushes live updates via Command::SetFileTransferSpeedLimits.
+    config = config.with_speed_limits(ft.download_speed_limit, ft.upload_speed_limit);
     config
 }
 
