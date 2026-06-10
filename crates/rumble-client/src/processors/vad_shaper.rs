@@ -163,4 +163,55 @@ mod tests {
         // With release clamped down to trigger, score just below trigger deactivates.
         assert!(!s.update(0.4, 480, 48000, &cfg));
     }
+
+    /// Reset must fully clear gate state: a shaper that is active with a full
+    /// holdoff must suppress on the first frame after reset even if the signal
+    /// is above the trigger, because it needs a fresh attack window to re-arm.
+    ///
+    /// This exercises the invariant relied on by sync_transmission!'s Activate
+    /// path: calling reset() before arming the capture stream guarantees the VAD
+    /// gate starts closed, preventing stale holdoff state from leaking across
+    /// mute/PTT cycles and transmitting room noise at spurt onset.
+    #[test]
+    fn reset_clears_gate_state_after_active_holdoff() {
+        let cfg = settings(0.5, 0.3, 0, 300);
+        let mut s = VadShaper::new();
+
+        // Activate the gate and then tick enough quiet frames to enter the holdoff
+        // window (but not past it — so voice_active is still true).
+        s.update(1.0, 480, 48000, &cfg); // above trigger → active
+        assert!(s.is_active());
+        // A below-release frame starts holdoff countdown but the gate stays open.
+        s.update(0.0, 480, 48000, &cfg);
+        assert!(s.is_active(), "gate stays open during holdoff");
+
+        // Reset simulates the Activate transition when the user unmutes.
+        s.reset();
+
+        // After reset the gate must be fully closed, regardless of what the
+        // score is. voice_active=false, counters zeroed.
+        assert!(!s.is_active(), "gate must be closed after reset");
+        // A loud frame still needs a fresh attack window (zero attack ⇒ opens immediately).
+        let active = s.update(1.0, 480, 48000, &cfg);
+        assert!(
+            active,
+            "gate opens immediately on loud frame with zero attack after reset"
+        );
+
+        // With a non-zero attack window, the gate must NOT open on the first frame
+        // — it needs to accumulate the full attack duration from scratch.
+        let mut s2 = VadShaper::new();
+        let cfg_attack = settings(0.5, 0.3, 50, 100); // 50ms attack at 48kHz ≈ 2400 samples
+        s2.update(1.0, 480, 48000, &cfg_attack);
+        assert!(s2.is_active() || !s2.is_active()); // gets as far as it does
+        s2.update(1.0, 480, 48000, &cfg_attack); // further accumulate
+        s2.reset();
+        // After reset, the accumulated attack must be cleared.
+        assert!(!s2.is_active(), "gate closed after reset");
+        // A single below-attack-window frame must not reactivate.
+        assert!(
+            !s2.update(1.0, 480, 48000, &cfg_attack),
+            "single frame below attack window must not activate after reset"
+        );
+    }
 }

@@ -863,6 +863,14 @@ async fn run_audio_task<P: Platform>(
     // callback's VAD decision lights the indicator.
     let was_transmitting = Arc::new(AtomicBool::new(false));
 
+    // Pipeline handle for the current capture stream. Retained alongside the
+    // capture stream so the sync_transmission! Activate arm can call reset()
+    // before arming the stream, clearing stale VAD-gate state (e.g. an open
+    // holdoff from a previous PTT press) that would otherwise open the gate
+    // and transmit room noise before the gate re-evaluates from silence.
+    // Set by start_transmission; cleared by stop_transmission.
+    let mut tx_pipeline_handle: Option<Arc<std::sync::Mutex<rumble_audio::AudioPipeline>>> = None;
+
     // Interval for cleaning up stale talking_users
     let mut cleanup_interval = tokio::time::interval(Duration::from_millis(500));
 
@@ -945,6 +953,19 @@ async fn run_audio_task<P: Platform>(
                         // monotonic.
                         let elapsed_frames = (capture_epoch.elapsed().as_micros() as u64) / FRAME_US;
                         capture_frame_index.fetch_max(elapsed_frames, Ordering::Relaxed);
+                        // Reset the TX pipeline so stale VAD-gate state (e.g. an
+                        // open holdoff from a previous mute/PTT cycle) does not
+                        // open the gate immediately on the next spurt, transmitting
+                        // room noise before the VAD re-evaluates. Activate is the
+                        // correct reset point: state must be clean when capture
+                        // resumes. Resetting at Deactivate would be equivalent but
+                        // would leave stale state visible to diagnostics in the
+                        // interval between deactivation and the next activation.
+                        if let Some(pipeline) = tx_pipeline_handle.as_ref() {
+                            if let Ok(mut guard) = pipeline.lock() {
+                                guard.reset();
+                            }
+                        }
                         stream.set_active(true);
                         // Don't light the transmitting indicator here: arming
                         // capture (e.g. unmuting) is not the same as
@@ -1032,6 +1053,7 @@ async fn run_audio_task<P: Platform>(
                                 &processor_registry,
                                 &encoder,
                                 &mut audio_input,
+                                &mut tx_pipeline_handle,
                                 &bus.voice,
                                 &audio_dumper,
                                 &meter_writer,
@@ -1060,7 +1082,7 @@ async fn run_audio_task<P: Platform>(
                         sync_transmission!();
 
                         // Destroy connection-scoped audio input stream
-                        stop_transmission::<P>(&mut audio_input);
+                        stop_transmission::<P>(&mut audio_input, &mut tx_pipeline_handle);
                         // Capture is connection-scoped; ConnectionEstablished
                         // will re-open on reconnect. Stop the recovery loop
                         // so the health tick doesn't spin while disconnected.
@@ -1117,7 +1139,7 @@ async fn run_audio_task<P: Platform>(
                         // Tear down the current stream so we always re-open
                         // against the new device.
                         if audio_input.is_some() {
-                            stop_transmission::<P>(&mut audio_input);
+                            stop_transmission::<P>(&mut audio_input, &mut tx_pipeline_handle);
                             capture_is_active = false;
                         }
 
@@ -1137,6 +1159,7 @@ async fn run_audio_task<P: Platform>(
                                 &processor_registry,
                                 &encoder,
                                 &mut audio_input,
+                                &mut tx_pipeline_handle,
                                 &bus.voice,
                                 &audio_dumper,
                                 &meter_writer,
@@ -1322,7 +1345,7 @@ async fn run_audio_task<P: Platform>(
 
                         // Recreate stream with new settings if connected
                         if audio_input.is_some() {
-                            stop_transmission::<P>(&mut audio_input);
+                            stop_transmission::<P>(&mut audio_input, &mut tx_pipeline_handle);
                             capture_is_active = false;
                         }
                         if connection.is_some()
@@ -1335,6 +1358,7 @@ async fn run_audio_task<P: Platform>(
                                 &processor_registry,
                                 &encoder,
                                 &mut audio_input,
+                                &mut tx_pipeline_handle,
                                 &bus.voice,
                                 &audio_dumper,
                                 &meter_writer,
@@ -1388,7 +1412,7 @@ async fn run_audio_task<P: Platform>(
 
                         // Recreate stream to rebuild pipeline with new config
                         if audio_input.is_some() {
-                            stop_transmission::<P>(&mut audio_input);
+                            stop_transmission::<P>(&mut audio_input, &mut tx_pipeline_handle);
                             capture_is_active = false;
                         }
                         if connection.is_some()
@@ -1401,6 +1425,7 @@ async fn run_audio_task<P: Platform>(
                                 &processor_registry,
                                 &encoder,
                                 &mut audio_input,
+                                &mut tx_pipeline_handle,
                                 &bus.voice,
                                 &audio_dumper,
                                 &meter_writer,
@@ -1688,12 +1713,21 @@ async fn run_audio_task<P: Platform>(
                             }
                     }
                     Ok(None) => {
-                        // Connection closed - the connection task will handle cleanup
+                        // Connection closed gracefully — null out the handle so the
+                        // select arm parks on pending() rather than spinning until
+                        // ConnectionClosed arrives. The connection task owns the
+                        // authoritative cleanup (decoders, talking users, etc.).
                         debug!("Datagram stream closed");
+                        connection = None;
                     }
                     Err(e) => {
-                        // Connection error - the connection task will handle cleanup
-                        debug!("Datagram read error: {}", e);
+                        // Fatal connection error — no more datagrams will arrive.
+                        // Null out the handle so the select arm parks on pending()
+                        // rather than busy-spinning at 100% CPU until the connection
+                        // task delivers ConnectionClosed. Send/receive both stop here;
+                        // the authoritative cleanup is still driven by ConnectionClosed.
+                        warn!("Voice datagram receive error, stopping poll: {}", e);
+                        connection = None;
                     }
                 }
             }
@@ -1739,7 +1773,7 @@ async fn run_audio_task<P: Platform>(
                 if input_needs_recovery {
                     if audio_input.is_some() {
                         warn!("audio: capture device died, attempting re-open");
-                        stop_transmission::<P>(&mut audio_input);
+                        stop_transmission::<P>(&mut audio_input, &mut tx_pipeline_handle);
                         capture_is_active = false;
                     }
                     input_recovering = true;
@@ -1757,6 +1791,7 @@ async fn run_audio_task<P: Platform>(
                             &processor_registry,
                             &encoder,
                             &mut audio_input,
+                            &mut tx_pipeline_handle,
                             &bus.voice,
                             &audio_dumper,
                             &meter_writer,
@@ -1880,6 +1915,7 @@ fn start_transmission<P: Platform>(
     processor_registry: &rumble_audio::ProcessorRegistry,
     encoder: &Arc<std::sync::Mutex<Option<Enc<P>>>>,
     audio_input: &mut Option<CapStream<P>>,
+    pipeline_handle: &mut Option<Arc<std::sync::Mutex<rumble_audio::AudioPipeline>>>,
     voice_tx: &tokio::sync::broadcast::Sender<VoiceEvent>,
     audio_dumper: &AudioDumper,
     meter_writer: &crate::snapshot::SnapshotWriter<crate::meter::MeterSnapshot>,
@@ -1933,6 +1969,9 @@ fn start_transmission<P: Platform>(
         }
     };
     let pipeline_mutex = std::sync::Arc::new(std::sync::Mutex::new(tx_pipeline));
+    // Expose the pipeline to the audio-task loop so sync_transmission!'s
+    // Activate arm can call reset() before arming the stream.
+    *pipeline_handle = Some(pipeline_mutex.clone());
 
     // Voice event sender for TransmittingChanged edges from the capture
     // callback. (Per-frame level events have moved off the bus onto the
@@ -2111,17 +2150,21 @@ fn start_transmission<P: Platform>(
     }
 }
 
-/// Stop and destroy the audio input stream.
+/// Stop and destroy the audio input stream and its associated TX pipeline handle.
 ///
 /// This destroys the underlying platform stream. It should only be called on
 /// disconnection, device change, settings change, or mute - NOT on PTT release.
 /// The `set_active()` method on the capture stream handles PTT gating.
-fn stop_transmission<P: Platform>(audio_input: &mut Option<CapStream<P>>) {
+fn stop_transmission<P: Platform>(
+    audio_input: &mut Option<CapStream<P>>,
+    pipeline_handle: &mut Option<Arc<std::sync::Mutex<rumble_audio::AudioPipeline>>>,
+) {
     if audio_input.is_none() {
         return; // No stream to destroy
     }
 
     *audio_input = None;
+    *pipeline_handle = None;
     info!("Destroyed audio input stream");
 }
 

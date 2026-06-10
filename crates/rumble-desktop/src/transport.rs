@@ -64,7 +64,10 @@ impl DatagramTransport for QuinnDatagramHandle {
     async fn recv_datagram(&self) -> anyhow::Result<Option<Vec<u8>>> {
         match self.connection.read_datagram().await {
             Ok(bytes) => Ok(Some(bytes.to_vec())),
-            Err(_) => Ok(None),
+            // Any ConnectionError means the connection is dead and no more
+            // datagrams will arrive. Return Err so the audio task can stop
+            // polling instead of spinning on instant-Ok(None).
+            Err(e) => Err(e.into()),
         }
     }
 }
@@ -367,7 +370,10 @@ impl Transport for QuinnTransport {
     async fn recv_datagram(&self) -> anyhow::Result<Option<Vec<u8>>> {
         match self.connection.read_datagram().await {
             Ok(bytes) => Ok(Some(bytes.to_vec())),
-            Err(_) => Ok(None),
+            // Any ConnectionError means the connection is dead and no more
+            // datagrams will arrive. Return Err so the audio task can stop
+            // polling instead of spinning on instant-Ok(None).
+            Err(e) => Err(e.into()),
         }
     }
 
