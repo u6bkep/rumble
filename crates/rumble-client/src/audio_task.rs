@@ -955,6 +955,42 @@ async fn run_audio_task<P: Platform>(
 
     info!("Audio task started");
 
+    /// Deactivate capture, performing the full side-effect list of the
+    /// `sync_transmission!` Deactivate arm: send `EndOfStream` (stamped with
+    /// the current media clock) so receivers stop concealing instead of
+    /// running PLC for up to the stale threshold, gate the callback off,
+    /// reset the `was_transmitting` baseline, and force the UI transmit
+    /// light off.
+    ///
+    /// EVERY path that stops processing captured samples must go through
+    /// this — including the stream-teardown paths (device change, settings
+    /// change, TX-pipeline change, device-death recovery), which previously
+    /// set `capture_is_active = false` directly and skipped all of the side
+    /// effects: no EOS (receivers concealed ~200 ms of a mid-speech switch)
+    /// and no `TransmittingChanged { active: false }` (the transmit light
+    /// could stick on). No-op when capture is already inactive.
+    macro_rules! deactivate_capture {
+        () => {{
+            if capture_is_active {
+                // Send end-of-stream before deactivating
+                // (PTT released, muted, disconnected, device/settings change…)
+                let _ = encoded_tx.send(CaptureMessage::EndOfStream {
+                    timestamp_us: capture_frame_index.load(Ordering::Relaxed) * FRAME_US,
+                });
+                capture_is_active = false;
+                if let Some(stream) = audio_input.as_ref() {
+                    stream.set_active(false);
+                }
+                // The callback is now gated off and can't emit its own false
+                // edge, so force the light off and reset the baseline for the
+                // next activation.
+                was_transmitting.store(false, Ordering::Relaxed);
+                let _ = bus.voice.send(VoiceEvent::TransmittingChanged { active: false });
+                info!("Capture deactivated (samples will be discarded)");
+            }
+        }};
+    }
+
     /// Macro to sync the capture state after any state change.
     /// This toggles whether captured samples are processed or discarded
     /// via `AudioCaptureStream::set_active()`, WITHOUT creating/destroying
@@ -1004,21 +1040,7 @@ async fn run_audio_task<P: Platform>(
                     }
                 }
                 CaptureTransition::Deactivate => {
-                    // Send end-of-stream before deactivating
-                    // (PTT released, muted, disconnected, etc.)
-                    let _ = encoded_tx.send(CaptureMessage::EndOfStream {
-                        timestamp_us: capture_frame_index.load(Ordering::Relaxed) * FRAME_US,
-                    });
-                    capture_is_active = false;
-                    if let Some(stream) = audio_input.as_ref() {
-                        stream.set_active(false);
-                    }
-                    // The callback is now gated off and can't emit its own false
-                    // edge, so force the light off and reset the baseline for the
-                    // next activation.
-                    was_transmitting.store(false, Ordering::Relaxed);
-                    let _ = bus.voice.send(VoiceEvent::TransmittingChanged { active: false });
-                    info!("Capture deactivated (samples will be discarded)");
+                    deactivate_capture!();
                 }
                 CaptureTransition::None => {}
             }
@@ -1164,10 +1186,12 @@ async fn run_audio_task<P: Platform>(
                         input_recovering = false;
 
                         // Tear down the current stream so we always re-open
-                        // against the new device.
+                        // against the new device. Deactivate first so a
+                        // mid-speech device switch sends EOS and drops the
+                        // transmit light instead of leaving receivers in PLC.
                         if audio_input.is_some() {
+                            deactivate_capture!();
                             stop_transmission::<P>(&mut audio_input, &mut tx_pipeline_handle);
-                            capture_is_active = false;
                         }
 
                         if connection.is_some() {
@@ -1370,10 +1394,11 @@ async fn run_audio_task<P: Platform>(
                             settings: settings.clone(),
                         });
 
-                        // Recreate stream with new settings if connected
+                        // Recreate stream with new settings if connected.
+                        // Deactivate first (EOS + transmit-light off).
                         if audio_input.is_some() {
+                            deactivate_capture!();
                             stop_transmission::<P>(&mut audio_input, &mut tx_pipeline_handle);
-                            capture_is_active = false;
                         }
                         if connection.is_some()
                             && let Err(e) = start_transmission::<P>(
@@ -1437,10 +1462,11 @@ async fn run_audio_task<P: Platform>(
                             config: config.clone(),
                         });
 
-                        // Recreate stream to rebuild pipeline with new config
+                        // Recreate stream to rebuild pipeline with new config.
+                        // Deactivate first (EOS + transmit-light off).
                         if audio_input.is_some() {
+                            deactivate_capture!();
                             stop_transmission::<P>(&mut audio_input, &mut tx_pipeline_handle);
-                            capture_is_active = false;
                         }
                         if connection.is_some()
                             && let Err(e) = start_transmission::<P>(
@@ -1800,8 +1826,12 @@ async fn run_audio_task<P: Platform>(
                 if input_needs_recovery {
                     if audio_input.is_some() {
                         warn!("audio: capture device died, attempting re-open");
+                        // Deactivate first: the EOS still goes out over QUIC
+                        // (only the capture device died, not the connection),
+                        // and the transmit light must not stick on across the
+                        // failure.
+                        deactivate_capture!();
                         stop_transmission::<P>(&mut audio_input, &mut tx_pipeline_handle);
-                        capture_is_active = false;
                     }
                     input_recovering = true;
 
