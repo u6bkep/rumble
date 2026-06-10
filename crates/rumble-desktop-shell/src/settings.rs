@@ -485,6 +485,54 @@ pub struct Settings {
     _extra: HashMap<String, Value>,
 }
 
+/// Write `contents` to `path` atomically via a sibling temp file.
+///
+/// Writes to `<path>.tmp` in the same directory, calls `sync_all`, then
+/// renames into place. A crash between write and rename leaves the original
+/// intact. The directory is assumed to already exist (callers ensure this).
+fn atomic_write(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let mut tmp_name = path.as_os_str().to_owned();
+    tmp_name.push(".tmp");
+    let tmp_path = std::path::PathBuf::from(tmp_name);
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&tmp_path)?;
+    file.write_all(contents)?;
+    file.sync_all()?;
+    fs::rename(&tmp_path, path)
+}
+
+/// Attempt to rename `path` to `<path>.corrupt` before proceeding with
+/// defaults. Returns `true` if the rename succeeded — the caller may keep
+/// the original path active because the file has been moved aside and the
+/// next save will create a fresh one there. Returns `false` if rename
+/// failed; the original bytes are still at `path` and the caller must
+/// disable persistence to prevent overwriting them.
+fn backup_corrupt_settings_file(path: &Path) -> bool {
+    let mut backup_name = path.as_os_str().to_owned();
+    backup_name.push(".corrupt");
+    let backup = PathBuf::from(backup_name);
+    match fs::rename(path, &backup) {
+        Ok(()) => {
+            tracing::warn!("settings: corrupt file preserved as {}", backup.display());
+            true
+        }
+        Err(e) => {
+            tracing::warn!(
+                "settings: could not rename to backup {}: {e} — disabling persistence for this session to protect \
+                 original",
+                backup.display()
+            );
+            false
+        }
+    }
+}
+
 /// In-memory wrapper that loads `Settings` from disk and saves changes
 /// after each mutation.
 ///
@@ -515,24 +563,41 @@ impl SettingsStore {
             };
         };
 
-        let mut settings = match fs::read_to_string(&path) {
+        // active_path is normally Some(path). It is set to None when a corrupt
+        // file could not be renamed to the backup — in that case the original
+        // bytes are still at path and saves must be suppressed to protect them.
+        let (mut settings, active_path) = match fs::read_to_string(&path) {
             Ok(text) => match serde_json::from_str::<Settings>(&text) {
                 Ok(s) => {
                     tracing::info!("settings: loaded {}", path.display());
-                    s
+                    (s, Some(path))
                 }
                 Err(err) => {
+                    // File is present but unparseable. Rename it aside before
+                    // proceeding with defaults so the next save cannot destroy it.
                     tracing::warn!("settings: failed to parse {}: {err} — using defaults", path.display());
-                    Settings::default()
+                    let active = if backup_corrupt_settings_file(&path) {
+                        Some(path)
+                    } else {
+                        None
+                    };
+                    (Self::initialised_defaults(), active)
                 }
             },
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 tracing::info!("settings: {} not found, using defaults", path.display());
-                Settings::default()
+                (Self::initialised_defaults(), Some(path))
             }
             Err(err) => {
+                // File exists but cannot be read. Rename it aside for the same
+                // reason as the parse-failure case above.
                 tracing::warn!("settings: could not read {}: {err} — using defaults", path.display());
-                Settings::default()
+                let active = if backup_corrupt_settings_file(&path) {
+                    Some(path)
+                } else {
+                    None
+                };
+                (Self::initialised_defaults(), active)
             }
         };
 
@@ -547,7 +612,7 @@ impl SettingsStore {
 
         Self {
             settings,
-            path: Some(path),
+            path: active_path,
         }
     }
 
@@ -593,7 +658,7 @@ impl SettingsStore {
                 return;
             }
         };
-        if let Err(err) = fs::write(path, json) {
+        if let Err(err) = atomic_write(path, json.as_bytes()) {
             tracing::warn!("settings: write to {} failed: {err}", path.display());
         }
     }
@@ -718,6 +783,63 @@ mod tests {
         assert!(s.should_auto_download("image/png", 1024));
         assert!(!s.should_auto_download("image/png", 50 * 1024 * 1024), "exceeds cap");
         assert!(!s.should_auto_download("video/mp4", 1024), "no rule matches");
+    }
+
+    /// save() must produce a valid, parseable file and leave no .tmp behind.
+    #[test]
+    fn atomic_save_produces_parseable_file_no_tmp_leftover() {
+        let dir = tempdir_for_test();
+        let path = dir.join("settings.json");
+        let mut store = SettingsStore::load_from_path(Some(path.clone()));
+        store.modify(|s| {
+            s.dark = true;
+            s.paradigm = Some("Test".into());
+        });
+
+        let contents = fs::read_to_string(&path).unwrap();
+        let reparsed: Settings = serde_json::from_str(&contents).expect("saved file must be valid JSON");
+        assert!(reparsed.dark);
+        assert_eq!(reparsed.paradigm.as_deref(), Some("Test"));
+
+        let mut tmp_name = path.as_os_str().to_owned();
+        tmp_name.push(".tmp");
+        assert!(
+            !std::path::Path::new(&tmp_name).exists(),
+            "temp file must be cleaned up after successful save"
+        );
+    }
+
+    /// A parse failure must rename the original to .corrupt, return defaults,
+    /// and keep saves enabled (the next write creates a fresh file).
+    #[test]
+    fn parse_failure_preserves_original_as_backup_and_returns_defaults() {
+        let dir = tempdir_for_test();
+        let path = dir.join("settings.json");
+        fs::write(&path, b"not valid json {{{").unwrap();
+
+        let store = SettingsStore::load_from_path(Some(path.clone()));
+
+        // Defaults must be in effect.
+        assert!(!store.settings().dark);
+        assert!(store.settings().recent_servers.is_empty());
+
+        // Original must have been moved to the backup path.
+        let mut backup_name = path.as_os_str().to_owned();
+        backup_name.push(".corrupt");
+        let backup = PathBuf::from(backup_name);
+        assert!(backup.exists(), "corrupt backup must exist at settings.json.corrupt");
+        assert_eq!(
+            fs::read(&backup).unwrap(),
+            b"not valid json {{{",
+            "backup must contain the original bytes verbatim"
+        );
+        assert!(!path.exists(), "original must have been renamed to backup");
+
+        // After backup, saves must be re-enabled (path is still Some).
+        assert!(
+            store.path().is_some(),
+            "path must remain active after successful backup"
+        );
     }
 
     fn tempdir_for_test() -> PathBuf {

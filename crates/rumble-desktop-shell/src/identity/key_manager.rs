@@ -27,33 +27,65 @@ use sha2::{Digest, Sha256};
 #[cfg(feature = "ssh-agent")]
 use tokio::sync::Mutex as TokioMutex;
 
-/// Write `contents` to `path`, owner-read/write only (`0600`) on Unix.
+/// Write `contents` to `path` atomically, owner-read/write only (`0600`) on Unix.
 ///
 /// The identity file can hold a plaintext private key, so it must not be
-/// world-readable. On Unix we create with mode `0600` and also tighten an
-/// existing file (whose mode predates this change or a looser umask). On other
-/// platforms we fall back to a plain write — the user profile directory is the
-/// access boundary there.
+/// world-readable. Atomicity is achieved by writing to a sibling temp file
+/// (`<name>.tmp` in the same directory), calling `sync_all`, then renaming
+/// into place. A crash between write and rename leaves the original intact
+/// rather than truncating it to zero.
+///
+/// On Unix the temp file is created with mode `0600` directly; permissions are
+/// also tightened before rename to cover a pre-existing temp file with a looser
+/// mode. On other platforms the temp+rename pattern still applies; access
+/// control relies on the containing directory.
 fn write_private(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let mut tmp_name = path.as_os_str().to_owned();
+    tmp_name.push(".tmp");
+    let tmp_path = std::path::PathBuf::from(tmp_name);
+
     #[cfg(unix)]
     {
-        use std::{
-            io::Write,
-            os::unix::fs::{OpenOptionsExt, PermissionsExt},
-        };
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .mode(0o600)
-            .open(path)?;
-        // `.mode()` only applies on creation; fix perms if the file pre-existed.
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-        file.write_all(contents)
+            .open(&tmp_path)?;
+        file.write_all(contents)?;
+        // Tighten permissions before rename: `.mode()` applies only on creation,
+        // so a pre-existing temp file may carry a looser mode.
+        std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600))?;
+        file.sync_all()?;
     }
     #[cfg(not(unix))]
     {
-        std::fs::write(path, contents)
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp_path)?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+    }
+
+    std::fs::rename(&tmp_path, path)
+}
+
+/// Rename `path` to `<path>.corrupt` so a subsequent overwrite cannot destroy
+/// the raw bytes. Failure to rename is non-fatal: the caller must decide whether
+/// to proceed anyway or disable further writes.
+fn backup_corrupt_identity_file(path: &std::path::Path) {
+    let mut backup_name = path.as_os_str().to_owned();
+    backup_name.push(".corrupt");
+    let backup = std::path::PathBuf::from(backup_name);
+    match std::fs::rename(path, &backup) {
+        Ok(()) => tracing::warn!("identity: corrupt file preserved as {}", backup.display()),
+        Err(e) => tracing::warn!("identity: could not rename corrupt file to {}: {e}", backup.display()),
     }
 }
 
@@ -321,11 +353,24 @@ impl KeyManager {
     }
 
     fn load_config(path: &PathBuf) -> Option<KeyConfig> {
-        let data = std::fs::read_to_string(path).ok()?;
+        let data = match std::fs::read_to_string(path) {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(e) => {
+                // File exists but is unreadable. Back it up so the setup flow
+                // cannot silently destroy the raw bytes via save_config.
+                tracing::warn!("identity: could not read {}: {e}", path.display());
+                backup_corrupt_identity_file(path);
+                return None;
+            }
+        };
         match serde_json::from_str(&data) {
             Ok(config) => Some(config),
             Err(e) => {
-                tracing::warn!("Failed to parse identity config: {}", e);
+                // File is present but unparseable. Back it up before the setup
+                // flow calls save_config(), which would overwrite it.
+                tracing::warn!("identity: failed to parse {}: {e}", path.display());
+                backup_corrupt_identity_file(path);
                 None
             }
         }
@@ -686,6 +731,19 @@ pub async fn generate_and_add_to_agent(comment: String) -> anyhow::Result<KeyInf
 mod tests {
     use super::*;
 
+    fn tempdir_for_test() -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "rumble-key-manager-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
     #[test]
     fn fingerprint_format() {
         let fp = compute_fingerprint(&[0u8; 32]);
@@ -715,5 +773,66 @@ mod tests {
         let hex = hex::encode(key.to_bytes());
         let parsed = parse_signing_key(&hex).unwrap();
         assert_eq!(key.to_bytes(), parsed.to_bytes());
+    }
+
+    /// write_private must leave no temp file behind and write the expected bytes.
+    #[test]
+    fn write_private_atomic_no_leftover_temp() {
+        let dir = tempdir_for_test();
+        let target = dir.join("identity.json");
+        let content = b"{ \"test\": true }";
+
+        write_private(&target, content).unwrap();
+
+        assert_eq!(std::fs::read(&target).unwrap(), content);
+
+        let mut tmp_name = target.as_os_str().to_owned();
+        tmp_name.push(".tmp");
+        assert!(
+            !std::path::Path::new(&tmp_name).exists(),
+            "temp file must be cleaned up after successful write"
+        );
+    }
+
+    /// write_private must produce a 0600 file on Unix.
+    #[cfg(unix)]
+    #[test]
+    fn write_private_sets_0600_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir_for_test();
+        let target = dir.join("identity.json");
+        write_private(&target, b"secret").unwrap();
+
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "identity file must be owner-read/write only");
+    }
+
+    /// A corrupt identity file must be renamed to .corrupt before the setup
+    /// flow can regenerate and save a new key.
+    #[test]
+    fn load_config_preserves_corrupt_file_as_backup() {
+        let dir = tempdir_for_test();
+        let identity_path = dir.join("identity.json");
+        std::fs::write(&identity_path, b"not valid json {{{").unwrap();
+
+        let km = KeyManager::new(dir.clone());
+
+        assert!(km.needs_setup(), "corrupt identity should trigger setup");
+
+        // Original file must have been renamed to the backup.
+        let mut backup_name = identity_path.as_os_str().to_owned();
+        backup_name.push(".corrupt");
+        let backup = std::path::PathBuf::from(backup_name);
+        assert!(backup.exists(), "corrupt backup must exist at identity.json.corrupt");
+        assert_eq!(
+            std::fs::read(&backup).unwrap(),
+            b"not valid json {{{",
+            "backup must contain the original bytes verbatim"
+        );
+        assert!(
+            !identity_path.exists(),
+            "original corrupt file must have been renamed to backup"
+        );
     }
 }
