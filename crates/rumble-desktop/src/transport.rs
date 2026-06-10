@@ -69,6 +69,27 @@ impl DatagramTransport for QuinnDatagramHandle {
     }
 }
 
+/// Append received bytes to a frame-accumulation buffer, bounding its size.
+///
+/// `rumble_protocol::try_decode_frame` does not itself enforce
+/// [`rumble_protocol::MAX_FRAME_LEN`]; a reader fed from an untrusted socket
+/// must cap its buffer or the peer can declare a huge length and exhaust
+/// memory by trickling bytes for a frame that never completes. A complete
+/// frame is always decoded once enough bytes arrive, so exceeding the cap
+/// means the peer declared an oversized (or never-completing) frame — fail
+/// the connection rather than grow. Mirrors the server's read loop,
+/// including the boundary: a buffer of exactly `MAX_FRAME_LEN` is allowed.
+fn accumulate_frame_bytes(buf: &mut BytesMut, chunk: &[u8]) -> anyhow::Result<()> {
+    buf.extend_from_slice(chunk);
+    if buf.len() > rumble_protocol::MAX_FRAME_LEN {
+        anyhow::bail!(
+            "control frame exceeds MAX_FRAME_LEN ({} bytes buffered); closing connection",
+            buf.len()
+        );
+    }
+    Ok(())
+}
+
 /// The receive half of a QUIC transport, split off for a separate receiver task.
 pub struct QuinnRecvStream {
     recv: quinn::RecvStream,
@@ -87,7 +108,7 @@ impl TransportRecvStream for QuinnRecvStream {
             match self.recv.read(&mut tmp).await? {
                 Some(0) => continue,
                 Some(n) => {
-                    self.buf.extend_from_slice(&tmp[..n]);
+                    accumulate_frame_bytes(&mut self.buf, &tmp[..n])?;
                 }
                 None => return Ok(None),
             }
@@ -325,7 +346,7 @@ impl Transport for QuinnTransport {
             match recv.read(&mut tmp).await? {
                 Some(0) => continue,
                 Some(n) => {
-                    self.buf.extend_from_slice(&tmp[..n]);
+                    accumulate_frame_bytes(&mut self.buf, &tmp[..n])?;
                 }
                 None => return Ok(None),
             }
@@ -390,5 +411,32 @@ impl Transport for QuinnTransport {
         // leave the server waiting for the 30s idle timeout to evict
         // the user.
         let _ = self.connection.closed().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accumulate_allows_buffer_up_to_max_frame_len() {
+        let mut buf = BytesMut::new();
+        // Fill in chunks the size the recv loops use; the boundary itself
+        // (exactly MAX_FRAME_LEN buffered) must be accepted.
+        let chunk = [0u8; 8192];
+        while buf.len() + chunk.len() <= rumble_protocol::MAX_FRAME_LEN {
+            accumulate_frame_bytes(&mut buf, &chunk).expect("buffer within cap must be accepted");
+        }
+        let remaining = rumble_protocol::MAX_FRAME_LEN - buf.len();
+        accumulate_frame_bytes(&mut buf, &vec![0u8; remaining]).expect("buffer of exactly MAX_FRAME_LEN is allowed");
+        assert_eq!(buf.len(), rumble_protocol::MAX_FRAME_LEN);
+    }
+
+    #[test]
+    fn accumulate_rejects_buffer_over_max_frame_len() {
+        let mut buf = BytesMut::new();
+        accumulate_frame_bytes(&mut buf, &vec![0u8; rumble_protocol::MAX_FRAME_LEN]).expect("cap itself is allowed");
+        let err = accumulate_frame_bytes(&mut buf, &[0u8]).expect_err("exceeding the cap must fail");
+        assert!(err.to_string().contains("MAX_FRAME_LEN"));
     }
 }

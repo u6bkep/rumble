@@ -805,6 +805,7 @@ const RECV_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 /// command they handle will see `transport` is `None` and no-op.
 async fn send_tracked<T: rumble_client_traits::transport::Transport>(
     transport: &mut Option<T>,
+    local_close: &Option<Arc<AtomicBool>>,
     env: &proto::Envelope,
     bus: &crate::projection::EventBus,
     audio_task: &AudioTaskHandle,
@@ -818,9 +819,23 @@ async fn send_tracked<T: rumble_client_traits::transport::Transport>(
         Ok(()) => true,
         Err(e) => {
             warn!("send failed, treating connection as lost: {}", e);
-            // Drop the dead transport so subsequent commands no-op
-            // instead of repeatedly hitting the broken stream.
-            *transport = None;
+            // Set the local-close flag *before* closing: the receiver
+            // task wakes on the dying connection and would otherwise
+            // emit a generic "Connection closed" ConnectionLost over
+            // the informative send error emitted below.
+            if let Some(flag) = local_close {
+                flag.store(true, Ordering::SeqCst);
+            }
+            // Take and close the dead transport: subsequent commands
+            // no-op instead of repeatedly hitting the broken stream,
+            // and the close tears the QUIC connection down server-side
+            // (a failed stream write does not imply the connection
+            // itself is gone). The remaining task-local cleanup (the
+            // file-transfer plugin) follows via the teardown request
+            // the receiver task sends once it observes this close.
+            if let Some(t) = transport.take() {
+                t.close().await;
+            }
             audio_task.send(AudioCommand::ConnectionClosed);
             let _ = bus.connection.send(crate::ConnectionEvent::ConnectionLost {
                 error: format!("Send failed: {e}"),
@@ -864,6 +879,25 @@ enum DeferredAction {
         sender: String,
         timestamp: std::time::SystemTime,
     },
+}
+
+/// Internal notification from a receiver task back into the connection
+/// task: the connection it was reading from is gone (stream EOF, read
+/// error, or a close triggered elsewhere), so the connection task must
+/// release its task-local resources — close the transport, drop the
+/// file-transfer plugin, retire the close flag. The receiver task has no
+/// other channel to those locals; without this, a receiver-detected loss
+/// leaves a zombie session: `transport.is_some()` keeps passing (chat
+/// appends locally while the write blackholes) and, after a bare stream
+/// FIN, the QUIC keep-alive holds the connection open as a ghost presence
+/// on the server.
+///
+/// Not part of the public [`Command`] API. Tagged with the connection
+/// generation so a notification that races a reconnect is recognized as
+/// stale: a teardown for connection N must never release connection N+1.
+#[derive(Debug)]
+struct TeardownRequest {
+    generation: u64,
 }
 
 /// A [`BackendEvent`] sender that also schedules a UI frame.
@@ -931,8 +965,39 @@ async fn run_connection_task<P: Platform>(
     // FileOffer envelope, which requires `transport`).
     let (deferred_tx, mut deferred_rx) = mpsc::unbounded_channel::<DeferredAction>();
 
+    // Channel for receiver tasks to request teardown of the connection
+    // they were reading from (see [`TeardownRequest`]). `conn_gen`
+    // identifies the connection currently owned by this task; it is
+    // bumped on every successful connect so a request tagged with an
+    // older generation is provably about an already-replaced connection.
+    let (teardown_tx, mut teardown_rx) = mpsc::unbounded_channel::<TeardownRequest>();
+    let mut conn_gen: u64 = 0;
+
     loop {
         tokio::select! {
+            Some(td) = teardown_rx.recv() => {
+                // Requests for anything but the current connection are
+                // stale — the resources they refer to are already gone
+                // (Disconnect ran, or a new connection replaced them).
+                if td.generation == conn_gen {
+                    // The receiver task has already emitted ConnectionLost
+                    // + the state wipe and notified the audio task; what
+                    // remains is releasing the connection-task locals.
+                    // Closing the transport matters even though the read
+                    // side is gone: after a server-side stream FIN the
+                    // QUIC connection itself is still alive (kept up by
+                    // the keep-alive), so without an explicit close the
+                    // server would hold a ghost presence indefinitely.
+                    if let Some(flag) = local_close.take() {
+                        flag.store(true, Ordering::SeqCst);
+                    }
+                    if let Some(t) = transport.take() {
+                        t.close().await;
+                    }
+                    file_transfer = None;
+                    publish_ft(&file_transfer);
+                }
+            }
             Some(action) = deferred_rx.recv() => {
                 match action {
                     DeferredAction::FinalizeShareUpload { message_id, attachment, sender, timestamp } => {
@@ -1009,6 +1074,24 @@ async fn run_connection_task<P: Platform>(
                 };
                 match cmd {
                     Command::Connect { addr, name, public_key, password } => {
+                        // A new connect supersedes any existing session:
+                        // silence its receiver (so the wake on the close
+                        // below can't emit a stale ConnectionLost over the
+                        // new session) and close it so the server doesn't
+                        // keep a ghost presence until its idle timeout.
+                        // The matching teardown request the old receiver
+                        // sends is dropped as stale once `conn_gen` bumps.
+                        if let Some(flag) = local_close.take() {
+                            flag.store(true, Ordering::SeqCst);
+                        }
+                        if let Some(mut t) = transport.take() {
+                            send_disconnect_envelope(&mut t, "client reconnecting").await;
+                            t.close().await;
+                            audio_task.send(AudioCommand::ConnectionClosed);
+                            file_transfer = None;
+                            publish_ft(&file_transfer);
+                        }
+
                         client_name = name.clone();
 
                         // Update state to Connecting via projection.
@@ -1117,13 +1200,16 @@ async fn run_connection_task<P: Platform>(
                                 // Spawn receiver task for reliable messages
                                 let close_flag = Arc::new(AtomicBool::new(false));
                                 local_close = Some(close_flag.clone());
+                                conn_gen += 1;
+                                let teardown_tx_clone = teardown_tx.clone();
+                                let generation = conn_gen;
                                 let state_clone = state.clone();
                                 let audio_task_clone = audio_task.clone();
                                 let command_tx_clone = command_tx.clone();
                                 let ft_slot_for_recv = file_transfer_slot.clone();
                                 let bus_for_recv = bus.clone();
                                 tokio::spawn(async move {
-                                    run_receiver_task(recv_stream, state_clone, audio_task_clone, command_tx_clone, ft_slot_for_recv, bus_for_recv, close_flag).await;
+                                    run_receiver_task(recv_stream, state_clone, audio_task_clone, command_tx_clone, ft_slot_for_recv, bus_for_recv, close_flag, teardown_tx_clone, generation).await;
                                 });
 
                                 // Spawn stream dispatch task for server-initiated bi-directional streams
@@ -1291,13 +1377,16 @@ async fn run_connection_task<P: Platform>(
                                     // Spawn receiver task
                                     let close_flag = Arc::new(AtomicBool::new(false));
                                     local_close = Some(close_flag.clone());
+                                    conn_gen += 1;
+                                    let teardown_tx_clone = teardown_tx.clone();
+                                    let generation = conn_gen;
                                     let state_clone = state.clone();
                                     let audio_task_clone = audio_task.clone();
                                     let command_tx_clone = command_tx.clone();
                                     let ft_slot_for_recv = file_transfer_slot.clone();
                                     let bus_for_recv = bus.clone();
                                     tokio::spawn(async move {
-                                        run_receiver_task(recv_stream, state_clone, audio_task_clone, command_tx_clone, ft_slot_for_recv, bus_for_recv, close_flag).await;
+                                        run_receiver_task(recv_stream, state_clone, audio_task_clone, command_tx_clone, ft_slot_for_recv, bus_for_recv, close_flag, teardown_tx_clone, generation).await;
                                     });
 
                                     // Spawn stream dispatch task for server-initiated bi-directional streams
@@ -1379,7 +1468,7 @@ async fn run_connection_task<P: Platform>(
                                     room_id: Some(room_id_from_uuid(room_id)),
                                 })),
                             };
-                            send_tracked(&mut transport, &env, &bus, &audio_task).await;
+                            send_tracked(&mut transport, &local_close, &env, &bus, &audio_task).await;
                         }
                     }
 
@@ -1393,7 +1482,7 @@ async fn run_connection_task<P: Platform>(
                                     description: None,
                                 })),
                             };
-                            send_tracked(&mut transport, &env, &bus, &audio_task).await;
+                            send_tracked(&mut transport, &local_close, &env, &bus, &audio_task).await;
                         }
                     }
 
@@ -1405,7 +1494,7 @@ async fn run_connection_task<P: Platform>(
                                     room_id: Some(room_id_from_uuid(room_id)),
                                 })),
                             };
-                            send_tracked(&mut transport, &env, &bus, &audio_task).await;
+                            send_tracked(&mut transport, &local_close, &env, &bus, &audio_task).await;
                         }
                     }
 
@@ -1418,7 +1507,7 @@ async fn run_connection_task<P: Platform>(
                                     new_name,
                                 })),
                             };
-                            send_tracked(&mut transport, &env, &bus, &audio_task).await;
+                            send_tracked(&mut transport, &local_close, &env, &bus, &audio_task).await;
                         }
                     }
 
@@ -1431,7 +1520,7 @@ async fn run_connection_task<P: Platform>(
                                     new_parent_id: Some(room_id_from_uuid(new_parent_id)),
                                 })),
                             };
-                            send_tracked(&mut transport, &env, &bus, &audio_task).await;
+                            send_tracked(&mut transport, &local_close, &env, &bus, &audio_task).await;
                         }
                     }
 
@@ -1444,7 +1533,7 @@ async fn run_connection_task<P: Platform>(
                                     description,
                                 })),
                             };
-                            send_tracked(&mut transport, &env, &bus, &audio_task).await;
+                            send_tracked(&mut transport, &local_close, &env, &bus, &audio_task).await;
                         }
                     }
 
@@ -1467,7 +1556,7 @@ async fn run_connection_task<P: Platform>(
                                     attachment: None,
                                 })),
                             };
-                            send_tracked(&mut transport, &env, &bus, &audio_task).await;
+                            send_tracked(&mut transport, &local_close, &env, &bus, &audio_task).await;
                             // Insert locally — server no longer echoes chat
                             // back to the sender. Projection applies the push.
                             let my_uid = read_state(&state).my_user_id;
@@ -1505,7 +1594,7 @@ async fn run_connection_task<P: Platform>(
                                     attachment: None,
                                 })),
                             };
-                            send_tracked(&mut transport, &env, &bus, &audio_task).await;
+                            send_tracked(&mut transport, &local_close, &env, &bus, &audio_task).await;
                             let my_uid = read_state(&state).my_user_id;
                             let _ = bus.chat.send(crate::ChatEvent::MessageAdded {
                                 msg: crate::events::ChatMessage {
@@ -1539,7 +1628,7 @@ async fn run_connection_task<P: Platform>(
                                     timestamp_ms,
                                 })),
                             };
-                            send_tracked(&mut transport, &env, &bus, &audio_task).await;
+                            send_tracked(&mut transport, &local_close, &env, &bus, &audio_task).await;
                             let my_uid = read_state(&state).my_user_id;
                             let _ = bus.chat.send(crate::ChatEvent::MessageAdded {
                                 msg: crate::events::ChatMessage {
@@ -1575,7 +1664,7 @@ async fn run_connection_task<P: Platform>(
                                     is_deafened,
                                 })),
                             };
-                            send_tracked(&mut transport, &env, &bus, &audio_task).await;
+                            send_tracked(&mut transport, &local_close, &env, &bus, &audio_task).await;
                         }
                     }
 
@@ -1591,7 +1680,7 @@ async fn run_connection_task<P: Platform>(
                                     is_deafened: deafened,
                                 })),
                             };
-                            send_tracked(&mut transport, &env, &bus, &audio_task).await;
+                            send_tracked(&mut transport, &local_close, &env, &bus, &audio_task).await;
                         }
                     }
 
@@ -1622,7 +1711,7 @@ async fn run_connection_task<P: Platform>(
                                     user_id: Some(proto::UserId { value: user_id }),
                                 })),
                             };
-                            send_tracked(&mut transport, &env, &bus, &audio_task).await;
+                            send_tracked(&mut transport, &local_close, &env, &bus, &audio_task).await;
                         }
                     }
 
@@ -1634,7 +1723,7 @@ async fn run_connection_task<P: Platform>(
                                     user_id: Some(proto::UserId { value: user_id }),
                                 })),
                             };
-                            send_tracked(&mut transport, &env, &bus, &audio_task).await;
+                            send_tracked(&mut transport, &local_close, &env, &bus, &audio_task).await;
                         }
                     }
 
@@ -1767,7 +1856,7 @@ async fn run_connection_task<P: Platform>(
                                     attachment: None,
                                 })),
                             };
-                            if send_tracked(&mut transport, &env, &bus, &audio_task).await {
+                            if send_tracked(&mut transport, &local_close, &env, &bus, &audio_task).await {
                                 info!("Sent chat history request to room");
                                 let _ = bus.chat.send(crate::ChatEvent::SystemNotice {
                                     text: "Requesting chat history from peers...".to_string(),
@@ -1803,7 +1892,7 @@ async fn run_connection_task<P: Platform>(
                                         attachment: None,
                                     })),
                                 };
-                                if send_tracked(&mut transport, &env, &bus, &audio_task).await {
+                                if send_tracked(&mut transport, &local_close, &env, &bus, &audio_task).await {
                                     debug!("Shared {} chat messages", share.content.messages.len());
                                 }
                             }
@@ -1822,7 +1911,7 @@ async fn run_connection_task<P: Platform>(
                                 state_hash: Vec::new(),
                                 payload: None,
                             };
-                            send_tracked(&mut transport, &env, &bus, &audio_task).await;
+                            send_tracked(&mut transport, &local_close, &env, &bus, &audio_task).await;
                         }
                     }
 
@@ -1838,7 +1927,7 @@ async fn run_connection_task<P: Platform>(
                                 actual_hash,
                             })),
                         };
-                        send_tracked(&mut transport, &env, &bus, &audio_task).await;
+                        send_tracked(&mut transport, &local_close, &env, &bus, &audio_task).await;
                     }
 
                     // ACL Commands
@@ -1851,7 +1940,7 @@ async fn run_connection_task<P: Platform>(
                                     reason,
                                 })),
                             };
-                            send_tracked(&mut transport, &env, &bus, &audio_task).await;
+                            send_tracked(&mut transport, &local_close, &env, &bus, &audio_task).await;
                         }
                     }
                     Command::BanUser {
@@ -1868,7 +1957,7 @@ async fn run_connection_task<P: Platform>(
                                     duration_seconds: duration_seconds.unwrap_or(0),
                                 })),
                             };
-                            send_tracked(&mut transport, &env, &bus, &audio_task).await;
+                            send_tracked(&mut transport, &local_close, &env, &bus, &audio_task).await;
                         }
                     }
                     Command::SetServerMute { target_user_id, muted } => {
@@ -1880,7 +1969,7 @@ async fn run_connection_task<P: Platform>(
                                     muted,
                                 })),
                             };
-                            send_tracked(&mut transport, &env, &bus, &audio_task).await;
+                            send_tracked(&mut transport, &local_close, &env, &bus, &audio_task).await;
                         }
                     }
                     Command::Elevate { password } => {
@@ -1889,7 +1978,7 @@ async fn run_connection_task<P: Platform>(
                                 state_hash: vec![],
                                 payload: Some(Payload::Elevate(proto::Elevate { password })),
                             };
-                            send_tracked(&mut transport, &env, &bus, &audio_task).await;
+                            send_tracked(&mut transport, &local_close, &env, &bus, &audio_task).await;
                         }
                     }
                     Command::CreateGroup { name, permissions } => {
@@ -1901,7 +1990,7 @@ async fn run_connection_task<P: Platform>(
                                     permissions,
                                 })),
                             };
-                            send_tracked(&mut transport, &env, &bus, &audio_task).await;
+                            send_tracked(&mut transport, &local_close, &env, &bus, &audio_task).await;
                         }
                     }
                     Command::DeleteGroup { name } => {
@@ -1910,7 +1999,7 @@ async fn run_connection_task<P: Platform>(
                                 state_hash: vec![],
                                 payload: Some(Payload::DeleteGroup(proto::DeleteGroup { name })),
                             };
-                            send_tracked(&mut transport, &env, &bus, &audio_task).await;
+                            send_tracked(&mut transport, &local_close, &env, &bus, &audio_task).await;
                         }
                     }
                     Command::ModifyGroup { name, permissions } => {
@@ -1922,7 +2011,7 @@ async fn run_connection_task<P: Platform>(
                                     permissions,
                                 })),
                             };
-                            send_tracked(&mut transport, &env, &bus, &audio_task).await;
+                            send_tracked(&mut transport, &local_close, &env, &bus, &audio_task).await;
                         }
                     }
                     Command::SetUserGroup {
@@ -1941,7 +2030,7 @@ async fn run_connection_task<P: Platform>(
                                     expires_at,
                                 })),
                             };
-                            send_tracked(&mut transport, &env, &bus, &audio_task).await;
+                            send_tracked(&mut transport, &local_close, &env, &bus, &audio_task).await;
                         }
                     }
                     Command::SetRoomAcl {
@@ -1958,7 +2047,7 @@ async fn run_connection_task<P: Platform>(
                                     entries,
                                 })),
                             };
-                            send_tracked(&mut transport, &env, &bus, &audio_task).await;
+                            send_tracked(&mut transport, &local_close, &env, &bus, &audio_task).await;
                         }
                     }
                     // PlaySfx is intercepted in BackendHandle::send() and never reaches here
@@ -2134,6 +2223,7 @@ async fn connect_to_server<T: Transport>(
 ///
 /// Uses `TransportRecvStream` for framed message reception. Connection loss
 /// is detected when `recv()` returns `None` or an error.
+#[allow(clippy::too_many_arguments)] // private helper; bundling its args would just push churn
 async fn run_receiver_task(
     mut recv: impl TransportRecvStream,
     state: Arc<RwLock<State>>,
@@ -2145,6 +2235,10 @@ async fn run_receiver_task(
     // (Disconnect/Shutdown). When set, the close we observe below is
     // intentional, so we must not emit `ConnectionLost`.
     local_close: Arc<AtomicBool>,
+    // Route back into the connection task to release its locals for this
+    // connection; `generation` identifies which connection we belong to.
+    teardown_tx: mpsc::UnboundedSender<TeardownRequest>,
+    generation: u64,
 ) {
     loop {
         // Bound the wait so a wedged server (alive QUIC connection, but
@@ -2184,6 +2278,15 @@ async fn run_receiver_task(
             }
         }
     }
+
+    // Hand the connection-task locals back for release: the connection
+    // task still holds the transport and file-transfer plugin for this
+    // connection and has no other way to learn the read side is gone.
+    // Harmless when the close was local (the request is idempotent /
+    // dropped as stale); essential on a server-side drop, where the
+    // surviving transport would otherwise blackhole sends and keep the
+    // QUIC connection alive as a ghost presence.
+    let _ = teardown_tx.send(TeardownRequest { generation });
 
     // Notify audio task
     audio_task.send(AudioCommand::ConnectionClosed);
