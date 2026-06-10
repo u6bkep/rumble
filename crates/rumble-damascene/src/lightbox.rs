@@ -11,6 +11,16 @@ use tokio::task::JoinHandle;
 
 use crate::{app::PendingVideoOpenResult, chat, media_cache::MediaCache, model, video};
 
+/// An in-flight `VideoStream::open` task plus the identity of the
+/// video it's opening, so the UI can show a pending overlay for it,
+/// treat a re-click on the same video as a no-op, and let the user
+/// cancel the wait.
+pub struct PendingVideoOpen {
+    pub transfer_id: String,
+    pub name: String,
+    pub handle: JoinHandle<PendingVideoOpenResult>,
+}
+
 /// Combined state of the three mutually-exclusive lightboxes.
 #[derive(Default)]
 pub struct Lightboxes {
@@ -20,7 +30,7 @@ pub struct Lightboxes {
     pub video: Option<video::ActiveVideo>,
     /// In-flight `VideoStream::open` task; promoted to `video` by the
     /// App's `poll_video_open` when it finishes.
-    pub pending_video_open: Option<JoinHandle<PendingVideoOpenResult>>,
+    pub pending_video_open: Option<PendingVideoOpen>,
     /// Orbit viewer for a downloaded 3D model.
     pub model: Option<model::ActiveModel>,
 }
@@ -35,8 +45,8 @@ impl Lightboxes {
     /// Tear down the video lightbox and abort any in-flight open.
     pub fn close_video(&mut self) {
         self.video = None;
-        if let Some(handle) = self.pending_video_open.take() {
-            handle.abort();
+        if let Some(pending) = self.pending_video_open.take() {
+            pending.handle.abort();
         }
     }
 
@@ -172,7 +182,11 @@ pub fn handle_event(
     {
         return LightboxAction::OpenVideo(transfer_id.to_string());
     }
-    if lb.video.is_some()
+    // Close applies both to an open lightbox and to a still-pending
+    // open (the loading overlay) — Escape / scrim / Cancel abort the
+    // in-flight `VideoStream::open` instead of leaving the user stuck
+    // waiting out the load deadline.
+    if (lb.video.is_some() || lb.pending_video_open.is_some())
         && (event.is_click_or_activate(video::KEY_LIGHTBOX_CLOSE)
             || (event.is_route(video::KEY_LIGHTBOX_DISMISS) && event.kind == UiEventKind::Click)
             || event.kind == UiEventKind::Escape)

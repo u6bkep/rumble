@@ -138,10 +138,11 @@ impl AdminOutcome {
 // Routed-key constants
 // ============================================================
 //
-// Group names appear inline in many keys. They are not validated for
-// `:` here — the rumble server treats group names as opaque strings —
-// but rumble's existing UI and CLI flow only produces alphanumeric
-// names. If that ever breaks we can hex-encode names in keys.
+// Group names appear inline in many keys, with `:` as the segment
+// separator — so a `:` inside a group name would corrupt every route
+// it appears in (`parse_group_route` splits at the first `:`). Both
+// the new-group dialog below and the server's group-creation op
+// reject names containing `:` to keep that invariant.
 
 const KEY_SEARCH: &str = "admin:search";
 const KEY_NEW_GROUP_OPEN: &str = "admin:newgroup:open";
@@ -475,7 +476,11 @@ fn render_members_section(
     let mut chips: Vec<El> = members
         .iter()
         .map(|u| {
-            let uid = u.user_id.as_ref().map(|i| i.value).unwrap_or(0);
+            // A `User` without an id (shouldn't happen, but the proto
+            // field is optional) renders as a plain, non-actionable
+            // chip — dispatching `SetUserGroup { target_user_id: 0 }`
+            // would misdirect the command at whoever id 0 resolves to.
+            let uid = u.user_id.as_ref().map(|i| i.value);
             chip(&u.username, uid, &group.name, is_builtin)
         })
         .collect();
@@ -510,7 +515,7 @@ fn render_members_section(
         .width(Size::Fill(1.0))
 }
 
-fn chip(username: &str, user_id: u64, group: &str, is_builtin: bool) -> El {
+fn chip(username: &str, user_id: Option<u64>, group: &str, is_builtin: bool) -> El {
     let initial = username
         .chars()
         .next()
@@ -522,7 +527,7 @@ fn chip(username: &str, user_id: u64, group: &str, is_builtin: bool) -> El {
         avatar_initials(initial.to_string()),
         text(username).font_size(tokens::TEXT_XS.size),
     ];
-    if !is_builtin {
+    if !is_builtin && let Some(user_id) = user_id {
         // Match the chip's pill radius so the × button's fill follows
         // the parent curve instead of stamping a flat corner into it.
         parts.push(
@@ -628,6 +633,9 @@ fn render_add_user_popover(popover_state: &AddUserPopover, app_state: &State, se
     let mut candidates: Vec<&User> = app_state
         .users
         .iter()
+        // Id-less users can't be targeted by SetUserGroup — picking
+        // one would dispatch against user id 0. Don't offer them.
+        .filter(|u| u.user_id.is_some())
         .filter(|u| !u.groups.contains(group))
         .filter(|u| query.is_empty() || u.username.to_lowercase().contains(&query))
         .collect();
@@ -660,9 +668,9 @@ fn render_add_user_popover(popover_state: &AddUserPopover, app_state: &State, se
     } else {
         candidates
             .iter()
-            .map(|u| {
-                let uid = u.user_id.as_ref().map(|i| i.value).unwrap_or(0);
-                menu_item(u.username.clone()).key(key_add_user_pick(group, uid))
+            .filter_map(|u| {
+                let uid = u.user_id.as_ref().map(|i| i.value)?;
+                Some(menu_item(u.username.clone()).key(key_add_user_pick(group, uid)))
             })
             .collect()
     };
@@ -850,6 +858,14 @@ fn handle_new_group_event(
         let name = form.name.trim().to_string();
         if name.is_empty() {
             form.error = Some("Name cannot be empty".into());
+            return Some(AdminOutcome::Handled);
+        }
+        // `:` is the routed-key segment separator — a name containing
+        // it would break every per-group route (perm toggles, member
+        // ops). The server rejects it too; catching it here gives
+        // inline feedback instead of a failed command.
+        if name.contains(':') {
+            form.error = Some("Name cannot contain ':'".into());
             return Some(AdminOutcome::Handled);
         }
         if app_state.group_definitions.iter().any(|g| g.name == name) {

@@ -620,9 +620,18 @@ impl<B: UiBackend> App for RumbleApp<B> {
         // image lightbox — only one is ever open at a time, so
         // they don't visually conflict. Same modal-suppression
         // rules apply (no popping over wizard / cert / unlock /
-        // settings).
-        let video_lightbox_layer = if content_layers_clear && let Some(active) = self.lightboxes.video.as_ref() {
-            Some(video::render_lightbox(active))
+        // settings). While `VideoStream::open` is still in flight
+        // a pending overlay holds the slot so the click has visible
+        // feedback and a Cancel / Escape way out.
+        let video_lightbox_layer = if content_layers_clear {
+            if let Some(active) = self.lightboxes.video.as_ref() {
+                Some(video::render_lightbox(active))
+            } else {
+                self.lightboxes
+                    .pending_video_open
+                    .as_ref()
+                    .map(|pending| video::render_pending_lightbox(&pending.name))
+            }
         } else {
             None
         };
@@ -783,15 +792,18 @@ impl<B: UiBackend> App for RumbleApp<B> {
             return;
         }
 
-        // Sudo elevation prompt claims its events first so a stray
-        // password-field click doesn't reach the chat input behind it.
+        // Sudo elevation prompt swallows everything while it's open —
+        // same focus-trap rule as the wizard/unlock layers. Without
+        // this, keystrokes (e.g. the sudo password) would fall through
+        // to whatever held keyboard focus behind the modal, such as
+        // the chat composer, and Enter would post them to the room.
         if self.elevate.is_some() {
             let outcome = {
                 let es = self.elevate.as_mut().expect("checked");
                 elevate::handle_event(es, &event, &mut self.selection)
             };
             match outcome {
-                ElevateOutcome::Ignored => {}
+                ElevateOutcome::Ignored => return,
                 ElevateOutcome::Handled => return,
                 ElevateOutcome::Cancel => {
                     self.elevate = None;
@@ -807,11 +819,13 @@ impl<B: UiBackend> App for RumbleApp<B> {
 
         // Per-room ACL editor modal claims events before the rest of
         // the UI. Save / Cancel close the modal; everything else
-        // mutates pending entries in place.
+        // mutates pending entries in place. Unrecognized events are
+        // swallowed (not cascaded) so nothing leaks to the UI behind
+        // the modal while it's open — same rule as wizard/unlock.
         if let Some(modal) = self.room_acl_modal.as_mut() {
             let app_state = self.backend.state();
             match room_acl::handle_event(modal, &event, &app_state, &mut self.selection) {
-                room_acl::RoomAclOutcome::Ignored => {}
+                room_acl::RoomAclOutcome::Ignored => return,
                 room_acl::RoomAclOutcome::Handled => return,
                 room_acl::RoomAclOutcome::Close => {
                     self.room_acl_modal = None;
@@ -867,16 +881,16 @@ impl<B: UiBackend> App for RumbleApp<B> {
                 self.server_picker.begin_add(&self.default_username);
                 return;
             }
-            ServerPickerOutcome::ConnectRecent(idx) => {
-                self.connect_to_recent(idx);
+            ServerPickerOutcome::ConnectRecent(addr) => {
+                self.connect_to_recent(&addr);
                 return;
             }
-            ServerPickerOutcome::BeginEdit(idx) => {
-                self.open_edit_form(idx);
+            ServerPickerOutcome::BeginEdit(addr) => {
+                self.open_edit_form(&addr);
                 return;
             }
-            ServerPickerOutcome::DeleteRecent(idx) => {
-                self.delete_recent(idx);
+            ServerPickerOutcome::DeleteRecent(addr) => {
+                self.delete_recent(&addr);
                 return;
             }
             ServerPickerOutcome::Save => {
@@ -1196,34 +1210,47 @@ impl<B: UiBackend> RumbleApp<B> {
         self.backend.send(Command::AcceptCertificate);
     }
 
-    /// Look up `recent_servers[idx]` and dispatch a connect to it.
-    /// `idx` is the position in the unsorted Vec — that's the only stable
-    /// identifier the row keys carry, so it's safe across re-renders that
-    /// re-sort the list visually.
-    fn connect_to_recent(&mut self, idx: usize) {
-        let Some(server) = self.settings.settings().recent_servers.get(idx).cloned() else {
-            tracing::warn!("rumble-damascene: connect_to_recent({idx}) — out of bounds");
+    /// Look up the saved server by address and dispatch a connect to
+    /// it. Addresses are the stable row identifier — a stale click
+    /// (e.g. the second half of a double-click after a removal shifted
+    /// the list) just misses instead of hitting the wrong entry.
+    fn connect_to_recent(&mut self, addr: &str) {
+        let Some(server) = self
+            .settings
+            .settings()
+            .recent_servers
+            .iter()
+            .find(|r| r.addr == addr)
+            .cloned()
+        else {
+            tracing::warn!("rumble-damascene: connect_to_recent({addr}) — no such saved server");
             return;
         };
         self.connect_to_server(&server);
     }
 
-    /// Open the form pre-populated with `recent_servers[idx]`. No-op if
-    /// idx is out of bounds — the row that sourced the click has gone.
-    fn open_edit_form(&mut self, idx: usize) {
-        let Some(server) = self.settings.settings().recent_servers.get(idx).cloned() else {
+    /// Open the form pre-populated with the saved server at `addr`.
+    /// No-op if no entry matches — the row that sourced the click has
+    /// gone.
+    fn open_edit_form(&mut self, addr: &str) {
+        let Some(server) = self
+            .settings
+            .settings()
+            .recent_servers
+            .iter()
+            .find(|r| r.addr == addr)
+            .cloned()
+        else {
             return;
         };
-        self.server_picker.begin_edit(idx, &server);
+        self.server_picker.begin_edit(&server);
     }
 
-    fn delete_recent(&mut self, idx: usize) {
+    fn delete_recent(&mut self, addr: &str) {
         self.settings.modify(|s| {
-            if idx < s.recent_servers.len() {
-                let removed = s.recent_servers.remove(idx);
-                if s.auto_connect_addr.as_deref() == Some(removed.addr.as_str()) {
-                    s.auto_connect_addr = None;
-                }
+            s.recent_servers.retain(|r| r.addr != addr);
+            if s.auto_connect_addr.as_deref() == Some(addr) {
+                s.auto_connect_addr = None;
             }
         });
     }
@@ -1283,11 +1310,11 @@ impl<B: UiBackend> RumbleApp<B> {
     /// `RecentServer` on success so callers can chain a connect; returns
     /// `None` (with `form.error` populated) on validation failure.
     ///
-    /// Edit semantics: removes the original entry at `editing_index`
-    /// first, then writes the new fields keyed by addr. If the new addr
-    /// already exists at a different position, that row's label/username
-    /// are overwritten and the edit's `last_used_unix` carries over to
-    /// the larger of the two.
+    /// Edit semantics: removes the original entry (looked up by its
+    /// `editing_addr`) first, then writes the new fields keyed by addr.
+    /// If the new addr already exists at a different position, that
+    /// row's label/username are overwritten and the edit's
+    /// `last_used_unix` carries over to the larger of the two.
     fn save_server_form(&mut self) -> Option<RecentServer> {
         let form = self.server_picker.form.as_mut()?;
         let addr = form.addr.trim().to_string();
@@ -1297,17 +1324,18 @@ impl<B: UiBackend> RumbleApp<B> {
         }
         let label = form.label.trim().to_string();
         let username = form.username.trim().to_string();
-        let editing_index = form.editing_index;
+        let editing_addr = form.editing_addr.clone();
 
         let mut saved: Option<RecentServer> = None;
         self.settings.modify(|s| {
-            let preserved_last_used = editing_index
+            let original_idx = editing_addr
+                .as_deref()
+                .and_then(|orig| s.recent_servers.iter().position(|r| r.addr == orig));
+            let preserved_last_used = original_idx
                 .and_then(|idx| s.recent_servers.get(idx))
                 .map(|r| r.last_used_unix)
                 .unwrap_or(0);
-            if let Some(idx) = editing_index
-                && idx < s.recent_servers.len()
-            {
+            if let Some(idx) = original_idx {
                 let original_addr = s.recent_servers[idx].addr.clone();
                 s.recent_servers.remove(idx);
                 if s.auto_connect_addr.as_deref() == Some(original_addr.as_str()) {
@@ -1767,6 +1795,19 @@ impl<B: UiBackend> RumbleApp<B> {
         if self.lightboxes.video.as_ref().map(|a| a.transfer_id.as_str()) == Some(transfer_id) {
             return;
         }
+        // Likewise while the same video's open is still in flight: an
+        // impatient re-click must not abort and restart the (up to
+        // 10s) load from scratch. The pending overlay's Cancel /
+        // Escape / scrim are the explicit ways out.
+        if self
+            .lightboxes
+            .pending_video_open
+            .as_ref()
+            .map(|p| p.transfer_id.as_str())
+            == Some(transfer_id)
+        {
+            return;
+        }
         // Find the file's name + path from the live transfer set.
         // Bail if the transfer was GC'd between the click and the
         // event firing.
@@ -1787,20 +1828,27 @@ impl<B: UiBackend> RumbleApp<B> {
         self.close_lightbox();
         self.close_model_lightbox();
         if let Some(prev) = self.lightboxes.pending_video_open.take() {
-            prev.abort();
+            prev.handle.abort();
         }
 
         let wake = self.backend.repaint_arc();
-        self.lightboxes.pending_video_open = Some(self.runtime.spawn_blocking(move || {
+        let task_id = id.clone();
+        let task_name = name.clone();
+        let handle = self.runtime.spawn_blocking(move || {
             // Open looped so the lightbox doesn't freeze the
             // moment a short clip ends — matches the "preview"
             // expectation users have for chat-attachment video.
-            let result = rumble_video::VideoStream::open(&path, true).map(|stream| (id, name, stream));
+            let result = rumble_video::VideoStream::open(&path, true).map(|stream| (task_id, task_name, stream));
             // Wake on both success and error so poll_video_open runs
             // promptly without requiring user input.
             wake();
             result
-        }));
+        });
+        self.lightboxes.pending_video_open = Some(crate::lightbox::PendingVideoOpen {
+            transfer_id: id,
+            name,
+            handle,
+        });
     }
 
     /// Tear down the video lightbox: drop the stream (which
@@ -1848,14 +1896,14 @@ impl<B: UiBackend> RumbleApp<B> {
     /// [`Self::sync_active_video_gpu`] once the host's wgpu
     /// device is available.
     fn poll_video_open(&mut self) {
-        let Some(handle) = self.lightboxes.pending_video_open.as_ref() else {
+        let Some(pending) = self.lightboxes.pending_video_open.as_ref() else {
             return;
         };
-        if !handle.is_finished() {
+        if !pending.handle.is_finished() {
             return;
         }
-        let handle = self.lightboxes.pending_video_open.take().unwrap();
-        let result = match self.runtime.block_on(handle) {
+        let pending = self.lightboxes.pending_video_open.take().unwrap();
+        let result = match self.runtime.block_on(pending.handle) {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(error = %e, "video: open task panicked");
@@ -1868,6 +1916,11 @@ impl<B: UiBackend> RumbleApp<B> {
             }
             Err(e) => {
                 tracing::warn!(error = %e, "video: stream open failed");
+                // The pending overlay just vanished — tell the user
+                // why instead of failing silently.
+                self.backend.send(Command::LocalMessage {
+                    text: format!("Could not play \"{}\": {e}", pending.name),
+                });
             }
         }
     }

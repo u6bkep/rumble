@@ -37,11 +37,11 @@ impl ServerPickerState {
         self.form = Some(ServerForm::for_add(default_username));
     }
 
-    /// Open an edit form pre-populated from `server`. `idx` is the
-    /// position in `Settings.recent_servers` so the eventual save
-    /// can find the original entry.
-    pub fn begin_edit(&mut self, idx: usize, server: &RecentServer) {
-        self.form = Some(ServerForm::for_edit(idx, server));
+    /// Open an edit form pre-populated from `server`. The entry's
+    /// address is remembered so the eventual save can find the
+    /// original entry even if the list is reordered meanwhile.
+    pub fn begin_edit(&mut self, server: &RecentServer) {
+        self.form = Some(ServerForm::for_edit(server));
     }
 
     pub fn close(&mut self) {
@@ -51,14 +51,16 @@ impl ServerPickerState {
 
 /// Local state for the saved-server add/edit modal.
 ///
-/// `editing_index` is the position in `Settings.recent_servers` when
-/// editing an existing entry, or `None` when the form is being used to
-/// add a new server. The text fields are rendered via the global
+/// `editing_addr` is the address of the `Settings.recent_servers`
+/// entry being edited, or `None` when the form is being used to add a
+/// new server. Addresses are unique within the list (saves dedupe by
+/// addr), so this survives reorders and deletions where a positional
+/// index would not. The text fields are rendered via the global
 /// `Selection` held on `RumbleApp`, so this struct doesn't carry
 /// per-input selection state.
 #[derive(Debug, Clone)]
 pub struct ServerForm {
-    pub editing_index: Option<usize>,
+    pub editing_addr: Option<String>,
     pub addr: String,
     pub label: String,
     pub username: String,
@@ -69,7 +71,7 @@ pub struct ServerForm {
 impl ServerForm {
     fn for_add(default_username: &str) -> Self {
         Self {
-            editing_index: None,
+            editing_addr: None,
             addr: "127.0.0.1:5000".to_string(),
             label: String::new(),
             username: default_username.to_string(),
@@ -77,9 +79,9 @@ impl ServerForm {
         }
     }
 
-    fn for_edit(idx: usize, server: &RecentServer) -> Self {
+    fn for_edit(server: &RecentServer) -> Self {
         Self {
-            editing_index: Some(idx),
+            editing_addr: Some(server.addr.clone()),
             addr: server.addr.clone(),
             label: server.label.clone(),
             username: server.username.clone(),
@@ -93,8 +95,12 @@ impl ServerForm {
 // ============================================================
 
 /// Result of routing a single event into the server picker. Every
-/// command-emitting variant carries the index or form action the App
-/// needs to apply against its `Identity` / `SettingsStore` / backend.
+/// command-emitting variant carries the server address or form action
+/// the App needs to apply against its `Identity` / `SettingsStore` /
+/// backend. Addresses (not list positions) identify rows so a stale
+/// click — e.g. the second half of a double-click landing after the
+/// first already removed an entry and shifted the list — can never
+/// resolve to a different server.
 pub enum ServerPickerOutcome {
     /// Event wasn't recognized — the App should keep checking.
     Ignored,
@@ -104,14 +110,15 @@ pub enum ServerPickerOutcome {
     /// User clicked "Add server…" — App should open a fresh form via
     /// [`ServerPickerState::begin_add`].
     BeginAdd,
-    /// User clicked Connect on saved-server `idx`.
-    ConnectRecent(usize),
-    /// User clicked Edit on saved-server `idx` — App should open an
-    /// edit form via [`ServerPickerState::begin_edit`] (it has access
-    /// to the `RecentServer` lookup; we don't pipe it through here).
-    BeginEdit(usize),
-    /// User clicked Remove on saved-server `idx`.
-    DeleteRecent(usize),
+    /// User clicked Connect on the saved server with this address.
+    ConnectRecent(String),
+    /// User clicked Edit on the saved server with this address — App
+    /// should open an edit form via [`ServerPickerState::begin_edit`]
+    /// (it has access to the `RecentServer` lookup; we don't pipe it
+    /// through here).
+    BeginEdit(String),
+    /// User clicked Remove on the saved server with this address.
+    DeleteRecent(String),
     /// User clicked Save in the form. App validates + persists; the
     /// picker stays open until the App calls
     /// [`ServerPickerState::close`] (typically after a successful save).
@@ -176,8 +183,9 @@ pub fn render_center(state: &State, recent_servers: &[RecentServer]) -> El {
     .width(Size::Fill(1.0));
 
     // Render the list sorted by last_used desc; the row's stable
-    // identifier remains the unsorted index (`server:connect:{idx}`),
-    // so settings.modify by index continues to point at the right row.
+    // identifier is the server address (`server:connect:{addr}`) —
+    // unique within the list and immune to rows shifting position
+    // when an entry is removed or the sort order changes.
     let body: El = if recent_servers.is_empty() {
         column([
             text("No saved servers yet.").muted(),
@@ -194,10 +202,7 @@ pub fn render_center(state: &State, recent_servers: &[RecentServer]) -> El {
     } else {
         let mut order: Vec<usize> = (0..recent_servers.len()).collect();
         order.sort_by(|&a, &b| recent_servers[b].last_used_unix.cmp(&recent_servers[a].last_used_unix));
-        let rows: Vec<El> = order
-            .into_iter()
-            .map(|idx| server_row(idx, &recent_servers[idx]))
-            .collect();
+        let rows: Vec<El> = order.into_iter().map(|idx| server_row(&recent_servers[idx])).collect();
         scroll([item_group(rows)])
             .padding(Sides::xy(tokens::SPACE_4, tokens::SPACE_2))
             .width(Size::Fill(1.0))
@@ -218,7 +223,7 @@ pub fn render_center(state: &State, recent_servers: &[RecentServer]) -> El {
     column(children).width(Size::Fill(1.0)).height(Size::Fill(1.0))
 }
 
-fn server_row(idx: usize, server: &RecentServer) -> El {
+fn server_row(server: &RecentServer) -> El {
     let title = if server.label.is_empty() {
         server.addr.clone()
     } else {
@@ -245,9 +250,13 @@ fn server_row(idx: usize, server: &RecentServer) -> El {
     item([
         item_content([item_title(title), item_description(subtitle)]),
         item_actions([
-            button("Connect").key(format!("{KEY_CONNECT_PREFIX}{idx}")).primary(),
-            button("Edit").key(format!("{KEY_EDIT_PREFIX}{idx}")).ghost(),
-            button("Remove").key(format!("{KEY_DELETE_PREFIX}{idx}")).ghost(),
+            button("Connect")
+                .key(format!("{KEY_CONNECT_PREFIX}{}", server.addr))
+                .primary(),
+            button("Edit").key(format!("{KEY_EDIT_PREFIX}{}", server.addr)).ghost(),
+            button("Remove")
+                .key(format!("{KEY_DELETE_PREFIX}{}", server.addr))
+                .ghost(),
         ]),
     ])
 }
@@ -255,7 +264,7 @@ fn server_row(idx: usize, server: &RecentServer) -> El {
 /// Render the add/edit form modal. Returns `None` when no form is open.
 pub fn render_form_modal(state: &ServerPickerState, selection: &Selection) -> Option<El> {
     let state_form = state.form.as_ref()?;
-    let title = if state_form.editing_index.is_some() {
+    let title = if state_form.editing_addr.is_some() {
         "Edit server"
     } else {
         "Add server"
@@ -310,14 +319,14 @@ pub fn handle_event(state: &mut ServerPickerState, event: &UiEvent, selection: &
     if event.is_click_or_activate(KEY_ADD) {
         return ServerPickerOutcome::BeginAdd;
     }
-    if let Some(idx) = parse_index_route(event, KEY_CONNECT_PREFIX) {
-        return ServerPickerOutcome::ConnectRecent(idx);
+    if let Some(addr) = parse_addr_route(event, KEY_CONNECT_PREFIX) {
+        return ServerPickerOutcome::ConnectRecent(addr);
     }
-    if let Some(idx) = parse_index_route(event, KEY_EDIT_PREFIX) {
-        return ServerPickerOutcome::BeginEdit(idx);
+    if let Some(addr) = parse_addr_route(event, KEY_EDIT_PREFIX) {
+        return ServerPickerOutcome::BeginEdit(addr);
     }
-    if let Some(idx) = parse_index_route(event, KEY_DELETE_PREFIX) {
-        return ServerPickerOutcome::DeleteRecent(idx);
+    if let Some(addr) = parse_addr_route(event, KEY_DELETE_PREFIX) {
+        return ServerPickerOutcome::DeleteRecent(addr);
     }
 
     // Form lifecycle. Cancel / dismiss / Escape all close, and only
@@ -381,11 +390,18 @@ fn form_field_from_target(event: &UiEvent) -> Option<FormField> {
     }
 }
 
-fn parse_index_route(event: &UiEvent, prefix: &str) -> Option<usize> {
+/// Extract the server address from a `server:{action}:{addr}` routed
+/// key. Addresses may themselves contain `:` (host:port), which is
+/// fine — everything after the action prefix is the address.
+fn parse_addr_route(event: &UiEvent, prefix: &str) -> Option<String> {
     if !matches!(event.kind, UiEventKind::Click | UiEventKind::Activate) {
         return None;
     }
-    event.route()?.strip_prefix(prefix)?.parse().ok()
+    let addr = event.route()?.strip_prefix(prefix)?;
+    if addr.is_empty() {
+        return None;
+    }
+    Some(addr.to_string())
 }
 
 // ============================================================
