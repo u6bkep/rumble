@@ -608,7 +608,7 @@ pub(crate) async fn apply_set_user_group_by_key(
     // while the admin saw success.
     if add {
         persist
-            .add_user_to_group(&public_key, &group)
+            .add_user_to_group_with_expiry(&public_key, &group, expires_at)
             .map_err(|e| format!("Failed to persist group membership: {e}"))?;
     } else {
         persist
@@ -655,6 +655,45 @@ pub(crate) async fn apply_set_user_group_by_key(
         if add { "to" } else { "from" },
         group
     ))
+}
+
+/// Sweep expired timed group memberships and make the removals visible: for each
+/// `(key, group)` whose expiry passed, the persistence layer has already dropped
+/// the membership; here we mirror that onto any live connection sharing the key
+/// (so cached `identity.groups()` and thus effective permissions update without
+/// a reconnect) and broadcast a `UserGroupChanged { added: false }` — the same
+/// update a manual removal produces. Returns the number of memberships swept.
+pub(crate) async fn sweep_expired_memberships(
+    state: &Arc<ServerState>,
+    persistence: &Arc<Persistence>,
+    now_secs: u64,
+) -> usize {
+    let expired = persistence.sweep_expired_memberships(now_secs);
+    for (public_key, group) in &expired {
+        for client in state.snapshot_clients() {
+            if state.get_user_public_key(client.user_id) != Some(*public_key) {
+                continue;
+            }
+            let mut groups = client.identity.groups().await;
+            let before = groups.len();
+            groups.retain(|g| g != group);
+            if groups.len() != before {
+                client.identity.set_groups(groups).await;
+            }
+            let _ = broadcast_state_update(
+                state,
+                proto::state_update::Update::UserGroupChanged(proto::UserGroupChanged {
+                    user_id: client.user_id,
+                    group: group.clone(),
+                    added: false,
+                    expires_at: 0,
+                }),
+            )
+            .await;
+        }
+        info!(group = %group, "membership expired");
+    }
+    expired.len()
 }
 
 // =============================================================================

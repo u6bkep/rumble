@@ -442,9 +442,11 @@ async fn handle_authenticate(
             let _ = persist.remove_user_from_group(&pending.public_key, "banned");
         }
 
-        // Load user's groups to check for BANNED flag
+        // Load user's groups to check for BANNED flag. Use the expiry-aware
+        // accessor so an expired timed membership is dropped (and cannot be
+        // exploited) before the background sweep runs.
         let mut check_groups = vec!["default".to_string()];
-        let user_groups = persist.get_user_groups(&pending.public_key);
+        let user_groups = persist.active_user_groups(&pending.public_key, now_secs);
         for g in &user_groups {
             if !check_groups.contains(g) {
                 check_groups.push(g.clone());
@@ -538,14 +540,16 @@ async fn handle_authenticate(
     // identity never gain a username-keyed group.
     let verified_username = {
         let persist = &persistence;
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         let mut groups = vec!["default".to_string()];
-        if let Some(user_groups_data) = persist.get_raw("user_groups", &pending.public_key)
-            && let Ok(stored_groups) = bincode::deserialize::<Vec<String>>(&user_groups_data)
-        {
-            for g in stored_groups {
-                if !groups.contains(&g) {
-                    groups.push(g);
-                }
+        // Expiry-aware: drops any timed membership that has already lapsed so the
+        // session never starts with an expired group cached.
+        for g in persist.active_user_groups(&pending.public_key, now_secs) {
+            if !groups.contains(&g) {
+                groups.push(g);
             }
         }
         sender.identity.set_groups(groups).await;

@@ -183,9 +183,11 @@ impl Server {
         // Load persisted rooms before accepting connections
         self.load_persisted_rooms().await;
 
-        // Spawn background task to sweep expired timed bans every 60 seconds.
+        // Spawn background task to sweep expired timed bans and timed group
+        // memberships every 60 seconds.
         {
             let persist = self.persistence.clone();
+            let state = self.state.clone();
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
                 loop {
@@ -197,6 +199,12 @@ impl Server {
                     let swept = persist.sweep_expired_bans(now_secs);
                     if swept > 0 {
                         info!(count = swept, "swept expired bans");
+                    }
+                    // Expired timed group memberships: removed from persistence,
+                    // mirrored onto live connections, and broadcast.
+                    let swept_groups = crate::ops::sweep_expired_memberships(&state, &persist, now_secs).await;
+                    if swept_groups > 0 {
+                        info!(count = swept_groups, "swept expired group memberships");
                     }
                 }
             });

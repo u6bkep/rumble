@@ -110,6 +110,13 @@ pub struct Persistence {
     groups: sled::Tree,
     /// Tree for user-group assignments: public_key (32 bytes) → Vec<String>
     user_groups: sled::Tree,
+    /// Tree for timed group-membership expiries. Key is `public_key (32 bytes)
+    /// ++ group name (UTF-8)`, value is the expiry as 8-byte big-endian Unix
+    /// seconds. A membership with no entry here is permanent — so existing
+    /// databases (which predate this tree) treat every membership as permanent,
+    /// exactly as before. Mirrors the ban model: the expiry record coexists with
+    /// the `user_groups` membership, and both are removed together on expiry.
+    group_expiries: sled::Tree,
     /// Tree for room ACLs: room UUID (16 bytes) → PersistedRoomAcl
     room_acls: sled::Tree,
     /// Tree for sudo password: fixed key b"sudo" → bcrypt hash string
@@ -134,6 +141,7 @@ impl Persistence {
         let rooms = db.open_tree("rooms")?;
         let groups = db.open_tree("groups")?;
         let user_groups = db.open_tree("user_groups")?;
+        let group_expiries = db.open_tree("group_expiries")?;
         let room_acls = db.open_tree("room_acls")?;
         let sudo_password = db.open_tree("sudo_password")?;
         let participant_defaults = db.open_tree("participant_defaults")?;
@@ -146,6 +154,7 @@ impl Persistence {
             rooms,
             groups,
             user_groups,
+            group_expiries,
             room_acls,
             sudo_password,
             participant_defaults,
@@ -161,6 +170,7 @@ impl Persistence {
         let rooms = db.open_tree("rooms")?;
         let groups = db.open_tree("groups")?;
         let user_groups = db.open_tree("user_groups")?;
+        let group_expiries = db.open_tree("group_expiries")?;
         let room_acls = db.open_tree("room_acls")?;
         let sudo_password = db.open_tree("sudo_password")?;
         let participant_defaults = db.open_tree("participant_defaults")?;
@@ -173,6 +183,7 @@ impl Persistence {
             rooms,
             groups,
             user_groups,
+            group_expiries,
             room_acls,
             sudo_password,
             participant_defaults,
@@ -462,17 +473,30 @@ impl Persistence {
             .and_then(|data| String::from_utf8(data.to_vec()).ok())
     }
 
-    /// Add a user to a group.
+    /// Add a user to a group (permanent membership).
+    ///
+    /// Adding clears any pre-existing expiry record for this `(key, group)`, so
+    /// re-adding a previously-timed membership without an expiry makes it
+    /// permanent (matching the `expires_at == 0` contract).
     pub fn add_user_to_group(&self, public_key: &[u8; 32], group: &str) -> Result<()> {
+        self.add_user_to_group_with_expiry(public_key, group, 0)
+    }
+
+    /// Add a user to a group with an optional expiry. `expires_at` is Unix
+    /// seconds; `0` means permanent (no expiry record stored).
+    pub fn add_user_to_group_with_expiry(&self, public_key: &[u8; 32], group: &str, expires_at: u64) -> Result<()> {
         let mut groups = self.get_user_groups(public_key);
         if !groups.iter().any(|g| g == group) {
             groups.push(group.to_string());
             self.set_user_groups(public_key, &groups)?;
         }
+        // Always (re)set the expiry so callers can extend, shorten, or clear it
+        // on an existing membership.
+        self.set_group_expiry(public_key, group, expires_at)?;
         Ok(())
     }
 
-    /// Remove a user from a group.
+    /// Remove a user from a group (and any associated expiry record).
     pub fn remove_user_from_group(&self, public_key: &[u8; 32], group: &str) -> Result<()> {
         let mut groups = self.get_user_groups(public_key);
         let before = groups.len();
@@ -480,6 +504,9 @@ impl Persistence {
         if groups.len() != before {
             self.set_user_groups(public_key, &groups)?;
         }
+        // Drop any orphaned expiry record regardless of whether the membership
+        // was present, so timed-membership bookkeeping never leaks.
+        let _ = self.group_expiries.remove(Self::expiry_key(public_key, group));
         Ok(())
     }
 
@@ -495,9 +522,96 @@ impl Persistence {
                     && let Ok(key_arr) = <[u8; 32]>::try_from(key.as_ref())
                 {
                     let _ = self.set_user_groups(&key_arr, &groups);
+                    let _ = self.group_expiries.remove(Self::expiry_key(&key_arr, group));
                 }
             }
         }
+    }
+
+    // ---- Timed group memberships ----
+
+    /// Build the `group_expiries` key for a `(public_key, group)` pair:
+    /// `public_key (32 bytes) ++ group name (UTF-8)`.
+    fn expiry_key(public_key: &[u8; 32], group: &str) -> Vec<u8> {
+        let mut key = Vec::with_capacity(32 + group.len());
+        key.extend_from_slice(public_key);
+        key.extend_from_slice(group.as_bytes());
+        key
+    }
+
+    /// Set (or clear) the expiry for a `(key, group)` membership. `expires_at`
+    /// of `0` removes any expiry record, making the membership permanent.
+    pub fn set_group_expiry(&self, public_key: &[u8; 32], group: &str, expires_at: u64) -> Result<()> {
+        let key = Self::expiry_key(public_key, group);
+        if expires_at == 0 {
+            self.group_expiries.remove(key)?;
+        } else {
+            self.group_expiries.insert(key, &expires_at.to_be_bytes())?;
+        }
+        Ok(())
+    }
+
+    /// Get the expiry (Unix seconds) for a `(key, group)` membership, or `0` if
+    /// the membership is permanent / has no expiry record.
+    pub fn get_group_expiry(&self, public_key: &[u8; 32], group: &str) -> u64 {
+        self.group_expiries
+            .get(Self::expiry_key(public_key, group))
+            .ok()
+            .flatten()
+            .and_then(|v| <[u8; 8]>::try_from(v.as_ref()).ok())
+            .map(u64::from_be_bytes)
+            .unwrap_or(0)
+    }
+
+    /// Return a user's currently-effective group list as of `now_secs`,
+    /// transparently removing memberships whose expiry has passed (both the
+    /// membership and the expiry record). This is the lazy enforcement path used
+    /// at auth/permission-evaluation time so an expired membership can't be
+    /// exploited in the window before the background sweep runs.
+    pub fn active_user_groups(&self, public_key: &[u8; 32], now_secs: u64) -> Vec<String> {
+        let groups = self.get_user_groups(public_key);
+        let mut active = Vec::with_capacity(groups.len());
+        for g in groups {
+            let expiry = self.get_group_expiry(public_key, &g);
+            if expiry != 0 && now_secs >= expiry {
+                // Expired: drop the membership and its record lazily.
+                let _ = self.remove_user_from_group(public_key, &g);
+            } else {
+                active.push(g);
+            }
+        }
+        active
+    }
+
+    /// Iterate all timed group memberships and remove any whose expiry has
+    /// passed as of `now_secs`. Returns the `(public_key, group)` pairs that were
+    /// removed, so the caller can mirror the change onto live connections and
+    /// broadcast it. Mirrors [`Self::sweep_expired_bans`].
+    pub fn sweep_expired_memberships(&self, now_secs: u64) -> Vec<([u8; 32], String)> {
+        let expired: Vec<([u8; 32], String)> = self
+            .group_expiries
+            .iter()
+            .filter_map(|entry| {
+                let (key, value) = entry.ok()?;
+                let expires_at = <[u8; 8]>::try_from(value.as_ref()).ok().map(u64::from_be_bytes)?;
+                if expires_at == 0 || now_secs < expires_at {
+                    return None;
+                }
+                let raw = key.as_ref();
+                if raw.len() < 32 {
+                    return None;
+                }
+                let pubkey: [u8; 32] = raw[..32].try_into().ok()?;
+                let group = String::from_utf8(raw[32..].to_vec()).ok()?;
+                Some((pubkey, group))
+            })
+            .collect();
+
+        for (key, group) in &expired {
+            // remove_user_from_group also clears the expiry record.
+            let _ = self.remove_user_from_group(key, group);
+        }
+        expired
     }
 
     // =========================================================================
@@ -1145,6 +1259,138 @@ mod tests {
                 .get_user_groups(&key_not_yet)
                 .contains(&"banned".to_string())
         );
+    }
+
+    // =========================================================================
+    // Timed group-membership expiry tests
+    // =========================================================================
+
+    #[test]
+    fn test_membership_zero_expiry_is_permanent() {
+        let persistence = Persistence::in_memory().unwrap();
+        let key = [20u8; 32];
+
+        // expires_at: 0 → permanent, no expiry record stored.
+        persistence.add_user_to_group_with_expiry(&key, "admin", 0).unwrap();
+        assert_eq!(persistence.get_group_expiry(&key, "admin"), 0);
+
+        // A sweep far in the future must not touch a permanent membership.
+        let swept = persistence.sweep_expired_memberships(u64::MAX);
+        assert!(swept.is_empty());
+        assert!(persistence.get_user_groups(&key).contains(&"admin".to_string()));
+
+        // active_user_groups also keeps it.
+        assert!(
+            persistence
+                .active_user_groups(&key, u64::MAX)
+                .contains(&"admin".to_string())
+        );
+    }
+
+    #[test]
+    fn test_membership_past_expiry_swept() {
+        let persistence = Persistence::in_memory().unwrap();
+        let key = [21u8; 32];
+
+        // expires at t=160.
+        persistence.add_user_to_group_with_expiry(&key, "admin", 160).unwrap();
+        assert_eq!(persistence.get_group_expiry(&key, "admin"), 160);
+
+        // Before expiry: survives.
+        assert!(persistence.sweep_expired_memberships(100).is_empty());
+        assert!(persistence.get_user_groups(&key).contains(&"admin".to_string()));
+
+        // After expiry: swept, membership and expiry record both gone.
+        let swept = persistence.sweep_expired_memberships(200);
+        assert_eq!(swept, vec![(key, "admin".to_string())]);
+        assert!(!persistence.get_user_groups(&key).contains(&"admin".to_string()));
+        assert_eq!(persistence.get_group_expiry(&key, "admin"), 0);
+    }
+
+    #[test]
+    fn test_active_user_groups_lazily_drops_expired() {
+        let persistence = Persistence::in_memory().unwrap();
+        let key = [22u8; 32];
+
+        persistence.add_user_to_group(&key, "default").unwrap(); // permanent
+        persistence.add_user_to_group_with_expiry(&key, "admin", 160).unwrap(); // timed
+
+        // Before expiry both are active.
+        let mut active = persistence.active_user_groups(&key, 100);
+        active.sort();
+        assert_eq!(active, vec!["admin".to_string(), "default".to_string()]);
+
+        // At/after expiry, the timed group is dropped (and cleaned up in sled).
+        let active = persistence.active_user_groups(&key, 160);
+        assert_eq!(active, vec!["default".to_string()]);
+        // The lazy drop persisted: the membership is gone from storage too.
+        assert!(!persistence.get_user_groups(&key).contains(&"admin".to_string()));
+    }
+
+    #[test]
+    fn test_remove_membership_clears_expiry_record() {
+        let persistence = Persistence::in_memory().unwrap();
+        let key = [23u8; 32];
+
+        persistence.add_user_to_group_with_expiry(&key, "admin", 999).unwrap();
+        assert_eq!(persistence.get_group_expiry(&key, "admin"), 999);
+
+        persistence.remove_user_from_group(&key, "admin").unwrap();
+        assert_eq!(persistence.get_group_expiry(&key, "admin"), 0);
+
+        // Re-adding as permanent does not resurrect the old expiry.
+        persistence.add_user_to_group(&key, "admin").unwrap();
+        assert_eq!(persistence.get_group_expiry(&key, "admin"), 0);
+    }
+
+    #[test]
+    fn test_readd_permanent_clears_prior_expiry() {
+        let persistence = Persistence::in_memory().unwrap();
+        let key = [24u8; 32];
+
+        // First a timed grant, then a permanent grant of the same group.
+        persistence.add_user_to_group_with_expiry(&key, "admin", 160).unwrap();
+        persistence.add_user_to_group_with_expiry(&key, "admin", 0).unwrap();
+
+        // Now permanent: a future sweep must not remove it.
+        assert!(persistence.sweep_expired_memberships(u64::MAX).is_empty());
+        assert!(persistence.get_user_groups(&key).contains(&"admin".to_string()));
+    }
+
+    #[test]
+    fn test_old_format_membership_is_permanent() {
+        // Simulate a database written before the group_expiries tree existed:
+        // a membership stored only as a bincode Vec<String>, no expiry record.
+        let persistence = Persistence::in_memory().unwrap();
+        let key = [25u8; 32];
+
+        persistence
+            .set_user_groups(&key, &["admin".to_string(), "moderator".to_string()])
+            .unwrap();
+
+        // No expiry records exist for these old-format memberships.
+        assert_eq!(persistence.get_group_expiry(&key, "admin"), 0);
+        assert_eq!(persistence.get_group_expiry(&key, "moderator"), 0);
+
+        // They load normally and are treated as permanent (survive any sweep and
+        // any active_user_groups call).
+        assert!(persistence.sweep_expired_memberships(u64::MAX).is_empty());
+        let mut active = persistence.active_user_groups(&key, u64::MAX);
+        active.sort();
+        assert_eq!(active, vec!["admin".to_string(), "moderator".to_string()]);
+    }
+
+    #[test]
+    fn test_delete_group_clears_expiry_records() {
+        let persistence = Persistence::in_memory().unwrap();
+        let key = [26u8; 32];
+
+        persistence.add_user_to_group_with_expiry(&key, "temp", 500).unwrap();
+        assert_eq!(persistence.get_group_expiry(&key, "temp"), 500);
+
+        persistence.remove_group_from_all_users("temp");
+        assert!(!persistence.get_user_groups(&key).contains(&"temp".to_string()));
+        assert_eq!(persistence.get_group_expiry(&key, "temp"), 0);
     }
 
     #[test]
