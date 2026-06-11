@@ -12,8 +12,10 @@ use tracing::{debug, info, warn};
 use crate::{
     config::BridgeConfig,
     mumble_proto::{MessageType, mumble},
-    mumble_server::MumbleOutbound,
-    mumble_voice, rumble_client,
+    mumble_server::{self, MumbleOutbound},
+    mumble_voice,
+    reconcile::{self, SkipRules, SyncMessage},
+    rumble_client,
     state::BridgeState,
 };
 
@@ -208,6 +210,14 @@ pub async fn run_bridge(
             }
 
             BridgeEvent::MumbleClientSender { session, sender } => {
+                // Send the initial channel/user snapshot and register the
+                // sender in the same event-loop step. Doing both here means no
+                // StateUpdate/ServerState can land between snapshot and
+                // registration (it is either reflected in the snapshot or
+                // broadcast to the now-registered sender) — previously the
+                // handshake snapshotted before this event was processed, so an
+                // update in that window was lost for the new client.
+                send_initial_sync(&config, &bridge_state, session, &sender);
                 client_senders.insert(session, ClientSender { tx: sender });
             }
 
@@ -579,6 +589,80 @@ pub async fn run_bridge(
     (Ok(()), bridge_rx)
 }
 
+/// Send the post-handshake state snapshot (channels, users, self, ServerSync,
+/// ServerConfig) to a freshly authenticated Mumble client.
+///
+/// Runs inside the bridge event loop (see `MumbleClientSender`) so the
+/// snapshot is atomic with sender registration relative to state updates.
+fn send_initial_sync(
+    config: &BridgeConfig,
+    bridge_state: &Arc<RwLock<BridgeState>>,
+    session: u32,
+    sender: &mpsc::UnboundedSender<MumbleOutbound>,
+) {
+    let (channels, users, client, welcome) = {
+        let mut state = write_bridge(bridge_state);
+        let state = &mut *state;
+        let channels = mumble_server::build_channel_states(state);
+        let users = mumble_server::build_user_states(state, session);
+        let client = state.mumble_clients.get(&session).cloned();
+        let welcome = state.welcome_message.clone();
+        (channels, users, client, welcome)
+    };
+    let Some(client) = client else {
+        // The client disconnected while this event was queued; the
+        // MumbleClientLeft event behind us cleans up the sender again.
+        debug!(session, "Mumble client gone before initial sync");
+        return;
+    };
+
+    fn send(sender: &mpsc::UnboundedSender<MumbleOutbound>, msg_type: MessageType, msg: &impl Message) {
+        let _ = sender.send(MumbleOutbound::Protobuf {
+            msg_type: msg_type as u16,
+            payload: msg.encode_to_vec(),
+        });
+    }
+
+    for ch in &channels {
+        send(sender, MessageType::ChannelState, ch);
+    }
+    for us in &users {
+        send(sender, MessageType::UserState, us);
+    }
+
+    // The connecting client's own state.
+    let self_user = mumble::UserState {
+        session: Some(session),
+        name: Some(client.username),
+        channel_id: Some(client.channel_id),
+        ..Default::default()
+    };
+    send(sender, MessageType::UserState, &self_user);
+
+    // Use the Rumble server's welcome message if available, otherwise fall
+    // back to config.
+    let welcome_text = welcome.unwrap_or_else(|| config.welcome_text.clone());
+
+    let sync = mumble::ServerSync {
+        session: Some(session),
+        max_bandwidth: Some(config.max_bandwidth),
+        welcome_text: Some(welcome_text.clone()),
+        permissions: Some(0x07FFFFFF), // All permissions
+    };
+    send(sender, MessageType::ServerSync, &sync);
+
+    let server_config = mumble::ServerConfig {
+        max_bandwidth: Some(config.max_bandwidth),
+        welcome_text: Some(welcome_text),
+        allow_html: Some(true),
+        message_length: Some(5000),
+        image_message_length: Some(131072),
+        max_users: Some(100),
+        recording_allowed: Some(false),
+    };
+    send(sender, MessageType::ServerConfig, &server_config);
+}
+
 /// Handle a Rumble server envelope and forward relevant events to Mumble clients.
 fn handle_rumble_envelope(
     env: proto::Envelope,
@@ -593,31 +677,73 @@ fn handle_rumble_envelope(
             if let Some(kind) = se.kind {
                 match kind {
                     proto::server_event::Kind::ServerState(ss) => {
-                        let mut state = write_bridge(bridge_state);
-                        state.rumble_rooms = ss.rooms.clone();
-                        state.rumble_users = ss.users.clone();
-
-                        for user in &ss.users {
-                            let rumble_id = user.user_id.as_ref().map(|id| id.value).unwrap_or(0);
-                            // Skip our own virtual users, including ones whose
-                            // registration is still in flight — otherwise they
-                            // get a proxy session and show up as duplicates.
-                            if Some(rumble_id) != state.bridge_user_id
-                                && !state.reverse_virtual_user_map.contains_key(&rumble_id)
-                                && !state
+                        // Full snapshot (initial connect, reconnect refresh, or
+                        // server resync): diff it against the previously
+                        // projected state and broadcast the delta to all
+                        // connected Mumble clients. This is the single
+                        // reconciliation point for anything missed while the
+                        // Rumble connection was down (ghost users, missing
+                        // joins, channel changes) and prunes stale proxy
+                        // sessions.
+                        let (rooms, users) = (ss.rooms.len(), ss.users.len());
+                        let out = {
+                            let mut state = write_bridge(bridge_state);
+                            let state = &mut *state;
+                            // Same skip rules as handle_state_update: never
+                            // give our own user or virtual users (registered
+                            // or in-flight, matched by username) a proxy
+                            // session or broadcast them as duplicates.
+                            let skip = SkipRules {
+                                bridge_user_id: state.bridge_user_id,
+                                virtual_user_ids: state.reverse_virtual_user_map.keys().copied().collect(),
+                                pending_usernames: state
                                     .pending_registrations
                                     .iter()
-                                    .any(|(name, _)| name == &user.username)
-                            {
-                                state.users.get_or_insert(rumble_id);
+                                    .map(|(name, _)| name.clone())
+                                    .collect(),
+                            };
+                            let old_rooms = std::mem::take(&mut state.rumble_rooms);
+                            let old_users = std::mem::take(&mut state.rumble_users);
+                            let out = reconcile::reconcile_server_state(
+                                &old_rooms,
+                                &old_users,
+                                &ss.rooms,
+                                &ss.users,
+                                &mut state.channels,
+                                &mut state.users,
+                                &skip,
+                            );
+                            state.rumble_rooms = ss.rooms;
+                            state.rumble_users = ss.users;
+                            out
+                        };
+                        for rumble_id in &out.removed_user_ids {
+                            rumble_outbound_seq.remove(rumble_id);
+                        }
+                        if !out.messages.is_empty() {
+                            info!(
+                                delta = out.messages.len(),
+                                pruned_users = out.removed_user_ids.len(),
+                                "Reconciled full Rumble state -> broadcasting delta to Mumble clients"
+                            );
+                        }
+                        for msg in &out.messages {
+                            match msg {
+                                SyncMessage::UserRemove(m) => {
+                                    broadcast_to_all_mumble(client_senders, MessageType::UserRemove, m)
+                                }
+                                SyncMessage::UserState(m) => {
+                                    broadcast_to_all_mumble(client_senders, MessageType::UserState, m)
+                                }
+                                SyncMessage::ChannelRemove(m) => {
+                                    broadcast_to_all_mumble(client_senders, MessageType::ChannelRemove, m)
+                                }
+                                SyncMessage::ChannelState(m) => {
+                                    broadcast_to_all_mumble(client_senders, MessageType::ChannelState, m)
+                                }
                             }
                         }
-                        for room in &ss.rooms {
-                            if let Some(uuid) = room.id.as_ref().and_then(rumble_protocol::uuid_from_room_id) {
-                                state.channels.get_or_insert(uuid);
-                            }
-                        }
-                        debug!(rooms = ss.rooms.len(), users = ss.users.len(), "Rumble state refreshed");
+                        debug!(rooms, users, "Rumble state refreshed");
                     }
 
                     proto::server_event::Kind::StateUpdate(su) => {
