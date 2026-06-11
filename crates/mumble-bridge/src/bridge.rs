@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet, VecDeque},
     sync::{Arc, RwLock},
 };
 
@@ -16,7 +16,7 @@ use crate::{
     mumble_voice,
     reconcile::{self, SkipRules, SyncMessage},
     rumble_client,
-    state::BridgeState,
+    state::{BridgeState, ChannelMap},
 };
 
 /// Acquire a read lock, recovering from poison if another thread panicked.
@@ -363,22 +363,32 @@ pub async fn run_bridge(
                     continue;
                 }
 
-                if !target_tree_ids.is_empty() {
-                    // Tree message - send as tree chat to Rumble
-                    let sender_name = {
+                let is_tree = !target_tree_ids.is_empty();
+
+                if let Some(vid) = virtual_user_id {
+                    // Route as the virtual user so the server attributes the
+                    // message to the actual sender and runs the TEXT_MESSAGE ACL
+                    // against the participant, not the bridge. A tree message
+                    // targets the subtree rooted at the first listed channel
+                    // (Mumble allows several targets; the bridge supports the
+                    // primary one, matching the old flattening).
+                    let room_id = if is_tree {
                         let state = read_bridge(&bridge_state);
-                        state
-                            .mumble_clients
-                            .get(&session)
-                            .map(|c| c.username.clone())
-                            .unwrap_or_else(|| format!("session-{}", session))
+                        target_tree_ids
+                            .first()
+                            .and_then(|&ch| {
+                                state
+                                    .channels
+                                    .get_rumble_uuid(ch)
+                                    .or((ch == 0).then_some(rumble_protocol::ROOT_ROOM_UUID))
+                            })
+                            .map(rumble_protocol::room_id_from_uuid)
+                    } else {
+                        None
                     };
-                    if let Err(e) = rumble_client::send_tree_chat(rumble_send, &sender_name, &message).await {
-                        warn!(error = %e, "Failed to send tree chat to Rumble");
-                    }
-                } else if let Some(vid) = virtual_user_id {
-                    // Normal channel message - send as the virtual user via bridge protocol
-                    if let Err(e) = rumble_client::send_participant_chat(rumble_send, vid, &message).await {
+                    if let Err(e) =
+                        rumble_client::send_participant_chat(rumble_send, vid, &message, room_id, is_tree).await
+                    {
                         warn!(error = %e, "Failed to send ParticipantChat to Rumble");
                     }
                 } else {
@@ -392,44 +402,48 @@ pub async fn run_bridge(
                             .unwrap_or_else(|| format!("session-{}", session))
                     };
                     let prefixed = format!("[{}] {}", username, message);
-                    if let Err(e) = rumble_client::send_chat(rumble_send, &config.bridge_name, &prefixed).await {
+                    if let Err(e) = rumble_client::send_chat(rumble_send, &config.bridge_name, &prefixed, is_tree).await
+                    {
                         warn!(error = %e, "Failed to send chat to Rumble");
                     }
                 }
 
                 // Also deliver locally to other Mumble clients (the server never
-                // echoes a participant's chat back to its own controller). Tree
-                // messages go to everyone; plain channel messages only to clients
-                // in the sender's channel, matching murmur's room scoping.
-                let sender_channel_id = {
-                    let state = read_bridge(&bridge_state);
-                    state.mumble_clients.get(&session).map(|c| c.channel_id).unwrap_or(0)
+                // echoes a participant's chat back to its own controller). Plain
+                // channel messages go only to clients in the sender's channel;
+                // tree messages only to clients in the targeted subtree(s),
+                // matching murmur's room scoping.
+                let state = read_bridge(&bridge_state);
+                let (origin_channel, target_channels) = if is_tree {
+                    let mut set = HashSet::new();
+                    for &ch in &target_tree_ids {
+                        set.extend(collect_subtree_channels(&state.rumble_rooms, &state.channels, ch));
+                    }
+                    (target_tree_ids[0], set)
+                } else {
+                    let ch = state.mumble_clients.get(&session).map(|c| c.channel_id).unwrap_or(0);
+                    (ch, HashSet::from([ch]))
                 };
                 let text_msg = mumble::TextMessage {
                     actor: Some(session),
-                    channel_id: vec![sender_channel_id],
+                    channel_id: vec![origin_channel],
                     message: Some(message),
                     ..Default::default()
                 };
-                if !target_tree_ids.is_empty() {
-                    broadcast_to_mumble_except(client_senders, session, MessageType::TextMessage, &text_msg);
-                } else {
-                    let payload = text_msg.encode_to_vec();
-                    let state = read_bridge(&bridge_state);
-                    for (&client_session, sender) in client_senders.iter() {
-                        if client_session == session {
-                            continue;
-                        }
-                        let in_channel = state
-                            .mumble_clients
-                            .get(&client_session)
-                            .is_some_and(|c| c.channel_id == sender_channel_id);
-                        if in_channel {
-                            let _ = sender.tx.send(MumbleOutbound::Protobuf {
-                                msg_type: MessageType::TextMessage as u16,
-                                payload: payload.clone(),
-                            });
-                        }
+                let payload = text_msg.encode_to_vec();
+                for (&client_session, sender) in client_senders.iter() {
+                    if client_session == session {
+                        continue;
+                    }
+                    let in_target = state
+                        .mumble_clients
+                        .get(&client_session)
+                        .is_some_and(|c| target_channels.contains(&c.channel_id));
+                    if in_target {
+                        let _ = sender.tx.send(MumbleOutbound::Protobuf {
+                            msg_type: MessageType::TextMessage as u16,
+                            payload: payload.clone(),
+                        });
                     }
                 }
             }
@@ -752,20 +766,29 @@ fn handle_rumble_envelope(
 
                     proto::server_event::Kind::ChatBroadcast(cb) => {
                         let text = format!("{}: {}", cb.sender, cb.text);
+                        let is_tree = cb.tree.unwrap_or(false);
 
-                        // Resolve the sender username to a Mumble session ID for proper
-                        // message attribution in Mumble clients.
-                        let actor = {
+                        // Resolve the sender for attribution (Mumble session ID)
+                        // and room scoping. The server only sent this broadcast
+                        // because someone in the sender's room (subtree, if tree)
+                        // should see it — mirror that scoping here instead of
+                        // fanning out to every connected Mumble client.
+                        let (actor, targets) = {
                             let state = read_bridge(bridge_state);
-                            // Find the Rumble user_id for this sender by matching username
-                            let rumble_user_id = state.rumble_users.iter().find_map(|u| {
-                                if u.username == cb.sender {
-                                    u.user_id.as_ref().map(|id| id.value)
-                                } else {
-                                    None
-                                }
-                            });
-                            rumble_user_id.and_then(|rid| {
+                            // Prefer the server-assigned sender_id (0 = unset on
+                            // older servers); fall back to a username match.
+                            let rumble_user_id = if cb.sender_id != 0 {
+                                Some(cb.sender_id)
+                            } else {
+                                state.rumble_users.iter().find_map(|u| {
+                                    if u.username == cb.sender {
+                                        u.user_id.as_ref().map(|id| id.value)
+                                    } else {
+                                        None
+                                    }
+                                })
+                            };
+                            let actor = rumble_user_id.and_then(|rid| {
                                 // Check if this is one of our virtual users (Mumble client)
                                 state
                                     .reverse_virtual_user_map
@@ -773,16 +796,52 @@ fn handle_rumble_envelope(
                                     .copied()
                                     // Otherwise look up as a remote Rumble user
                                     .or_else(|| state.users.get_mumble_session(rid))
-                            })
+                            });
+                            let targets =
+                                resolve_chat_sender_channel(&state, cb.sender_id, &cb.sender).map(|sender_channel| {
+                                    let set = if is_tree {
+                                        collect_subtree_channels(&state.rumble_rooms, &state.channels, sender_channel)
+                                    } else {
+                                        HashSet::from([sender_channel])
+                                    };
+                                    (sender_channel, set)
+                                });
+                            (actor, targets)
                         };
 
-                        let text_msg = mumble::TextMessage {
-                            actor,
-                            channel_id: vec![0],
-                            message: Some(text),
-                            ..Default::default()
-                        };
-                        broadcast_to_all_mumble(client_senders, MessageType::TextMessage, &text_msg);
+                        if let Some((sender_channel, target_channels)) = targets {
+                            let text_msg = mumble::TextMessage {
+                                actor,
+                                channel_id: vec![sender_channel],
+                                message: Some(text),
+                                ..Default::default()
+                            };
+                            let payload = text_msg.encode_to_vec();
+                            let state = read_bridge(bridge_state);
+                            for (&client_session, sender) in client_senders.iter() {
+                                let in_target = state
+                                    .mumble_clients
+                                    .get(&client_session)
+                                    .is_some_and(|c| target_channels.contains(&c.channel_id));
+                                if in_target {
+                                    let _ = sender.tx.send(MumbleOutbound::Protobuf {
+                                        msg_type: MessageType::TextMessage as u16,
+                                        payload: payload.clone(),
+                                    });
+                                }
+                            }
+                        } else {
+                            // The sender's room couldn't be resolved (e.g. a
+                            // hidden author not in the roster) — over-delivering
+                            // beats dropping, so keep the broadcast-to-all path.
+                            let text_msg = mumble::TextMessage {
+                                actor,
+                                channel_id: vec![0],
+                                message: Some(text),
+                                ..Default::default()
+                            };
+                            broadcast_to_all_mumble(client_senders, MessageType::TextMessage, &text_msg);
+                        }
                     }
 
                     proto::server_event::Kind::DirectMessageReceived(dm) => {
@@ -1275,5 +1334,254 @@ fn broadcast_to_mumble_except(
             msg_type: msg_type as u16,
             payload: payload.clone(),
         });
+    }
+}
+
+/// Resolve the Mumble channel of a `ChatBroadcast` sender.
+///
+/// Checks the bridge's own virtual users first (the sender is a Mumble client
+/// on this bridge), then the cached Rumble roster (`current_room` mapped
+/// through the channel map). `sender_id` 0 means "unset" (older servers); in
+/// that case — or when the id is in neither cache — a username match is
+/// attempted. Returns `None` when the sender's room cannot be resolved at all;
+/// the caller falls back to broadcast-to-all (over-delivering beats dropping).
+pub(crate) fn resolve_chat_sender_channel(state: &BridgeState, sender_id: u64, sender_name: &str) -> Option<u32> {
+    if sender_id != 0 {
+        if let Some(session) = state.reverse_virtual_user_map.get(&sender_id)
+            && let Some(client) = state.mumble_clients.get(session)
+        {
+            return Some(client.channel_id);
+        }
+        if let Some(channel) = state
+            .rumble_users
+            .iter()
+            .find(|u| u.user_id.as_ref().map(|id| id.value) == Some(sender_id))
+            .and_then(|u| roster_user_channel(state, u))
+        {
+            return Some(channel);
+        }
+    }
+    // Username fallback: sender_id unset (older server) or unknown.
+    if let Some(client) = state.mumble_clients.values().find(|c| c.username == sender_name) {
+        return Some(client.channel_id);
+    }
+    state
+        .rumble_users
+        .iter()
+        .find(|u| u.username == sender_name)
+        .and_then(|u| roster_user_channel(state, u))
+}
+
+/// Map a cached roster user's `current_room` to its Mumble channel.
+fn roster_user_channel(state: &BridgeState, user: &proto::User) -> Option<u32> {
+    let uuid = user
+        .current_room
+        .as_ref()
+        .and_then(rumble_protocol::uuid_from_room_id)?;
+    state
+        .channels
+        .get_mumble_id(&uuid)
+        // Channel 0 is always Root, even before the map has seen the root room.
+        .or((uuid == rumble_protocol::ROOT_ROOM_UUID).then_some(0))
+}
+
+/// Collect the Mumble channel IDs of `root_channel` plus all of its
+/// descendants, walking the cached Rumble room tree's parent links through the
+/// channel map. Rooms without a `parent_id` hang directly under Root. The
+/// visited set guards against malformed parent-link cycles, so the walk always
+/// terminates.
+pub(crate) fn collect_subtree_channels(
+    rooms: &[proto::RoomInfo],
+    channels: &ChannelMap,
+    root_channel: u32,
+) -> HashSet<u32> {
+    let mut result = HashSet::from([root_channel]);
+
+    let root_uuid = match channels
+        .get_rumble_uuid(root_channel)
+        // Channel 0 is always Root, even before the map has seen the root room.
+        .or((root_channel == 0).then_some(rumble_protocol::ROOT_ROOM_UUID))
+    {
+        Some(uuid) => uuid,
+        None => return result,
+    };
+
+    // Parent UUID -> child room UUIDs. The Root room itself is skipped to
+    // avoid a self-edge (its parent_id is unset, like root-level rooms').
+    let mut children: HashMap<uuid::Uuid, Vec<uuid::Uuid>> = HashMap::new();
+    for room in rooms {
+        let Some(id) = room.id.as_ref().and_then(rumble_protocol::uuid_from_room_id) else {
+            continue;
+        };
+        if id == rumble_protocol::ROOT_ROOM_UUID {
+            continue;
+        }
+        let parent = room
+            .parent_id
+            .as_ref()
+            .and_then(rumble_protocol::uuid_from_room_id)
+            .unwrap_or(rumble_protocol::ROOT_ROOM_UUID);
+        children.entry(parent).or_default().push(id);
+    }
+
+    let mut visited = HashSet::from([root_uuid]);
+    let mut queue = VecDeque::from([root_uuid]);
+    while let Some(current) = queue.pop_front() {
+        if let Some(kids) = children.get(&current) {
+            for &kid in kids {
+                if visited.insert(kid) {
+                    queue.push_back(kid);
+                    if let Some(ch) = channels.get_mumble_id(&kid) {
+                        result.insert(ch);
+                    }
+                }
+            }
+        }
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::MumbleClient;
+    use uuid::Uuid;
+
+    fn room(id: Uuid, parent: Option<Uuid>) -> proto::RoomInfo {
+        proto::RoomInfo {
+            id: Some(rumble_protocol::room_id_from_uuid(id)),
+            parent_id: parent.map(rumble_protocol::room_id_from_uuid),
+            ..Default::default()
+        }
+    }
+
+    fn roster_user(user_id: u64, username: &str, current_room: Uuid) -> proto::User {
+        proto::User {
+            user_id: Some(proto::UserId { value: user_id }),
+            username: username.to_string(),
+            current_room: Some(rumble_protocol::room_id_from_uuid(current_room)),
+            ..Default::default()
+        }
+    }
+
+    fn mumble_client(session: u32, username: &str, channel_id: u32) -> MumbleClient {
+        MumbleClient {
+            session,
+            username: username.to_string(),
+            channel_id,
+            is_muted: false,
+            is_deafened: false,
+        }
+    }
+
+    /// Root(0) <- a, Root(0) <- c, a <- b. `a` encodes its root parent
+    /// explicitly while `c` uses the unset-parent form; both mean "directly
+    /// under Root" and must be treated identically.
+    fn sample_tree() -> (Vec<proto::RoomInfo>, ChannelMap, [u32; 3]) {
+        let root = rumble_protocol::ROOT_ROOM_UUID;
+        let a = Uuid::from_u128(0xA);
+        let b = Uuid::from_u128(0xB);
+        let c = Uuid::from_u128(0xC);
+        let mut channels = ChannelMap::new();
+        channels.get_or_insert(root);
+        let ch_a = channels.get_or_insert(a);
+        let ch_b = channels.get_or_insert(b);
+        let ch_c = channels.get_or_insert(c);
+        let rooms = vec![room(root, None), room(a, Some(root)), room(b, Some(a)), room(c, None)];
+        (rooms, channels, [ch_a, ch_b, ch_c])
+    }
+
+    #[test]
+    fn subtree_of_leaf_is_just_the_room() {
+        let (rooms, channels, [_, ch_b, _]) = sample_tree();
+        assert_eq!(collect_subtree_channels(&rooms, &channels, ch_b), HashSet::from([ch_b]));
+    }
+
+    #[test]
+    fn subtree_includes_nested_descendants() {
+        let (rooms, channels, [ch_a, ch_b, _]) = sample_tree();
+        assert_eq!(
+            collect_subtree_channels(&rooms, &channels, ch_a),
+            HashSet::from([ch_a, ch_b])
+        );
+    }
+
+    #[test]
+    fn subtree_from_root_channel_covers_everything() {
+        let (rooms, channels, [ch_a, ch_b, ch_c]) = sample_tree();
+        assert_eq!(
+            collect_subtree_channels(&rooms, &channels, 0),
+            HashSet::from([0, ch_a, ch_b, ch_c])
+        );
+    }
+
+    #[test]
+    fn subtree_of_unmapped_channel_is_just_the_channel() {
+        let (rooms, channels, _) = sample_tree();
+        assert_eq!(collect_subtree_channels(&rooms, &channels, 99), HashSet::from([99]));
+    }
+
+    #[test]
+    fn subtree_terminates_on_parent_cycle() {
+        let x = Uuid::from_u128(1);
+        let y = Uuid::from_u128(2);
+        let mut channels = ChannelMap::new();
+        let ch_x = channels.get_or_insert(x);
+        let ch_y = channels.get_or_insert(y);
+        // Malformed state: x and y are each other's parent.
+        let rooms = vec![room(x, Some(y)), room(y, Some(x))];
+        assert_eq!(
+            collect_subtree_channels(&rooms, &channels, ch_x),
+            HashSet::from([ch_x, ch_y])
+        );
+    }
+
+    #[test]
+    fn resolve_virtual_user_by_sender_id() {
+        let mut state = BridgeState::new();
+        state.reverse_virtual_user_map.insert(42, 1000);
+        state.mumble_clients.insert(1000, mumble_client(1000, "alice", 5));
+        assert_eq!(resolve_chat_sender_channel(&state, 42, "alice"), Some(5));
+    }
+
+    #[test]
+    fn resolve_roster_user_by_sender_id() {
+        let mut state = BridgeState::new();
+        let room_uuid = Uuid::from_u128(7);
+        let ch = state.channels.get_or_insert(room_uuid);
+        state.rumble_users.push(roster_user(9, "bob", room_uuid));
+        assert_eq!(resolve_chat_sender_channel(&state, 9, "bob"), Some(ch));
+    }
+
+    #[test]
+    fn resolve_roster_user_in_root_room_without_channel_mapping() {
+        // The roster user sits in Root, but the channel map has never seen the
+        // root room — channel 0 must still resolve.
+        let mut state = BridgeState::new();
+        state
+            .rumble_users
+            .push(roster_user(9, "bob", rumble_protocol::ROOT_ROOM_UUID));
+        assert_eq!(resolve_chat_sender_channel(&state, 9, "bob"), Some(0));
+    }
+
+    #[test]
+    fn resolve_falls_back_to_username_when_sender_id_unset() {
+        let mut state = BridgeState::new();
+        let room_uuid = Uuid::from_u128(7);
+        let ch = state.channels.get_or_insert(room_uuid);
+        state.rumble_users.push(roster_user(9, "bob", room_uuid));
+        state.mumble_clients.insert(1000, mumble_client(1000, "alice", 3));
+        // Older server: sender_id == 0, only the username identifies the sender.
+        assert_eq!(resolve_chat_sender_channel(&state, 0, "bob"), Some(ch));
+        assert_eq!(resolve_chat_sender_channel(&state, 0, "alice"), Some(3));
+    }
+
+    #[test]
+    fn resolve_unknown_sender_is_none() {
+        // Unresolvable sender (e.g. a hidden author in no cache): callers fall
+        // back to broadcast-to-all, since over-delivering beats dropping.
+        let state = BridgeState::new();
+        assert_eq!(resolve_chat_sender_channel(&state, 0, "ghost"), None);
+        assert_eq!(resolve_chat_sender_channel(&state, 1234, "ghost"), None);
     }
 }
