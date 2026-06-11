@@ -666,6 +666,14 @@ impl AudioTaskHandle {
     pub fn send(&self, cmd: AudioCommand) {
         let _ = self.command_tx.send(cmd);
     }
+
+    /// Test-only constructor wrapping a raw command channel so unit
+    /// tests (e.g. the projection's) can observe dispatched commands
+    /// without spawning a real audio task.
+    #[cfg(test)]
+    pub(crate) fn from_raw(command_tx: mpsc::UnboundedSender<AudioCommand>) -> Self {
+        Self { command_tx }
+    }
 }
 
 /// Configuration for the audio task.
