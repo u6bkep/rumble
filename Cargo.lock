@@ -5130,7 +5130,7 @@ checksum = "4ade083ccbb4bf536df69d1f6432cc23deb7acccff86b183f3923a6fd56a1153"
 
 [[package]]
 name = "rumble-admin-web"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "damascene-core",
  "damascene-web",
@@ -5329,7 +5329,7 @@ dependencies = [
 
 [[package]]
 name = "rumble-web-types"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "serde",
 ]
