@@ -34,7 +34,11 @@ use rumble_client_traits::file_transfer::TransferStatus;
 use rumble_desktop_shell::ChatSettings;
 use rumble_protocol::{permissions::Permissions, proto::RelayFileSharePayload};
 
-use crate::{animated_gpu::AnimatedGpu, media_cache::MediaCache, theme as palette};
+use crate::{
+    animated_gpu::AnimatedSurface,
+    media_cache::{MediaCache, MediaKind, MediaTouch},
+    theme as palette,
+};
 
 /// Active file-transfer status keyed by `transfer_id`. Built once per
 /// frame from `BackendHandle::transfers()` and threaded through the
@@ -298,18 +302,19 @@ fn history(
         .collect();
     let keys: Vec<String> = msgs.iter().map(|m| chat_row_key(m)).collect();
 
-    // Attachments (images/gifs/video thumbs/file cards) borrow live GPU textures
-    // and transfer state out of the media cache, which `build_row` can't capture.
-    // Pre-render just the attachment messages here, eagerly (O(attachments) — a
-    // small fraction of a backlog) and clone the El into the row when realized.
-    // NOTE: this keeps every backlog image's texture resident even off-screen;
-    // culling invisible media is tracked separately (needs a visible-range →
-    // cache-eviction loop the virtual list can't express today). See issue #16.
-    let mut attachment_els: HashMap<usize, El> = HashMap::new();
+    // Attachments (images/gifs/video thumbs/file cards) need media-cache and
+    // transfer state that `build_row` (`'static + Send + Sync`) can't borrow.
+    // Snapshot it per attachment message instead — all Arc bumps and small
+    // copies, no decode work. Crucially the snapshot uses non-touching peeks:
+    // only rows the virtual list actually realizes (i.e. visible ones) record
+    // an LRU touch, so the media cache's byte-budget eviction (issue #37) sees
+    // off-screen backlog media as evictable, and an evicted entry re-decodes
+    // when its row scrolls back into view. That's the visible-range →
+    // cache-eviction loop of issue #16, expressed through lazy realization.
+    let mut attachments: HashMap<usize, AttachmentRow> = HashMap::new();
     for (i, msg) in msgs.iter().enumerate() {
         if let Some(att) = msg.attachment.as_ref() {
-            let view = attachment_view(att, media_cache, transfers);
-            attachment_els.insert(i, render_attachment_view(view, rows[i].is_own, pending_cancel_confirm));
+            attachments.insert(i, attachment_row(att, media_cache, transfers));
         }
     }
 
@@ -317,13 +322,19 @@ fn history(
     let keys = Arc::new(keys);
     let keys_for_key = keys.clone();
     let settings = chat_settings.clone();
+    let attachments = Arc::new(attachments);
+    let touch = media_cache.touch_handle();
+    let pending_cancel_confirm = Arc::new(pending_cancel_confirm.clone());
 
     virtual_list_dyn(
         count,
         CHAT_ROW_EST_HEIGHT,
         move |i| keys_for_key[i].clone(),
         move |i| {
-            let attachment = attachment_els.get(&i).cloned();
+            let attachment = attachments.get(&i).map(|row| {
+                row.record_use(&touch);
+                render_attachment_view(row, rows[i].is_own, &pending_cancel_confirm)
+            });
             render_chat_row(&rows[i], &settings, attachment)
         },
     )
@@ -467,24 +478,29 @@ fn render_chat_row(entry: &ChatRow, chat_settings: &ChatSettings, attachment: Op
 /// render before any El is built. The variants encode the dispatch
 /// precedence as data — `Failed` always beats every preview variant,
 /// `Image` beats `Video`, `Video` beats the plain `File` card.
-enum AttachmentView<'a> {
+/// Owned snapshot of everything one attachment row needs to render,
+/// cloned out of the `MediaCache`/`TransferMap` while `history()` still
+/// holds the frame's borrows (all `Arc` bumps and small copies). The
+/// virtual list realizes it into an El only when the row scrolls into
+/// view; [`Self::record_use`] runs at that moment.
+enum AttachmentRow {
     Image {
         offer: RelayFileSharePayload,
-        cached: &'a CachedImage,
-        playback: Option<&'a GifPlayback>,
-        gpu: Option<&'a AnimatedGpu>,
+        cached: CachedImage,
+        playback: Option<GifPlayback>,
+        gpu: Option<AnimatedSurface>,
     },
     Video {
         offer: RelayFileSharePayload,
-        thumb: &'a Image,
+        thumb: Image,
     },
     Model {
         offer: RelayFileSharePayload,
-        thumb: &'a Image,
+        thumb: Image,
     },
     File {
         offer: RelayFileSharePayload,
-        status: Option<&'a TransferStatus>,
+        status: Option<TransferStatus>,
     },
     Failed {
         offer: RelayFileSharePayload,
@@ -495,20 +511,38 @@ enum AttachmentView<'a> {
     },
 }
 
-fn attachment_view<'a>(
+impl AttachmentRow {
+    /// Record this row's media use at realization time. A hit keeps the
+    /// entry's cache family alive past the next LRU eviction pass; a
+    /// `File` card notes re-decode demand — if the id was previously
+    /// decoded media that got evicted, next frame's demand drain
+    /// re-spawns the decode from disk (ids that were never media are
+    /// filtered out there by the `sources` lookup).
+    fn record_use(&self, touch: &MediaTouch) {
+        match self {
+            AttachmentRow::Image { offer, .. } => touch.touch(MediaKind::Image, &offer.transfer_id),
+            AttachmentRow::Video { offer, .. } => touch.touch(MediaKind::VideoThumb, &offer.transfer_id),
+            AttachmentRow::Model { offer, .. } => touch.touch(MediaKind::Model, &offer.transfer_id),
+            AttachmentRow::File { offer, .. } => touch.note_miss(&offer.transfer_id),
+            AttachmentRow::Failed { .. } | AttachmentRow::UnknownPlugin { .. } => {}
+        }
+    }
+}
+
+fn attachment_row(
     att: &rumble_protocol::ChatAttachment,
-    media_cache: &'a MediaCache,
-    transfers: &'a TransferMap,
-) -> AttachmentView<'a> {
+    media_cache: &MediaCache,
+    transfers: &TransferMap,
+) -> AttachmentRow {
     use rumble_client_traits::file_transfer::TransferStage;
 
     if att.namespace != rumble_desktop::FILE_TRANSFER_RELAY_NAMESPACE {
-        return AttachmentView::UnknownPlugin {
+        return AttachmentRow::UnknownPlugin {
             text: att.fallback_text.clone(),
         };
     }
     let Some(offer) = rumble_desktop::decode_relay_payload(&att.payload) else {
-        return AttachmentView::UnknownPlugin {
+        return AttachmentRow::UnknownPlugin {
             text: att.fallback_text.clone(),
         };
     };
@@ -518,48 +552,59 @@ fn attachment_view<'a>(
     if let Some(s) = status
         && let TransferStage::Failed { reason } = &s.stage
     {
-        return AttachmentView::Failed {
+        return AttachmentRow::Failed {
             offer,
             reason: reason.clone(),
         };
     }
 
-    if let Some(cached) = media_cache.image_for(&offer.transfer_id) {
-        return AttachmentView::Image {
-            cached,
-            playback: media_cache.gif_playback_for(&offer.transfer_id),
-            gpu: media_cache.animated_gpu_for(&offer.transfer_id),
+    if let Some(cached) = media_cache.peek_image_for(&offer.transfer_id) {
+        return AttachmentRow::Image {
+            cached: cached.clone(),
+            playback: media_cache.gif_playback_for(&offer.transfer_id).cloned(),
+            gpu: media_cache
+                .animated_gpu_for(&offer.transfer_id)
+                .map(|gpu| gpu.surface_handle()),
             offer,
         };
     }
-    if let Some(thumb) = media_cache.video_thumb_for(&offer.transfer_id) {
-        return AttachmentView::Video { offer, thumb };
+    if let Some(thumb) = media_cache.peek_video_thumb_for(&offer.transfer_id) {
+        return AttachmentRow::Video {
+            offer,
+            thumb: thumb.clone(),
+        };
     }
-    if let Some(thumb) = media_cache.model_thumb_for(&offer.transfer_id) {
-        return AttachmentView::Model { offer, thumb };
+    if let Some(thumb) = media_cache.peek_model_thumb_for(&offer.transfer_id) {
+        return AttachmentRow::Model {
+            offer,
+            thumb: thumb.clone(),
+        };
     }
-    AttachmentView::File { offer, status }
+    AttachmentRow::File {
+        offer,
+        status: status.cloned(),
+    }
 }
 
 fn render_attachment_view(
-    view: AttachmentView<'_>,
+    view: &AttachmentRow,
     is_local_sender: bool,
     pending_cancel_confirm: &HashMap<String, Instant>,
 ) -> El {
     match view {
-        AttachmentView::Image {
+        AttachmentRow::Image {
             offer,
             cached,
             playback,
             gpu,
-        } => image_preview::image_preview(&offer, cached, playback, gpu),
-        AttachmentView::Video { offer, thumb } => image_preview::video_preview(&offer, thumb),
-        AttachmentView::Model { offer, thumb } => image_preview::model_preview(&offer, thumb),
-        AttachmentView::File { offer, status } => {
-            file_card::file_offer_card(&offer, status, is_local_sender, pending_cancel_confirm)
+        } => image_preview::image_preview(offer, cached, playback.as_ref(), gpu.as_ref()),
+        AttachmentRow::Video { offer, thumb } => image_preview::video_preview(offer, thumb),
+        AttachmentRow::Model { offer, thumb } => image_preview::model_preview(offer, thumb),
+        AttachmentRow::File { offer, status } => {
+            file_card::file_offer_card(offer, status.as_ref(), is_local_sender, pending_cancel_confirm)
         }
-        AttachmentView::Failed { offer, reason } => file_card::failed_card(&offer, &reason, is_local_sender),
-        AttachmentView::UnknownPlugin { text } => paragraph(text)
+        AttachmentRow::Failed { offer, reason } => file_card::failed_card(offer, reason, is_local_sender),
+        AttachmentRow::UnknownPlugin { text } => paragraph(text.clone())
             .muted()
             .italic()
             .font_size(tokens::TEXT_XS.size)

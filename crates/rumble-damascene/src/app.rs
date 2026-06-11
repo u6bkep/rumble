@@ -285,6 +285,10 @@ impl<B: UiBackend> RumbleApp<B> {
 
         let runtime_handle_for_media_cache = runtime.handle().clone();
         let initial_gif_autoplay = settings.settings().chat.gif_autoplay;
+        // Off-thread decode completions poke a repaint so demand
+        // re-decodes (evicted media scrolling back into view) land
+        // without waiting for the next input event.
+        let media_cache_repaint = backend.repaint_arc();
         Self {
             backend,
             identity,
@@ -312,7 +316,11 @@ impl<B: UiBackend> RumbleApp<B> {
             sfx: crate::sfx::SfxEngine::default(),
             pending_file_dialog: None,
             auto_handled_offers: HashSet::new(),
-            media_cache: crate::media_cache::MediaCache::new(runtime_handle_for_media_cache, initial_gif_autoplay),
+            media_cache: crate::media_cache::MediaCache::new(
+                runtime_handle_for_media_cache,
+                initial_gif_autoplay,
+                media_cache_repaint,
+            ),
             lightboxes: crate::lightbox::Lightboxes::default(),
             file_context_menu: None,
             pending_save_as: None,

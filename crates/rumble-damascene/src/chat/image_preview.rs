@@ -7,7 +7,7 @@ use std::{
 use damascene_core::{prelude::*, surface::SurfaceAlpha};
 use rumble_protocol::proto::RelayFileSharePayload;
 
-use crate::animated_gpu::AnimatedGpu;
+use crate::animated_gpu::{AnimatedGpu, AnimatedSurface};
 
 use super::{format_size, gif_lightbox_key, gif_play_key, preview_key};
 
@@ -33,10 +33,12 @@ pub type AnimatedTextureMap = HashMap<String, AnimatedGpu>;
 /// swap a `file_offer_card` for a `video_preview` card.
 pub type VideoThumbMap = HashMap<String, Image>;
 
-/// Per-message GIF playback state, keyed by `transfer_id`. Lives on the
-/// App separate from the cache so a re-decode (e.g. cache eviction +
-/// repopulation) doesn't reset playback position. Static images don't
-/// need an entry — the absence of a key is "n/a".
+/// Per-message GIF playback state, keyed by `transfer_id`. Lives in the
+/// `MediaCache` as part of the animated entry's family: an LRU eviction
+/// drops it with the frames, so an evict + re-decode cycle restarts
+/// playback at frame 0 with the autoplay default (acceptable — it only
+/// happens under byte-budget pressure for off-screen rows). Static
+/// images don't need an entry — the absence of a key is "n/a".
 #[derive(Clone, Debug)]
 pub struct GifPlayback {
     /// Index into the animated cache entry's `frames` vec.
@@ -189,7 +191,7 @@ pub(super) fn image_preview(
     offer: &RelayFileSharePayload,
     cached: &CachedImage,
     playback: Option<&GifPlayback>,
-    gpu: Option<&AnimatedGpu>,
+    gpu: Option<&AnimatedSurface>,
 ) -> El {
     const PREVIEW_HEIGHT: f32 = 400.0;
 
@@ -411,7 +413,7 @@ pub(super) fn model_preview(offer: &RelayFileSharePayload, thumb: &Image) -> El 
 /// Build the surface-based preview for an animated entry.
 fn animated_surface_preview(
     transfer_id: &str,
-    gpu: &AnimatedGpu,
+    gpu: &AnimatedSurface,
     is_playing: bool,
     next_frame_in: Option<Duration>,
     preview_height: f32,
@@ -419,9 +421,9 @@ fn animated_surface_preview(
     /// Cap on the inscribed surface width.
     const PREVIEW_MAX_WIDTH: f32 = 480.0;
 
-    let (tw, th) = gpu.size();
+    let (tw, th) = gpu.size;
 
-    let mut surface_el = surface(gpu.app_texture().clone())
+    let mut surface_el = surface(gpu.texture.clone())
         .surface_alpha(SurfaceAlpha::Straight)
         .width(Size::Fill(1.0))
         .height(Size::Fill(1.0))

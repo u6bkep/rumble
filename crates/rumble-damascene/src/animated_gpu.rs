@@ -15,6 +15,17 @@ use std::{sync::Arc, time::Duration};
 
 use damascene_core::{prelude::Image, surface::AppTexture};
 
+/// Owned, cheap-clone handle to an animated entry's GPU surface —
+/// everything the chat preview El needs from an [`AnimatedGpu`]
+/// (`Arc`-backed texture wrapper + pixel size). Snapshotted per frame
+/// so the virtual list's `'static` row closures can build the
+/// `surface(...)` El without borrowing the media cache.
+#[derive(Clone, Debug)]
+pub struct AnimatedSurface {
+    pub texture: AppTexture,
+    pub size: (u32, u32),
+}
+
 /// Per-entry GPU mirror of a [`crate::chat::CachedImage::Animated`].
 #[derive(Debug)]
 pub struct AnimatedGpu {
@@ -73,6 +84,14 @@ impl AnimatedGpu {
     /// Pixel size of the underlying texture.
     pub fn size(&self) -> (u32, u32) {
         self.size
+    }
+
+    /// Owned snapshot for the chat row closures (Arc bumps only).
+    pub fn surface_handle(&self) -> AnimatedSurface {
+        AnimatedSurface {
+            texture: self.app_texture.clone(),
+            size: self.size,
+        }
     }
 
     /// Upload `frames[idx]` if it isn't already on the GPU. Returns
