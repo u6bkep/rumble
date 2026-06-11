@@ -87,6 +87,9 @@ mod native {
                         apply_here: true,
                         apply_subs: true,
                     }],
+                    // Fixture token only — lint scenes never save, so any
+                    // non-zero value works.
+                    acl_version: 1,
                 },
                 RoomDto {
                     id: "lobby".into(),
@@ -101,6 +104,7 @@ mod native {
                         apply_here: true,
                         apply_subs: false,
                     }],
+                    acl_version: 2,
                 },
             ],
             groups: vec![

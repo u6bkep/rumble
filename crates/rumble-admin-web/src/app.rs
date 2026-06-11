@@ -49,12 +49,11 @@ const KEY_GROUP_CREATE: &str = "group:create";
 const KEY_GROUP_DEL: &str = "group:del:"; // + name
 const KEY_GROUP_EDIT: &str = "group:edit:"; // + name
 
-// group permission editor
+// group permission editor (every change dispatches immediately — no Save)
 const KEY_GE_PERM: &str = "ge:perm:"; // + 8-hex bit
 const KEY_GE_ALL: &str = "ge:all";
 const KEY_GE_CLEAR: &str = "ge:clear";
-const KEY_GE_SAVE: &str = "ge:save";
-const KEY_GE_CANCEL: &str = "ge:cancel";
+const KEY_GE_DONE: &str = "ge:done";
 
 // room ACL editor
 const KEY_ROOM_ACL: &str = "room:acl:"; // + uuid
@@ -255,7 +254,11 @@ impl AclEntry {
     }
 }
 
-/// In-progress group base-permission edit.
+/// Open group base-permission editor. There is no pending-save snapshot:
+/// each switch dispatches an atomic per-bit delta immediately
+/// ([`api::toggle_group_permission`]) so two admins toggling different bits
+/// concurrently both land (#38). `permissions` mirrors the changes
+/// optimistically so the switches track intent before the refetch lands.
 struct GroupEdit {
     name: String,
     is_builtin: bool,
@@ -280,6 +283,11 @@ struct AclEdit {
     entries: Vec<AclEntry>,
     /// Index of the expanded entry card, at most one at a time.
     expanded: Option<usize>,
+    /// The [`RoomDto::acl_version`] of the snapshot this editor copied at
+    /// open. Echoed on save so the server rejects a stale write instead of
+    /// clobbering another admin's concurrent edit (#38); the rejection shows
+    /// in the status line and the snapshot refetch brings the fresh rules.
+    base_version: u64,
 }
 
 /// Parse a per-entry route `ae:e:<idx>:<action>[:<payload>]`.
@@ -707,30 +715,32 @@ impl AdminApp {
     }
 
     /// Route a click while the group editor is open. Returns true if consumed.
+    ///
+    /// Every mutation dispatches immediately. Per-switch clicks send an atomic
+    /// per-bit delta (`enable` = the switch's new state) instead of an absolute
+    /// bitmask computed from a possibly-stale snapshot, which would silently
+    /// revert another admin's concurrent toggle (#38). "+ all" / "Clear all"
+    /// stay absolute — there the user's intent really is the whole mask.
     fn handle_group_edit_click(&mut self, route: &str) -> bool {
         if self.editing_group.is_none() {
             return false;
         }
         match route {
-            KEY_GE_CANCEL => {
+            KEY_GE_DONE => {
                 self.editing_group = None;
-                return true;
-            }
-            KEY_GE_SAVE => {
-                if let Some(ge) = self.editing_group.take() {
-                    api::modify_group(self.inbox.clone(), ge.name, ge.permissions);
-                }
                 return true;
             }
             KEY_GE_ALL => {
                 if let Some(ge) = self.editing_group.as_mut() {
                     ge.permissions = all_perm_bits();
+                    api::modify_group(self.inbox.clone(), ge.name.clone(), ge.permissions);
                 }
                 return true;
             }
             KEY_GE_CLEAR => {
                 if let Some(ge) = self.editing_group.as_mut() {
                     ge.permissions = 0;
+                    api::modify_group(self.inbox.clone(), ge.name.clone(), 0);
                 }
                 return true;
             }
@@ -740,7 +750,9 @@ impl AdminApp {
             && let Ok(bit) = u32::from_str_radix(hex, 16)
         {
             if let Some(ge) = self.editing_group.as_mut() {
+                let enable = ge.permissions & bit == 0;
                 ge.permissions ^= bit;
+                api::toggle_group_permission(self.inbox.clone(), ge.name.clone(), bit, enable);
             }
             return true;
         }
@@ -769,6 +781,7 @@ impl AdminApp {
                 inherit_acl: r.inherit_acl,
                 entries,
                 expanded: None,
+                base_version: r.acl_version,
             });
             self.editing_group = None;
         }
@@ -800,6 +813,7 @@ impl AdminApp {
                     let req = SetRoomAclRequest {
                         inherit_acl: ae.inherit_acl,
                         entries,
+                        base_version: ae.base_version,
                     };
                     api::set_room_acl(self.inbox.clone(), ae.room_id, req);
                 }
@@ -1193,7 +1207,14 @@ impl AdminApp {
             .map(|(bit, label, desc)| perm_switch_row(*bit, label, desc, ge.permissions & bit != 0))
             .collect();
 
-        let mut body: Vec<El> = vec![header];
+        let mut body: Vec<El> = vec![
+            header,
+            text("Toggle permissions — each change is saved immediately.")
+                .muted()
+                .small()
+                .wrap_text()
+                .fill_width(),
+        ];
         if ge.is_builtin {
             body.push(
                 text("Built-in group — change its base permissions with care.")
@@ -1207,13 +1228,9 @@ impl AdminApp {
         body.push(column(server_rows).gap(tokens::SPACE_1).fill_width());
         body.push(divider());
         body.push(
-            row([
-                spacer(),
-                button("Cancel").key(KEY_GE_CANCEL).ghost(),
-                button("Save").key(KEY_GE_SAVE).primary(),
-            ])
-            .gap(tokens::SPACE_2)
-            .fill_width(),
+            row([spacer(), button("Done").key(KEY_GE_DONE).primary()])
+                .gap(tokens::SPACE_2)
+                .fill_width(),
         );
 
         card_section("Group permissions", tokens::SPACE_3, body)

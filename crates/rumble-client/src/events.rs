@@ -1400,10 +1400,20 @@ pub enum Command {
     DeleteGroup {
         name: String,
     },
-    /// Modify an existing permission group.
+    /// Modify an existing permission group. Absolute write — `permissions`
+    /// replaces the whole bitmask. Use [`Command::ToggleGroupPermission`] for
+    /// individual switch toggles so concurrent edits don't clobber each other.
     ModifyGroup {
         name: String,
         permissions: u32,
+    },
+    /// Set or clear specific permission bit(s) on a group without touching the
+    /// rest of its bitmask. `enable` is the desired state (idempotent on
+    /// retry); the server applies the delta atomically.
+    ToggleGroupPermission {
+        name: String,
+        bits: u32,
+        enable: bool,
     },
     /// Add or remove a user from a group.
     SetUserGroup {
@@ -1412,11 +1422,15 @@ pub enum Command {
         add: bool,
         expires_at: u64,
     },
-    /// Set room ACL entries.
+    /// Set room ACL entries. `base_version` is the
+    /// [`rumble_protocol::room_acl_version`] of the configuration the editor
+    /// loaded before editing — the server rejects the save if the room's ACL
+    /// changed meanwhile (0 = unversioned legacy write, always accepted).
     SetRoomAcl {
         room_id: Uuid,
         inherit_acl: bool,
         entries: Vec<rumble_protocol::proto::RoomAclEntry>,
+        base_version: u64,
     },
 }
 
@@ -1571,6 +1585,12 @@ impl std::fmt::Debug for Command {
                 .field("name", name)
                 .field("permissions", permissions)
                 .finish(),
+            Command::ToggleGroupPermission { name, bits, enable } => f
+                .debug_struct("ToggleGroupPermission")
+                .field("name", name)
+                .field("bits", bits)
+                .field("enable", enable)
+                .finish(),
             Command::SetUserGroup {
                 target_user_id,
                 group,
@@ -1587,11 +1607,13 @@ impl std::fmt::Debug for Command {
                 room_id,
                 inherit_acl,
                 entries,
+                base_version,
             } => f
                 .debug_struct("SetRoomAcl")
                 .field("room_id", room_id)
                 .field("inherit_acl", inherit_acl)
                 .field("entries_count", &entries.len())
+                .field("base_version", base_version)
                 .finish(),
         }
     }

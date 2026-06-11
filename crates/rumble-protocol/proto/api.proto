@@ -163,6 +163,7 @@ message Envelope {
     ModifyGroup modify_group = 87;
     SetUserGroup set_user_group = 88;
     SetRoomAcl set_room_acl = 89;
+    ToggleGroupPermission toggle_group_permission = 93;
 
     // Server -> Client
     PermissionDenied permission_denied = 91;
@@ -586,9 +587,29 @@ message DeleteGroup {
 }
 
 // Group management: modify a permission group.
+// This is an absolute write — `permissions` replaces the group's whole
+// bitmask. Use ToggleGroupPermission for individual switch toggles so
+// concurrent edits to different bits don't clobber each other.
 message ModifyGroup {
   string name = 1;
   uint32 permissions = 2;
+}
+
+// Group management: set or clear specific permission bit(s) on a group
+// without overwriting the rest of its bitmask.
+//
+// `enable` carries the *desired* state for the bits (not a blind XOR), so a
+// retried or duplicated delivery is idempotent. The server applies the delta
+// atomically against the group's current permissions, so two admins toggling
+// different bits concurrently both land (the stale-read-modify-write hazard
+// of absolute ModifyGroup writes).
+message ToggleGroupPermission {
+  string name = 1;
+  // Permission bit(s) to set or clear. Must be non-zero and contain only
+  // known permission flags.
+  uint32 bits = 2;
+  // Desired state: true = set the bits, false = clear them.
+  bool enable = 3;
 }
 
 // Group management: add or remove a user from a group.
@@ -608,11 +629,20 @@ message RoomAclEntry {
   bool apply_subs = 5;
 }
 
-// Set room ACL entries.
+// Set room ACL entries. This replaces the room's whole ACL list, so it
+// carries an optimistic-concurrency version of the base the client edited
+// from (see `room_acl_version` in the rumble-protocol crate).
 message SetRoomAcl {
   bytes room_id = 1;
   bool inherit_acl = 2;
   repeated RoomAclEntry entries = 3;
+  // Content-derived version of the ACL configuration the client loaded
+  // before editing: `room_acl_version(inherit_acl, entries)` over the
+  // *pre-edit* values. The server rejects the write when this no longer
+  // matches the room's current ACL (someone else saved meanwhile).
+  // 0 = unversioned legacy write — accepted unconditionally so older
+  // clients keep working.
+  uint64 base_version = 4;
 }
 
 // Group definition (for state sync).

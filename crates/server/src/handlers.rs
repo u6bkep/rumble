@@ -273,6 +273,12 @@ pub async fn handle_envelope(
             }
             handle_modify_group(mg, sender, state, persistence).await?;
         }
+        Some(Payload::ToggleGroupPermission(tgp)) => {
+            if !sender.authenticated.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            handle_toggle_group_permission(tgp, sender, state, persistence).await?;
+        }
         Some(Payload::SetUserGroup(sug)) => {
             if !sender.authenticated.load(Ordering::SeqCst) {
                 return Ok(());
@@ -2308,6 +2314,28 @@ async fn handle_modify_group(
     }
 }
 
+/// Handle ToggleGroupPermission - set/clear specific bit(s) on a group as an
+/// atomic delta, so concurrent toggles don't clobber each other (#38).
+async fn handle_toggle_group_permission(
+    tgp: proto::ToggleGroupPermission,
+    sender: Arc<ClientHandle>,
+    state: Arc<ServerState>,
+    persistence: Arc<Persistence>,
+) -> Result<()> {
+    // Permission check: MANAGE_ACL at root (same gate as ModifyGroup).
+    if let Err(denied) =
+        acl::check_permission(&state, &sender, Uuid::nil(), Permissions::MANAGE_ACL, &persistence).await
+    {
+        send_permission_denied(&sender, denied).await?;
+        return Ok(());
+    }
+
+    match crate::ops::apply_toggle_group_permission(&state, &persistence, tgp.name, tgp.bits, tgp.enable).await {
+        Ok(msg) => send_command_result(&sender, "ToggleGroupPermission", true, &msg).await,
+        Err(msg) => send_command_result(&sender, "ToggleGroupPermission", false, &msg).await,
+    }
+}
+
 /// Handle SetUserGroup - add or remove a user from a group.
 async fn handle_set_user_group(
     sug: proto::SetUserGroup,
@@ -2363,7 +2391,16 @@ async fn handle_set_room_acl(
         return Ok(());
     }
 
-    match crate::ops::apply_set_room_acl(&state, &persistence, room_uuid, sra.inherit_acl, sra.entries).await {
+    match crate::ops::apply_set_room_acl(
+        &state,
+        &persistence,
+        room_uuid,
+        sra.inherit_acl,
+        sra.entries,
+        sra.base_version,
+    )
+    .await
+    {
         Ok(msg) => send_command_result(&sender, "SetRoomAcl", true, &msg).await,
         Err(msg) => send_command_result(&sender, "SetRoomAcl", false, &msg).await,
     }

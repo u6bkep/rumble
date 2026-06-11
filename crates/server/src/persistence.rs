@@ -392,6 +392,34 @@ impl Persistence {
         }
     }
 
+    /// Atomically set (`enable`) or clear specific permission bit(s) on a
+    /// group, leaving the rest of its bitmask untouched. The read-modify-write
+    /// happens inside sled's `update_and_fetch` compare-and-swap loop, so two
+    /// concurrent toggles of different bits both land.
+    ///
+    /// Returns `Ok(Some(new_permissions))` on success, `Ok(None)` if the group
+    /// does not exist.
+    pub fn toggle_group_permission(&self, name: &str, bits: u32, enable: bool) -> Result<Option<u32>> {
+        let updated = self.groups.update_and_fetch(name.as_bytes(), |old| {
+            let old = old?;
+            let group: PersistedGroup = bincode::deserialize(old).ok()?;
+            let permissions = if enable {
+                group.permissions | bits
+            } else {
+                group.permissions & !bits
+            };
+            bincode::serialize(&PersistedGroup { permissions }).ok()
+        })?;
+        match updated {
+            Some(data) => {
+                let group: PersistedGroup =
+                    bincode::deserialize(&data).map_err(|e| anyhow::anyhow!("corrupt group record: {e}"))?;
+                Ok(Some(group.permissions))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// List all groups.
     pub fn list_groups(&self) -> Vec<(String, PersistedGroup)> {
         self.groups
@@ -462,40 +490,43 @@ impl Persistence {
             .and_then(|data| String::from_utf8(data.to_vec()).ok())
     }
 
-    /// Add a user to a group.
-    pub fn add_user_to_group(&self, public_key: &[u8; 32], group: &str) -> Result<()> {
-        let mut groups = self.get_user_groups(public_key);
-        if !groups.iter().any(|g| g == group) {
-            groups.push(group.to_string());
-            self.set_user_groups(public_key, &groups)?;
-        }
+    /// Atomically mutate a user's group list inside sled's `update_and_fetch`
+    /// compare-and-swap loop, so two concurrent membership changes for the
+    /// same user (e.g. two admins toggling different groups) don't lose each
+    /// other to a get→modify→insert race. A missing record mutates from the
+    /// empty list. The mutator must be pure — sled may retry it.
+    fn update_user_groups(&self, public_key: &[u8; 32], mutate: impl Fn(&mut Vec<String>)) -> Result<()> {
+        self.user_groups.update_and_fetch(public_key, |old| {
+            let mut groups: Vec<String> = old.and_then(|d| bincode::deserialize(d).ok()).unwrap_or_default();
+            mutate(&mut groups);
+            // Serializing Vec<String> can't realistically fail, but returning
+            // None here would *delete* the record — fall back to the old value.
+            bincode::serialize(&groups).ok().or_else(|| old.map(|d| d.to_vec()))
+        })?;
         Ok(())
     }
 
-    /// Remove a user from a group.
+    /// Add a user to a group (atomic; idempotent if already a member).
+    pub fn add_user_to_group(&self, public_key: &[u8; 32], group: &str) -> Result<()> {
+        self.update_user_groups(public_key, |groups| {
+            if !groups.iter().any(|g| g == group) {
+                groups.push(group.to_string());
+            }
+        })
+    }
+
+    /// Remove a user from a group (atomic; idempotent if not a member).
     pub fn remove_user_from_group(&self, public_key: &[u8; 32], group: &str) -> Result<()> {
-        let mut groups = self.get_user_groups(public_key);
-        let before = groups.len();
-        groups.retain(|g| g != group);
-        if groups.len() != before {
-            self.set_user_groups(public_key, &groups)?;
-        }
-        Ok(())
+        self.update_user_groups(public_key, |groups| groups.retain(|g| g != group))
     }
 
     /// Remove a group from all users' group lists (used when deleting a group).
     pub fn remove_group_from_all_users(&self, group: &str) {
         for entry in self.user_groups.iter() {
-            if let Ok((key, value)) = entry
-                && let Ok(mut groups) = bincode::deserialize::<Vec<String>>(&value)
+            if let Ok((key, _)) = entry
+                && let Ok(key_arr) = <[u8; 32]>::try_from(key.as_ref())
             {
-                let before = groups.len();
-                groups.retain(|g| g != group);
-                if groups.len() != before
-                    && let Ok(key_arr) = <[u8; 32]>::try_from(key.as_ref())
-                {
-                    let _ = self.set_user_groups(&key_arr, &groups);
-                }
+                let _ = self.update_user_groups(&key_arr, |groups| groups.retain(|g| g != group));
             }
         }
     }

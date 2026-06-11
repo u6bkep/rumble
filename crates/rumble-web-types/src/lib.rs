@@ -82,9 +82,24 @@ pub struct CreateGroupRequest {
     pub permissions: u32,
 }
 
+/// `PATCH /api/groups/{name}` — absolute write: replaces the group's whole
+/// permission bitmask. Use [`ToggleGroupPermissionRequest`] for individual
+/// switch toggles so concurrent edits to different bits don't clobber each
+/// other.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModifyGroupRequest {
     pub permissions: u32,
+}
+
+/// `POST /api/groups/{name}/permissions` — set or clear specific permission
+/// bit(s) without overwriting the rest of the group's bitmask. `enable` is the
+/// desired state (idempotent on retry), applied atomically server-side.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToggleGroupPermissionRequest {
+    /// Permission bit(s) to set or clear. Must be non-zero, known flags only.
+    pub bits: u32,
+    /// Desired state: true = set the bits, false = clear them.
+    pub enable: bool,
 }
 
 /// `POST /api/users/{id}/groups` (by live user id) or
@@ -114,6 +129,12 @@ pub struct RoomDto {
     /// without a second round-trip. Empty when the room has no local rules.
     #[serde(default)]
     pub acls: Vec<AclEntryDto>,
+    /// Content-derived version of `(inherit_acl, acls)`, computed server-side
+    /// (`rumble_protocol::room_acl_version`). The ACL editor echoes it back in
+    /// [`SetRoomAclRequest::base_version`] so a save from a stale snapshot is
+    /// rejected instead of clobbering another admin's concurrent edit.
+    #[serde(default)]
+    pub acl_version: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -140,6 +161,12 @@ pub struct SetRoomAclRequest {
     pub inherit_acl: bool,
     #[serde(default)]
     pub entries: Vec<AclEntryDto>,
+    /// The [`RoomDto::acl_version`] the editor loaded before editing. The
+    /// server rejects the save when the room's ACL has changed since (another
+    /// admin saved meanwhile). 0 = unversioned legacy write, accepted
+    /// unconditionally.
+    #[serde(default)]
+    pub base_version: u64,
 }
 
 // =============================================================================

@@ -1007,24 +1007,48 @@ fn handle_group_action(
                 return AdminOutcome::Handled;
             };
             let current = g.permissions;
-            let new_bits = match payload {
-                Some("all") => (ALL_ROOM_SCOPED | ALL_SERVER_SCOPED).bits(),
-                Some("clear") => 0,
+            match payload {
+                // "+ all" / "Clear all" are deliberate whole-mask writes — the
+                // user's intent is absolute ("everything on/off"), so the
+                // existing absolute ModifyGroup is the right op.
+                Some("all") => {
+                    let all = (ALL_ROOM_SCOPED | ALL_SERVER_SCOPED).bits();
+                    if all == current {
+                        AdminOutcome::Handled
+                    } else {
+                        AdminOutcome::one(Command::ModifyGroup {
+                            name: group.to_string(),
+                            permissions: all,
+                        })
+                    }
+                }
+                Some("clear") => {
+                    if current == 0 {
+                        AdminOutcome::Handled
+                    } else {
+                        AdminOutcome::one(Command::ModifyGroup {
+                            name: group.to_string(),
+                            permissions: 0,
+                        })
+                    }
+                }
+                // A single switch click is a per-bit *delta*, not an absolute
+                // bitmask computed from the (possibly stale) State snapshot:
+                // until the server round-trips the previous toggle, `current`
+                // doesn't include it, and an absolute write would silently
+                // revert it (#38). The server applies the delta atomically;
+                // `enable` is the desired state so retries are idempotent.
                 Some(hex) => {
                     let Ok(bit) = u32::from_str_radix(hex, 16) else {
                         return AdminOutcome::Handled;
                     };
-                    current ^ bit
+                    AdminOutcome::one(Command::ToggleGroupPermission {
+                        name: group.to_string(),
+                        bits: bit,
+                        enable: current & bit == 0,
+                    })
                 }
-                None => return AdminOutcome::Handled,
-            };
-            if new_bits == current {
-                AdminOutcome::Handled
-            } else {
-                AdminOutcome::one(Command::ModifyGroup {
-                    name: group.to_string(),
-                    permissions: new_bits,
-                })
+                None => AdminOutcome::Handled,
             }
         }
         _ => AdminOutcome::Ignored,
