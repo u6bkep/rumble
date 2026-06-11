@@ -61,6 +61,12 @@ pub struct DenoiseSettings {
 
     /// Minimum sustained-over-trigger duration before activating.
     /// 0 = activate on first chunk above trigger.
+    ///
+    /// Delays the gate *decision*, not the audio: frames suppressed while
+    /// the window accumulates sit in the encode gate's pre-roll ring
+    /// (`rumble_client::preroll`, 100 ms) and are transmitted retroactively
+    /// when the gate opens. Attack durations beyond the pre-roll length
+    /// lose the excess.
     pub vad_attack_ms: u32,
 
     /// After dropping below release, continue transmitting for this
@@ -336,7 +342,7 @@ impl ProcessorFactory for DenoiseProcessorFactory {
                 "vad_attack_ms": {
                     "type": "integer",
                     "title": "Voice attack (ms)",
-                    "description": "Probability must stay above trigger for this long before activating.",
+                    "description": "Probability must stay above trigger for this long before activating. The delayed audio is recovered from the 100 ms pre-roll buffer, not lost.",
                     "default": 0,
                     "minimum": 0,
                     "maximum": 200

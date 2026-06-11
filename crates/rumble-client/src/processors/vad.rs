@@ -46,6 +46,12 @@ pub struct VadSettings {
     /// above `threshold_db` for this long before activating. Rejects
     /// short transients (keyboard clicks, pops). 0 = activate on first
     /// frame above threshold (original behavior).
+    ///
+    /// The attack window delays the *decision*, not the audio: frames
+    /// suppressed while the window accumulates sit in the encode gate's
+    /// pre-roll ring (`rumble_client::preroll`, 100 ms) and are transmitted
+    /// retroactively when the gate opens. Attack durations beyond the
+    /// pre-roll length lose the excess.
     pub attack_ms: u32,
 
     /// Holdoff time in milliseconds.
@@ -245,7 +251,7 @@ impl ProcessorFactory for VadProcessorFactory {
                 "attack_ms": {
                     "type": "integer",
                     "title": "Attack (ms)",
-                    "description": "Signal must stay above the trigger threshold for this long before activating. Rejects short transients.",
+                    "description": "Signal must stay above the trigger threshold for this long before activating. Rejects short transients; the delayed audio is recovered from the 100 ms pre-roll buffer, not lost.",
                     "default": 0,
                     "minimum": 0,
                     "maximum": 200
