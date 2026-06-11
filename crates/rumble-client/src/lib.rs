@@ -123,6 +123,10 @@ pub use snapshot::{Snapshot, SnapshotWriter};
 pub mod meter;
 pub use meter::{Level, MeterSnapshot};
 
+// TX pre-roll ring: retains VAD-suppressed capture frames so the encode gate
+// can flush them retroactively when the gate opens (speech-onset clipping fix).
+pub(crate) mod preroll;
+
 // Audio processing pipeline - processors
 pub mod processors;
 pub use processors::{

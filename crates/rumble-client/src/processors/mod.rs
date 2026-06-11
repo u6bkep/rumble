@@ -24,7 +24,9 @@
 mod denoise;
 mod gain;
 mod vad;
-mod vad_shaper;
+// `pub(crate)`: the pre-roll ring's tests (`crate::preroll`) drive a real
+// `VadShaper` to pin the gate↔ring interaction.
+pub(crate) mod vad_shaper;
 
 pub use denoise::{DenoiseProcessor, DenoiseProcessorFactory};
 pub use gain::{GainProcessor, GainProcessorFactory};

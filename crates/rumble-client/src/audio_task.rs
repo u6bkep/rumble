@@ -314,6 +314,20 @@ const RESTART_BACKWARD_FRAMES: u64 = 100;
 /// re-sync, so the stream recovers instead of dropping every frame forever.
 const LATE_RESYNC_FRAMES: u32 = 10;
 
+/// The TX pre-roll flush emits `PRE_ROLL_FRAMES + 1` datagrams back-to-back at
+/// a VAD gate opening (see `crate::preroll`). While `started`,
+/// [`UserAudioState::insert_packet`] trims buffered depth to
+/// `target_frames + DRIFT_DROP_SLACK` and force-advances the playout cursor
+/// past trimmed frames — which would drop the *head* of a larger burst (the
+/// onset audio pre-roll exists to save) and skip the silence-classification
+/// re-anchor + decoder prime. Keep the worst-case burst within the smallest
+/// possible trim threshold.
+const _: () = assert!(
+    // i.e. PRE_ROLL_FRAMES ring frames + 1 gate-opening frame ≤ min trim depth
+    crate::preroll::PRE_ROLL_FRAMES < (MIN_TARGET_FRAMES + DRIFT_DROP_SLACK) as usize,
+    "pre-roll burst must fit the receiver's minimum jitter-buffer trim depth"
+);
+
 /// If no packet arrives for this long with no EOS, treat the stream as ended so
 /// PLC doesn't run forever (sender crash, NAT rebind, lost EOS). Comfortably
 /// longer than the deepest adaptive buffer so normal jitter never trips it.
@@ -2170,6 +2184,19 @@ fn start_transmission<P: Platform>(
     // VAD-suppressed silence is encoded as a timestamp gap (see the field doc).
     let capture_frame_index_cb = capture_frame_index.clone();
 
+    // Pre-roll lookback ring (issue #41): the last ~100 ms of VAD-suppressed
+    // *processed* frames, kept so the encode gate can transmit them
+    // retroactively when the gate opens — speech onsets (fricatives,
+    // plosives, the attack window) score below the trigger and would
+    // otherwise be clipped. Flushed frames carry their original media-clock
+    // timestamps, so on the receive side they are simply an onset anchored up
+    // to 100 ms earlier (or, for a gap that fits the ring entirely, a
+    // timestamp-contiguous continuation played gaplessly). Capacity is bounded
+    // by the receiver's burst absorption — see `crate::preroll` module docs
+    // and the compile-time assert next to `DRIFT_DROP_SLACK`. All slots are
+    // preallocated; steady-state pushes don't allocate in the callback.
+    let mut preroll = crate::preroll::PreRollRing::new(crate::preroll::PRE_ROLL_FRAMES, FRAME_US);
+
     // Create audio input via AudioBackend trait
     let encoded_tx = encoded_tx.clone();
     let input = audio_backend.open_input(
@@ -2257,6 +2284,10 @@ fn start_transmission<P: Platform>(
                     was_transmitting_for_callback.store(false, std::sync::atomic::Ordering::Relaxed);
                     let _ = encoded_tx.send(CaptureMessage::EndOfStream { timestamp_us });
                 }
+                // Stash the processed frame in the pre-roll ring instead of
+                // discarding it: if the gate opens within the next ~100 ms,
+                // this audio is flushed retroactively below.
+                preroll.push(timestamp_us, &sample_scratch);
                 return;
             }
 
@@ -2268,6 +2299,32 @@ fn start_transmission<P: Platform>(
                 && let Some(enc) = guard.as_mut()
             {
                 let mut opus_buf = [0u8; OPUS_MAX_PACKET_SIZE];
+
+                // The gate just opened (the ring only holds frames pushed
+                // while suppressed): flush the buffered onset audio through
+                // the same encoder *ahead of* the current frame. The ring
+                // frames are consecutive capture frames ending right before
+                // this one (contiguity enforced by the ring), so the encoder
+                // sees contiguous PCM, and each flushed frame is sent with
+                // its original media timestamp — the receiver re-anchors the
+                // spurt at the first flushed frame (or plays straight through
+                // when the suppressed gap fit the ring). No-op while the gate
+                // stays open or in PTT mode (nothing is ever suppressed).
+                preroll.flush_into(timestamp_us, |ts, samples| match enc.encode(samples, &mut opus_buf) {
+                    Ok(len) => {
+                        let encoded = &opus_buf[..len];
+                        dumper_for_callback.write_tx_opus(encoded);
+                        let _ = encoded_tx.send(CaptureMessage::EncodedFrame {
+                            data: Bytes::copy_from_slice(encoded),
+                            size_bytes: len,
+                            timestamp_us: ts,
+                        });
+                    }
+                    Err(e) => {
+                        trace!("Pre-roll encode error: {}", e);
+                    }
+                });
+
                 match enc.encode(&sample_scratch, &mut opus_buf) {
                     Ok(len) => {
                         let encoded = &opus_buf[..len];
@@ -3283,6 +3340,79 @@ mod tests {
             state.frames_concealed, 0,
             "silence must not be concealed frame-by-frame"
         );
+    }
+
+    /// The TX pre-roll flush (issue #41) delivers `PRE_ROLL_FRAMES + 1`
+    /// packets essentially at once when the VAD gate opens after a long
+    /// suppressed gap. The buffer must absorb the whole burst — no
+    /// head-trimming by the `target + DRIFT_DROP_SLACK` depth bound, which
+    /// would silently drop the recovered onset audio — and must still
+    /// classify the gap as silence, re-anchoring at the *first flushed*
+    /// frame so every pre-rolled frame plays in order with no phantom loss.
+    #[test]
+    fn jitter_absorbs_preroll_flush_burst_after_long_gap() {
+        let mut state = make_state(MIN_TARGET_FRAMES);
+        let epoch = Instant::now();
+        // Spurt A: frames 0..=3 (seq 0..=3) play out, then EOS consumes seq 4.
+        for n in 0..4u8 {
+            feed_contig(&mut state, epoch, n);
+        }
+        assert_eq!(drain_some(&mut state, 4), vec![0.0, 1.0, 2.0, 3.0]);
+        state.mark_end_of_stream(4);
+        // The gap: a few dry ticks must stay silent (no PLC after EOS).
+        assert_eq!(drain_tags(&mut state, 3), vec![None, None, None]);
+        assert_eq!(state.frames_concealed, 0);
+
+        // Gate opens at frame 50: the sender flushes its pre-roll ring (the
+        // PRE_ROLL_FRAMES suppressed frames right before the onset) plus the
+        // gate-opening frame, all arriving back-to-back at the same instant.
+        let burst = crate::preroll::PRE_ROLL_FRAMES as u64 + 1;
+        let onset = 50u64;
+        let first = onset - burst + 1;
+        let arrival = epoch + Duration::from_micros(onset * FRAME_US);
+        for (i, frame) in (first..=onset).enumerate() {
+            let seq = 5 + i as u32; // EOS took seq 4; flush is consecutive.
+            state.insert_packet_at(seq, frame * FRAME_US, packet(frame as u8), arrival);
+        }
+
+        // Every flushed frame plays, oldest first — the burst's head (the
+        // onset audio the pre-roll exists to save) must not be trimmed.
+        // (burst + 1 ticks: the first tick classifies the gap and re-anchors,
+        // producing no frame; further ticks would be live-stream PLC since the
+        // test sender stops after the onset frame.)
+        let expected: Vec<f32> = (first..=onset).map(|f| f as f32).collect();
+        assert_eq!(drain_some(&mut state, burst as usize + 1), expected);
+        assert_eq!(state.packets_lost, 0, "a flushed silence gap is not loss");
+        assert_eq!(state.frames_concealed, 0, "nothing to conceal across the flush");
+    }
+
+    /// When the suppressed gap fits entirely inside the sender's pre-roll
+    /// ring, the flushed frames are timestamp-contiguous with the previous
+    /// spurt (the EOS sequence is discounted): the receiver plays straight
+    /// through with no re-anchor, no loss, and no concealment — a short VAD
+    /// dropout becomes gapless.
+    #[test]
+    fn jitter_plays_ring_covered_gap_gaplessly() {
+        let mut state = make_state(MIN_TARGET_FRAMES);
+        let epoch = Instant::now();
+        for n in 0..4u8 {
+            feed_contig(&mut state, epoch, n);
+        }
+        assert_eq!(drain_some(&mut state, 4), vec![0.0, 1.0, 2.0, 3.0]);
+        state.mark_end_of_stream(4); // gate closed at frame 4 (seq 4)
+        // Frames 4..=6 were suppressed but fit the ring; gate reopens at 7.
+        // Flush: frames 4,5,6 (seq 5,6,7) + current frame 7 (seq 8), at once.
+        let arrival = epoch + Duration::from_micros(7 * FRAME_US);
+        for (i, frame) in (4u64..=7).enumerate() {
+            state.insert_packet_at(5 + i as u32, frame * FRAME_US, packet(frame as u8), arrival);
+        }
+        assert_eq!(
+            drain_tags(&mut state, 4),
+            vec![Some(4.0), Some(5.0), Some(6.0), Some(7.0)],
+            "ring-covered gap must play through contiguously, with no buffering pause"
+        );
+        assert_eq!(state.packets_lost, 0);
+        assert_eq!(state.frames_concealed, 0);
     }
 
     #[test]

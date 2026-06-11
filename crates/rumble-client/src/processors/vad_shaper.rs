@@ -8,6 +8,12 @@
 //! supplies matching thresholds. The energy VAD uses dB; the RNNoise VAD
 //! uses a 0..1 probability. Wrapping logic and defaults belong to the
 //! consuming processor, not here.
+//!
+//! Suppressed frames are not necessarily lost audio: the encode gate in
+//! `audio_task` keeps the last ~100 ms of suppressed frames in a pre-roll
+//! ring (`crate::preroll`) and transmits them retroactively when the gate
+//! opens, so low-scoring speech onsets and the `attack_ms` window cost
+//! decision latency, not audio.
 
 /// Per-call settings for [`VadShaper::update`].
 ///
