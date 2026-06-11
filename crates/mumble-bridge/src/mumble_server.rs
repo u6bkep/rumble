@@ -11,7 +11,7 @@ use tokio_rustls::{TlsAcceptor, server::TlsStream};
 use tracing::{info, warn};
 
 use crate::{
-    bridge::{BridgeEvent, read_bridge, write_bridge},
+    bridge::{BridgeEvent, write_bridge},
     config::BridgeConfig,
     mumble_framing::{self, write_message, write_udp_tunnel},
     mumble_proto::{MessageType, mumble},
@@ -45,13 +45,12 @@ pub async fn run_mumble_server(
         let acceptor = tls_acceptor.clone();
         let state = bridge_state.clone();
         let btx = bridge_tx.clone();
-        let cfg = config.clone();
 
         tokio::spawn(async move {
             match acceptor.accept(tcp_stream).await {
                 Ok(tls_stream) => {
                     info!(%peer_addr, "TLS handshake complete");
-                    if let Err(e) = handle_mumble_client(tls_stream, state, btx, cfg).await {
+                    if let Err(e) = handle_mumble_client(tls_stream, state, btx).await {
                         warn!(%peer_addr, error = %e, "Mumble client handler error");
                     }
                 }
@@ -68,7 +67,6 @@ async fn handle_mumble_client(
     tls_stream: TlsStream<tokio::net::TcpStream>,
     bridge_state: Arc<RwLock<BridgeState>>,
     bridge_tx: mpsc::UnboundedSender<BridgeEvent>,
-    config: Arc<BridgeConfig>,
 ) -> Result<()> {
     let (reader, mut writer) = tokio::io::split(tls_stream);
     let mut reader = reader;
@@ -77,7 +75,7 @@ async fn handle_mumble_client(
     // authenticates can't pin a handler task forever.
     let (username, session) = tokio::time::timeout(
         std::time::Duration::from_secs(30),
-        mumble_auth_handshake(&mut reader, &mut writer, &bridge_state, &config),
+        mumble_auth_handshake(&mut reader, &mut writer, &bridge_state),
     )
     .await
     .map_err(|_| anyhow::anyhow!("Mumble auth handshake timed out"))??;
@@ -144,13 +142,16 @@ async fn handle_mumble_client(
 
 /// Perform the Mumble authentication handshake.
 ///
-/// Waits for Version + Authenticate from the client, then sends back the full
-/// channel/user state and ServerSync.
+/// Waits for Version + Authenticate from the client, then sends Version,
+/// CryptSetup and CodecVersion. The state snapshot (ChannelState/UserState)
+/// and ServerSync are NOT sent here: they are delivered through the client's
+/// outbound channel by the bridge event loop when it processes
+/// `BridgeEvent::MumbleClientSender`, so the snapshot is atomic with sender
+/// registration and no state update can fall between the two (issue #20).
 async fn mumble_auth_handshake(
     reader: &mut ReadHalf<TlsStream<tokio::net::TcpStream>>,
     writer: &mut WriteHalf<TlsStream<tokio::net::TcpStream>>,
     bridge_state: &Arc<RwLock<BridgeState>>,
-    config: &BridgeConfig,
 ) -> Result<(String, u32)> {
     // Wait for Version and Authenticate messages
     let username = loop {
@@ -209,14 +210,10 @@ async fn mumble_auth_handshake(
                     is_deafened: false,
                 },
             );
-
-            // Snapshot current state for sending to the client
-            let channels = build_channel_states(&mut state);
-            let users = build_user_states(&state, session);
-            Some((session, channels, users))
+            Some(session)
         }
     };
-    let Some((session, channels, users)) = registration else {
+    let Some(session) = registration else {
         let reject = mumble::Reject {
             r#type: Some(mumble::reject::RejectType::UsernameInUse.into()),
             reason: Some(format!("Username \"{username}\" is already in use")),
@@ -258,55 +255,9 @@ async fn mumble_auth_handshake(
     };
     write_message(writer, MessageType::CodecVersion, &codec).await?;
 
-    // Send ChannelState for each channel
-    for ch in &channels {
-        write_message(writer, MessageType::ChannelState, ch).await?;
-    }
-
-    // Send UserState for each existing user
-    for us in &users {
-        write_message(writer, MessageType::UserState, us).await?;
-    }
-
-    // Send UserState for the connecting client itself
-    let self_user = mumble::UserState {
-        session: Some(session),
-        name: Some(username.clone()),
-        channel_id: Some(0), // Root channel
-        ..Default::default()
-    };
-    write_message(writer, MessageType::UserState, &self_user).await?;
-
-    // Use the Rumble server's welcome message if available, otherwise fall back to config
-    let welcome_text = {
-        let state = read_bridge(bridge_state);
-        state
-            .welcome_message
-            .clone()
-            .unwrap_or_else(|| config.welcome_text.clone())
-    };
-
-    // Send ServerSync
-    let sync = mumble::ServerSync {
-        session: Some(session),
-        max_bandwidth: Some(config.max_bandwidth),
-        welcome_text: Some(welcome_text.clone()),
-        permissions: Some(0x07FFFFFF), // All permissions
-    };
-    write_message(writer, MessageType::ServerSync, &sync).await?;
-
-    // Send ServerConfig
-    let server_config = mumble::ServerConfig {
-        max_bandwidth: Some(config.max_bandwidth),
-        welcome_text: Some(welcome_text),
-        allow_html: Some(true),
-        message_length: Some(5000),
-        image_message_length: Some(131072),
-        max_users: Some(100),
-        recording_allowed: Some(false),
-    };
-    write_message(writer, MessageType::ServerConfig, &server_config).await?;
-
+    // The ChannelState/UserState snapshot, ServerSync and ServerConfig follow
+    // via the client's outbound channel once the bridge event loop registers
+    // the sender (see `send_initial_sync` in bridge.rs).
     Ok((username, session))
 }
 
@@ -315,7 +266,7 @@ async fn mumble_auth_handshake(
 /// Channels are returned in BFS order (root first, then children) to match
 /// the Mumble reference server behavior. Mumble clients expect parent channels
 /// to be sent before their children.
-fn build_channel_states(state: &mut BridgeState) -> Vec<mumble::ChannelState> {
+pub(crate) fn build_channel_states(state: &mut BridgeState) -> Vec<mumble::ChannelState> {
     use std::collections::{HashMap, VecDeque};
 
     // First pass: assign Mumble IDs and build a parent->children map
@@ -407,7 +358,7 @@ fn build_channel_states(state: &mut BridgeState) -> Vec<mumble::ChannelState> {
 }
 
 /// Build UserState messages for all known Rumble users.
-fn build_user_states(state: &BridgeState, exclude_session: u32) -> Vec<mumble::UserState> {
+pub(crate) fn build_user_states(state: &BridgeState, exclude_session: u32) -> Vec<mumble::UserState> {
     let mut users = Vec::new();
 
     for user in &state.rumble_users {

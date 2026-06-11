@@ -54,6 +54,11 @@ impl ChannelMap {
             self.mumble_to_rumble.remove(&id);
         }
     }
+
+    /// Iterate over all known Rumble room UUIDs (unordered).
+    pub fn rumble_uuids(&self) -> impl Iterator<Item = Uuid> + '_ {
+        self.rumble_to_mumble.keys().copied()
+    }
 }
 
 /// Bidirectional mapping between Rumble user IDs (u64) and Mumble session IDs (u32).
@@ -104,6 +109,11 @@ impl UserMap {
         if let Some(session) = self.rumble_to_mumble.remove(&rumble_id) {
             self.mumble_to_rumble.remove(&session);
         }
+    }
+
+    /// Iterate over all `(rumble_id, mumble_session)` pairs (unordered).
+    pub fn entries(&self) -> impl Iterator<Item = (u64, u32)> + '_ {
+        self.rumble_to_mumble.iter().map(|(&id, &session)| (id, session))
     }
 }
 

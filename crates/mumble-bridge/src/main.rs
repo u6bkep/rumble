@@ -13,6 +13,7 @@ use mumble_bridge::{
     mumble_server, mumble_tls, rumble_client,
     state::BridgeState,
 };
+use rumble_protocol::proto;
 
 #[derive(Parser, Debug)]
 #[command(name = "mumble-bridge", about = "Bridge between Mumble and Rumble voice chat")]
@@ -263,26 +264,15 @@ async fn main() -> Result<()> {
         }
         info!("Sent ControllerHello");
 
-        // Update bridge state with fresh Rumble state
+        // Record the new connection identity. The fresh room/user state is
+        // NOT applied here: it is routed through the bridge event loop as a
+        // synthesized ServerState event below, so the loop can diff it against
+        // the previously projected state and broadcast the delta to connected
+        // Mumble clients (issue #20).
         {
             let mut state = write_bridge(&bridge_state);
             state.bridge_user_id = Some(rumble_conn.user_id);
             state.rumble_connected = true;
-            state.rumble_rooms = rumble_conn.rooms.clone();
-            state.rumble_users = rumble_conn.users.clone();
-
-            // Pre-populate channel and user mappings
-            for room in &rumble_conn.rooms {
-                if let Some(uuid) = room.id.as_ref().and_then(rumble_protocol::uuid_from_room_id) {
-                    state.channels.get_or_insert(uuid);
-                }
-            }
-            for user in &rumble_conn.users {
-                let rumble_id = user.user_id.as_ref().map(|id| id.value).unwrap_or(0);
-                if rumble_id != rumble_conn.user_id {
-                    state.users.get_or_insert(rumble_id);
-                }
-            }
         }
 
         // Re-register all currently connected Mumble clients as virtual users
@@ -323,6 +313,27 @@ async fn main() -> Result<()> {
             // ParticipantRegistered responses arrive in the bridge event loop
             // (pending_join_rooms logic + MumbleMuteDeafChange events)
         }
+
+        // Feed the fresh full state through the event loop's ServerState
+        // reconciliation path: run_bridge diffs it against the previously
+        // projected state and broadcasts the delta (users/channels that
+        // appeared, vanished or changed during the outage) to all connected
+        // Mumble clients, pruning stale proxy-session mappings. Ordering
+        // matters: bridge_user_id, the cleared virtual-user maps and the
+        // re-pushed pending_registrations above are all in place before this
+        // event is processed, so the reconcile skip rules see the right state.
+        let server_state = proto::ServerState {
+            rooms: std::mem::take(&mut rumble_conn.rooms),
+            users: std::mem::take(&mut rumble_conn.users),
+            groups: Vec::new(),
+            slash_commands: Vec::new(),
+        };
+        let _ = bridge_tx.send(BridgeEvent::RumbleEnvelope(proto::Envelope {
+            payload: Some(proto::envelope::Payload::ServerEvent(proto::ServerEvent {
+                kind: Some(proto::server_event::Kind::ServerState(server_state)),
+            })),
+            ..Default::default()
+        }));
 
         // Split the transport: recv stream for receiver task, transport for sending,
         // raw quinn::Connection for datagrams + closed detection.
