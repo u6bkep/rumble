@@ -35,6 +35,10 @@ fn room_dto(r: &rumble_protocol::proto::RoomInfo) -> RoomDto {
         description: r.description.clone(),
         inherit_acl: r.inherit_acl,
         acls,
+        // Optimistic-concurrency token the ACL editor echoes back on save.
+        // Computed from the same hydrated values the DTO carries, so what the
+        // editor loads is exactly what the version covers.
+        acl_version: rumble_protocol::room_acl_version(r.inherit_acl, &r.acls),
     }
 }
 

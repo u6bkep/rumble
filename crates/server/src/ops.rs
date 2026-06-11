@@ -550,6 +550,51 @@ pub(crate) async fn apply_modify_group(
     Ok(format!("Modified group '{}'", name))
 }
 
+/// Set or clear specific permission bit(s) on a group, leaving the rest of its
+/// bitmask untouched. `enable` is the *desired* state for the bits, so a
+/// duplicated or retried delivery is idempotent. The read-modify-write runs
+/// atomically inside persistence ([`Persistence::toggle_group_permission`]),
+/// so two admins toggling different bits concurrently both land — unlike an
+/// absolute [`apply_modify_group`] computed from a stale snapshot, which would
+/// silently revert the other admin's change (#38).
+pub(crate) async fn apply_toggle_group_permission(
+    state: &Arc<ServerState>,
+    persistence: &Arc<Persistence>,
+    name: String,
+    bits: u32,
+    enable: bool,
+) -> Result<String, String> {
+    if bits == 0 {
+        return Err("No permission bits specified".to_string());
+    }
+    if Permissions::from_bits(bits).is_none() {
+        return Err("Unknown permission bits".to_string());
+    }
+
+    let new_permissions = match persistence.toggle_group_permission(&name, bits, enable) {
+        Ok(Some(p)) => p,
+        Ok(None) => return Err("Group not found".to_string()),
+        Err(e) => return Err(format!("Failed: {e}")),
+    };
+
+    info!(group = %name, bits, enable, new_permissions, "ToggleGroupPermission");
+
+    let _ = broadcast_state_update(
+        state,
+        proto::state_update::Update::GroupChanged(proto::GroupChanged {
+            group: Some(proto::GroupInfo {
+                name: name.clone(),
+                permissions: new_permissions,
+                is_builtin: BUILTIN_GROUPS.contains(&name.as_str()),
+            }),
+            deleted: false,
+        }),
+    )
+    .await;
+
+    Ok(format!("Modified group '{}'", name))
+}
+
 /// Add or remove `target_user_id` to/from `group`. Group membership is keyed by
 /// the user's long-term public key, so this resolves the key from the live
 /// session and delegates to [`apply_set_user_group_by_key`]. Used by the QUIC
@@ -700,17 +745,68 @@ pub(crate) async fn sweep_expired_memberships(
 // Room ACLs
 // =============================================================================
 
+/// User-facing rejection reason for a stale-base [`apply_set_room_acl`].
+pub(crate) const ACL_CONFLICT_MSG: &str =
+    "Room ACL changed while you were editing — reopen the editor to load the latest rules and retry";
+
+/// Compute the room's *current* ACL version from the authoritative source.
+///
+/// Persistence is the source of truth for room ACLs (in-memory `ServerState`
+/// rooms only carry ACLs touched since startup — see
+/// [`ServerState::build_room_list`]); a room with no persisted record has the
+/// default configuration `(inherit_acl = true, no entries)`, which is exactly
+/// what clients see in `RoomInfo`.
+fn current_room_acl_version(persistence: &Persistence, room_uuid: Uuid) -> u64 {
+    match persistence.get_room_acl(room_uuid.as_bytes()) {
+        Some(acl) => {
+            let entries: Vec<proto::RoomAclEntry> = acl
+                .entries
+                .iter()
+                .map(|e| proto::RoomAclEntry {
+                    group: e.group.clone(),
+                    grant: e.grant,
+                    deny: e.deny,
+                    apply_here: e.apply_here,
+                    apply_subs: e.apply_subs,
+                })
+                .collect();
+            rumble_protocol::room_acl_version(acl.inherit_acl, &entries)
+        }
+        None => rumble_protocol::room_acl_version(true, &[]),
+    }
+}
+
 /// Replace a room's ACL entries, persist them, broadcast the change, and
 /// re-evaluate `SPEAK` for every member in the room (server-muting those who
 /// lost it, unmuting those who regained it unless manually muted).
+///
+/// `base_version` is the optimistic-concurrency token
+/// ([`rumble_protocol::room_acl_version`]) of the configuration the client
+/// loaded before editing. A non-zero mismatch against the room's current
+/// version is rejected with [`ACL_CONFLICT_MSG`] instead of clobbering a
+/// concurrent admin's save. `0` means an unversioned legacy write (older
+/// clients) and is accepted unconditionally.
 pub(crate) async fn apply_set_room_acl(
     state: &Arc<ServerState>,
     persistence: &Arc<Persistence>,
     room_uuid: Uuid,
     inherit_acl: bool,
     entries: Vec<proto::RoomAclEntry>,
+    base_version: u64,
 ) -> Result<String, String> {
     let persist = persistence;
+
+    // Serialize the version check against other ACL saves: without the gate,
+    // two writers holding the same stale base could both pass the compare
+    // before either persists.
+    let _gate = state.acl_write_gate.lock().await;
+
+    if base_version != 0 {
+        let current = current_room_acl_version(persist, room_uuid);
+        if base_version != current {
+            return Err(ACL_CONFLICT_MSG.to_string());
+        }
+    }
 
     let persisted_acl = PersistedRoomAcl {
         inherit_acl,
@@ -909,6 +1005,183 @@ mod tests {
             .unwrap_err();
         assert!(err.contains("registered username"), "got: {err}");
         assert!(persist.get_user_groups(&key).is_empty());
+    }
+
+    // --- ToggleGroupPermission (#38) -----------------------------------------
+
+    /// Two interleaved toggles of *different* bits must both land — the whole
+    /// point of the delta op over absolute ModifyGroup writes computed from a
+    /// stale snapshot.
+    #[tokio::test]
+    async fn toggle_preserves_concurrent_bits() {
+        let (state, persist) = test_env();
+        persist.create_group("mods", 0).unwrap();
+
+        // Simulate two admins firing toggles concurrently.
+        let (a, b) = tokio::join!(
+            apply_toggle_group_permission(&state, &persist, "mods".into(), Permissions::SPEAK.bits(), true),
+            apply_toggle_group_permission(&state, &persist, "mods".into(), Permissions::ENTER.bits(), true),
+        );
+        a.unwrap();
+        b.unwrap();
+
+        let bits = persist.get_group("mods").unwrap().permissions;
+        assert_eq!(
+            bits,
+            (Permissions::SPEAK | Permissions::ENTER).bits(),
+            "both toggled bits must survive; an absolute RMW would have dropped one"
+        );
+    }
+
+    /// `enable` is a desired state, so duplicated/retried delivery is a no-op,
+    /// not a flip-back.
+    #[tokio::test]
+    async fn toggle_is_idempotent_on_redelivery() {
+        let (state, persist) = test_env();
+        persist.create_group("mods", 0).unwrap();
+        let bit = Permissions::SPEAK.bits();
+
+        apply_toggle_group_permission(&state, &persist, "mods".into(), bit, true)
+            .await
+            .unwrap();
+        apply_toggle_group_permission(&state, &persist, "mods".into(), bit, true)
+            .await
+            .unwrap();
+        assert_eq!(persist.get_group("mods").unwrap().permissions, bit, "still set");
+
+        apply_toggle_group_permission(&state, &persist, "mods".into(), bit, false)
+            .await
+            .unwrap();
+        apply_toggle_group_permission(&state, &persist, "mods".into(), bit, false)
+            .await
+            .unwrap();
+        assert_eq!(persist.get_group("mods").unwrap().permissions, 0, "still clear");
+    }
+
+    /// Toggling other bits leaves the untouched part of the mask intact.
+    #[tokio::test]
+    async fn toggle_leaves_other_bits_alone() {
+        let (state, persist) = test_env();
+        let initial = (Permissions::TRAVERSE | Permissions::ENTER | Permissions::KICK).bits();
+        persist.create_group("mods", initial).unwrap();
+
+        apply_toggle_group_permission(&state, &persist, "mods".into(), Permissions::ENTER.bits(), false)
+            .await
+            .unwrap();
+        assert_eq!(
+            persist.get_group("mods").unwrap().permissions,
+            (Permissions::TRAVERSE | Permissions::KICK).bits()
+        );
+    }
+
+    /// Unknown groups and bogus bit masks are rejected.
+    #[tokio::test]
+    async fn toggle_rejects_unknown_group_and_bits() {
+        let (state, persist) = test_env();
+        persist.create_group("mods", 0).unwrap();
+
+        let err = apply_toggle_group_permission(&state, &persist, "ghost".into(), 0x4, true)
+            .await
+            .unwrap_err();
+        assert!(err.contains("not found"), "got: {err}");
+
+        let err = apply_toggle_group_permission(&state, &persist, "mods".into(), 0, true)
+            .await
+            .unwrap_err();
+        assert!(err.contains("No permission bits"), "got: {err}");
+
+        let err = apply_toggle_group_permission(&state, &persist, "mods".into(), 0x8000_0000, true)
+            .await
+            .unwrap_err();
+        assert!(err.contains("Unknown permission bits"), "got: {err}");
+    }
+
+    // --- Versioned SetRoomAcl (#38) ------------------------------------------
+
+    fn acl_entry(group: &str, grant: u32) -> proto::RoomAclEntry {
+        proto::RoomAclEntry {
+            group: group.into(),
+            grant,
+            deny: 0,
+            apply_here: true,
+            apply_subs: true,
+        }
+    }
+
+    /// A save carrying the room's *current* version is accepted; a save from a
+    /// stale base is rejected without clobbering, and retrying with the fresh
+    /// version succeeds.
+    #[tokio::test]
+    async fn set_room_acl_rejects_stale_base_and_accepts_current() {
+        let (state, persist) = test_env();
+        let room = apply_create_room(&state, &persist, "lobby".into(), None, None)
+            .await
+            .unwrap();
+
+        // A never-edited room's current version is the default config.
+        let v0 = rumble_protocol::room_acl_version(true, &[]);
+        let first = vec![acl_entry("default", 0x4)];
+        apply_set_room_acl(&state, &persist, room, true, first.clone(), v0)
+            .await
+            .unwrap();
+
+        // Second writer still holds v0 — must be rejected, not clobber.
+        let err = apply_set_room_acl(&state, &persist, room, true, vec![acl_entry("admin", 0x2)], v0)
+            .await
+            .unwrap_err();
+        assert_eq!(err, ACL_CONFLICT_MSG);
+        let kept = persist.get_room_acl(room.as_bytes()).unwrap();
+        assert_eq!(kept.entries.len(), 1);
+        assert_eq!(kept.entries[0].group, "default", "stale save must not clobber");
+
+        // Retrying against the fresh version succeeds.
+        let v1 = rumble_protocol::room_acl_version(true, &first);
+        apply_set_room_acl(&state, &persist, room, true, vec![acl_entry("admin", 0x2)], v1)
+            .await
+            .unwrap();
+        let now = persist.get_room_acl(room.as_bytes()).unwrap();
+        assert_eq!(now.entries[0].group, "admin");
+    }
+
+    /// `base_version == 0` is the legacy/unversioned write — accepted even when
+    /// the ACL has changed, so deployed older clients keep working.
+    #[tokio::test]
+    async fn set_room_acl_accepts_unversioned_legacy_write() {
+        let (state, persist) = test_env();
+        let room = apply_create_room(&state, &persist, "lobby".into(), None, None)
+            .await
+            .unwrap();
+
+        apply_set_room_acl(&state, &persist, room, true, vec![acl_entry("default", 0x4)], 0)
+            .await
+            .unwrap();
+        // Content changed since, but a 0-version write still lands.
+        apply_set_room_acl(&state, &persist, room, false, vec![acl_entry("admin", 0x2)], 0)
+            .await
+            .unwrap();
+        let now = persist.get_room_acl(room.as_bytes()).unwrap();
+        assert!(!now.inherit_acl);
+        assert_eq!(now.entries[0].group, "admin");
+    }
+
+    /// The version covers the inherit flag too — flipping only `inherit_acl`
+    /// must invalidate a stale base.
+    #[tokio::test]
+    async fn set_room_acl_version_covers_inherit_flag() {
+        let (state, persist) = test_env();
+        let room = apply_create_room(&state, &persist, "lobby".into(), None, None)
+            .await
+            .unwrap();
+
+        let v0 = rumble_protocol::room_acl_version(true, &[]);
+        apply_set_room_acl(&state, &persist, room, false, vec![], v0)
+            .await
+            .unwrap();
+
+        let err = apply_set_room_acl(&state, &persist, room, true, vec![], v0)
+            .await
+            .unwrap_err();
+        assert_eq!(err, ACL_CONFLICT_MSG);
     }
 
     /// Adding an offline user to a real group persists the membership.

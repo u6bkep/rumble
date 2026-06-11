@@ -203,6 +203,7 @@ fn router(web_state: WebState, assets_dir: Option<std::path::PathBuf>) -> Router
             "/api/groups/{name}",
             axum::routing::patch(api::modify_group).delete(api::delete_group),
         )
+        .route("/api/groups/{name}/permissions", post(api::toggle_group_permission))
         // --- rooms ---
         .route("/api/rooms", get(monitor::list_rooms).post(api::create_room))
         .route("/api/rooms/{uuid}", axum::routing::delete(api::delete_room))

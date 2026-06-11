@@ -212,6 +212,44 @@ pub fn with_state_hash(mut env: proto::Envelope, hash: Vec<u8>) -> proto::Envelo
     env
 }
 
+/// Content-derived optimistic-concurrency version of a room's ACL
+/// configuration, used by `SetRoomAcl.base_version`.
+///
+/// A whole-list ACL save replaces everything another admin may have changed
+/// meanwhile, so the client echoes the version of the configuration it
+/// *loaded* and the server rejects the write on mismatch instead of silently
+/// clobbering. Deriving the version from content (truncated BLAKE3 over a
+/// canonical encoding of `inherit_acl` + the ordered entry list) rather than
+/// a stored monotonic counter means:
+///
+/// - nothing extra to persist or migrate — it survives server restarts and
+///   stays correct for pre-existing rooms,
+/// - no new field in the state-synced `RoomInfo` (clients compute it locally
+///   from the `inherit_acl`/`acls` they already hold),
+/// - identical content ⇒ identical version, so an edit that was made and
+///   reverted between load and save is correctly *not* a conflict.
+///
+/// The result is never 0: 0 is reserved on the wire to mean "unversioned
+/// legacy write" (older clients that don't send a version), which servers
+/// accept unconditionally.
+pub fn room_acl_version(inherit_acl: bool, entries: &[proto::RoomAclEntry]) -> u64 {
+    let mut hasher = Hasher::new();
+    hasher.update(&[inherit_acl as u8]);
+    for e in entries {
+        // Length-prefix the group name so entry boundaries are unambiguous.
+        hasher.update(&(e.group.len() as u64).to_le_bytes());
+        hasher.update(e.group.as_bytes());
+        hasher.update(&e.grant.to_le_bytes());
+        hasher.update(&e.deny.to_le_bytes());
+        hasher.update(&[e.apply_here as u8, e.apply_subs as u8]);
+    }
+    let digest = hasher.finalize();
+    let v = u64::from_le_bytes(digest.as_bytes()[..8].try_into().expect("blake3 digest >= 8 bytes"));
+    // 0 is the wire sentinel for "no version" — remap the (astronomically
+    // unlikely) zero digest so a real version is always non-zero.
+    if v == 0 { 1 } else { v }
+}
+
 // =============================================================================
 // Ed25519 Authentication Helpers
 // =============================================================================
@@ -454,5 +492,58 @@ mod state_hash_tests {
             "7b83a5d8da7bc18c942bdf3a7ea6e5a2068611ef8cfdc6a1f1c5861f8ebc5660",
             "ServerState hash encoding changed"
         );
+    }
+}
+
+#[cfg(test)]
+mod room_acl_version_tests {
+    use super::*;
+
+    fn entry(group: &str, grant: u32, deny: u32, here: bool, subs: bool) -> proto::RoomAclEntry {
+        proto::RoomAclEntry {
+            group: group.into(),
+            grant,
+            deny,
+            apply_here: here,
+            apply_subs: subs,
+        }
+    }
+
+    #[test]
+    fn version_is_deterministic_and_content_sensitive() {
+        let a = vec![entry("default", 0x4, 0, true, true)];
+        let v = room_acl_version(true, &a);
+        assert_eq!(v, room_acl_version(true, &a), "same content, same version");
+        assert_ne!(v, 0, "0 is reserved for legacy/unversioned");
+
+        assert_ne!(v, room_acl_version(false, &a), "inherit flag participates");
+        assert_ne!(
+            v,
+            room_acl_version(true, &[entry("default", 0x4, 0x2, true, true)]),
+            "deny bits participate"
+        );
+        assert_ne!(
+            v,
+            room_acl_version(true, &[entry("admins", 0x4, 0, true, true)]),
+            "group name participates"
+        );
+        assert_ne!(v, room_acl_version(true, &[]), "entry count participates");
+    }
+
+    #[test]
+    fn version_is_order_sensitive() {
+        // ACL entries are an *ordered* list (applied in sequence), so two
+        // different orders are genuinely different configurations.
+        let ab = vec![entry("a", 1, 0, true, true), entry("b", 2, 0, true, true)];
+        let ba = vec![entry("b", 2, 0, true, true), entry("a", 1, 0, true, true)];
+        assert_ne!(room_acl_version(true, &ab), room_acl_version(true, &ba));
+    }
+
+    #[test]
+    fn entry_boundaries_are_unambiguous() {
+        // Length-prefixing must keep ("ab", ...) ≠ ("a", "b…")-style splices.
+        let one = vec![entry("ab", 0, 0, true, true)];
+        let two = vec![entry("a", 0, 0, true, true), entry("b", 0, 0, true, true)];
+        assert_ne!(room_acl_version(true, &one), room_acl_version(true, &two));
     }
 }

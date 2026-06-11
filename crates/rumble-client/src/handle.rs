@@ -2047,6 +2047,19 @@ async fn run_connection_task<P: Platform>(
                             send_tracked(&mut transport, &local_close, &env, &bus, &audio_task).await;
                         }
                     }
+                    Command::ToggleGroupPermission { name, bits, enable } => {
+                        if transport.is_some() {
+                            let env = proto::Envelope {
+                                state_hash: vec![],
+                                payload: Some(Payload::ToggleGroupPermission(proto::ToggleGroupPermission {
+                                    name,
+                                    bits,
+                                    enable,
+                                })),
+                            };
+                            send_tracked(&mut transport, &local_close, &env, &bus, &audio_task).await;
+                        }
+                    }
                     Command::SetUserGroup {
                         target_user_id,
                         group,
@@ -2070,6 +2083,7 @@ async fn run_connection_task<P: Platform>(
                         room_id,
                         inherit_acl,
                         entries,
+                        base_version,
                     } => {
                         if transport.is_some() {
                             let env = proto::Envelope {
@@ -2078,6 +2092,7 @@ async fn run_connection_task<P: Platform>(
                                     room_id: room_id.as_bytes().to_vec(),
                                     inherit_acl,
                                     entries,
+                                    base_version,
                                 })),
                             };
                             send_tracked(&mut transport, &local_close, &env, &bus, &audio_task).await;
@@ -2507,6 +2522,18 @@ fn handle_server_message(
 ) {
     match env.payload {
         Some(Payload::CommandResult(cr)) => {
+            // A failed room-ACL save also gets a toast: the editor modal has
+            // already closed by the time the result arrives, so the chat-log
+            // notice alone is easy to miss. The conflict path (#38 — "ACLs
+            // changed while you were editing") rides this; reopening the
+            // editor shows the fresh rules, since the concurrent admin's
+            // RoomAclChanged broadcast has already updated local state.
+            if !cr.success && cr.command == "SetRoomAcl" {
+                events.send(BackendEvent::Toast {
+                    level: NotificationLevel::Error,
+                    text: cr.message.clone(),
+                });
+            }
             // Display command results as local chat messages
             let prefix = if cr.success { "✔" } else { "✖" };
             add_local_message(bus, format!("{} {}", prefix, cr.message));

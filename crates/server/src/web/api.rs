@@ -11,7 +11,7 @@ use axum::{
 use rumble_protocol::proto;
 use rumble_web_types::{
     BanRequest, CreateGroupRequest, CreateRoomRequest, KickRequest, ModifyGroupRequest, OkMessage, SetRoomAclRequest,
-    SetUserGroupRequest,
+    SetUserGroupRequest, ToggleGroupPermissionRequest,
 };
 use uuid::Uuid;
 
@@ -49,6 +49,20 @@ pub async fn modify_group(
     Json(req): Json<ModifyGroupRequest>,
 ) -> ApiResult<OkMessage> {
     let msg = map_op(ops::apply_modify_group(&st.state, &st.persistence, name, req.permissions).await)?;
+    ok(msg)
+}
+
+/// `POST /api/groups/{name}/permissions` — set or clear specific permission
+/// bit(s) atomically against the group's current state. Per-switch toggles use
+/// this instead of [`modify_group`] so two admins editing different bits
+/// concurrently don't clobber each other (#38).
+pub async fn toggle_group_permission(
+    _admin: Admin,
+    State(st): State<WebState>,
+    Path(name): Path<String>,
+    Json(req): Json<ToggleGroupPermissionRequest>,
+) -> ApiResult<OkMessage> {
+    let msg = map_op(ops::apply_toggle_group_permission(&st.state, &st.persistence, name, req.bits, req.enable).await)?;
     ok(msg)
 }
 
@@ -97,7 +111,17 @@ pub async fn set_room_acl(
             apply_subs: e.apply_subs,
         })
         .collect();
-    let msg = map_op(ops::apply_set_room_acl(&st.state, &st.persistence, room_uuid, req.inherit_acl, entries).await)?;
+    let msg = map_op(
+        ops::apply_set_room_acl(
+            &st.state,
+            &st.persistence,
+            room_uuid,
+            req.inherit_acl,
+            entries,
+            req.base_version,
+        )
+        .await,
+    )?;
     ok(msg)
 }
 

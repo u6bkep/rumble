@@ -243,6 +243,13 @@ pub struct RoomAclModalState {
     /// `+ add group rule` popover state, holds the current filter
     /// string. `None` when the popover is closed.
     pub add_rule_query: Option<String>,
+    /// Optimistic-concurrency token: [`rumble_protocol::room_acl_version`]
+    /// of the `(inherit_acl, acls)` snapshot this modal copied at open.
+    /// Echoed in `Command::SetRoomAcl` so the server rejects the save if
+    /// another admin changed the room's ACL while the modal was open,
+    /// instead of silently clobbering their edit (#38). The rejection
+    /// surfaces as an error toast; reopening the modal loads fresh rules.
+    pub base_version: u64,
 }
 
 impl RoomAclModalState {
@@ -267,6 +274,10 @@ impl RoomAclModalState {
 
         let entries: Vec<AclEditEntry> = room.acls.iter().map(AclEditEntry::from_proto).collect();
 
+        // Version of the exact configuration we're copying into the editor —
+        // the server compares the save against this base.
+        let base_version = rumble_protocol::room_acl_version(room.inherit_acl, &room.acls);
+
         Some(RoomAclModalState {
             room_id,
             room_name,
@@ -276,6 +287,7 @@ impl RoomAclModalState {
             expanded_entry: None,
             inherited_open: true,
             add_rule_query: None,
+            base_version,
         })
     }
 
@@ -292,6 +304,7 @@ impl RoomAclModalState {
             room_id: self.room_id,
             inherit_acl: self.inherit_acl,
             entries: self.entries.iter().map(AclEditEntry::to_proto).collect(),
+            base_version: self.base_version,
         }
     }
 }
@@ -1041,6 +1054,7 @@ mod tests {
             expanded_entry: Some(0),
             inherited_open: false,
             add_rule_query: None,
+            base_version: 0,
         }
     }
 

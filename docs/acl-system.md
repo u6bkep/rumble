@@ -50,6 +50,7 @@ Groups are named permission sets stored in the sled `groups` tree (`persistence.
 
 - **`default`** and **`admin`** are created on first startup by `Persistence::ensure_default_groups()` (only if the `groups` tree is empty) with `DEFAULT_PERMISSIONS` / `ADMIN_PERMISSIONS`.
 - **Custom groups** are created at runtime via `CreateGroup` (handler `handle_create_group` in `handlers.rs`), gated on `MANAGE_ACL` at root. `default`/`admin` cannot be re-created; duplicate names are rejected.
+- **Editing a group's bits** has two ops (both gated on `MANAGE_ACL` at root): `ModifyGroup` is an *absolute* write that replaces the whole bitmask (used for deliberate whole-mask actions like "+ all" / "Clear all"), while `ToggleGroupPermission { name, bits, enable }` sets/clears specific bit(s) as an atomic server-side delta (`Persistence::toggle_group_permission`, a sled compare-and-swap loop). Per-switch toggles in the admin UIs use the delta op so two admins flipping different bits concurrently both land; `enable` carries the desired state, making retries idempotent.
 - **User→group assignments** live in the `user_groups` tree (key = 32-byte Ed25519 public key → bincode `Vec<String>`). Managed via `add_user_to_group` / `remove_user_from_group` / `set_user_groups`.
 - A `controllers` group (granting only `MANAGE_PARTICIPANTS`) is lazily created by the `add-controller` CLI subcommand.
 
@@ -80,6 +81,10 @@ PersistedAclEntry {
 ```
 
 The runtime equivalents are `RoomAclData` / `AclEntry` in `permissions.rs`. Set via `SetRoomAcl` (handler `handle_set_room_acl`, gated on `MANAGE_ACL` or room `WRITE`). Entries are **ordered** and applied in sequence.
+
+### Optimistic concurrency on `SetRoomAcl`
+
+`SetRoomAcl` replaces the room's whole ACL list, so it carries `base_version`: a content-derived token (`rumble_protocol::room_acl_version` — truncated BLAKE3 over a canonical encoding of `inherit_acl` + the ordered entries, never 0) of the configuration the editor *loaded*. The server recomputes the room's current version from persistence under `ServerState::acl_write_gate` and rejects the save on mismatch (`ops::ACL_CONFLICT_MSG`) instead of clobbering a concurrent admin's edit. Because the version is derived from content, nothing extra is persisted or state-synced — clients compute it locally from the `RoomInfo` they already hold (the web admin gets it precomputed as `RoomDto.acl_version`). **`base_version == 0` means an unversioned legacy write and is accepted unconditionally**, so older deployed clients keep working. On rejection the desktop client shows an error toast (the modal closed at save; reopening loads the fresh rules) and the web admin shows the error in the status line and refetches the snapshot.
 
 ## Evaluation algorithm
 
@@ -136,4 +141,4 @@ Admin subcommands run against the sled DB and exit (`handle_subcommand` in `crat
 
 ## Proto wire fields
 
-ACL-related payloads occupy proto fields 80–93 in `crates/rumble-protocol/proto/api.proto`: `KickUser`=80, `BanUser`=81, `SetServerMute`=83, `Elevate`=84, `CreateGroup`=85, `DeleteGroup`=86, `ModifyGroup`=87, `SetUserGroup`=88, `SetRoomAcl`=89, `PermissionDenied`=91, `UserKicked`=92. State updates include `GroupChanged` and `UserGroupChanged`. `proto::User` carries `server_muted` / `is_elevated` for the roster.
+ACL-related payloads occupy proto fields 80–93 in `crates/rumble-protocol/proto/api.proto`: `KickUser`=80, `BanUser`=81, `SetServerMute`=83, `Elevate`=84, `CreateGroup`=85, `DeleteGroup`=86, `ModifyGroup`=87, `SetUserGroup`=88, `SetRoomAcl`=89 (carries `base_version`, see above), `PermissionDenied`=91, `UserKicked`=92, `ToggleGroupPermission`=93. State updates include `GroupChanged` and `UserGroupChanged`. `proto::User` carries `server_muted` / `is_elevated` for the roster.

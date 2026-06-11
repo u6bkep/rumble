@@ -454,6 +454,12 @@ pub struct ServerState {
     /// Slash commands aggregated from plugins, set once at startup and reported
     /// to clients in the full [`rumble_protocol::proto::ServerState`] snapshot.
     slash_commands: OnceLock<Vec<rumble_protocol::proto::SlashCommand>>,
+    /// Serializes room-ACL check-and-set sequences (`ops::apply_set_room_acl`):
+    /// the optimistic-version compare against persistence and the subsequent
+    /// write must be atomic with respect to other ACL saves, or two stale
+    /// writers could both pass the check. Held for the duration of one ACL
+    /// save (check + persist + broadcast); never held by readers.
+    pub(crate) acl_write_gate: tokio::sync::Mutex<()>,
 }
 
 impl ServerState {
@@ -472,6 +478,7 @@ impl ServerState {
             audio_sinks: DashMap::new(),
             next_sub_id: AtomicU64::new(1),
             slash_commands: OnceLock::new(),
+            acl_write_gate: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -490,6 +497,7 @@ impl ServerState {
             audio_sinks: DashMap::new(),
             next_sub_id: AtomicU64::new(1),
             slash_commands: OnceLock::new(),
+            acl_write_gate: tokio::sync::Mutex::new(()),
         }
     }
 

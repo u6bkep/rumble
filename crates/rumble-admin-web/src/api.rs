@@ -14,7 +14,7 @@ use std::{cell::RefCell, rc::Rc};
 
 use rumble_web_types::{
     BanRequest, BootstrapRequest, CreateGroupRequest, CreateRoomRequest, KickRequest, LoginRequest, ModifyGroupRequest,
-    OkMessage, SessionInfo, SetRoomAclRequest, SetUserGroupRequest, StateSnapshot,
+    OkMessage, SessionInfo, SetRoomAclRequest, SetUserGroupRequest, StateSnapshot, ToggleGroupPermissionRequest,
 };
 
 use crate::inbox::{Inbox, Msg};
@@ -126,16 +126,17 @@ fn deliver(inbox: &Inb, msg: Msg) {
     inbox.borrow_mut().push(msg);
 }
 
-/// Common tail for a mutating call: report the success line and refresh the
-/// dashboard snapshot, or report the failure.
+/// Common tail for a mutating call: report the outcome and refresh the
+/// dashboard snapshot. The refresh runs on failure too — a rejected action
+/// (e.g. a stale room-ACL save another admin beat us to) usually means our
+/// snapshot is out of date, so pulling fresh state lets the user reopen the
+/// editor against the latest data.
 fn settle_action(inbox: Inb, res: Result<OkMessage, String>) {
     match res {
-        Ok(ok) => {
-            deliver(&inbox, Msg::ActionOk(ok.message));
-            fetch_state(inbox);
-        }
+        Ok(ok) => deliver(&inbox, Msg::ActionOk(ok.message)),
         Err(e) => deliver(&inbox, Msg::Error(e)),
     }
+    fetch_state(inbox);
 }
 
 // --- auth & bootstrap -------------------------------------------------------
@@ -223,10 +224,23 @@ pub fn delete_group(inbox: Inb, name: String) {
     });
 }
 
+/// Absolute write: replaces the group's whole bitmask. Used by the deliberate
+/// whole-mask actions ("+ all" / "Clear all"); per-switch toggles go through
+/// [`toggle_group_permission`] so concurrent edits don't clobber each other.
 pub fn modify_group(inbox: Inb, name: String, permissions: u32) {
     spawn_local(async move {
         let req = ModifyGroupRequest { permissions };
         let res = patch_json::<_, OkMessage>(&format!("/api/groups/{name}"), &req).await;
+        settle_action(inbox, res);
+    });
+}
+
+/// Set or clear specific permission bit(s) on a group as an atomic server-side
+/// delta. `enable` is the desired state, so retries are idempotent.
+pub fn toggle_group_permission(inbox: Inb, name: String, bits: u32, enable: bool) {
+    spawn_local(async move {
+        let req = ToggleGroupPermissionRequest { bits, enable };
+        let res = post_json::<_, OkMessage>(&format!("/api/groups/{name}/permissions"), &req).await;
         settle_action(inbox, res);
     });
 }
