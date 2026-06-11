@@ -428,8 +428,37 @@ impl<B: UiBackend> App for RumbleApp<B> {
         // for images → render reads cache).
         self.media_cache
             .set_gif_autoplay_default(self.settings.settings().chat.gif_autoplay);
+        // Pin lightbox-backing media before `drain_pending` runs the LRU
+        // byte-budget eviction pass: an entry backing a currently-open
+        // (or still-opening) lightbox must never be evicted (issue #37).
+        let mut pinned = std::collections::HashSet::new();
+        if let Some(lb) = self.lightboxes.image.as_ref() {
+            pinned.insert(lb.transfer_id.clone());
+        }
+        if let Some(active) = self.lightboxes.video.as_ref() {
+            pinned.insert(active.transfer_id.clone());
+        }
+        if let Some(pending) = self.lightboxes.pending_video_open.as_ref() {
+            pinned.insert(pending.transfer_id.clone());
+        }
+        if let Some(active) = self.lightboxes.model.as_ref() {
+            pinned.insert(active.transfer_id.clone());
+        }
+        self.media_cache.set_pinned(pinned);
         self.drain_backend_events();
         self.media_cache.drain_pending();
+        // Defense in depth: if the image lightbox's backing cache entry
+        // disappeared anyway (pinning should make this unreachable),
+        // close it instead of leaving an invisible overlay that would
+        // swallow wheel events.
+        let image_lightbox_stale = self
+            .lightboxes
+            .image
+            .as_ref()
+            .is_some_and(|lb| self.media_cache.lightbox_image_for(&lb.transfer_id).is_none());
+        if image_lightbox_stale {
+            self.lightboxes.close_image(&mut self.media_cache);
+        }
         let now = Instant::now();
         self.media_cache.advance_gif_playheads(now);
         self.poll_video_open();
@@ -556,6 +585,10 @@ impl<B: UiBackend> App for RumbleApp<B> {
         // the settings dialog, which would otherwise paint behind them
         // while still interactive.
         let content_layers_clear = session_gate_clear && !self.settings_state.open;
+        // `content_layers_clear_for` is the event-time mirror of this
+        // computation (wheel routing must agree with visibility) —
+        // keep the two in lockstep.
+        debug_assert_eq!(content_layers_clear, self.content_layers_clear_for(&state.connection));
         // Suppress the server form whenever a higher-priority modal is up.
         let connect_layer = if session_gate_clear {
             server_picker::render_form_modal(&self.server_picker, &self.selection)
@@ -1134,8 +1167,22 @@ impl<B: UiBackend> App for RumbleApp<B> {
     /// doesn't move the chat list underneath the overlay. Other modes
     /// fall through to the default (forward to `on_event`, no consume),
     /// so chat / room-tree / settings scrolling all keep working.
+    ///
+    /// Keyed off actual lightbox *visibility*, not just
+    /// `lightboxes.image.is_some()`: `build` suppresses the overlay
+    /// under session-gate modals / settings and when the backing cache
+    /// entry is missing, and an invisible lightbox must not silently
+    /// swallow scrolling (issue #37).
     fn on_wheel_event(&mut self, event: UiEvent, cx: &EventCx) -> bool {
-        if self.lightboxes.image.is_some() {
+        let connection = self.backend.state().connection.clone();
+        let image_lightbox_visible = self.lightboxes.image.is_some()
+            && self.content_layers_clear_for(&connection)
+            && self
+                .lightboxes
+                .image
+                .as_ref()
+                .is_some_and(|lb| self.media_cache.lightbox_image_for(&lb.transfer_id).is_some());
+        if image_lightbox_visible {
             let image_size = self.lightboxes.image.as_ref().and_then(|lightbox| {
                 let cached = self.media_cache.lightbox_image_for(&lightbox.transfer_id)?;
                 let playback = self.media_cache.gif_playback_for(&lightbox.transfer_id);
@@ -1181,6 +1228,27 @@ impl<B: UiBackend> WinitWgpuApp for RumbleApp<B> {
 }
 
 impl<B: UiBackend> RumbleApp<B> {
+    /// Whether the content-overlay layer (lightboxes, file context
+    /// menu) is actually interactive — i.e. no session-gate modal
+    /// (wizard / unlock / cert) or settings dialog covers it. Mirrors
+    /// the `session_gate_clear` / `content_layers_clear` computation in
+    /// [`App::build`] (kept in lockstep by a `debug_assert!` there) so
+    /// event-time decisions like the lightbox wheel claim agree with
+    /// what is actually on screen.
+    fn content_layers_clear_for(&self, connection: &ConnectionState) -> bool {
+        let wizard_open = !matches!(self.wizard, WizardState::NotNeeded | WizardState::Complete);
+        if wizard_open {
+            return false;
+        }
+        if self.identity.needs_unlock() || self.force_unlock_for_test {
+            return false;
+        }
+        if matches!(connection, ConnectionState::CertificatePending { .. }) {
+            return false;
+        }
+        !self.settings_state.open
+    }
+
     /// Persist the currently-pending cert into shared shell settings and
     /// tell the backend to proceed. Dedup by `(server_name, fingerprint)`
     /// so accepting the same cert twice doesn't grow the file.

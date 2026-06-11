@@ -46,6 +46,7 @@ use std::{
     collections::{HashMap, HashSet},
     io::BufReader,
     path::{Path, PathBuf},
+    sync::Mutex,
     time::{Duration, Instant},
 };
 
@@ -97,6 +98,155 @@ const MAX_ANIMATED_RGBA_BYTES: usize = 256 * 1024 * 1024;
 /// after the 2nd wait 8s. Long enough to outlast a busy upload reader
 /// while staying interactive on the cold-start path.
 const THUMB_RETRY_DELAYS: &[Duration] = &[Duration::from_secs(2), Duration::from_secs(8)];
+
+/// Soft byte budget for CPU-side decoded media (decoded RGBA frames,
+/// animated frame sequences, video/model posters, parsed model
+/// geometry). Enforced once per frame by LRU eviction (issue #37).
+/// Entries rendered last frame and entries backing an open lightbox are
+/// exempt, so this is a soft cap on *off-screen* accumulation, not a
+/// hard limit. ~512 MiB keeps a generous working set while bounding a
+/// long session full of animated images.
+const CPU_BUDGET_BYTES: usize = 512 * 1024 * 1024;
+
+/// Soft byte budget for app-owned GPU textures (the `animated_gpu`
+/// mirrors of animated previews). Same exemptions as
+/// [`CPU_BUDGET_BYTES`]. Note that evicting an animated entry frees its
+/// GPU mirror together with its CPU frames — the two budgets share one
+/// LRU order.
+const GPU_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+
+/// Nominal CPU cost charged for a parsed SVG entry. The real in-memory
+/// size of a vector asset isn't observable from here, but it's small
+/// compared to raster frames; a fixed estimate keeps pathological
+/// many-SVG sessions bounded without overstating the common case.
+const SVG_NOMINAL_BYTES: usize = 256 * 1024;
+
+/// Which per-id "family" of cache maps an LRU entry covers. Eviction
+/// always removes a family as a unit so linked state can't orphan
+/// (e.g. evicting an animated image also drops its `gif_playback`
+/// record and `animated_gpu` texture).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum MediaKind {
+    /// `image_cache` entry + linked `gif_playback` + `animated_gpu`.
+    Image,
+    /// `lightbox_full` entry (full-res decode for an open lightbox).
+    LightboxFull,
+    /// `video_thumbs` poster.
+    VideoThumb,
+    /// `models` geometry + linked `model_thumbs` poster.
+    Model,
+}
+
+/// Interior-mutable LRU bookkeeping. Lives behind a `Mutex` because the
+/// lookup accessors that need to touch entries take `&self` (the render
+/// path borrows the cache immutably). Contention is nil — everything
+/// runs on the UI thread.
+#[derive(Default)]
+struct LruState {
+    /// Monotonic use counter; bumped on every touch.
+    clock: u64,
+    /// Clock value at the previous budget-enforcement pass. Entries
+    /// touched since then were used by the frame just built and are
+    /// exempt from eviction (see [`plan_evictions`]).
+    floor: u64,
+    last_used: HashMap<(MediaKind, String), u64>,
+    /// Transfer ids whose render lookup missed but for which we still
+    /// hold a source path (previously decoded, since evicted). Drained
+    /// once per frame to re-spawn the decode — the "evicted then
+    /// re-scrolled" recovery path.
+    demand: HashSet<String>,
+}
+
+/// One evictable cache unit, as seen by [`plan_evictions`]: the whole
+/// per-id family for its kind with its approximate byte costs.
+struct EvictionCandidate {
+    kind: MediaKind,
+    id: String,
+    last_used: u64,
+    cpu_bytes: usize,
+    gpu_bytes: usize,
+}
+
+/// Pure LRU eviction planner. Returns the `(kind, id)` families to
+/// evict, least-recently-used first, until both totals fit their
+/// budgets. Skips pinned ids (open lightboxes) and entries touched
+/// after `recent_floor` (rendered last frame) — evicting those would
+/// flicker visible content and trigger an immediate re-decode storm,
+/// so the budgets are soft when the *visible* set alone exceeds them.
+fn plan_evictions(
+    mut candidates: Vec<EvictionCandidate>,
+    cpu_budget: usize,
+    gpu_budget: usize,
+    recent_floor: u64,
+    pinned: &HashSet<String>,
+) -> Vec<(MediaKind, String)> {
+    let mut cpu_total: usize = candidates.iter().map(|c| c.cpu_bytes).sum();
+    let mut gpu_total: usize = candidates.iter().map(|c| c.gpu_bytes).sum();
+    if cpu_total <= cpu_budget && gpu_total <= gpu_budget {
+        return Vec::new();
+    }
+    candidates.sort_by_key(|c| c.last_used);
+    let mut evict = Vec::new();
+    for c in candidates {
+        if cpu_total <= cpu_budget && gpu_total <= gpu_budget {
+            break;
+        }
+        if pinned.contains(&c.id) || c.last_used > recent_floor {
+            continue;
+        }
+        // Only evict entries that shrink a dimension that's actually
+        // over budget — dropping a CPU-only poster does nothing for a
+        // GPU overage.
+        let helps_cpu = cpu_total > cpu_budget && c.cpu_bytes > 0;
+        let helps_gpu = gpu_total > gpu_budget && c.gpu_bytes > 0;
+        if !helps_cpu && !helps_gpu {
+            continue;
+        }
+        cpu_total = cpu_total.saturating_sub(c.cpu_bytes);
+        gpu_total = gpu_total.saturating_sub(c.gpu_bytes);
+        evict.push((c.kind, c.id));
+    }
+    evict
+}
+
+/// Approximate CPU bytes of one decoded RGBA image.
+fn image_bytes(img: &Image) -> usize {
+    img.width() as usize * img.height() as usize * 4
+}
+
+/// Approximate CPU bytes of one [`chat::CachedImage`] entry.
+fn cached_image_cpu_bytes(cached: &chat::CachedImage) -> usize {
+    match cached {
+        chat::CachedImage::Static(img) => image_bytes(img),
+        chat::CachedImage::Animated { frames } => frames.iter().map(|(img, _)| image_bytes(img)).sum(),
+        chat::CachedImage::Svg(_) => SVG_NOMINAL_BYTES,
+    }
+}
+
+/// Approximate CPU bytes of parsed model geometry.
+fn model_cpu_bytes(model: &LoadedModel) -> usize {
+    use damascene_core::scene::{MeshVertex, ScenePoint};
+    match model {
+        LoadedModel::Mesh(handle) => {
+            let (data, _) = handle.snapshot();
+            data.vertices.len() * std::mem::size_of::<MeshVertex>()
+                + data
+                    .indices
+                    .as_ref()
+                    .map_or(0, |i| i.len() * std::mem::size_of::<u32>())
+        }
+        LoadedModel::Points(handle) => {
+            let (data, _) = handle.snapshot();
+            data.points.len() * std::mem::size_of::<ScenePoint>()
+        }
+    }
+}
+
+/// GPU bytes of one animated-preview texture (`Rgba8UnormSrgb`).
+fn animated_gpu_bytes(gpu: &AnimatedGpu) -> usize {
+    let (w, h) = gpu.size();
+    w as usize * h as usize * 4
+}
 
 /// Per-id retry bookkeeping for video thumbnail decoding.
 #[derive(Clone, Copy, Debug)]
@@ -170,6 +320,21 @@ pub struct MediaCache {
     /// keyed by `transfer_id` so a re-open of the same image avoids
     /// re-decoding while the cache entry is live.
     lightbox_full: HashMap<String, chat::CachedImage>,
+
+    /// LRU bookkeeping for the byte-budget eviction pass (issue #37).
+    /// Interior-mutable so the `&self` lookup accessors can touch
+    /// entries on use and record demand on miss.
+    lru: Mutex<LruState>,
+    /// `transfer_id → (local_path, name)` for every media-typed
+    /// transfer that has hit `Done`. Kept so an evicted entry can be
+    /// re-decoded straight from disk when its message scrolls back
+    /// into view — no new transfer event required. Tiny per entry
+    /// (a path + name), so it isn't itself budgeted.
+    sources: HashMap<String, (PathBuf, String)>,
+    /// Transfer ids that must never be evicted: anything backing a
+    /// currently-open (or opening) lightbox. Refreshed by the App once
+    /// per frame, before [`Self::drain_pending`] runs the eviction pass.
+    pinned: HashSet<String>,
 }
 
 impl MediaCache {
@@ -193,7 +358,37 @@ impl MediaCache {
             model_thumbnailer: ModelThumbnailer::new(),
             pending_lightbox: None,
             lightbox_full: HashMap::new(),
+            lru: Mutex::new(LruState::default()),
+            sources: HashMap::new(),
+            pinned: HashSet::new(),
         }
+    }
+
+    /// Mark an entry as used at the current LRU clock. `&self` because
+    /// the render path holds the cache immutably.
+    fn touch(&self, kind: MediaKind, id: &str) {
+        let mut lru = self.lru.lock().unwrap();
+        lru.clock += 1;
+        let clock = lru.clock;
+        lru.last_used.insert((kind, id.to_string()), clock);
+    }
+
+    /// Record a render-time lookup miss for an id we previously decoded
+    /// (its source path is still on file): next frame's
+    /// [`Self::process_demand`] re-spawns the decode so evicted media
+    /// repopulates when scrolled back into view.
+    fn note_miss(&self, id: &str) {
+        if !self.sources.contains_key(id) {
+            return;
+        }
+        self.lru.lock().unwrap().demand.insert(id.to_string());
+    }
+
+    /// Replace the set of never-evict transfer ids. The App calls this
+    /// once per frame (before [`Self::drain_pending`]) with the ids
+    /// backing the open image/video/model lightboxes.
+    pub fn set_pinned(&mut self, pinned: HashSet<String>) {
+        self.pinned = pinned;
     }
 
     /// Update the autoplay default. The App calls this once per
@@ -230,6 +425,12 @@ impl MediaCache {
     /// frames, enough to freeze the UI for seconds on the UI thread.
     /// Video thumbs likewise go async; libmpv cold-start is 50–200ms.
     fn on_transfer_done(&mut self, id: &str, name: &str, local_path: &Path) {
+        if chat::is_image_name(name) || crate::video::is_video_name(name) || model::is_model_name(name) {
+            // Remember where the bytes live so an LRU-evicted entry can
+            // be re-decoded from disk when it scrolls back into view.
+            self.sources
+                .insert(id.to_string(), (local_path.to_path_buf(), name.to_string()));
+        }
         if chat::is_image_name(name)
             && !self.image_cache.contains_key(id)
             && !self.image_failed.contains(id)
@@ -286,6 +487,9 @@ impl MediaCache {
         if let Some(handle) = self.pending_model_loads.remove(id) {
             handle.abort();
         }
+        // The local file is no longer trustworthy after a failure;
+        // don't let the eviction-demand path re-decode from it.
+        self.sources.remove(id);
     }
 
     fn spawn_video_thumb(&mut self, id: String, path: PathBuf) {
@@ -305,13 +509,131 @@ impl MediaCache {
 
     /// Land any off-thread decode results that finished since the
     /// last frame, plus respawn any video-thumb retries whose backoff
-    /// has elapsed. Called once per frame from `App::before_build`.
+    /// has elapsed, then run the LRU byte-budget eviction pass.
+    /// Called once per frame from `App::before_build` (after the App
+    /// has refreshed [`Self::set_pinned`]).
     pub fn drain_pending(&mut self) {
+        self.process_demand();
         self.drain_image_decodes();
         self.drain_video_thumbs();
         self.maybe_respawn_video_thumbs();
         self.drain_model_loads();
         self.drain_lightbox();
+        self.enforce_budgets();
+    }
+
+    /// Re-spawn decodes for evicted entries whose render lookup missed
+    /// last frame. Goes back through [`Self::on_transfer_done`], so all
+    /// the in-flight / already-cached / known-failed guards apply and a
+    /// repopulated entry behaves exactly like a fresh download.
+    fn process_demand(&mut self) {
+        let demanded: Vec<String> = {
+            let mut lru = self.lru.lock().unwrap();
+            if lru.demand.is_empty() {
+                return;
+            }
+            lru.demand.drain().collect()
+        };
+        for id in demanded {
+            let Some((path, name)) = self.sources.get(&id) else {
+                continue;
+            };
+            // A video-thumb failure record means the retry/backoff
+            // machinery (or its give-up decision) owns this id; the
+            // demand path must not reset its counter every frame.
+            if self.failed_video_thumbs.contains_key(&id) {
+                continue;
+            }
+            let (path, name) = (path.clone(), name.clone());
+            self.on_transfer_done(&id, &name, &path);
+        }
+    }
+
+    /// LRU eviction down to the byte budgets. See [`plan_evictions`]
+    /// for the policy (pinned + just-rendered entries are exempt).
+    fn enforce_budgets(&mut self) {
+        self.enforce_budgets_with(CPU_BUDGET_BYTES, GPU_BUDGET_BYTES);
+    }
+
+    fn enforce_budgets_with(&mut self, cpu_budget: usize, gpu_budget: usize) {
+        let (recent_floor, last_used) = {
+            let mut lru = self.lru.lock().unwrap();
+            let floor = lru.floor;
+            // Entries touched after this point are the next frame's
+            // active set.
+            lru.floor = lru.clock;
+            (floor, lru.last_used.clone())
+        };
+        let stamp = |kind: MediaKind, id: &str| last_used.get(&(kind, id.to_string())).copied().unwrap_or(0);
+
+        let mut candidates: Vec<EvictionCandidate> = Vec::new();
+        for (id, cached) in &self.image_cache {
+            candidates.push(EvictionCandidate {
+                kind: MediaKind::Image,
+                id: id.clone(),
+                last_used: stamp(MediaKind::Image, id),
+                cpu_bytes: cached_image_cpu_bytes(cached),
+                gpu_bytes: self.animated_gpu.get(id).map_or(0, animated_gpu_bytes),
+            });
+        }
+        for (id, cached) in &self.lightbox_full {
+            candidates.push(EvictionCandidate {
+                kind: MediaKind::LightboxFull,
+                id: id.clone(),
+                last_used: stamp(MediaKind::LightboxFull, id),
+                cpu_bytes: cached_image_cpu_bytes(cached),
+                gpu_bytes: 0,
+            });
+        }
+        for (id, thumb) in &self.video_thumbs {
+            candidates.push(EvictionCandidate {
+                kind: MediaKind::VideoThumb,
+                id: id.clone(),
+                last_used: stamp(MediaKind::VideoThumb, id),
+                cpu_bytes: image_bytes(thumb),
+                gpu_bytes: 0,
+            });
+        }
+        for (id, model) in &self.models {
+            candidates.push(EvictionCandidate {
+                kind: MediaKind::Model,
+                id: id.clone(),
+                last_used: stamp(MediaKind::Model, id),
+                cpu_bytes: model_cpu_bytes(model) + self.model_thumbs.get(id).map_or(0, image_bytes),
+                gpu_bytes: 0,
+            });
+        }
+
+        for (kind, id) in plan_evictions(candidates, cpu_budget, gpu_budget, recent_floor, &self.pinned) {
+            self.evict_entry(kind, &id);
+        }
+    }
+
+    /// Remove one per-id family from the cache, including all linked
+    /// state — evicting an animated image drops its `gif_playback`
+    /// record and `animated_gpu` texture in the same step so neither
+    /// can orphan. Deliberately does *not* mark the id as failed: a
+    /// later render miss re-decodes it via [`Self::process_demand`].
+    fn evict_entry(&mut self, kind: MediaKind, id: &str) {
+        self.lru.lock().unwrap().last_used.remove(&(kind, id.to_string()));
+        match kind {
+            MediaKind::Image => {
+                self.image_cache.remove(id);
+                self.gif_playback.remove(id);
+                self.animated_gpu.remove(id);
+            }
+            MediaKind::LightboxFull => {
+                self.lightbox_full.remove(id);
+            }
+            MediaKind::VideoThumb => {
+                self.video_thumbs.remove(id);
+            }
+            MediaKind::Model => {
+                self.models.remove(id);
+                self.model_thumbs.remove(id);
+            }
+        }
+        tracing::debug!("media_cache: LRU-evicted {kind:?} entry for {id} (over byte budget)");
     }
 
     /// Land finished off-thread image decodes. Animated results get a
@@ -335,6 +657,7 @@ impl MediaCache {
                             .entry(id.clone())
                             .or_insert_with(|| chat::GifPlayback::new(self.gif_autoplay_default));
                     }
+                    self.touch(MediaKind::Image, &id);
                     self.image_cache.insert(id, cached);
                 }
                 Ok(Err(e)) => {
@@ -364,6 +687,7 @@ impl MediaCache {
             let handle = self.pending_model_loads.remove(&id).unwrap();
             match self.runtime.block_on(handle) {
                 Ok(Ok(model)) => {
+                    self.touch(MediaKind::Model, &id);
                     self.models.insert(id, model);
                 }
                 Ok(Err(e)) => {
@@ -393,6 +717,7 @@ impl MediaCache {
                     tracing::debug!("video thumbnail decoded for {id}: {}x{}", image.width(), image.height());
                     self.failed_video_thumbs.remove(&id);
                     self.pending_video_thumb_retries.remove(&id);
+                    self.touch(MediaKind::VideoThumb, &id);
                     self.video_thumbs.insert(id, image);
                 }
                 Ok(Err(e)) => {
@@ -465,6 +790,7 @@ impl MediaCache {
         let pending = self.pending_lightbox.take().unwrap();
         match self.runtime.block_on(pending.handle) {
             Ok(Ok(img)) => {
+                self.touch(MediaKind::LightboxFull, &pending.transfer_id);
                 self.lightbox_full.insert(pending.transfer_id, img);
             }
             Ok(Err(e)) => {
@@ -549,6 +875,7 @@ impl MediaCache {
                     image.width(),
                     image.height()
                 );
+                self.touch(MediaKind::Model, &id);
                 self.model_thumbs.insert(id, image);
             }
         }
@@ -608,9 +935,22 @@ impl MediaCache {
     }
 
     // ---------- lookup accessors ----------
+    //
+    // Every hit touches the entry's LRU stamp (the render path is what
+    // keeps on-screen media alive); a miss on a previously-decoded id
+    // records re-decode demand (see [`Self::note_miss`]).
 
     pub fn image_for(&self, transfer_id: &str) -> Option<&chat::CachedImage> {
-        self.image_cache.get(transfer_id)
+        match self.image_cache.get(transfer_id) {
+            Some(cached) => {
+                self.touch(MediaKind::Image, transfer_id);
+                Some(cached)
+            }
+            None => {
+                self.note_miss(transfer_id);
+                None
+            }
+        }
     }
 
     pub fn gif_playback_for(&self, transfer_id: &str) -> Option<&chat::GifPlayback> {
@@ -622,26 +962,55 @@ impl MediaCache {
     }
 
     pub fn video_thumb_for(&self, transfer_id: &str) -> Option<&Image> {
-        self.video_thumbs.get(transfer_id)
+        match self.video_thumbs.get(transfer_id) {
+            Some(thumb) => {
+                self.touch(MediaKind::VideoThumb, transfer_id);
+                Some(thumb)
+            }
+            None => {
+                self.note_miss(transfer_id);
+                None
+            }
+        }
     }
 
     /// Poster thumbnail for a downloaded 3D model, if one has rendered.
     pub fn model_thumb_for(&self, transfer_id: &str) -> Option<&Image> {
-        self.model_thumbs.get(transfer_id)
+        match self.model_thumbs.get(transfer_id) {
+            Some(thumb) => {
+                self.touch(MediaKind::Model, transfer_id);
+                Some(thumb)
+            }
+            None => {
+                self.note_miss(transfer_id);
+                None
+            }
+        }
     }
 
     /// Parsed geometry for a downloaded 3D model, if the parse succeeded.
     /// The lightbox clones this (cheap `Arc` bump) to build its scene.
     pub fn model_for(&self, transfer_id: &str) -> Option<&LoadedModel> {
-        self.models.get(transfer_id)
+        match self.models.get(transfer_id) {
+            Some(model) => {
+                self.touch(MediaKind::Model, transfer_id);
+                Some(model)
+            }
+            None => {
+                self.note_miss(transfer_id);
+                None
+            }
+        }
     }
 
     /// Best image available for the open lightbox: full-resolution if
     /// the decode has landed, otherwise the inline thumbnail.
     pub fn lightbox_image_for(&self, transfer_id: &str) -> Option<&chat::CachedImage> {
-        self.lightbox_full
-            .get(transfer_id)
-            .or_else(|| self.image_cache.get(transfer_id))
+        if let Some(full) = self.lightbox_full.get(transfer_id) {
+            self.touch(MediaKind::LightboxFull, transfer_id);
+            return Some(full);
+        }
+        self.image_for(transfer_id)
     }
 
     // ---------- test/bundle-dump helpers ----------
@@ -844,5 +1213,204 @@ fn advance_gif_frame(pb: &mut chat::GifPlayback, frames: &[(Image, Duration)], n
         // Anchor `last_advance` at the boundary we landed on, so
         // residual sub-frame elapsed time doesn't accumulate drift.
         pb.last_advance = now - elapsed;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cand(kind: MediaKind, id: &str, last_used: u64, cpu: usize, gpu: usize) -> EvictionCandidate {
+        EvictionCandidate {
+            kind,
+            id: id.to_string(),
+            last_used,
+            cpu_bytes: cpu,
+            gpu_bytes: gpu,
+        }
+    }
+
+    fn ids(plan: &[(MediaKind, String)]) -> Vec<&str> {
+        plan.iter().map(|(_, id)| id.as_str()).collect()
+    }
+
+    #[test]
+    fn under_budget_evicts_nothing() {
+        let plan = plan_evictions(
+            vec![
+                cand(MediaKind::Image, "a", 1, 100, 0),
+                cand(MediaKind::VideoThumb, "b", 2, 100, 0),
+            ],
+            1000,
+            1000,
+            u64::MAX,
+            &HashSet::new(),
+        );
+        assert!(plan.is_empty());
+    }
+
+    #[test]
+    fn evicts_least_recently_used_first_until_under_budget() {
+        let plan = plan_evictions(
+            vec![
+                cand(MediaKind::Image, "newest", 30, 100, 0),
+                cand(MediaKind::Image, "oldest", 10, 100, 0),
+                cand(MediaKind::Image, "middle", 20, 100, 0),
+            ],
+            150,
+            1000,
+            u64::MAX,
+            &HashSet::new(),
+        );
+        // Total 300 over a 150 budget: dropping oldest (→200) isn't
+        // enough, dropping middle too (→100) is; newest survives.
+        assert_eq!(ids(&plan), vec!["oldest", "middle"]);
+    }
+
+    #[test]
+    fn pinned_entries_survive_even_over_budget() {
+        let pinned: HashSet<String> = ["oldest".to_string()].into_iter().collect();
+        let plan = plan_evictions(
+            vec![
+                cand(MediaKind::Image, "oldest", 10, 100, 0),
+                cand(MediaKind::Image, "newer", 20, 100, 0),
+            ],
+            0,
+            0,
+            u64::MAX,
+            &pinned,
+        );
+        assert_eq!(ids(&plan), vec!["newer"]);
+    }
+
+    #[test]
+    fn recently_used_entries_survive() {
+        // floor = 15: "fresh" (20 > 15) was rendered last frame and is
+        // exempt; "stale" (10 ≤ 15) is fair game.
+        let plan = plan_evictions(
+            vec![
+                cand(MediaKind::Image, "stale", 10, 100, 0),
+                cand(MediaKind::Image, "fresh", 20, 100, 0),
+            ],
+            0,
+            0,
+            15,
+            &HashSet::new(),
+        );
+        assert_eq!(ids(&plan), vec!["stale"]);
+    }
+
+    #[test]
+    fn gpu_only_overage_skips_cpu_only_entries() {
+        let plan = plan_evictions(
+            vec![
+                cand(MediaKind::VideoThumb, "cpu_only", 1, 100, 0),
+                cand(MediaKind::Image, "animated", 2, 100, 500),
+            ],
+            1000,
+            300,
+            u64::MAX,
+            &HashSet::new(),
+        );
+        // Only the GPU budget is exceeded — evicting the CPU-only
+        // poster would be pure waste even though it's older.
+        assert_eq!(ids(&plan), vec!["animated"]);
+    }
+
+    #[test]
+    fn cached_image_cost_counts_all_animated_frames() {
+        let frame = || (Image::from_rgba8(2, 2, vec![0; 16]), Duration::from_millis(20));
+        let animated = chat::CachedImage::Animated {
+            frames: vec![frame(), frame(), frame()],
+        };
+        assert_eq!(cached_image_cpu_bytes(&animated), 3 * 2 * 2 * 4);
+        let single = chat::CachedImage::Static(Image::from_rgba8(4, 2, vec![0; 32]));
+        assert_eq!(cached_image_cpu_bytes(&single), 4 * 2 * 4);
+    }
+
+    #[test]
+    fn evicting_animated_image_cleans_playback_and_lru_meta() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut mc = MediaCache::new(rt.handle().clone(), true);
+        let frame = || (Image::from_rgba8(2, 2, vec![0; 16]), Duration::from_millis(20));
+        mc.image_cache.insert(
+            "anim".into(),
+            chat::CachedImage::Animated {
+                frames: vec![frame(), frame()],
+            },
+        );
+        mc.gif_playback.insert("anim".into(), chat::GifPlayback::new(true));
+        mc.touch(MediaKind::Image, "anim");
+
+        // First pass: the entry was touched since the last floor, so it
+        // counts as "in active use" and survives even at zero budget.
+        mc.enforce_budgets_with(0, 0);
+        assert!(mc.image_cache.contains_key("anim"));
+
+        // Second pass: no touch since the previous pass → evicted, and
+        // the linked playback record goes with it (the GPU mirror would
+        // too — same `evict_entry` arm — but needs a wgpu device to
+        // construct in a test).
+        mc.enforce_budgets_with(0, 0);
+        assert!(mc.image_cache.is_empty());
+        assert!(mc.gif_playback.is_empty());
+        assert!(mc.lru.lock().unwrap().last_used.is_empty());
+        // Not marked failed: a re-decode stays possible.
+        assert!(!mc.image_failed.contains("anim"));
+    }
+
+    #[test]
+    fn pinned_id_survives_enforcement_on_the_cache() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut mc = MediaCache::new(rt.handle().clone(), true);
+        mc.image_cache.insert(
+            "pinned".into(),
+            chat::CachedImage::Static(Image::from_rgba8(2, 2, vec![0; 16])),
+        );
+        mc.set_pinned(["pinned".to_string()].into_iter().collect());
+        mc.enforce_budgets_with(0, 0);
+        mc.enforce_budgets_with(0, 0);
+        assert!(mc.image_cache.contains_key("pinned"));
+    }
+
+    #[test]
+    fn evicted_image_redecodes_on_render_demand() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut mc = MediaCache::new(rt.handle().clone(), true);
+
+        let dir = std::env::temp_dir().join(format!("rumble-media-cache-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("img.png");
+        image::RgbaImage::from_pixel(4, 4, image::Rgba([10, 20, 30, 255]))
+            .save(&path)
+            .unwrap();
+
+        let wait_for_decode = |mc: &mut MediaCache| {
+            for _ in 0..500 {
+                mc.drain_pending();
+                if mc.image_cache.contains_key("t1") {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!("decode never landed");
+        };
+
+        mc.on_transfer_done("t1", "img.png", &path);
+        wait_for_decode(&mut mc);
+
+        // Evict (two passes so the insert-time touch ages out).
+        mc.enforce_budgets_with(0, 0);
+        mc.enforce_budgets_with(0, 0);
+        assert!(mc.image_cache.is_empty());
+        assert!(!mc.image_failed.contains("t1"));
+
+        // A render-time miss records demand…
+        assert!(mc.image_for("t1").is_none());
+        // …and the next frames re-decode from the still-on-disk file.
+        wait_for_decode(&mut mc);
+        assert!(mc.image_for("t1").is_some());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
