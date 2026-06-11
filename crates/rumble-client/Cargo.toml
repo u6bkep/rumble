@@ -27,7 +27,7 @@ nnnoiseless = { version = "0.5.2", default-features = false }
 # real-time output callback off a general-purpose Mutex. Its only dependency,
 # crossbeam-utils, is already in the tree.
 rtrb = "0.3"
-serde = { workspace = true }
+serde = { workspace = true, features = ["rc"] }
 serde_json = { workspace = true }
 hex = { workspace = true }
 ed25519-dalek = { workspace = true }

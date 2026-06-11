@@ -952,7 +952,7 @@ fn file_share_state(scene: Scene) -> State {
     );
     let mut msg = make_chat_full(20, "alice", summary, ChatMessageKind::Room, Some(attachment));
     msg.visibility = ChatMessageVisibility::SenderDraft;
-    state.chat_messages.push(msg);
+    std::sync::Arc::make_mut(&mut state.chat_messages).push(msg);
     state
 }
 
@@ -979,7 +979,7 @@ fn connected_state() -> State {
         my_user_id: Some(1),
         my_room_id: Some(Uuid::from_u128(ROOM_LOBBY)),
         audio,
-        chat_messages: vec![
+        chat_messages: std::sync::Arc::new(vec![
             make_chat(1, "alice", "morning everyone", ChatMessageKind::Room),
             make_chat(2, "bob", "did the deploy go through?", ChatMessageKind::Room),
             make_chat(
@@ -1014,7 +1014,7 @@ fn connected_state() -> State {
                     "shared file: deploy_notes.md (12.3 KB)",
                 )),
             ),
-        ],
+        ]),
         // The chat composer enables itself only when the local user has
         // TEXT_MESSAGE in the current room, so seed the bit so the
         // connected scene shows the active composer (not the disabled
@@ -1180,7 +1180,7 @@ fn demo_preview_image() -> Image {
 /// preview / lightbox scenes dispatch through the model path.
 fn connected_state_with_model() -> State {
     let mut state = connected_state();
-    if let Some(msg) = state.chat_messages.last_mut() {
+    if let Some(msg) = std::sync::Arc::make_mut(&mut state.chat_messages).last_mut() {
         let summary = "shared model: bracket.stl (48.0 KB)";
         msg.text = summary.into();
         msg.attachment = Some(relay_attachment(

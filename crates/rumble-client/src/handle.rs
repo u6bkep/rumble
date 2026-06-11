@@ -299,7 +299,8 @@ impl<P: Platform> BackendHandle<P> {
                 input_fault: None,
                 output_fault: None,
             },
-            chat_messages: Vec::new(),
+            chat_messages: std::sync::Arc::new(Vec::new()),
+            chat_epoch: 0,
             room_tree: Default::default(),
             effective_permissions: 0,
             per_room_permissions: HashMap::new(),
@@ -771,6 +772,13 @@ async fn send_disconnect_envelope<T: rumble_client_traits::transport::Transport>
 /// that accepts the connection but never answers ServerHello/auth) would
 /// otherwise leave the UI stuck on "Connecting…" until the QUIC idle
 /// timeout. On timeout we fall back to Disconnected so the user can retry.
+/// Most-recent-messages window for a peer-to-peer chat-history share.
+/// The session log itself is unbounded; the share is capped because it
+/// serializes into a single chat-message envelope subject to the
+/// 16 MiB protocol frame limit. 500 comfortably exceeds the old
+/// 100-message log cap while staying far below the frame ceiling.
+const SHARE_HISTORY_MAX_MESSAGES: usize = 500;
+
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// How long the receiver task waits on a single reliable-stream `recv`
@@ -1904,7 +1912,14 @@ async fn run_connection_task<P: Platform>(
                                 let s = read_state(&state);
                                 s.chat_messages.clone()
                             };
-                            let content = crate::events::ChatHistoryContent::from_messages(&messages);
+                            // The session log is unbounded (issue #16 phase 2),
+                            // but a history share travels as ONE chat-message
+                            // envelope and must stay well under the 16 MiB
+                            // frame cap — share only the most recent window.
+                            // Receivers dedup by id, so a smaller share is
+                            // always safe.
+                            let recent = &messages[messages.len().saturating_sub(SHARE_HISTORY_MAX_MESSAGES)..];
+                            let content = crate::events::ChatHistoryContent::from_messages(recent);
                             if content.messages.is_empty() {
                                 debug!("ShareChatHistory: nothing to share");
                             } else {
@@ -2506,7 +2521,7 @@ fn plugin_event_sink(events: EventSink, bus: crate::projection::EventBus) -> rum
 }
 
 /// Emit a system notice to the chat log. The projection task does the
-/// actual `chat_messages.push` + trim + repaint.
+/// actual `chat_messages.push` + repaint.
 fn add_local_message(bus: &crate::projection::EventBus, text: String) {
     let _ = bus.chat.send(crate::ChatEvent::SystemNotice { text });
 }

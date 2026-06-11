@@ -32,13 +32,18 @@
 //! Lookup accessors (`image_for`, `gif_playback_for`,
 //! `animated_gpu_for`, `video_thumb_for`, `lightbox_image_for`)
 //! return `Option<&T>` keyed by `transfer_id`; a hit bumps the
-//! entry's LRU stamp and a miss records re-decode demand, so they're
-//! for genuinely-visible uses (the lightbox). The chat history instead
-//! snapshots per-message media via the non-touching `peek_*` accessors
-//! and records touches/misses only for rows its virtual list actually
-//! realizes, through a [`MediaTouch`] handle — that's what scopes the
-//! byte-budget eviction (issue #37) to what's truly on screen
-//! (issue #16).
+//! entry's LRU stamp and a miss records re-decode demand, so they are
+//! for genuinely-visible uses only: the lightbox, and the chat
+//! history's `build_row` closures — which the virtual list invokes
+//! solely for rows in the visible window, locking the shared
+//! `Arc<Mutex<MediaCache>>` for the lookup. That realization-time
+//! lookup is what scopes the byte-budget eviction (issue #37) to
+//! what's truly on screen (issue #16): off-screen backlog media ages
+//! out, and an evicted entry re-decodes from disk when its row
+//! scrolls back into view.
+//!
+//! Because the cache is shared into `Send + Sync` row closures, the
+//! whole struct must stay `Send` — asserted statically below.
 //!
 //! ## Plugin-agnostic by construction
 //!
@@ -172,32 +177,6 @@ impl LruState {
     }
 }
 
-/// Shareable handle for recording LRU touches and re-decode demand from
-/// contexts that can't borrow the cache — specifically the virtual
-/// list's `'static + Send + Sync` `build_row` closures. A row records
-/// its touch only when it actually realizes (scrolls into view), which
-/// is what makes the eviction pass's "used last frame" exemption mean
-/// *visible*, not "anywhere in the backlog" (issue #16).
-#[derive(Clone)]
-pub struct MediaTouch {
-    lru: Arc<Mutex<LruState>>,
-}
-
-impl MediaTouch {
-    /// Mark an entry's family as used at the current LRU clock.
-    pub(crate) fn touch(&self, kind: MediaKind, id: &str) {
-        self.lru.lock().unwrap().touch(kind, id);
-    }
-
-    /// Record re-decode demand for an id whose media wasn't in the
-    /// cache when its row realized. Unfiltered — ids that were never
-    /// media (or whose source is gone) are dropped by
-    /// [`MediaCache::process_demand`]'s `sources` lookup.
-    pub(crate) fn note_miss(&self, id: &str) {
-        self.lru.lock().unwrap().demand.insert(id.to_string());
-    }
-}
-
 /// One evictable cache unit, as seen by [`plan_evictions`]: the whole
 /// per-id family for its kind with its approximate byte costs.
 struct EvictionCandidate {
@@ -308,6 +287,16 @@ struct PendingLightboxDecode {
     handle: JoinHandle<Result<chat::CachedImage, image::ImageError>>,
 }
 
+/// The chat history's row closures capture an `Arc<Mutex<MediaCache>>`
+/// and must be `Send + Sync`, which requires `MediaCache: Send`. This
+/// assertion turns a future non-`Send` field (e.g. an `Rc` sneaking
+/// into a decoder) into an immediate, locatable compile error here
+/// instead of an opaque one at the closure site.
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<MediaCache>();
+};
+
 /// Centralized media cache. See module docs for the lifecycle model.
 pub struct MediaCache {
     runtime: Handle,
@@ -376,8 +365,7 @@ pub struct MediaCache {
 
     /// LRU bookkeeping for the byte-budget eviction pass (issue #37).
     /// Interior-mutable so the `&self` lookup accessors can touch
-    /// entries on use and record demand on miss; `Arc`-shared so
-    /// [`MediaTouch`] handles can record from `'static` row closures.
+    /// entries on use and record demand on miss.
     lru: Arc<Mutex<LruState>>,
     /// `transfer_id → (local_path, name)` for every media-typed
     /// transfer that has hit `Done`. Kept so an evicted entry can be
@@ -417,12 +405,6 @@ impl MediaCache {
             sources: HashMap::new(),
             pinned: HashSet::new(),
         }
-    }
-
-    /// Handle for recording touches/misses from the chat virtual list's
-    /// `'static` row closures. Cheap to clone per frame.
-    pub fn touch_handle(&self) -> MediaTouch {
-        MediaTouch { lru: self.lru.clone() }
     }
 
     /// Spawn a blocking decode task that pokes the repaint callback on
@@ -1088,26 +1070,6 @@ impl MediaCache {
         self.image_for(transfer_id)
     }
 
-    // ---------- non-touching peek accessors ----------
-    //
-    // Used by the chat history's per-frame attachment snapshot, which
-    // is built for every backlog attachment regardless of visibility —
-    // so it must not bump LRU stamps or record re-decode demand. Those
-    // are recorded by the rows that actually realize, via
-    // [`MediaTouch`] (issue #16).
-
-    pub fn peek_image_for(&self, transfer_id: &str) -> Option<&chat::CachedImage> {
-        self.image_cache.get(transfer_id)
-    }
-
-    pub fn peek_video_thumb_for(&self, transfer_id: &str) -> Option<&Image> {
-        self.video_thumbs.get(transfer_id)
-    }
-
-    pub fn peek_model_thumb_for(&self, transfer_id: &str) -> Option<&Image> {
-        self.model_thumbs.get(transfer_id)
-    }
-
     // ---------- test/bundle-dump helpers ----------
 
     /// Mutable image-cache access for `dump_bundles` (which pre-seeds
@@ -1452,86 +1414,6 @@ mod tests {
         assert!(mc.lru.lock().unwrap().last_used.is_empty());
         // Not marked failed: a re-decode stays possible.
         assert!(!mc.image_failed.contains("anim"));
-    }
-
-    #[test]
-    fn peeks_do_not_keep_entries_alive() {
-        // The chat history's per-frame attachment snapshot peeks every
-        // backlog attachment regardless of visibility. Those peeks must
-        // not count as use, or the eviction pass could never reclaim
-        // off-screen backlog media (issue #16).
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let mut mc = MediaCache::new(rt.handle().clone(), true, Arc::new(|| {}));
-        mc.image_cache.insert(
-            "img".into(),
-            chat::CachedImage::Static(Image::from_rgba8(2, 2, vec![0; 16])),
-        );
-        mc.touch(MediaKind::Image, "img");
-
-        mc.enforce_budgets_with(0, 0); // insert-time touch ages out
-        assert!(mc.peek_image_for("img").is_some());
-        mc.enforce_budgets_with(0, 0);
-        assert!(mc.image_cache.is_empty());
-        // The peek also must not have recorded demand — only realized
-        // rows do that, via MediaTouch::note_miss.
-        assert!(mc.lru.lock().unwrap().demand.is_empty());
-    }
-
-    #[test]
-    fn touch_handle_keeps_entry_alive_like_direct_touch() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let mut mc = MediaCache::new(rt.handle().clone(), true, Arc::new(|| {}));
-        mc.image_cache.insert(
-            "img".into(),
-            chat::CachedImage::Static(Image::from_rgba8(2, 2, vec![0; 16])),
-        );
-        let touch = mc.touch_handle();
-
-        // Touched through the handle every pass (a visible realized
-        // row) → survives enforcement at zero budget indefinitely.
-        for _ in 0..3 {
-            touch.touch(MediaKind::Image, "img");
-            mc.enforce_budgets_with(0, 0);
-            assert!(mc.image_cache.contains_key("img"));
-        }
-        // Stop touching → evicted after the stamp ages past the floor.
-        mc.enforce_budgets_with(0, 0);
-        assert!(mc.image_cache.is_empty());
-    }
-
-    #[test]
-    fn touch_handle_miss_demands_redecode_only_for_known_sources() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let mut mc = MediaCache::new(rt.handle().clone(), true, Arc::new(|| {}));
-        let touch = mc.touch_handle();
-
-        // An id with no recorded source (plain file attachment, or a
-        // failed transfer): demand is recorded but dropped harmlessly
-        // by the drain's `sources` lookup.
-        touch.note_miss("not-media");
-        mc.drain_pending();
-        assert!(mc.lru.lock().unwrap().demand.is_empty());
-        assert!(mc.pending_image_decodes.is_empty());
-
-        // An evicted media id with a source on disk re-decodes.
-        let dir = std::env::temp_dir().join(format!("rumble-media-touch-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("img.png");
-        image::RgbaImage::from_pixel(4, 4, image::Rgba([10, 20, 30, 255]))
-            .save(&path)
-            .unwrap();
-        mc.sources.insert("t1".into(), (path, "img.png".into()));
-
-        touch.note_miss("t1");
-        for _ in 0..500 {
-            mc.drain_pending();
-            if mc.image_cache.contains_key("t1") {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(mc.image_cache.contains_key("t1"));
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

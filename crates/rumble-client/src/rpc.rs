@@ -253,8 +253,13 @@ impl RpcServer {
     ) -> RpcResponse {
         match request {
             RpcRequest::GetState => {
-                let state = state.read().unwrap_or_else(|e| e.into_inner());
-                match serde_json::to_value(&*state) {
+                // Clone, then serialize OUTSIDE the lock: the clone is
+                // cheap (the unbounded chat log is Arc-shared), while
+                // serializing a long session's log to JSON is not — doing
+                // it under the read guard would block the projection
+                // writer for the duration.
+                let snapshot = state.read().unwrap_or_else(|e| e.into_inner()).clone();
+                match serde_json::to_value(&snapshot) {
                     Ok(value) => RpcResponse::ok_with_data(value),
                     Err(e) => RpcResponse::error(format!("Serialization error: {}", e)),
                 }

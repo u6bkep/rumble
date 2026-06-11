@@ -693,8 +693,9 @@ pub enum ChatMessageKind {
 /// explicit, so renderer and history-sync filters can `match`
 /// exhaustively.
 ///
-/// `chat_messages` is append-only: each entry is constructed with a
-/// fixed visibility at insertion time. The sender-side file-share
+/// A `chat_messages` entry is never rewritten in place (the log is
+/// append-plus-resort): each entry is constructed with a fixed
+/// visibility at insertion time. The sender-side file-share
 /// flow inserts a [`SenderDraft`] when the share starts and, once the
 /// upload broadcasts, a separate [`SenderMirror`] entry with the same
 /// `id` — the draft stays on screen (with live transfer state) and
@@ -1088,9 +1089,19 @@ pub struct State {
     /// Audio subsystem state.
     pub audio: AudioState,
 
-    // Chat (recent messages, not persisted)
-    /// Recent chat messages.
-    pub chat_messages: Vec<ChatMessage>,
+    // Chat (session log, not persisted)
+    /// Chat log for the current session. Unbounded — it grows until the
+    /// next connect clears it (closing the app is the retention bound).
+    /// `Arc`-wrapped so the UI's per-frame `state()` clone is a pointer
+    /// bump rather than a deep copy of the log; the projection task
+    /// (sole writer) mutates via `Arc::make_mut`.
+    pub chat_messages: std::sync::Arc<Vec<ChatMessage>>,
+    /// Bumped by the projection on every chat mutation that is NOT a
+    /// pure append (the connect-time clear, history-merge re-sorts).
+    /// Consumers caching derived per-message state can rely on: same
+    /// epoch + same-or-grown length ⇒ existing entries unchanged, only
+    /// appended — so a cache update is O(new messages), not O(log).
+    pub chat_epoch: u64,
 
     // Room tree (derived from rooms)
     /// Hierarchical tree structure of rooms, rebuilt when rooms change.
@@ -1700,7 +1711,8 @@ mod tests {
                 },
             ],
             audio: AudioState::default(),
-            chat_messages: vec![],
+            chat_messages: std::sync::Arc::new(vec![]),
+            chat_epoch: 0,
             room_tree: RoomTree::default(),
             effective_permissions: 0,
             per_room_permissions: HashMap::new(),

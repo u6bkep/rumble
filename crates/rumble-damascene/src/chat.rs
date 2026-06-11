@@ -21,8 +21,9 @@ pub use image_preview::{
 pub use lightbox::{Lightbox, PanDrag, ZoomDirection, render_lightbox};
 
 use std::{
+    cell::RefCell,
     collections::HashMap,
-    sync::{Arc, LazyLock},
+    sync::{Arc, LazyLock, Mutex, RwLock},
     time::{Instant, SystemTime},
 };
 
@@ -34,11 +35,7 @@ use rumble_client_traits::file_transfer::TransferStatus;
 use rumble_desktop_shell::ChatSettings;
 use rumble_protocol::{permissions::Permissions, proto::RelayFileSharePayload};
 
-use crate::{
-    animated_gpu::AnimatedSurface,
-    media_cache::{MediaCache, MediaKind, MediaTouch},
-    theme as palette,
-};
+use crate::{media_cache::MediaCache, theme as palette};
 
 /// Active file-transfer status keyed by `transfer_id`. Built once per
 /// frame from `BackendHandle::transfers()` and threaded through the
@@ -227,8 +224,9 @@ pub fn parse_file_card_key(key: &str) -> Option<&str> {
 pub fn render(
     state: &State,
     chat_settings: &ChatSettings,
-    media_cache: &MediaCache,
-    transfers: &TransferMap,
+    history_cache: &RefCell<ChatHistory>,
+    media_cache: &Arc<Mutex<MediaCache>>,
+    transfers: &Arc<TransferMap>,
     pending_cancel_confirm: &HashMap<String, Instant>,
     chat_input: &str,
     selection: &Selection,
@@ -244,6 +242,7 @@ pub fn render(
         history(
             state,
             chat_settings,
+            history_cache,
             media_cache,
             transfers,
             pending_cancel_confirm,
@@ -257,15 +256,87 @@ pub fn render(
     .fill(tokens::CARD)
 }
 
+/// Incrementally-maintained render cache for the chat history: the
+/// filtered, owned [`ChatRow`] snapshots the virtual list's `'static`
+/// closures index into.
+///
+/// The chat log is unbounded (issue #16 phase 2), so rebuilding this
+/// every frame — O(log) String clones plus a relay-payload protobuf
+/// decode per attachment — is the difference between flat frames and
+/// frame cost growing with session age. [`Self::sync`] relies on the
+/// projection's epoch contract (`State::chat_epoch`): same epoch +
+/// same-or-grown length ⇒ pure append, so only the new tail is built.
+/// An epoch bump (connect-time clear, history-merge re-sort) or an
+/// identity change triggers the O(log) full rebuild.
+///
+/// Rows live behind `Arc<RwLock<…>>` so per-frame closures share the
+/// same backing store instead of cloning it; appends never copy the
+/// existing rows. Contention is nil (the UI thread is the only writer,
+/// during `sync`; closures only read during layout, which is strictly
+/// after).
+#[derive(Default)]
+pub struct ChatHistory {
+    epoch: u64,
+    /// Raw `state.chat_messages` entries consumed so far. Distinct
+    /// from `rows.len()`: SenderMirror messages are filtered out.
+    raw_len: usize,
+    my_user_id: Option<u64>,
+    own_username: String,
+    rows: Arc<RwLock<Vec<ChatRow>>>,
+}
+
+impl ChatHistory {
+    /// Bring the row cache up to date with `state.chat_messages` and
+    /// return the shared row store for this frame's closures.
+    fn sync(&mut self, state: &State, my_user_id: Option<u64>, own_username: &str) -> Arc<RwLock<Vec<ChatRow>>> {
+        let msgs = &state.chat_messages;
+        let appendable = state.chat_epoch == self.epoch
+            && msgs.len() >= self.raw_len
+            && my_user_id == self.my_user_id
+            && own_username == self.own_username;
+        if appendable {
+            if msgs.len() > self.raw_len {
+                let mut rows = self.rows.write().unwrap();
+                rows.extend(
+                    msgs[self.raw_len..]
+                        .iter()
+                        .filter(|m| m.visibility.renders_locally())
+                        .map(|m| ChatRow::from_msg(m, my_user_id, own_username)),
+                );
+                self.raw_len = msgs.len();
+            }
+        } else {
+            *self.rows.write().unwrap() = msgs
+                .iter()
+                .filter(|m| m.visibility.renders_locally())
+                .map(|m| ChatRow::from_msg(m, my_user_id, own_username))
+                .collect();
+            self.epoch = state.chat_epoch;
+            self.raw_len = msgs.len();
+            self.my_user_id = my_user_id;
+            self.own_username = own_username.to_string();
+        }
+        self.rows.clone()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn history(
     state: &State,
     chat_settings: &ChatSettings,
-    media_cache: &MediaCache,
-    transfers: &TransferMap,
+    history_cache: &RefCell<ChatHistory>,
+    media_cache: &Arc<Mutex<MediaCache>>,
+    transfers: &Arc<TransferMap>,
     pending_cancel_confirm: &HashMap<String, Instant>,
     my_user_id: Option<u64>,
     own_username: &str,
 ) -> El {
+    // Sync before the empty-placeholder early-out so a connect-time
+    // clear (epoch bump, empty log) releases the previous session's
+    // cached rows immediately instead of holding them until the new
+    // server's first message.
+    let rows = history_cache.borrow_mut().sync(state, my_user_id, own_username);
+
     if state.chat_messages.is_empty() {
         let placeholder = text(if state.connection.is_connected() {
             "No messages yet"
@@ -281,61 +352,35 @@ fn history(
             .height(Size::Fill(1.0))
             .pin_end();
     }
+    let count = rows.read().unwrap().len();
 
-    // SenderMirror entries are sender-side history twins of broadcasts whose
-    // SenderDraft card is already on screen — never render.
-    let msgs: Vec<&ChatMessage> = state
-        .chat_messages
-        .iter()
-        .filter(|msg| msg.visibility.renders_locally())
-        .collect();
-    let count = msgs.len();
-
-    // Owned, 'static row data for the lazy text path. The virtual list realizes
-    // a row's El only when it scrolls into view, so `build_row` can't borrow the
-    // frame's `&State` — it captures these owned snapshots instead. Cheap:
-    // O(messages) String clones, vs the O(visible) markdown-parse + layout that
-    // virtualization now defers.
-    let rows: Vec<ChatRow> = msgs
-        .iter()
-        .map(|m| ChatRow::from_msg(m, my_user_id, own_username))
-        .collect();
-    let keys: Vec<String> = msgs.iter().map(|m| chat_row_key(m)).collect();
-
-    // Attachments (images/gifs/video thumbs/file cards) need media-cache and
-    // transfer state that `build_row` (`'static + Send + Sync`) can't borrow.
-    // Snapshot it per attachment message instead — all Arc bumps and small
-    // copies, no decode work. Crucially the snapshot uses non-touching peeks:
-    // only rows the virtual list actually realizes (i.e. visible ones) record
-    // an LRU touch, so the media cache's byte-budget eviction (issue #37) sees
-    // off-screen backlog media as evictable, and an evicted entry re-decodes
-    // when its row scrolls back into view. That's the visible-range →
-    // cache-eviction loop of issue #16, expressed through lazy realization.
-    let mut attachments: HashMap<usize, AttachmentRow> = HashMap::new();
-    for (i, msg) in msgs.iter().enumerate() {
-        if let Some(att) = msg.attachment.as_ref() {
-            attachments.insert(i, attachment_row(att, media_cache, transfers));
-        }
-    }
-
-    let rows = Arc::new(rows);
-    let keys = Arc::new(keys);
-    let keys_for_key = keys.clone();
+    // Media, transfer state, and confirm timers are looked up lazily,
+    // inside `build_row` — i.e. only for rows the virtual list actually
+    // realizes (the visible window). The touching MediaCache accessors
+    // record LRU use on hit and re-decode demand on miss right there, so
+    // the byte-budget eviction (issue #37) sees off-screen backlog media
+    // as evictable and an evicted entry repopulates when its row scrolls
+    // back into view. That's the visible-range → cache-eviction loop of
+    // issue #16, expressed through lazy realization; per-frame cost is
+    // O(visible), independent of backlog length.
+    let rows_for_key = rows.clone();
     let settings = chat_settings.clone();
-    let attachments = Arc::new(attachments);
-    let touch = media_cache.touch_handle();
+    let media = media_cache.clone();
+    let transfers = transfers.clone();
     let pending_cancel_confirm = Arc::new(pending_cancel_confirm.clone());
 
     virtual_list_dyn(
         count,
         CHAT_ROW_EST_HEIGHT,
-        move |i| keys_for_key[i].clone(),
+        move |i| format!("chat:row:{}", rows_for_key.read().unwrap()[i].msg_key),
         move |i| {
-            let attachment = attachments.get(&i).map(|row| {
-                row.record_use(&touch);
-                render_attachment_view(row, rows[i].is_own, &pending_cancel_confirm)
-            });
-            render_chat_row(&rows[i], &settings, attachment)
+            let rows = rows.read().unwrap();
+            let row = &rows[i];
+            let attachment = row
+                .attachment
+                .as_ref()
+                .map(|att| attachment_el(att, &media, &transfers, row.is_own, &pending_cancel_confirm));
+            render_chat_row(row, &settings, attachment)
         },
     )
     .key(CHAT_HISTORY_KEY)
@@ -363,10 +408,11 @@ pub(crate) fn chat_row_key(msg: &ChatMessage) -> String {
     format!("chat:row:{}", u128::from_le_bytes(msg.id))
 }
 
-/// Owned text-render inputs for one chat row — everything `render_chat_row`
-/// needs that isn't the (eagerly pre-rendered) attachment El. Cloned out of the
-/// borrowed `ChatMessage` so the virtual list's `build_row` closure can be
-/// `'static + Send + Sync`.
+/// Owned render inputs for one chat row, cloned out of the borrowed
+/// `ChatMessage` so the virtual list's `build_row` closure can be
+/// `'static + Send + Sync`. Built once per message ([`ChatHistory`]
+/// caches rows across frames); the attachment's relay payload is
+/// decoded here so realization never re-parses protobuf.
 struct ChatRow {
     text: String,
     sender: String,
@@ -375,6 +421,30 @@ struct ChatRow {
     msg_key: u128,
     is_own: bool,
     is_system: bool,
+    attachment: Option<RowAttachment>,
+}
+
+/// Static (per-message, immutable) attachment data carried by a
+/// [`ChatRow`]. The *live* half — decoded media, transfer progress —
+/// is looked up at realization time in [`attachment_el`].
+enum RowAttachment {
+    /// A relay file share with its payload already decoded.
+    Relay(RelayFileSharePayload),
+    /// Attachment from an unknown plugin namespace (or an undecodable
+    /// payload): rendered as its fallback text.
+    Unknown(String),
+}
+
+impl RowAttachment {
+    fn from_attachment(att: &rumble_protocol::ChatAttachment) -> Self {
+        if att.namespace != rumble_desktop::FILE_TRANSFER_RELAY_NAMESPACE {
+            return RowAttachment::Unknown(att.fallback_text.clone());
+        }
+        match rumble_desktop::decode_relay_payload(&att.payload) {
+            Some(offer) => RowAttachment::Relay(offer),
+            None => RowAttachment::Unknown(att.fallback_text.clone()),
+        }
+    }
 }
 
 impl ChatRow {
@@ -400,6 +470,7 @@ impl ChatRow {
             msg_key: u128::from_le_bytes(msg.id),
             is_own,
             is_system,
+            attachment: msg.attachment.as_ref().map(RowAttachment::from_attachment),
         }
     }
 }
@@ -478,73 +549,33 @@ fn render_chat_row(entry: &ChatRow, chat_settings: &ChatSettings, attachment: Op
 /// render before any El is built. The variants encode the dispatch
 /// precedence as data — `Failed` always beats every preview variant,
 /// `Image` beats `Video`, `Video` beats the plain `File` card.
-/// Owned snapshot of everything one attachment row needs to render,
-/// cloned out of the `MediaCache`/`TransferMap` while `history()` still
-/// holds the frame's borrows (all `Arc` bumps and small copies). The
-/// virtual list realizes it into an El only when the row scrolls into
-/// view; [`Self::record_use`] runs at that moment.
-enum AttachmentRow {
-    Image {
-        offer: RelayFileSharePayload,
-        cached: CachedImage,
-        playback: Option<GifPlayback>,
-        gpu: Option<AnimatedSurface>,
-    },
-    Video {
-        offer: RelayFileSharePayload,
-        thumb: Image,
-    },
-    Model {
-        offer: RelayFileSharePayload,
-        thumb: Image,
-    },
-    File {
-        offer: RelayFileSharePayload,
-        status: Option<TransferStatus>,
-    },
-    Failed {
-        offer: RelayFileSharePayload,
-        reason: String,
-    },
-    UnknownPlugin {
-        text: String,
-    },
-}
-
-impl AttachmentRow {
-    /// Record this row's media use at realization time. A hit keeps the
-    /// entry's cache family alive past the next LRU eviction pass; a
-    /// `File` card notes re-decode demand — if the id was previously
-    /// decoded media that got evicted, next frame's demand drain
-    /// re-spawns the decode from disk (ids that were never media are
-    /// filtered out there by the `sources` lookup).
-    fn record_use(&self, touch: &MediaTouch) {
-        match self {
-            AttachmentRow::Image { offer, .. } => touch.touch(MediaKind::Image, &offer.transfer_id),
-            AttachmentRow::Video { offer, .. } => touch.touch(MediaKind::VideoThumb, &offer.transfer_id),
-            AttachmentRow::Model { offer, .. } => touch.touch(MediaKind::Model, &offer.transfer_id),
-            AttachmentRow::File { offer, .. } => touch.note_miss(&offer.transfer_id),
-            AttachmentRow::Failed { .. } | AttachmentRow::UnknownPlugin { .. } => {}
-        }
-    }
-}
-
-fn attachment_row(
-    att: &rumble_protocol::ChatAttachment,
-    media_cache: &MediaCache,
+/// Realize one attachment into an El, looking up the live half (decoded
+/// media, transfer progress) at this moment. Runs inside the virtual
+/// list's `build_row` — i.e. only for visible rows — which is exactly
+/// what scopes the media cache's LRU to the on-screen set: the touching
+/// accessors (`image_for` & co.) bump the entry's stamp on hit and
+/// record re-decode demand on miss. The brief Mutex lock is uncontended
+/// (layout runs on the UI thread, strictly after the App's own cache
+/// access during build).
+fn attachment_el(
+    att: &RowAttachment,
+    media_cache: &Mutex<MediaCache>,
     transfers: &TransferMap,
-) -> AttachmentRow {
+    is_local_sender: bool,
+    pending_cancel_confirm: &HashMap<String, Instant>,
+) -> El {
     use rumble_client_traits::file_transfer::TransferStage;
 
-    if att.namespace != rumble_desktop::FILE_TRANSFER_RELAY_NAMESPACE {
-        return AttachmentRow::UnknownPlugin {
-            text: att.fallback_text.clone(),
-        };
-    }
-    let Some(offer) = rumble_desktop::decode_relay_payload(&att.payload) else {
-        return AttachmentRow::UnknownPlugin {
-            text: att.fallback_text.clone(),
-        };
+    let offer = match att {
+        RowAttachment::Relay(offer) => offer,
+        RowAttachment::Unknown(text) => {
+            return paragraph(text.clone())
+                .muted()
+                .italic()
+                .font_size(tokens::TEXT_XS.size)
+                .selectable()
+                .width(Size::Fill(1.0));
+        }
     };
 
     let status = transfers.get(&offer.transfer_id);
@@ -552,65 +583,27 @@ fn attachment_row(
     if let Some(s) = status
         && let TransferStage::Failed { reason } = &s.stage
     {
-        return AttachmentRow::Failed {
-            offer,
-            reason: reason.clone(),
-        };
+        return file_card::failed_card(offer, reason, is_local_sender);
     }
 
-    if let Some(cached) = media_cache.peek_image_for(&offer.transfer_id) {
-        return AttachmentRow::Image {
-            cached: cached.clone(),
-            playback: media_cache.gif_playback_for(&offer.transfer_id).cloned(),
-            gpu: media_cache
-                .animated_gpu_for(&offer.transfer_id)
-                .map(|gpu| gpu.surface_handle()),
-            offer,
-        };
-    }
-    if let Some(thumb) = media_cache.peek_video_thumb_for(&offer.transfer_id) {
-        return AttachmentRow::Video {
-            offer,
-            thumb: thumb.clone(),
-        };
-    }
-    if let Some(thumb) = media_cache.peek_model_thumb_for(&offer.transfer_id) {
-        return AttachmentRow::Model {
-            offer,
-            thumb: thumb.clone(),
-        };
-    }
-    AttachmentRow::File {
-        offer,
-        status: status.cloned(),
-    }
-}
-
-fn render_attachment_view(
-    view: &AttachmentRow,
-    is_local_sender: bool,
-    pending_cancel_confirm: &HashMap<String, Instant>,
-) -> El {
-    match view {
-        AttachmentRow::Image {
+    let media = media_cache.lock().unwrap();
+    if let Some(cached) = media.image_for(&offer.transfer_id) {
+        return image_preview::image_preview(
             offer,
             cached,
-            playback,
-            gpu,
-        } => image_preview::image_preview(offer, cached, playback.as_ref(), gpu.as_ref()),
-        AttachmentRow::Video { offer, thumb } => image_preview::video_preview(offer, thumb),
-        AttachmentRow::Model { offer, thumb } => image_preview::model_preview(offer, thumb),
-        AttachmentRow::File { offer, status } => {
-            file_card::file_offer_card(offer, status.as_ref(), is_local_sender, pending_cancel_confirm)
-        }
-        AttachmentRow::Failed { offer, reason } => file_card::failed_card(offer, reason, is_local_sender),
-        AttachmentRow::UnknownPlugin { text } => paragraph(text.clone())
-            .muted()
-            .italic()
-            .font_size(tokens::TEXT_XS.size)
-            .selectable()
-            .width(Size::Fill(1.0)),
+            media.gif_playback_for(&offer.transfer_id),
+            media.animated_gpu_for(&offer.transfer_id),
+        );
     }
+    if let Some(thumb) = media.video_thumb_for(&offer.transfer_id) {
+        return image_preview::video_preview(offer, thumb);
+    }
+    if let Some(thumb) = media.model_thumb_for(&offer.transfer_id) {
+        return image_preview::model_preview(offer, thumb);
+    }
+    drop(media);
+
+    file_card::file_offer_card(offer, status, is_local_sender, pending_cancel_confirm)
 }
 
 fn composer(state: &State, chat_input: &str, selection: &Selection, cmd_selected: Option<usize>) -> El {

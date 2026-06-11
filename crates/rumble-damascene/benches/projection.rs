@@ -3,12 +3,18 @@
 //!
 //! Run: `cargo bench -p rumble-damascene --bench projection`
 //!
-//! The client redraws ~30×/sec even when idle (a known workaround for damascene
-//! lacking an event-loop wakeup hook — see docs/performance-testing.md §3), so
-//! every one of these calls runs 30 times a second on a connected client. These
-//! benches answer: how much does that idle redraw cost, and how does it scale
-//! with chat backlog (the dominant O(messages) term — `app.rs` rebuilds the
-//! whole tree from scratch each frame, with per-message markdown parsing).
+//! The chat log is unbounded (issue #16 phase 2), so these benches answer:
+//! how does a frame scale with backlog size? Three groups:
+//!
+//! - `projection_build/<n>`: steady-state build over an n-message backlog.
+//!   With the incremental `ChatHistory` row cache this should be ~flat in n
+//!   (the per-frame `State` clone is an Arc bump; rows are cached).
+//! - `projection_layout/<n>`: build + measure/layout. The damascene
+//!   `virtual_list_dyn` walk is O(n) per frame upstream (row keys + height
+//!   prefix sums), so this group tracks the library-side ceiling.
+//! - `projection_append/<n>`: the frame that absorbs one newly-arrived
+//!   message at backlog size n — the incremental extend path (epoch
+//!   unchanged, length grown ⇒ only the tail row is built).
 //!
 //! This drives the REAL `RumbleApp::build` / `render_bundle` path (the same one
 //! `dump_bundles` snapshots), against a `MockBackend` returning a canned
@@ -42,14 +48,16 @@ const ROOM_LOBBY: u128 = 0x1111_1111_1111_1111_1111_1111_1111_1111;
 const ROOM_WORK: u128 = 0x2222_2222_2222_2222_2222_2222_2222_2222;
 
 /// Returns a canned `State` and discards commands — the renderer only exercises
-/// the read half of [`UiBackend`].
+/// the read half of [`UiBackend`]. The state lives behind a shared lock so the
+/// append bench can push messages between frames, mirroring how the projection
+/// task mutates the real shared state.
 struct MockBackend {
-    state: State,
+    state: std::sync::Arc<std::sync::RwLock<State>>,
 }
 
 impl UiBackend for MockBackend {
     fn state(&self) -> State {
-        self.state.clone()
+        self.state.read().unwrap().clone()
     }
     fn send(&self, _command: Command) {}
     fn meter(&self) -> MeterSnapshot {
@@ -117,9 +125,11 @@ fn connected_state_with_chat(n_messages: usize) -> State {
     audio.talking_users.insert(2);
 
     let senders = ["alice", "bob", "charlie", "diana"];
-    let chat_messages = (0..n_messages as u32)
-        .map(|seq| make_chat(seq, senders[seq as usize % senders.len()]))
-        .collect();
+    let chat_messages = std::sync::Arc::new(
+        (0..n_messages as u32)
+            .map(|seq| make_chat(seq, senders[seq as usize % senders.len()]))
+            .collect::<Vec<_>>(),
+    );
 
     let mut state = State {
         connection: ConnectionState::Connected {
@@ -147,11 +157,17 @@ fn connected_state_with_chat(n_messages: usize) -> State {
 /// Build a connected `RumbleApp` over `n_messages` of chat backlog, with the
 /// first-run wizard suppressed so we render the main shell. The temp config dir
 /// is kept alive by the returned guard (identity/settings persist to disk).
-fn make_app(n_messages: usize) -> (RumbleApp<MockBackend>, tempfile::TempDir) {
+#[allow(clippy::type_complexity)]
+fn make_app(
+    n_messages: usize,
+) -> (
+    RumbleApp<MockBackend>,
+    std::sync::Arc<std::sync::RwLock<State>>,
+    tempfile::TempDir,
+) {
     let dir = tempfile::tempdir().expect("tempdir");
-    let backend = MockBackend {
-        state: connected_state_with_chat(n_messages),
-    };
+    let shared = std::sync::Arc::new(std::sync::RwLock::new(connected_state_with_chat(n_messages)));
+    let backend = MockBackend { state: shared.clone() };
     let identity = Identity::load(dir.path().to_path_buf()).expect("identity");
     let settings = SettingsStore::load_from_path(Some(dir.path().join("settings.json")));
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -160,15 +176,15 @@ fn make_app(n_messages: usize) -> (RumbleApp<MockBackend>, tempfile::TempDir) {
         .expect("runtime");
     let mut app = RumbleApp::new(backend, identity, settings, runtime);
     app.suppress_first_run_for_test();
-    (app, dir)
+    (app, shared, dir)
 }
 
 fn bench_projection(c: &mut Criterion) {
     let viewport = Rect::new(0.0, 0.0, 1280.0, 800.0);
 
     let mut build = c.benchmark_group("projection_build");
-    for &n in &[10usize, 100, 1000] {
-        let (app, _dir) = make_app(n);
+    for &n in &[10usize, 100, 1000, 10_000, 100_000] {
+        let (app, _shared, _dir) = make_app(n);
         let theme = app.theme();
         let cx = BuildCx::new(&theme);
         build.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
@@ -178,8 +194,8 @@ fn bench_projection(c: &mut Criterion) {
     build.finish();
 
     let mut layout = c.benchmark_group("projection_layout");
-    for &n in &[10usize, 100, 1000] {
-        let (app, _dir) = make_app(n);
+    for &n in &[10usize, 100, 1000, 10_000, 100_000] {
+        let (app, _shared, _dir) = make_app(n);
         let theme = app.theme();
         let cx = BuildCx::new(&theme);
         layout.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
@@ -190,6 +206,57 @@ fn bench_projection(c: &mut Criterion) {
         });
     }
     layout.finish();
+
+    // The frame that absorbs one new message at backlog size n: push one
+    // message, build. Exercises the incremental `ChatHistory` extend (same
+    // epoch, length+1 ⇒ only the new row is built). To keep the workload
+    // stationary while criterion iterates, the log is reset to its
+    // n-message template (and the row cache re-warmed) every 1000 appends,
+    // outside the timed region.
+    let mut append = c.benchmark_group("projection_append");
+    for &n in &[1000usize, 10_000, 100_000] {
+        let (app, shared, _dir) = make_app(n);
+        let theme = app.theme();
+        let cx = BuildCx::new(&theme);
+        let template = shared.read().unwrap().chat_messages.clone();
+        // Warm the row cache so the first timed iteration is an append,
+        // not the initial O(n) build.
+        let _ = app.build(&cx);
+        append.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
+            let mut next_seq = n as u32;
+            b.iter_custom(|iters| {
+                let mut total = std::time::Duration::ZERO;
+                for _ in 0..iters {
+                    if next_seq >= n as u32 + 1000 {
+                        // Untimed reset: fresh deep copy of the template
+                        // (so subsequent pushes mutate in place without
+                        // copy-on-write spikes), epoch bump to force the
+                        // cache rebuild, then one untimed build to
+                        // re-warm.
+                        {
+                            let mut s = shared.write().unwrap();
+                            s.chat_messages = std::sync::Arc::new(template.as_ref().clone());
+                            s.chat_epoch += 1;
+                        }
+                        let _ = app.build(&cx);
+                        next_seq = n as u32;
+                    }
+                    {
+                        let mut s = shared.write().unwrap();
+                        let senders = ["alice", "bob", "charlie", "diana"];
+                        let msg = make_chat(next_seq, senders[next_seq as usize % senders.len()]);
+                        std::sync::Arc::make_mut(&mut s.chat_messages).push(msg);
+                    }
+                    next_seq += 1;
+                    let start = std::time::Instant::now();
+                    black_box(app.build(&cx));
+                    total += start.elapsed();
+                }
+                total
+            });
+        });
+    }
+    append.finish();
 }
 
 criterion_group!(benches, bench_projection);

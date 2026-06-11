@@ -173,9 +173,11 @@ fn connected_state_with_images(n_images: usize) -> State {
     audio.talking_users.insert(2);
 
     let senders = ["alice", "bob", "charlie", "diana"];
-    let chat_messages = (0..n_images as u32)
-        .map(|seq| make_image_chat(seq, senders[seq as usize % senders.len()]))
-        .collect();
+    let chat_messages = std::sync::Arc::new(
+        (0..n_images as u32)
+            .map(|seq| make_image_chat(seq, senders[seq as usize % senders.len()]))
+            .collect::<Vec<_>>(),
+    );
 
     let mut state = State {
         connection: ConnectionState::Connected {
@@ -226,7 +228,11 @@ fn make_app(n_images: usize) -> (RumbleApp<MockBackend>, tempfile::TempDir) {
 
 fn bench_chat_images(c: &mut Criterion) {
     let viewport = Rect::new(0.0, 0.0, 1280.0, 800.0);
-    let counts = [1usize, 10, 50, 100];
+    // 1000 exercises the unbounded-backlog path: rows are cached
+    // incrementally and media is looked up only for realized (visible)
+    // rows, so build and layout should stay near-flat from 100 to 1000
+    // (modulo damascene's O(n) virtual-list walk in the layout group).
+    let counts = [1usize, 10, 50, 100, 1000];
 
     let mut build = c.benchmark_group("chat_images_build");
     for &n in &counts {

@@ -4,10 +4,10 @@
 //! room) and projects `(state, ui_state) -> El` on every frame.
 
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::LazyLock,
+    sync::{Arc, LazyLock, Mutex},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -128,13 +128,11 @@ pub struct RumbleApp<B: UiBackend = crate::backend::NativeUiBackend> {
     /// drag-and-drop, confirmation modals). See [`crate::room_tree`].
     room_tree: RoomTreeState,
 
-    /// Id set of every chat message observed on the previous frame.
-    /// `None` until the first non-empty observation, which seeds the set
-    /// silently so the connect-time backlog isn't treated as new arrivals.
-    /// After seeding, held as `Some` so id-based diffing can detect new
-    /// messages even when the 100-entry sliding window caps the list length.
-    /// See [`diff_new_chat_messages`].
-    seen_chat_ids: Option<HashSet<[u8; 16]>>,
+    /// New-arrival cursor over the chat log. `None` until the first
+    /// non-empty observation, which seeds silently so the connect-time
+    /// backlog isn't treated as new arrivals. Steady-state frames advance
+    /// it in O(new); see [`diff_new_chat_messages`].
+    chat_seen: Option<ChatSeen>,
 
     /// Row key the chat-history virtual list should stick to bottom on next
     /// `drain_scroll_requests`. Set when the backlog grows (new message, initial
@@ -164,7 +162,14 @@ pub struct RumbleApp<B: UiBackend = crate::backend::NativeUiBackend> {
     /// decode). Replaces what used to be eight parallel maps on App.
     /// Reacts to [`rumble_client::BackendEvent::TransferStageChanged`]
     /// drained each frame in `drain_backend_events`.
-    media_cache: crate::media_cache::MediaCache,
+    /// Shared with the chat history's `'static` row closures, which
+    /// look media up at realization time (visible rows only). All App
+    /// access is brief transient locks on the UI thread; never hold a
+    /// guard across a call into another `self` method that locks.
+    media_cache: Arc<Mutex<crate::media_cache::MediaCache>>,
+    /// Incremental chat-row render cache (issue #16 phase 2). RefCell
+    /// because it's synced inside `build(&self)`.
+    chat_history: RefCell<chat::ChatHistory>,
 
     /// The three mutually-exclusive media lightboxes (image / video /
     /// 3D model). See [`crate::lightbox::Lightboxes`].
@@ -311,16 +316,17 @@ impl<B: UiBackend> RumbleApp<B> {
             chat_row_w: Cell::new(0.0),
             processor_registry,
             room_tree: RoomTreeState::default(),
-            seen_chat_ids: None,
+            chat_seen: None,
             pending_scroll_to_bottom: None,
             sfx: crate::sfx::SfxEngine::default(),
             pending_file_dialog: None,
             auto_handled_offers: HashSet::new(),
-            media_cache: crate::media_cache::MediaCache::new(
+            media_cache: Arc::new(Mutex::new(crate::media_cache::MediaCache::new(
                 runtime_handle_for_media_cache,
                 initial_gif_autoplay,
                 media_cache_repaint,
-            ),
+            ))),
+            chat_history: RefCell::new(chat::ChatHistory::default()),
             lightboxes: crate::lightbox::Lightboxes::default(),
             file_context_menu: None,
             pending_save_as: None,
@@ -349,28 +355,77 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
-/// Compute the subset of `messages` not yet present in `seen`, preserving
-/// their order in the slice. Also returns the id set to carry into the next
-/// frame (`None` = still unseeded).
+/// New-arrival cursor over the unbounded chat log, driving per-frame
+/// auto-download and sound cues. See [`diff_new_chat_messages`].
+struct ChatSeen {
+    /// `State::chat_epoch` at the last observation.
+    epoch: u64,
+    /// `chat_messages.len()` at the last observation.
+    len: usize,
+    /// Ids of every message observed so far. Consulted (and rebuilt)
+    /// only on epoch-change frames; steady-state frames just extend it
+    /// with the appended tail.
+    ids: HashSet<[u8; 16]>,
+}
+
+/// Compute the subset of `messages` not yet observed, preserving their
+/// slice order, and advance the cursor. The second return is
+/// `seeded_now`: true only on the frame that absorbs the first
+/// non-empty backlog.
 ///
-/// Seeding: while `seen` is `None` and the list is empty, stay unseeded — at
-/// that point there is no way to tell whether the next batch will be a
-/// connect-time history replay or a live message, and the backlog must not
-/// fire sound cues or auto-downloads. The first non-empty observation seeds
-/// the set silently (absorbing the initial backlog); every later arrival is
-/// diffed by id, which survives the 100-entry sliding window and
-/// HistoryMerged re-sorts. Known cost: on a server with no history at all,
-/// the first live batch is absorbed as if it were backlog.
+/// Seeding: while `seen` is `None` and the list is empty, stay
+/// unseeded — at that point there is no way to tell whether the next
+/// batch will be a connect-time history replay or a live message, and
+/// the backlog must not fire sound cues or auto-downloads. The first
+/// non-empty observation seeds silently. Known cost: on a server with
+/// no history at all, the first live batch is absorbed as if it were
+/// backlog.
+///
+/// Steady state leans on the projection's epoch contract
+/// (`State::chat_epoch`): same epoch + same-or-grown length ⇒ pure
+/// append, so the new messages are exactly `messages[seen.len..]` —
+/// O(new) per frame regardless of log size. An epoch bump (connect
+/// clear, history-merge re-sort) falls back to one O(log) id-set diff,
+/// which detects merged-in messages at any position.
 fn diff_new_chat_messages<'a>(
     messages: &'a [ChatMessage],
-    seen: &Option<HashSet<[u8; 16]>>,
-) -> (Vec<&'a ChatMessage>, Option<HashSet<[u8; 16]>>) {
+    epoch: u64,
+    seen: &mut Option<ChatSeen>,
+) -> (Vec<&'a ChatMessage>, bool) {
     match seen {
-        None if messages.is_empty() => (Vec::new(), None),
-        None => (Vec::new(), Some(messages.iter().map(|m| m.id).collect())),
-        Some(prev_ids) => {
-            let new = messages.iter().filter(|m| !prev_ids.contains(&m.id)).collect();
-            (new, Some(messages.iter().map(|m| m.id).collect()))
+        None if messages.is_empty() => (Vec::new(), false),
+        None => {
+            *seen = Some(ChatSeen {
+                epoch,
+                len: messages.len(),
+                ids: messages.iter().map(|m| m.id).collect(),
+            });
+            (Vec::new(), true)
+        }
+        Some(s) if s.epoch == epoch && messages.len() >= s.len => {
+            let new: Vec<&'a ChatMessage> = messages[s.len..].iter().collect();
+            s.ids.extend(new.iter().map(|m| m.id));
+            s.len = messages.len();
+            (new, false)
+        }
+        Some(_) if messages.is_empty() => {
+            // Epoch bump to an empty log = the connect-time clear. Re-arm
+            // seeding so the new server's history (arriving over the next
+            // frames) is absorbed as backlog instead of firing a sound cue
+            // and auto-download per message of an unbounded peer log. This
+            // covers the disconnect-then-connect flow, where the
+            // disconnect-frame re-arm immediately re-seeded from the
+            // still-visible old log; connect-while-connected already
+            // reaches the clear with the cursor unseeded.
+            *seen = None;
+            (Vec::new(), false)
+        }
+        Some(s) => {
+            let new: Vec<&'a ChatMessage> = messages.iter().filter(|m| !s.ids.contains(&m.id)).collect();
+            s.ids = messages.iter().map(|m| m.id).collect();
+            s.epoch = epoch;
+            s.len = messages.len();
+            (new, false)
         }
     }
 }
@@ -415,19 +470,17 @@ impl<B: UiBackend> App for RumbleApp<B> {
             // Re-arm chat seeding: the next connect clears chat_messages and
             // delivers the new server's history, which must be absorbed as
             // backlog (no sounds/auto-downloads), not detected as new ids.
-            self.seen_chat_ids = None;
+            self.chat_seen = None;
         }
         self.prev_was_connected = now_connected;
 
-        let was_seeded = self.seen_chat_ids.is_some();
-        let (new_messages, new_seen) = diff_new_chat_messages(&snapshot.chat_messages, &self.seen_chat_ids);
         // True only on the frame that absorbs the initial backlog — used to
         // scroll the freshly-loaded history to the bottom without treating
         // it as new arrivals.
-        let seeded_now = !was_seeded && new_seen.is_some();
+        let (new_messages, seeded_now) =
+            diff_new_chat_messages(&snapshot.chat_messages, snapshot.chat_epoch, &mut self.chat_seen);
         self.pump_auto_download(&snapshot, &new_messages);
         self.pump_sfx(&snapshot, &new_messages, seeded_now);
-        self.seen_chat_ids = new_seen;
         // Drain backend events FIRST so any TransferStageChanged
         // lands on the media cache before its drain_pending +
         // playback advance run for this frame. The order is what
@@ -435,6 +488,8 @@ impl<B: UiBackend> App for RumbleApp<B> {
         // finishes (event arrives → media cache decodes synchronously
         // for images → render reads cache).
         self.media_cache
+            .lock()
+            .unwrap()
             .set_gif_autoplay_default(self.settings.settings().chat.gif_autoplay);
         // Pin lightbox-backing media before `drain_pending` runs the LRU
         // byte-budget eviction pass: an entry backing a currently-open
@@ -452,23 +507,25 @@ impl<B: UiBackend> App for RumbleApp<B> {
         if let Some(active) = self.lightboxes.model.as_ref() {
             pinned.insert(active.transfer_id.clone());
         }
-        self.media_cache.set_pinned(pinned);
+        self.media_cache.lock().unwrap().set_pinned(pinned);
         self.drain_backend_events();
-        self.media_cache.drain_pending();
+        self.media_cache.lock().unwrap().drain_pending();
         // Defense in depth: if the image lightbox's backing cache entry
         // disappeared anyway (pinning should make this unreachable),
         // close it instead of leaving an invisible overlay that would
         // swallow wheel events.
-        let image_lightbox_stale = self
-            .lightboxes
-            .image
-            .as_ref()
-            .is_some_and(|lb| self.media_cache.lightbox_image_for(&lb.transfer_id).is_none());
+        let image_lightbox_stale = self.lightboxes.image.as_ref().is_some_and(|lb| {
+            self.media_cache
+                .lock()
+                .unwrap()
+                .lightbox_image_for(&lb.transfer_id)
+                .is_none()
+        });
         if image_lightbox_stale {
-            self.lightboxes.close_image(&mut self.media_cache);
+            self.lightboxes.close_image(&mut self.media_cache.lock().unwrap());
         }
         let now = Instant::now();
-        self.media_cache.advance_gif_playheads(now);
+        self.media_cache.lock().unwrap().advance_gif_playheads(now);
         self.poll_video_open();
         self.pump_hotkeys();
         self.pending_cancel_confirm
@@ -508,7 +565,8 @@ impl<B: UiBackend> App for RumbleApp<B> {
 
         let all_transfers = self.backend.transfers();
 
-        let transfers: chat::TransferMap = all_transfers.iter().map(|t| (t.id.0.clone(), t.clone())).collect();
+        let transfers: Arc<chat::TransferMap> =
+            Arc::new(all_transfers.iter().map(|t| (t.id.0.clone(), t.clone())).collect());
 
         let (in_flight_uploads, in_flight_downloads) = {
             use rumble_client_traits::file_transfer::{TransferDirection, TransferStage};
@@ -538,6 +596,7 @@ impl<B: UiBackend> App for RumbleApp<B> {
                 chat::render(
                     &state,
                     &shell.chat,
+                    &self.chat_history,
                     &self.media_cache,
                     &transfers,
                     &self.pending_cancel_confirm,
@@ -644,12 +703,13 @@ impl<B: UiBackend> App for RumbleApp<B> {
         // when ready; until then we fall back to the chat thumbnail
         // so the panel opens instantly and just gets sharper a frame
         // later.
+        let media = self.media_cache.lock().unwrap();
         let lightbox_layer = if content_layers_clear
             && let Some(lightbox_state) = self.lightboxes.image.as_ref()
-            && let Some(cached) = self.media_cache.lightbox_image_for(&lightbox_state.transfer_id)
+            && let Some(cached) = media.lightbox_image_for(&lightbox_state.transfer_id)
         {
-            let playback = self.media_cache.gif_playback_for(&lightbox_state.transfer_id);
-            let gpu = self.media_cache.animated_gpu_for(&lightbox_state.transfer_id);
+            let playback = media.gif_playback_for(&lightbox_state.transfer_id);
+            let gpu = media.animated_gpu_for(&lightbox_state.transfer_id);
             // Previous frame's laid-out body rect (one frame stale, fine
             // for the grab-cursor decision); event-time zoom re-queries
             // it live via `EventCx::rect_of_key`.
@@ -658,6 +718,7 @@ impl<B: UiBackend> App for RumbleApp<B> {
         } else {
             None
         };
+        drop(media);
 
         // Video lightbox sits in the same overlay slot as the
         // image lightbox — only one is ever open at a time, so
@@ -1069,7 +1130,11 @@ impl<B: UiBackend> App for RumbleApp<B> {
         // Media lightboxes (image / video / 3D model). The module owns
         // the shared overlay state + dispatch; collaborator-heavy opens
         // run here in response to the returned action.
-        match lightbox::handle_event(&mut self.lightboxes, &event, cx, &mut self.media_cache) {
+        let lightbox_outcome = {
+            let mut media = self.media_cache.lock().unwrap();
+            lightbox::handle_event(&mut self.lightboxes, &event, cx, &mut media)
+        };
+        match lightbox_outcome {
             lightbox::LightboxAction::Ignored => {}
             lightbox::LightboxAction::Handled => return,
             lightbox::LightboxAction::OpenImage(id) => {
@@ -1185,15 +1250,18 @@ impl<B: UiBackend> App for RumbleApp<B> {
         let connection = self.backend.state().connection.clone();
         let image_lightbox_visible = self.lightboxes.image.is_some()
             && self.content_layers_clear_for(&connection)
-            && self
-                .lightboxes
-                .image
-                .as_ref()
-                .is_some_and(|lb| self.media_cache.lightbox_image_for(&lb.transfer_id).is_some());
+            && self.lightboxes.image.as_ref().is_some_and(|lb| {
+                self.media_cache
+                    .lock()
+                    .unwrap()
+                    .lightbox_image_for(&lb.transfer_id)
+                    .is_some()
+            });
         if image_lightbox_visible {
             let image_size = self.lightboxes.image.as_ref().and_then(|lightbox| {
-                let cached = self.media_cache.lightbox_image_for(&lightbox.transfer_id)?;
-                let playback = self.media_cache.gif_playback_for(&lightbox.transfer_id);
+                let media = self.media_cache.lock().unwrap();
+                let cached = media.lightbox_image_for(&lightbox.transfer_id)?;
+                let playback = media.gif_playback_for(&lightbox.transfer_id);
                 Some(cached.current_frame_size(playback))
             });
             let body_size = cx.rect_of_key(chat::KEY_LIGHTBOX_IMAGE).map(|r| (r.w, r.h));
@@ -1810,7 +1878,7 @@ impl<B: UiBackend> RumbleApp<B> {
     /// 1024-capped thumbnail as the inline preview, so the open is
     /// always immediate.
     fn open_lightbox(&mut self, transfer_id: &str) {
-        if self.media_cache.image_for(transfer_id).is_none() {
+        if self.media_cache.lock().unwrap().image_for(transfer_id).is_none() {
             return;
         }
         let snapshot = self.backend.state();
@@ -1827,7 +1895,7 @@ impl<B: UiBackend> RumbleApp<B> {
         self.close_video_lightbox();
         self.close_model_lightbox();
         self.lightboxes.image = Some(chat::Lightbox::new(transfer_id, name));
-        self.media_cache.force_resume_playback(transfer_id);
+        self.media_cache.lock().unwrap().force_resume_playback(transfer_id);
 
         // Look up the local file path from the live transfer set; if
         // it's missing (e.g., the transfer plugin GC'd a finished
@@ -1841,7 +1909,7 @@ impl<B: UiBackend> RumbleApp<B> {
         let Some(path) = path else {
             return;
         };
-        self.media_cache.open_lightbox_decode(transfer_id, path);
+        self.media_cache.lock().unwrap().open_lightbox_decode(transfer_id, path);
     }
 
     /// Close the lightbox: clear the active state, drop the
@@ -1849,7 +1917,7 @@ impl<B: UiBackend> RumbleApp<B> {
     /// in-flight decode so it can't deliver a result we'd just throw
     /// away.
     fn close_lightbox(&mut self) {
-        self.lightboxes.close_image(&mut self.media_cache);
+        self.lightboxes.close_image(&mut self.media_cache.lock().unwrap());
     }
 
     /// Open the video lightbox for `transfer_id`. Looks up the
@@ -1947,10 +2015,9 @@ impl<B: UiBackend> RumbleApp<B> {
         if self.lightboxes.model.as_ref().map(|a| a.transfer_id.as_str()) == Some(transfer_id) {
             return;
         }
-        let Some(loaded) = self.media_cache.model_for(transfer_id) else {
+        let Some(model) = self.media_cache.lock().unwrap().model_for(transfer_id).cloned() else {
             return;
         };
-        let model = loaded.clone();
         let name = self
             .backend
             .transfers()
@@ -2011,7 +2078,7 @@ impl<B: UiBackend> RumbleApp<B> {
         // MediaCache resets the wall-clock anchor on every toggle so
         // the current frame still shows for its full delay rather than
         // immediately advancing if the entry sat paused for a while.
-        let _ = self.media_cache.toggle_playback(transfer_id);
+        let _ = self.media_cache.lock().unwrap().toggle_playback(transfer_id);
     }
 
     /// Scan newly-arrived chat messages and auto-download any `FileOffer`
@@ -2207,7 +2274,7 @@ impl<B: UiBackend> RumbleApp<B> {
             // below only handles UI-side reactions (toast queue);
             // the actual transfer-state handling lives in
             // media_cache::on_event.
-            self.media_cache.on_event(&event);
+            self.media_cache.lock().unwrap().on_event(&event);
             match event {
                 rumble_client::BackendEvent::Toast { level, text } => {
                     let tl = match level {
@@ -2233,7 +2300,7 @@ impl<B: UiBackend> RumbleApp<B> {
         let Some(device) = self.gpu_device.as_ref() else {
             return;
         };
-        self.media_cache.sync_animated_gpu(device, queue);
+        self.media_cache.lock().unwrap().sync_animated_gpu(device, queue);
     }
 
     /// Lazily allocate the active video's GPU mirror (needs the
@@ -2262,7 +2329,7 @@ impl<B: UiBackend> RumbleApp<B> {
         let Some(device) = self.gpu_device.as_ref() else {
             return;
         };
-        self.media_cache.sync_model_thumbs(device, queue);
+        self.media_cache.lock().unwrap().sync_model_thumbs(device, queue);
     }
 
     // ---------- wizard plumbing ----------
@@ -2740,6 +2807,8 @@ impl<B: UiBackend> RumbleApp<B> {
     /// let the scene-builder push a synthetic decoded image directly.
     pub fn insert_image_preview_for_test(&mut self, transfer_id: impl Into<String>, img: Image) {
         self.media_cache
+            .lock()
+            .unwrap()
             .image_cache_mut()
             .insert(transfer_id.into(), chat::CachedImage::Static(img));
     }
@@ -2768,13 +2837,21 @@ impl<B: UiBackend> RumbleApp<B> {
     /// path renders it offscreen in `before_paint`; bundle dumps have no
     /// GPU device, so push a synthetic poster directly.
     pub fn insert_model_thumb_for_test(&mut self, transfer_id: impl Into<String>, img: Image) {
-        self.media_cache.model_thumbs_mut().insert(transfer_id.into(), img);
+        self.media_cache
+            .lock()
+            .unwrap()
+            .model_thumbs_mut()
+            .insert(transfer_id.into(), img);
     }
 
     /// Test/scene-dump hook to seed parsed model geometry, so the lightbox
     /// scene has a `chart3d` to project without a real download + parse.
     pub fn insert_model_for_test(&mut self, transfer_id: impl Into<String>, model: model::LoadedModel) {
-        self.media_cache.models_mut().insert(transfer_id.into(), model);
+        self.media_cache
+            .lock()
+            .unwrap()
+            .models_mut()
+            .insert(transfer_id.into(), model);
     }
 
     /// Test/scene-dump hook to open the model lightbox without a click.
@@ -3119,12 +3196,14 @@ mod tests {
     #[test]
     fn first_observation_populated_seeds_without_new() {
         let msgs = [make_msg([1u8; 16]), make_msg([2u8; 16])];
-        let (new, seen) = diff_new_chat_messages(&msgs, &None);
+        let mut seen = None;
+        let (new, seeded_now) = diff_new_chat_messages(&msgs, 0, &mut seen);
         assert!(new.is_empty(), "seeding must not produce new messages");
+        assert!(seeded_now);
         let seen = seen.expect("non-empty observation must seed");
-        assert_eq!(seen.len(), 2);
-        assert!(seen.contains(&[1u8; 16]));
-        assert!(seen.contains(&[2u8; 16]));
+        assert_eq!(seen.ids.len(), 2);
+        assert!(seen.ids.contains(&[1u8; 16]));
+        assert!(seen.ids.contains(&[2u8; 16]));
     }
 
     // Empty observations stay unseeded, so the eventual backlog (which may
@@ -3132,76 +3211,73 @@ mod tests {
     // arrivals after that first batch are detected as new.
     #[test]
     fn empty_observation_stays_unseeded_until_backlog() {
-        let (new_seed, seen_seed) = diff_new_chat_messages(&[], &None);
+        let mut seen = None;
+        let (new_seed, seeded_now) = diff_new_chat_messages(&[], 0, &mut seen);
         assert!(new_seed.is_empty());
-        assert!(seen_seed.is_none(), "empty observation must not seed");
+        assert!(!seeded_now);
+        assert!(seen.is_none(), "empty observation must not seed");
 
         // Many frames later: the connect-time backlog lands — absorbed.
         let backlog = [make_msg([1u8; 16]), make_msg([2u8; 16])];
-        let (new, seen) = diff_new_chat_messages(&backlog, &seen_seed);
+        let (new, seeded_now) = diff_new_chat_messages(&backlog, 0, &mut seen);
         assert!(new.is_empty(), "backlog must be absorbed, not treated as new");
-        let seen = seen.expect("backlog must seed");
+        assert!(seeded_now);
+        assert!(seen.is_some(), "backlog must seed");
 
-        // A genuinely-live arrival after seeding is detected.
+        // A genuinely-live arrival after seeding is detected via the
+        // append fast path (same epoch, grown length).
         let msgs = [make_msg([1u8; 16]), make_msg([2u8; 16]), make_msg([3u8; 16])];
-        let (new, _) = diff_new_chat_messages(&msgs, &Some(seen));
+        let (new, seeded_now) = diff_new_chat_messages(&msgs, 0, &mut seen);
+        assert!(!seeded_now);
         assert_eq!(new.len(), 1);
         assert_eq!(new[0].id, [3u8; 16]);
     }
 
-    // Window-slide: when the 100-entry cap drains old ids from the front, newly
-    // appended ids at the tail are detected while evicted ids are not re-fired.
+    // Re-sorted order: a HistoryMerged bumps the epoch and can insert a
+    // message anywhere in the list. The new id must be detected regardless
+    // of its position, via the id-set fallback.
     #[test]
-    fn window_slide_drops_old_ids_detects_new_tail() {
-        // Ids 0–99 are in the seen set (previous snapshot).
-        let prev_seen: HashSet<[u8; 16]> = (0u8..100)
-            .map(|i| {
-                let mut id = [0u8; 16];
-                id[0] = i;
-                id
-            })
-            .collect();
-
-        // Snapshot now holds ids 1–100 (id 0 slid out, id 100 is new).
-        let msgs: Vec<ChatMessage> = (1u8..=100)
-            .map(|i| {
-                let mut id = [0u8; 16];
-                id[0] = i;
-                make_msg(id)
-            })
-            .collect();
-
-        let (new, updated) = diff_new_chat_messages(&msgs, &Some(prev_seen));
-        assert_eq!(new.len(), 1, "only id 100 must be new");
-        assert_eq!(new[0].id[0], 100);
-
-        // Updated set reflects the snapshot, not the old seen set.
-        let updated = updated.expect("diff against a seeded set stays seeded");
-        assert_eq!(updated.len(), 100);
-        let evicted = {
-            let mut id = [0u8; 16];
-            id[0] = 0;
-            id
-        };
-        assert!(!updated.contains(&evicted), "evicted id must not be in updated set");
-    }
-
-    // Re-sorted order: a HistoryMerged can insert a message anywhere in the list.
-    // The new id must be detected regardless of its position.
-    #[test]
-    fn resorted_middle_insertion_is_detected() {
-        let prev_seen: HashSet<[u8; 16]> = [[1u8; 16], [3u8; 16]].into_iter().collect();
+    fn epoch_bump_detects_resorted_middle_insertion() {
+        let seed = [make_msg([1u8; 16]), make_msg([3u8; 16])];
+        let mut seen = None;
+        let _ = diff_new_chat_messages(&seed, 0, &mut seen);
 
         let middle_id = {
             let mut id = [0u8; 16];
             id[0] = 2;
             id
         };
-        // Timestamp-sorted order: id 1, id 2, id 3.
+        // Timestamp-sorted order after a HistoryMerged: id 1, id 2, id 3 —
+        // same length growth, but the epoch bump forces the id diff.
         let msgs = [make_msg([1u8; 16]), make_msg(middle_id), make_msg([3u8; 16])];
 
-        let (new, _) = diff_new_chat_messages(&msgs, &Some(prev_seen));
+        let (new, _) = diff_new_chat_messages(&msgs, 1, &mut seen);
         assert_eq!(new.len(), 1);
         assert_eq!(new[0].id, middle_id);
+        // Cursor advanced: the next same-epoch frame appends from len 3.
+        let s = seen.as_ref().unwrap();
+        assert_eq!((s.epoch, s.len), (1, 3));
+    }
+
+    // Connect-time clear: epoch bumps and the log restarts from empty. The
+    // cleared frame yields nothing new and re-arms seeding, so the next
+    // server's history is absorbed as backlog (no sound cues or
+    // auto-downloads for an unbounded peer log).
+    #[test]
+    fn epoch_bump_on_clear_rearms_seeding() {
+        let seed = [make_msg([1u8; 16]), make_msg([2u8; 16])];
+        let mut seen = None;
+        let _ = diff_new_chat_messages(&seed, 0, &mut seen);
+
+        let (new, seeded_now) = diff_new_chat_messages(&[], 1, &mut seen);
+        assert!(new.is_empty());
+        assert!(!seeded_now);
+        assert!(seen.is_none(), "clear must re-arm seeding");
+
+        // The new server's history lands: absorbed silently as backlog.
+        let backlog = [make_msg([7u8; 16]), make_msg([8u8; 16])];
+        let (new, seeded_now) = diff_new_chat_messages(&backlog, 1, &mut seen);
+        assert!(new.is_empty(), "post-clear backlog must not be treated as new");
+        assert!(seeded_now);
     }
 }

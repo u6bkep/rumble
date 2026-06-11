@@ -7,7 +7,7 @@ use std::{
 use damascene_core::{prelude::*, surface::SurfaceAlpha};
 use rumble_protocol::proto::RelayFileSharePayload;
 
-use crate::animated_gpu::{AnimatedGpu, AnimatedSurface};
+use crate::animated_gpu::AnimatedGpu;
 
 use super::{format_size, gif_lightbox_key, gif_play_key, preview_key};
 
@@ -191,7 +191,7 @@ pub(super) fn image_preview(
     offer: &RelayFileSharePayload,
     cached: &CachedImage,
     playback: Option<&GifPlayback>,
-    gpu: Option<&AnimatedSurface>,
+    gpu: Option<&AnimatedGpu>,
 ) -> El {
     const PREVIEW_HEIGHT: f32 = 400.0;
 
@@ -413,7 +413,7 @@ pub(super) fn model_preview(offer: &RelayFileSharePayload, thumb: &Image) -> El 
 /// Build the surface-based preview for an animated entry.
 fn animated_surface_preview(
     transfer_id: &str,
-    gpu: &AnimatedSurface,
+    gpu: &AnimatedGpu,
     is_playing: bool,
     next_frame_in: Option<Duration>,
     preview_height: f32,
@@ -421,9 +421,9 @@ fn animated_surface_preview(
     /// Cap on the inscribed surface width.
     const PREVIEW_MAX_WIDTH: f32 = 480.0;
 
-    let (tw, th) = gpu.size;
+    let (tw, th) = gpu.size();
 
-    let mut surface_el = surface(gpu.texture.clone())
+    let mut surface_el = surface(gpu.app_texture().clone())
         .surface_alpha(SurfaceAlpha::Straight)
         .width(Size::Fill(1.0))
         .height(Size::Fill(1.0))

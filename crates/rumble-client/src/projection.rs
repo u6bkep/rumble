@@ -159,6 +159,13 @@ pub fn spawn_projection_task(
     } = receivers;
 
     tokio::spawn(async move {
+        // Ids of every message currently in (or ever deduped into) the
+        // chat log — the O(1) duplicate check for an unbounded log,
+        // replacing the old per-insert linear scan. Owned by this task
+        // (never read by the UI); cleared together with the log on
+        // connect. Kept in lockstep with `state.chat_messages` by
+        // `apply_chat`/`apply_connection` below.
+        let mut chat_ids: std::collections::HashSet<[u8; 16]> = std::collections::HashSet::new();
         loop {
             tokio::select! {
                 // Each branch handles one domain. `Closed` means every
@@ -167,7 +174,7 @@ pub fn spawn_projection_task(
                 // independently of connection task during connect/disconnect
                 // cycles). `Lagged` is a hard fault — see module docs.
                 chat = chat_rx.recv() => match chat {
-                    Ok(ev) => apply_chat(&state, ev, &repaint),
+                    Ok(ev) => apply_chat(&state, ev, &mut chat_ids, &repaint),
                     Err(RecvError::Lagged(skipped)) => on_lag("chat", skipped, &command_tx),
                     Err(RecvError::Closed) => {
                         debug!("projection: chat channel closed");
@@ -187,7 +194,7 @@ pub fn spawn_projection_task(
                     }
                 },
                 conn = conn_rx.recv() => match conn {
-                    Ok(ev) => apply_connection(&state, ev, &repaint),
+                    Ok(ev) => apply_connection(&state, ev, &mut chat_ids, &repaint),
                     Err(RecvError::Lagged(skipped)) => on_lag("connection", skipped, &command_tx),
                     Err(RecvError::Closed) => {
                         debug!("projection: connection channel closed");
@@ -340,13 +347,20 @@ fn is_closed<T: Clone>(rx: &broadcast::Receiver<T>) -> bool {
     rx.sender_strong_count() == 0
 }
 
-/// Trim the chat log to the recent-message cap. The cap is the same
-/// 100-entry sliding window the connection task used to enforce
-/// inline at every push site. Centralised here so we only have to
-/// reason about it in one place.
-const CHAT_MESSAGE_CAP: usize = 100;
-
-fn apply_chat(state: &Arc<RwLock<State>>, ev: ChatEvent, repaint: &Arc<dyn Fn() + Send + Sync>) {
+/// Fold one chat event into the unbounded session log.
+///
+/// `chat_ids` is the projection-owned id set mirroring
+/// `state.chat_messages` (plus draft/mirror twin ids), giving O(1)
+/// dedup. Mutation discipline: pure appends leave `chat_epoch` alone;
+/// anything that reorders or rewrites existing entries (the
+/// history-merge re-sort) bumps it, so epoch-keyed consumer caches
+/// know when an incremental extend is safe.
+fn apply_chat(
+    state: &Arc<RwLock<State>>,
+    ev: ChatEvent,
+    chat_ids: &mut std::collections::HashSet<[u8; 16]>,
+    repaint: &Arc<dyn Fn() + Send + Sync>,
+) {
     let mut s = match state.write() {
         Ok(g) => g,
         Err(p) => p.into_inner(),
@@ -356,13 +370,13 @@ fn apply_chat(state: &Arc<RwLock<State>>, ev: ChatEvent, repaint: &Arc<dyn Fn() 
             // Dedup by id covers history-sync re-arrival of a message we
             // already have (including the sender's SenderMirror coming
             // back via someone else's history share).
-            if s.chat_messages.iter().any(|m| m.id == msg.id) {
+            if !chat_ids.insert(msg.id) {
                 return;
             }
-            s.chat_messages.push(msg);
+            Arc::make_mut(&mut s.chat_messages).push(msg);
         }
         ChatEvent::SystemNotice { text } => {
-            s.chat_messages.push(crate::events::ChatMessage {
+            let msg = crate::events::ChatMessage {
                 id: uuid::Uuid::new_v4().into_bytes(),
                 sender: String::new(),
                 sender_id: None,
@@ -371,38 +385,40 @@ fn apply_chat(state: &Arc<RwLock<State>>, ev: ChatEvent, repaint: &Arc<dyn Fn() 
                 kind: Default::default(),
                 attachment: None,
                 visibility: crate::events::ChatMessageVisibility::System,
-            });
+            };
+            chat_ids.insert(msg.id);
+            Arc::make_mut(&mut s.chat_messages).push(msg);
         }
         ChatEvent::SenderDraftInserted { msg } | ChatEvent::SenderMirrorInserted { msg } => {
             // Draft and Mirror twins share an id intentionally
             // (sender's own outgoing share has a local card AND a
             // history-sync twin). The render/history filters tell
-            // them apart by visibility; no dedup here.
-            s.chat_messages.push(msg);
+            // them apart by visibility; no dedup here — but the id
+            // still enters the set so a history-sync re-arrival of
+            // the same share dedups against it.
+            chat_ids.insert(msg.id);
+            Arc::make_mut(&mut s.chat_messages).push(msg);
         }
         ChatEvent::HistoryMerged { msgs } => {
             // Caller (connection task) pre-filtered against existing
             // ids; we still re-check defensively because between the
             // filter snapshot and our apply, another event may have
             // added an entry that collides.
-            let existing: std::collections::HashSet<[u8; 16]> = s.chat_messages.iter().map(|m| m.id).collect();
             let mut added = false;
+            let log = Arc::make_mut(&mut s.chat_messages);
             for msg in msgs {
-                if !existing.contains(&msg.id) {
-                    s.chat_messages.push(msg);
+                if chat_ids.insert(msg.id) {
+                    log.push(msg);
                     added = true;
                 }
             }
             if added {
-                s.chat_messages.sort_by_key(|m| m.timestamp);
+                // The sort can reorder existing entries — not an
+                // append. Epoch bump tells caches to rebuild.
+                log.sort_by_key(|m| m.timestamp);
+                s.chat_epoch += 1;
             }
         }
-    }
-    // Cap retention. Same 100-entry sliding window the connection
-    // task used to enforce at every push site, now centralised.
-    let len = s.chat_messages.len();
-    if len > CHAT_MESSAGE_CAP {
-        s.chat_messages.drain(0..len - CHAT_MESSAGE_CAP);
     }
     drop(s);
     repaint();
@@ -506,7 +522,12 @@ fn apply_voice(state: &Arc<RwLock<State>>, ev: VoiceEvent, repaint: &Arc<dyn Fn(
     repaint();
 }
 
-fn apply_connection(state: &Arc<RwLock<State>>, ev: ConnectionEvent, repaint: &Arc<dyn Fn() + Send + Sync>) {
+fn apply_connection(
+    state: &Arc<RwLock<State>>,
+    ev: ConnectionEvent,
+    chat_ids: &mut std::collections::HashSet<[u8; 16]>,
+    repaint: &Arc<dyn Fn() + Send + Sync>,
+) {
     let mut s = match state.write() {
         Ok(g) => g,
         Err(p) => p.into_inner(),
@@ -520,8 +541,11 @@ fn apply_connection(state: &Arc<RwLock<State>>, ev: ConnectionEvent, repaint: &A
             // one's — in particular file-offer cards, whose share ids are
             // only meaningful on the server that issued them. A transient
             // drop (ConnectionLost / Disconnected) keeps the log visible;
-            // only an explicit connect wipes it.
-            s.chat_messages.clear();
+            // only an explicit connect wipes it. This is the unbounded
+            // log's only retention bound (plus app exit).
+            s.chat_messages = Arc::new(Vec::new());
+            s.chat_epoch += 1;
+            chat_ids.clear();
         }
         ConnectionEvent::CertificatePending { cert_info } => {
             s.connection = crate::events::ConnectionState::CertificatePending { cert_info };
