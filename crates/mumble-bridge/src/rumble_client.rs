@@ -122,8 +122,9 @@ pub async fn connect(
     })
 }
 
-/// Send a chat message to the Rumble server.
-pub async fn send_chat(transport: &mut QuinnTransport, sender: &str, text: &str) -> Result<()> {
+/// Send a chat message to the Rumble server as the bridge user itself. When
+/// `tree` is set the server fans it out to the bridge user's room subtree.
+pub async fn send_chat(transport: &mut QuinnTransport, sender: &str, text: &str, tree: bool) -> Result<()> {
     let msg = proto::Envelope {
         state_hash: Vec::new(),
         payload: Some(Payload::ChatMessage(proto::ChatMessage {
@@ -131,7 +132,7 @@ pub async fn send_chat(transport: &mut QuinnTransport, sender: &str, text: &str)
             timestamp_ms: now_ms(),
             sender: sender.to_string(),
             text: text.to_string(),
-            tree: None,
+            tree: tree.then_some(true),
             attachment: None,
         })),
     };
@@ -147,22 +148,6 @@ pub async fn send_direct_message(transport: &mut QuinnTransport, target_user_id:
             text: text.to_string(),
             id: uuid::Uuid::new_v4().as_bytes().to_vec(),
             timestamp_ms: now_ms(),
-        })),
-    };
-    send_envelope(transport, &msg).await
-}
-
-/// Send a tree chat message (broadcast to room and all descendants).
-pub async fn send_tree_chat(transport: &mut QuinnTransport, sender: &str, text: &str) -> Result<()> {
-    let msg = proto::Envelope {
-        state_hash: Vec::new(),
-        payload: Some(Payload::ChatMessage(proto::ChatMessage {
-            id: uuid::Uuid::new_v4().as_bytes().to_vec(),
-            timestamp_ms: now_ms(),
-            sender: sender.to_string(),
-            text: text.to_string(),
-            tree: Some(true),
-            attachment: None,
         })),
     };
     send_envelope(transport, &msg).await
@@ -235,13 +220,24 @@ pub async fn send_set_participant_status(
     send_envelope(transport, &msg).await
 }
 
-/// Send a chat message on behalf of a participant.
-pub async fn send_participant_chat(transport: &mut QuinnTransport, user_id: u64, text: &str) -> Result<()> {
+/// Send a chat message on behalf of a participant. `room_id` targets an
+/// explicit room (the participant's current room when `None`); `tree` fans the
+/// message out to the target room's descendants as well. The server enforces
+/// the participant's TEXT_MESSAGE ACL in the target room.
+pub async fn send_participant_chat(
+    transport: &mut QuinnTransport,
+    user_id: u64,
+    text: &str,
+    room_id: Option<proto::RoomId>,
+    tree: bool,
+) -> Result<()> {
     let msg = proto::Envelope {
         state_hash: Vec::new(),
         payload: Some(Payload::ParticipantChat(proto::ParticipantChat {
             user_id,
             text: text.to_string(),
+            room_id,
+            tree: tree.then_some(true),
         })),
     };
     send_envelope(transport, &msg).await
