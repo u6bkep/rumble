@@ -697,6 +697,13 @@ message SetParticipantStatus {
 message ParticipantChat {
   uint64 user_id = 1;
   string text = 2;
+  // Optional explicit target room. When absent, the message goes to the
+  // participant's current room (legacy behavior). The participant's
+  // TEXT_MESSAGE ACL is checked in the target room either way.
+  optional RoomId room_id = 3;
+  // When true, the message also fans out to all descendants of the target
+  // room (tree-message semantics). Absent/false = single room.
+  optional bool tree = 4;
 }
 
 // =============================================================================

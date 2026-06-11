@@ -926,17 +926,27 @@ pub(crate) async fn broadcast_chat_in_room(
 async fn collect_descendant_rooms(state: &ServerState, root: uuid::Uuid) -> std::collections::HashSet<uuid::Uuid> {
     let rooms = state.get_rooms().await;
 
-    // Build parent -> children map
+    // Build parent -> children map. A missing parent_id means "directly under
+    // Root" (the Root room itself is skipped to avoid a self-edge), so a tree
+    // message from Root really does reach every room.
     let mut children_map: std::collections::HashMap<uuid::Uuid, Vec<uuid::Uuid>> = std::collections::HashMap::new();
     for room in &rooms {
-        let room_uuid = room.id.as_ref().and_then(uuid_from_room_id);
-        let parent_uuid = room.parent_id.as_ref().and_then(uuid_from_room_id);
-        if let (Some(rid), Some(pid)) = (room_uuid, parent_uuid) {
-            children_map.entry(pid).or_default().push(rid);
+        let Some(rid) = room.id.as_ref().and_then(uuid_from_room_id) else {
+            continue;
+        };
+        if rid == ROOT_ROOM_UUID {
+            continue;
         }
+        let pid = room
+            .parent_id
+            .as_ref()
+            .and_then(uuid_from_room_id)
+            .unwrap_or(ROOT_ROOM_UUID);
+        children_map.entry(pid).or_default().push(rid);
     }
 
-    // BFS from root
+    // BFS from root; the visited (insert) check doubles as a guard against
+    // malformed parent-link cycles, so the walk always terminates.
     let mut result = std::collections::HashSet::new();
     result.insert(root);
     let mut queue = std::collections::VecDeque::new();
@@ -944,8 +954,9 @@ async fn collect_descendant_rooms(state: &ServerState, root: uuid::Uuid) -> std:
     while let Some(current) = queue.pop_front() {
         if let Some(kids) = children_map.get(&current) {
             for &kid in kids {
-                result.insert(kid);
-                queue.push_back(kid);
+                if result.insert(kid) {
+                    queue.push_back(kid);
+                }
             }
         }
     }
@@ -2685,7 +2696,27 @@ async fn handle_participant_chat(
     }
     let id = uuid::Uuid::new_v4().into_bytes().to_vec();
     let text_for_plugins = pc.text.clone();
-    let accepted_room = broadcast_chat_as(&state, &persistence, pc.user_id, pc.text, false, id, now_ms(), None).await?;
+    let is_tree = pc.tree.unwrap_or(false);
+    // An explicit room target (e.g. a bridged Mumble tree message aimed at a
+    // subtree the participant isn't standing in) routes straight to
+    // `broadcast_chat_in_room`; absent, the participant's current room is used,
+    // preserving older-controller behavior. ACL runs in the target room.
+    let accepted_room = match pc.room_id.as_ref().and_then(uuid_from_room_id) {
+        Some(room) => broadcast_chat_in_room(
+            &state,
+            &persistence,
+            pc.user_id,
+            room,
+            pc.text,
+            is_tree,
+            id,
+            now_ms(),
+            None,
+        )
+        .await?
+        .then_some(room),
+        None => broadcast_chat_as(&state, &persistence, pc.user_id, pc.text, is_tree, id, now_ms(), None).await?,
+    };
     if let Some(room) = accepted_room {
         notify_chat_accepted(plugins, pc.user_id, room, &text_for_plugins, ctx).await;
     }
@@ -2740,6 +2771,90 @@ mod tests {
             accepted, None,
             "chat from a non-member must not be accepted, so plugins are never notified"
         );
+    }
+
+    /// `broadcast_chat_in_room` accepts an explicit room target for a
+    /// registered participant (the bridge's tree-message path), running the
+    /// TEXT_MESSAGE ACL against the participant in the *target* room — with or
+    /// without the tree flag. This is what `handle_participant_chat` calls when
+    /// `ParticipantChat.room_id` is set.
+    #[tokio::test]
+    async fn participant_chat_accepts_explicit_room_and_tree_target() {
+        let state = Arc::new(ServerState::new());
+        let persist = Arc::new(Persistence::in_memory().expect("in-memory persistence"));
+        persist
+            .create_group("default", rumble_protocol::permissions::DEFAULT_PERMISSIONS.bits())
+            .expect("create default group");
+
+        let room = state.create_room("target".to_string()).await;
+        state.register_participant(participant(7));
+
+        // Explicit room target: accepted even though the participant never
+        // joined the room (it stands wherever its controller left it).
+        let accepted = broadcast_chat_in_room(
+            &state,
+            &persist,
+            7,
+            room,
+            "hello".to_string(),
+            false,
+            vec![0u8; 16],
+            0,
+            None,
+        )
+        .await
+        .expect("broadcast does not error");
+        assert!(accepted, "participant chat into an explicit room must be accepted");
+
+        // Same target with tree fan-out enabled.
+        let accepted_tree = broadcast_chat_in_room(
+            &state,
+            &persist,
+            7,
+            room,
+            "hello tree".to_string(),
+            true,
+            vec![1u8; 16],
+            0,
+            None,
+        )
+        .await
+        .expect("broadcast does not error");
+        assert!(accepted_tree, "tree-flagged participant chat must be accepted");
+    }
+
+    /// Tree fan-out: rooms created without an explicit parent hang directly
+    /// under Root, so a Root-targeted tree message must reach them (and their
+    /// children), while a subtree target only covers its own descendants.
+    #[tokio::test]
+    async fn tree_descendants_cover_root_level_and_nested_rooms() {
+        let state = ServerState::new();
+        let a = state.create_room("a".to_string()).await; // directly under Root
+        let b = state.create_room_with_parent("b".to_string(), Some(a)).await;
+
+        let from_root = collect_descendant_rooms(&state, ROOT_ROOM_UUID).await;
+        assert!(from_root.contains(&ROOT_ROOM_UUID));
+        assert!(from_root.contains(&a), "root-level room must be in a Root tree");
+        assert!(from_root.contains(&b), "nested room must be in a Root tree");
+
+        let from_a = collect_descendant_rooms(&state, a).await;
+        assert_eq!(from_a, HashSet::from([a, b]));
+
+        let from_b = collect_descendant_rooms(&state, b).await;
+        assert_eq!(from_b, HashSet::from([b]));
+    }
+
+    /// A malformed parent-link cycle must not hang the tree walk.
+    #[tokio::test]
+    async fn tree_descendants_terminate_on_parent_cycle() {
+        let state = ServerState::new();
+        let a = state.create_room("a".to_string()).await;
+        let b = state.create_room_with_parent("b".to_string(), Some(a)).await;
+        assert!(state.move_room(a, b).await); // a <-> b parent cycle
+
+        let set = collect_descendant_rooms(&state, a).await;
+        assert!(set.contains(&a));
+        assert!(set.contains(&b));
     }
 
     /// A client-sent datagram. `sender_id`/`room_id` are left unset (or spoofed
