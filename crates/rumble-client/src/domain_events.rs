@@ -308,8 +308,28 @@ pub enum RoomEvent {
         user_id: u64,
         room_id: Option<Uuid>,
     },
-    UserUpdated {
-        user: User,
+    /// One user's status flags changed (mute / deafen / server-mute /
+    /// elevation). A *delta*: it carries exactly the wire payload of the
+    /// server's `UserStatusChanged` and nothing else. The projection —
+    /// the sole `State` writer — overlays these fields onto the `User`
+    /// entry it owns. The receiver must NOT pre-merge this against a
+    /// `State` snapshot: the projection applies events asynchronously,
+    /// so a receiver-side read-modify-write can build on stale state
+    /// and silently revert a just-applied update (issue #39).
+    UserStatusChanged {
+        user_id: u64,
+        is_muted: bool,
+        is_deafened: bool,
+        server_muted: bool,
+        is_elevated: bool,
+    },
+    /// A group was added to (or removed from) one user's membership
+    /// set. Same delta-shape rationale as
+    /// [`RoomEvent::UserStatusChanged`].
+    UserGroupChanged {
+        user_id: u64,
+        group: String,
+        added: bool,
     },
 
     GroupAdded {

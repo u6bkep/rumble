@@ -440,8 +440,8 @@ fn apply_voice(state: &Arc<RwLock<State>>, ev: VoiceEvent, repaint: &Arc<dyn Fn(
         VoiceEvent::ServerMutedChanged { .. } => {
             // The `server_muted` bit lives on the matching `User` entry
             // in `state.users`, which is written by the RoomEvent stream
-            // (UserUpdated). This event exists purely as a notification
-            // for SFX / toasts.
+            // (UserStatusChanged). This event exists purely as a
+            // notification for SFX / toasts.
         }
         VoiceEvent::TransmittingChanged { active } => {
             s.audio.is_transmitting = active;
@@ -572,8 +572,8 @@ fn apply_connection(state: &Arc<RwLock<State>>, ev: ConnectionEvent, repaint: &A
         }
         ConnectionEvent::ElevatedChanged { .. } => {
             // The is_elevated bit lives on the matching `User` entry,
-            // which is updated by the RoomEvent stream (UserUpdated /
-            // FullStateReplaced). Nothing to do here.
+            // which is updated by the RoomEvent stream (UserStatusChanged
+            // / FullStateReplaced). Nothing to do here.
         }
         ConnectionEvent::WelcomeMessageReceived { text } => {
             // Welcome text is rendered as a chat system notice; the
@@ -644,21 +644,9 @@ fn apply_room(
             // it can pre-create decoders, and propagate the matching
             // server_muted flag.
             if let Some(my_room_id) = s.my_room_id {
-                let my_user_id = s.my_user_id;
-                let user_ids_in_room: Vec<u64> = s
-                    .users
-                    .iter()
-                    .filter_map(|u| {
-                        let user_id = u.user_id.as_ref().map(|id| id.value)?;
-                        let user_room = u.current_room.as_ref().and_then(rumble_protocol::uuid_from_room_id)?;
-                        if user_room == my_room_id && Some(user_id) != my_user_id {
-                            Some(user_id)
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                audio_cmds.push(AudioCommand::RoomChanged { user_ids_in_room });
+                audio_cmds.push(AudioCommand::RoomChanged {
+                    user_ids_in_room: room_user_ids(&s, my_room_id, s.my_user_id),
+                });
             }
             if let Some(my_user_id) = s.my_user_id
                 && let Some(muted) = s
@@ -778,9 +766,21 @@ fn apply_room(
             }
 
             if my_user_id == Some(user_id) {
-                // Our own move — handled by the matching SelfMovedToRoom
-                // event the connection task fires alongside. Nothing else
-                // to do here.
+                // Our own move. Decided here, against the State this task
+                // owns — the receiver used to read `my_user_id` from a
+                // snapshot to fire a separate SelfMovedToRoom, a cross-task
+                // read that could race the projection's own applies
+                // (issue #39 class). Same side effects as SelfMovedToRoom:
+                // my_room_id, audio-task room change, file-transfer nudge,
+                // permission recompute.
+                if let Some(rid) = room_id {
+                    s.my_room_id = Some(rid);
+                    new_room_id_for_ft = Some(Some(rid));
+                    audio_cmds.push(AudioCommand::RoomChanged {
+                        user_ids_in_room: room_user_ids(&s, rid, my_user_id),
+                    });
+                    recompute_perms = true;
+                }
             } else {
                 let joined_our_room = my_room_id.is_some() && room_id == my_room_id;
                 let left_our_room = my_room_id.is_some() && from_room_id == my_room_id;
@@ -791,27 +791,73 @@ fn apply_room(
                 }
             }
         }
-        RoomEvent::UserUpdated { user } => {
+        RoomEvent::UserStatusChanged {
+            user_id,
+            is_muted,
+            is_deafened,
+            server_muted,
+            is_elevated,
+        } => {
             let my_user_id = s.my_user_id;
-            let new_user_id = user.user_id.as_ref().map(|id| id.value);
-            if let Some(existing) = s
+            if let Some(user) = s
                 .users
                 .iter_mut()
-                .find(|u| u.user_id.as_ref().map(|id| id.value) == new_user_id)
+                .find(|u| u.user_id.as_ref().map(|id| id.value) == Some(user_id))
             {
-                let prev_server_muted = existing.server_muted;
-                let prev_groups = existing.groups.clone();
-                let new_server_muted = user.server_muted;
-                let new_groups = user.groups.clone();
-                *existing = user;
-                if my_user_id.is_some() && my_user_id == new_user_id && prev_server_muted != new_server_muted {
-                    audio_cmds.push(AudioCommand::SetServerMuted {
-                        muted: new_server_muted,
-                    });
+                let prev_server_muted = user.server_muted;
+                let prev_elevated = user.is_elevated;
+                user.is_muted = is_muted;
+                user.is_deafened = is_deafened;
+                user.server_muted = server_muted;
+                user.is_elevated = is_elevated;
+                if my_user_id == Some(user_id) {
+                    if prev_server_muted != server_muted {
+                        audio_cmds.push(AudioCommand::SetServerMuted { muted: server_muted });
+                    }
+                    // Elevation bypasses ACL evaluation entirely, so a
+                    // flip changes our effective permissions.
+                    if prev_elevated != is_elevated {
+                        recompute_perms = true;
+                    }
                 }
-                if my_user_id == new_user_id && prev_groups != new_groups {
+            } else {
+                // Room-channel ordering guarantees any preceding
+                // UserJoined was applied before this delta, so an unknown
+                // user here is real divergence (e.g. we missed the join).
+                // Drop the delta; the StateHashCheckpoint that follows it
+                // will catch the divergence and trigger a resync on
+                // hash-capable servers.
+                warn!(user_id, "projection: UserStatusChanged for unknown user; dropping");
+            }
+        }
+        RoomEvent::UserGroupChanged { user_id, group, added } => {
+            let my_user_id = s.my_user_id;
+            if let Some(user) = s
+                .users
+                .iter_mut()
+                .find(|u| u.user_id.as_ref().map(|id| id.value) == Some(user_id))
+            {
+                let changed = if added {
+                    if user.groups.contains(&group) {
+                        false
+                    } else {
+                        user.groups.push(group);
+                        true
+                    }
+                } else {
+                    let before = user.groups.len();
+                    user.groups.retain(|g| g != &group);
+                    user.groups.len() != before
+                };
+                if changed && my_user_id == Some(user_id) {
                     recompute_perms = true;
                 }
+            } else {
+                // Same divergence rationale as UserStatusChanged above.
+                warn!(
+                    user_id,
+                    group, "projection: UserGroupChanged for unknown user; dropping"
+                );
             }
         }
         RoomEvent::GroupAdded { group } | RoomEvent::GroupModified { group } => {
@@ -829,22 +875,9 @@ fn apply_room(
         RoomEvent::SelfMovedToRoom { room_id } => {
             s.my_room_id = Some(room_id);
             new_room_id_for_ft = Some(Some(room_id));
-
-            let my_user_id = s.my_user_id;
-            let user_ids_in_room: Vec<u64> = s
-                .users
-                .iter()
-                .filter_map(|u| {
-                    let uid = u.user_id.as_ref().map(|id| id.value)?;
-                    let user_room = u.current_room.as_ref().and_then(rumble_protocol::uuid_from_room_id)?;
-                    if user_room == room_id && Some(uid) != my_user_id {
-                        Some(uid)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            audio_cmds.push(AudioCommand::RoomChanged { user_ids_in_room });
+            audio_cmds.push(AudioCommand::RoomChanged {
+                user_ids_in_room: room_user_ids(&s, room_id, s.my_user_id),
+            });
             recompute_perms = true;
         }
         RoomEvent::StateHashCheckpoint { .. } => {
@@ -868,6 +901,24 @@ fn apply_room(
         recompute_effective_permissions(state);
     }
     repaint();
+}
+
+/// User ids co-located in `room_id`, excluding `exclude` (our own id).
+/// Feeds `AudioCommand::RoomChanged` so the audio task can pre-create
+/// decoders for everyone we can now hear.
+fn room_user_ids(s: &State, room_id: Uuid, exclude: Option<u64>) -> Vec<u64> {
+    s.users
+        .iter()
+        .filter_map(|u| {
+            let uid = u.user_id.as_ref().map(|id| id.value)?;
+            let user_room = u.current_room.as_ref().and_then(rumble_protocol::uuid_from_room_id)?;
+            if user_room == room_id && Some(uid) != exclude {
+                Some(uid)
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 // =============================================================================
@@ -1169,5 +1220,187 @@ mod tests {
 
         let ids: Vec<Uuid> = chain.iter().map(|(id, _)| *id).collect();
         assert_eq!(ids, vec![rumble_protocol::ROOT_ROOM_UUID, Uuid::from_u128(1)]);
+    }
+
+    // =========================================================================
+    // apply_room delta application (issue #39)
+    // =========================================================================
+
+    /// Drives `apply_room` directly — synchronous, no runtime — with
+    /// observable side-effect channels.
+    struct Harness {
+        state: Arc<RwLock<State>>,
+        repaint: Arc<dyn Fn() + Send + Sync>,
+        audio_task: AudioTaskHandle,
+        audio_rx: mpsc::UnboundedReceiver<AudioCommand>,
+        file_transfer: Arc<RwLock<Option<Arc<dyn FileTransferPlugin>>>>,
+        command_tx: mpsc::UnboundedSender<Command>,
+        // Held so resync requests don't hit a closed channel.
+        _command_rx: mpsc::UnboundedReceiver<Command>,
+    }
+
+    impl Harness {
+        fn new(initial: State) -> Self {
+            let (audio_tx, audio_rx) = mpsc::unbounded_channel();
+            let (command_tx, command_rx) = mpsc::unbounded_channel();
+            Self {
+                state: Arc::new(RwLock::new(initial)),
+                repaint: Arc::new(|| {}),
+                audio_task: AudioTaskHandle::from_raw(audio_tx),
+                audio_rx,
+                file_transfer: Arc::new(RwLock::new(None)),
+                command_tx,
+                _command_rx: command_rx,
+            }
+        }
+
+        fn apply(&mut self, ev: RoomEvent) {
+            apply_room(
+                &self.state,
+                ev,
+                &self.repaint,
+                &self.audio_task,
+                &self.file_transfer,
+                &self.command_tx,
+            );
+        }
+
+        fn user(&self, id: u64) -> Option<rumble_protocol::proto::User> {
+            self.state
+                .read()
+                .unwrap()
+                .users
+                .iter()
+                .find(|u| u.user_id.as_ref().map(|x| x.value) == Some(id))
+                .cloned()
+        }
+
+        fn drain_audio(&mut self) -> Vec<AudioCommand> {
+            let mut out = Vec::new();
+            while let Ok(cmd) = self.audio_rx.try_recv() {
+                out.push(cmd);
+            }
+            out
+        }
+    }
+
+    /// The issue #39 race, encoded deterministically: a join followed by
+    /// two back-to-back deltas for the same user. With the old
+    /// receiver-side read-modify-write, the second delta's payload could
+    /// be built from a snapshot that predates the first delta's apply and
+    /// silently revert it. Deltas applied in order by the sole writer
+    /// must compose instead.
+    #[test]
+    fn back_to_back_user_deltas_compose() {
+        let mut h = Harness::new(State::default());
+
+        h.apply(RoomEvent::UserJoined { user: user(2, "alice") });
+        h.apply(RoomEvent::UserStatusChanged {
+            user_id: 2,
+            is_muted: true,
+            is_deafened: false,
+            server_muted: false,
+            is_elevated: false,
+        });
+        h.apply(RoomEvent::UserGroupChanged {
+            user_id: 2,
+            group: "admin".to_string(),
+            added: true,
+        });
+
+        let alice = h.user(2).expect("alice must exist");
+        assert!(alice.is_muted, "first delta (mute) must survive the second");
+        assert_eq!(
+            alice.groups,
+            vec!["admin".to_string()],
+            "second delta (group add) must land on top of the first"
+        );
+    }
+
+    /// A status delta for a user we don't know about (real divergence —
+    /// in-channel ordering means any preceding UserJoined was already
+    /// applied) is dropped without panicking and without conjuring a
+    /// user; a subsequent join + delta works normally.
+    #[test]
+    fn status_change_for_unknown_user_is_dropped() {
+        let mut h = Harness::new(State::default());
+
+        h.apply(RoomEvent::UserStatusChanged {
+            user_id: 7,
+            is_muted: true,
+            is_deafened: true,
+            server_muted: true,
+            is_elevated: false,
+        });
+        assert!(h.user(7).is_none(), "a dropped delta must not create a user");
+
+        h.apply(RoomEvent::UserJoined { user: user(7, "bob") });
+        h.apply(RoomEvent::UserGroupChanged {
+            user_id: 7,
+            group: "mods".to_string(),
+            added: true,
+        });
+        let bob = h.user(7).expect("bob joined");
+        assert!(!bob.is_muted, "the pre-join delta must not be retroactively applied");
+        assert_eq!(bob.groups, vec!["mods".to_string()]);
+    }
+
+    /// A server-mute flip on *our* user dispatches SetServerMuted to the
+    /// audio task exactly once per transition (no command on a repeat of
+    /// the same value).
+    #[test]
+    fn self_server_mute_flip_dispatches_audio_command() {
+        let mut h = Harness::new(State {
+            my_user_id: Some(1),
+            users: vec![user(1, "me")],
+            ..Default::default()
+        });
+
+        let status = |server_muted: bool| RoomEvent::UserStatusChanged {
+            user_id: 1,
+            is_muted: false,
+            is_deafened: false,
+            server_muted,
+            is_elevated: false,
+        };
+
+        h.apply(status(true));
+        let cmds = h.drain_audio();
+        assert!(
+            matches!(cmds.as_slice(), [AudioCommand::SetServerMuted { muted: true }]),
+            "expected exactly one SetServerMuted(true), got {cmds:?}"
+        );
+
+        h.apply(status(true));
+        let cmds = h.drain_audio();
+        assert!(cmds.is_empty(), "no transition, no command; got {cmds:?}");
+    }
+
+    /// Our own UserMoved is detected by the projection against its own
+    /// `my_user_id` (the receiver no longer pre-reads State to emit a
+    /// separate SelfMovedToRoom): my_room_id updates and the audio task
+    /// gets the co-located peer set.
+    #[test]
+    fn self_user_moved_updates_my_room_and_audio() {
+        let target = Uuid::from_u128(5);
+        let mut peer = user(2, "peer");
+        peer.current_room = Some(rumble_protocol::room_id_from_uuid(target));
+        let mut h = Harness::new(State {
+            my_user_id: Some(1),
+            users: vec![user(1, "me"), peer],
+            ..Default::default()
+        });
+
+        h.apply(RoomEvent::UserMoved {
+            user_id: 1,
+            room_id: Some(target),
+        });
+
+        assert_eq!(h.state.read().unwrap().my_room_id, Some(target));
+        let cmds = h.drain_audio();
+        assert!(
+            matches!(cmds.as_slice(), [AudioCommand::RoomChanged { user_ids_in_room }] if user_ids_in_room == &vec![2]),
+            "expected RoomChanged with the co-located peer, got {cmds:?}"
+        );
     }
 }

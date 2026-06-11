@@ -2535,7 +2535,7 @@ fn handle_server_message(
                         });
                     }
                     proto::server_event::Kind::StateUpdate(su) => {
-                        apply_state_update(su, state, bus);
+                        apply_state_update(su, bus);
                     }
                     proto::server_event::Kind::ChatBroadcast(cb) => {
                         // Extract message ID or generate a fallback
@@ -2677,7 +2677,14 @@ fn handle_server_message(
 /// emission. The projection task in `projection.rs` is the sole
 /// writer of room/user/group state and the sole dispatcher of audio-task
 /// notifications and file-transfer-plugin room-id updates.
-fn apply_state_update(update: proto::StateUpdate, state: &Arc<RwLock<State>>, bus: &crate::projection::EventBus) {
+///
+/// Deliberately a *pure* translation: no arm may read `State` to enrich
+/// an event. The projection applies events asynchronously, so any
+/// receiver-side read here observes a snapshot that may predate events
+/// already on the bus — a read-modify-write against it can revert or
+/// drop rapid back-to-back updates (issue #39). Deltas go on the bus as
+/// deltas; the projection merges them against the State it owns.
+fn apply_state_update(update: proto::StateUpdate, bus: &crate::projection::EventBus) {
     use crate::RoomEvent;
 
     // Server's BLAKE3 hash of the post-apply ServerState. Forwarded to
@@ -2744,42 +2751,32 @@ fn apply_state_update(update: proto::StateUpdate, state: &Arc<RwLock<State>>, bu
         }
         proto::state_update::Update::UserMoved(um) => {
             if let (Some(uid), Some(to_room)) = (um.user_id, um.to_room_id) {
-                let to_room_uuid = rumble_protocol::uuid_from_room_id(&to_room);
-                let my_user_id = read_state(state).my_user_id;
+                // Whether this is *us* moving (→ my_room_id update, audio
+                // room change, file-transfer nudge) is decided by the
+                // projection against the State it owns; reading
+                // `my_user_id` here would race the projection's apply of
+                // the `Connected` event.
                 let _ = bus.room.send(RoomEvent::UserMoved {
                     user_id: uid.value,
-                    room_id: to_room_uuid,
+                    room_id: rumble_protocol::uuid_from_room_id(&to_room),
                 });
-                // If it's us moving and the target is set, follow up with
-                // SelfMovedToRoom so the projection updates my_room_id +
-                // notifies the audio task + nudges the file-transfer plugin.
-                if my_user_id == Some(uid.value)
-                    && let Some(room_uuid) = to_room_uuid
-                {
-                    let _ = bus.room.send(RoomEvent::SelfMovedToRoom { room_id: room_uuid });
-                }
             }
         }
         proto::state_update::Update::UserStatusChanged(usc) => {
-            // Build the full updated User by reading the current snapshot
-            // and overlaying the changed fields. The projection takes the
-            // full User and applies the side effect (SetServerMuted if it
-            // affects us) inside its locked section.
+            // Pure translation: forward the wire delta as-is. The
+            // projection overlays it onto the `User` it owns and applies
+            // the side effects (SetServerMuted / permission recompute if
+            // it affects us) inside its locked section. Pre-merging
+            // against a `State` snapshot here would race the
+            // projection's apply of earlier events (issue #39).
             if let Some(uid) = usc.user_id {
-                let snapshot = read_state(state);
-                if let Some(existing) = snapshot
-                    .users
-                    .iter()
-                    .find(|u| u.user_id.as_ref().map(|id| id.value) == Some(uid.value))
-                {
-                    let mut user = existing.clone();
-                    user.is_muted = usc.is_muted;
-                    user.is_deafened = usc.is_deafened;
-                    user.server_muted = usc.server_muted;
-                    user.is_elevated = usc.is_elevated;
-                    drop(snapshot);
-                    let _ = bus.room.send(RoomEvent::UserUpdated { user });
-                }
+                let _ = bus.room.send(RoomEvent::UserStatusChanged {
+                    user_id: uid.value,
+                    is_muted: usc.is_muted,
+                    is_deafened: usc.is_deafened,
+                    server_muted: usc.server_muted,
+                    is_elevated: usc.is_elevated,
+                });
             }
         }
         proto::state_update::Update::GroupChanged(gc) => {
@@ -2795,24 +2792,12 @@ fn apply_state_update(update: proto::StateUpdate, state: &Arc<RwLock<State>>, bu
             }
         }
         proto::state_update::Update::UserGroupChanged(ugc) => {
-            // Same "merge into existing user" pattern as UserStatusChanged.
-            let snapshot = read_state(state);
-            if let Some(existing) = snapshot
-                .users
-                .iter()
-                .find(|u| u.user_id.as_ref().map(|id| id.value) == Some(ugc.user_id))
-            {
-                let mut user = existing.clone();
-                if ugc.added {
-                    if !user.groups.contains(&ugc.group) {
-                        user.groups.push(ugc.group);
-                    }
-                } else {
-                    user.groups.retain(|g| g != &ugc.group);
-                }
-                drop(snapshot);
-                let _ = bus.room.send(RoomEvent::UserUpdated { user });
-            }
+            // Pure translation, same shape as UserStatusChanged above.
+            let _ = bus.room.send(RoomEvent::UserGroupChanged {
+                user_id: ugc.user_id,
+                group: ugc.group,
+                added: ugc.added,
+            });
         }
         proto::state_update::Update::RoomAclChanged(rac) => {
             if let Some(rid) = rac.room_id.and_then(|r| rumble_protocol::uuid_from_room_id(&r)) {
