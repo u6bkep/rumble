@@ -280,6 +280,13 @@ impl<B: UiBackend> RumbleApp<B> {
         // needs an async init; we use `runtime.block_on` so the
         // initialisation completes before the first frame is built.
         let mut hotkeys = HotkeyManager::new();
+        // Hotkey events arrive on backend threads (portal D-Bus listener
+        // / global-hotkey hook) but are only consumed by the pre-frame
+        // `pump_hotkeys` poll. With push-driven redraws the loop idles
+        // between events, so event arrival must poke the repaint wakeup
+        // itself — global hotkeys mostly fire while the window is
+        // unfocused, where no winit input is coming to flush them.
+        hotkeys.set_wakeup(backend.repaint_arc());
         let runtime_handle = runtime.handle().clone();
         runtime.block_on(async {
             hotkeys.init_portal_backend(runtime_handle).await;

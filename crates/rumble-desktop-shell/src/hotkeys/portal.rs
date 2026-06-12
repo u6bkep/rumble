@@ -17,7 +17,10 @@
 //! the system shortcut settings UI tagged with their portal
 //! description (`HotkeyFunction::label() + HotkeyData::label()`).
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 use ashpd::desktop::{
     Session,
@@ -26,7 +29,11 @@ use ashpd::desktop::{
 use futures_util::StreamExt;
 use tokio::sync::{RwLock, mpsc};
 
-use super::{HotkeyData, HotkeyEvent, HotkeyFunction, ShortcutEntry};
+use super::{HotkeyData, HotkeyEvent, HotkeyFunction, HotkeyWakeup, ShortcutEntry};
+
+/// Shared slot for the GUI wakeup hook, written by `set_wakeup` on the
+/// UI thread and read by the listener task after each event enqueue.
+type WakeupSlot = Arc<Mutex<Option<HotkeyWakeup>>>;
 
 #[derive(Debug, Clone)]
 pub struct ShortcutInfo {
@@ -59,6 +66,10 @@ pub struct PortalHotkeyBackend {
     shortcuts: Arc<GlobalShortcuts>,
     session: Arc<Session<GlobalShortcuts>>,
     state: Arc<RwLock<PortalState>>,
+    /// GUI wakeup hook poked by the listener task whenever it enqueues
+    /// a `HotkeyEvent`, so an idle push-redraw GUI schedules the frame
+    /// that will drain `poll_events`.
+    wakeup: WakeupSlot,
     runtime_handle: tokio::runtime::Handle,
     /// Handle to the background signal-listener task. Aborted and
     /// awaited in [`Self::shutdown`] so the task releases its
@@ -96,12 +107,14 @@ impl PortalHotkeyBackend {
 
         let state = Arc::new(RwLock::new(PortalState::default()));
         let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let wakeup: WakeupSlot = Arc::new(Mutex::new(None));
 
         let listener_shortcuts = Arc::clone(&shortcuts);
         let listener_state = Arc::clone(&state);
         let listener_tx = event_tx.clone();
+        let listener_wakeup = Arc::clone(&wakeup);
         let listener_handle = runtime_handle.spawn(async move {
-            Self::listen_for_signals(listener_shortcuts, listener_state, listener_tx).await;
+            Self::listen_for_signals(listener_shortcuts, listener_state, listener_tx, listener_wakeup).await;
         });
 
         Some(Self {
@@ -110,10 +123,17 @@ impl PortalHotkeyBackend {
             shortcuts,
             session,
             state,
+            wakeup,
             runtime_handle,
             listener_handle,
             has_bound: false,
         })
+    }
+
+    /// Install the GUI wakeup hook. May be called before or after any
+    /// events have fired; takes effect for the next enqueue.
+    pub fn set_wakeup(&self, wakeup: HotkeyWakeup) {
+        *self.wakeup.lock().unwrap() = Some(wakeup);
     }
 
     /// Re-bind the portal session against the user's current shortcut
@@ -191,6 +211,7 @@ impl PortalHotkeyBackend {
         shortcuts: Arc<GlobalShortcuts>,
         state: Arc<RwLock<PortalState>>,
         event_tx: mpsc::UnboundedSender<HotkeyEvent>,
+        wakeup: WakeupSlot,
     ) {
         tracing::debug!("Starting GlobalShortcuts signal listener");
 
@@ -225,12 +246,12 @@ impl PortalHotkeyBackend {
             Some(mut changed) => loop {
                 tokio::select! {
                     Some(ev) = activated.next() => {
-                        if Self::handle_activated(&state, &event_tx, ev).await.is_break() {
+                        if Self::handle_activated(&state, &event_tx, &wakeup, ev).await.is_break() {
                             break;
                         }
                     }
                     Some(ev) = deactivated.next() => {
-                        if Self::handle_deactivated(&state, &event_tx, ev).await.is_break() {
+                        if Self::handle_deactivated(&state, &event_tx, &wakeup, ev).await.is_break() {
                             break;
                         }
                     }
@@ -248,12 +269,12 @@ impl PortalHotkeyBackend {
             None => loop {
                 tokio::select! {
                     Some(ev) = activated.next() => {
-                        if Self::handle_activated(&state, &event_tx, ev).await.is_break() {
+                        if Self::handle_activated(&state, &event_tx, &wakeup, ev).await.is_break() {
                             break;
                         }
                     }
                     Some(ev) = deactivated.next() => {
-                        if Self::handle_deactivated(&state, &event_tx, ev).await.is_break() {
+                        if Self::handle_deactivated(&state, &event_tx, &wakeup, ev).await.is_break() {
                             break;
                         }
                     }
@@ -267,14 +288,16 @@ impl PortalHotkeyBackend {
     async fn handle_activated(
         state: &Arc<RwLock<PortalState>>,
         event_tx: &mpsc::UnboundedSender<HotkeyEvent>,
+        wakeup: &WakeupSlot,
         ev: ashpd::desktop::global_shortcuts::Activated,
     ) -> std::ops::ControlFlow<()> {
         let id = ev.shortcut_id().to_string();
         let action = state.read().await.actions.get(&id).copied();
-        if let Some((function, data)) = action
-            && event_tx.send(HotkeyEvent::Pressed { function, data }).is_err()
-        {
-            return std::ops::ControlFlow::Break(());
+        if let Some((function, data)) = action {
+            if event_tx.send(HotkeyEvent::Pressed { function, data }).is_err() {
+                return std::ops::ControlFlow::Break(());
+            }
+            Self::poke_wakeup(wakeup);
         }
         std::ops::ControlFlow::Continue(())
     }
@@ -282,16 +305,27 @@ impl PortalHotkeyBackend {
     async fn handle_deactivated(
         state: &Arc<RwLock<PortalState>>,
         event_tx: &mpsc::UnboundedSender<HotkeyEvent>,
+        wakeup: &WakeupSlot,
         ev: ashpd::desktop::global_shortcuts::Deactivated,
     ) -> std::ops::ControlFlow<()> {
         let id = ev.shortcut_id().to_string();
         let action = state.read().await.actions.get(&id).copied();
-        if let Some((function, data)) = action
-            && event_tx.send(HotkeyEvent::Released { function, data }).is_err()
-        {
-            return std::ops::ControlFlow::Break(());
+        if let Some((function, data)) = action {
+            if event_tx.send(HotkeyEvent::Released { function, data }).is_err() {
+                return std::ops::ControlFlow::Break(());
+            }
+            Self::poke_wakeup(wakeup);
         }
         std::ops::ControlFlow::Continue(())
+    }
+
+    /// Clone the hook out of the slot before calling so the lock isn't
+    /// held across arbitrary GUI wakeup code.
+    fn poke_wakeup(wakeup: &WakeupSlot) {
+        let hook = wakeup.lock().unwrap().clone();
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 
     /// Release all compositor-side shortcut bindings without closing the

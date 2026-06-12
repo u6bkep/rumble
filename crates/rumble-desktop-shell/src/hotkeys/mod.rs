@@ -10,7 +10,7 @@
 //! - **Anywhere else** the manager exists but is dormant — callers can
 //!   still query `is_available()`, `is_wayland()`, etc. without `cfg`.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 
@@ -25,6 +25,15 @@ pub mod portal;
 
 #[cfg(all(target_os = "linux", feature = "wayland-portal"))]
 use portal::PortalHotkeyBackend;
+
+/// Callback poked whenever a hotkey event is enqueued from a backend
+/// thread. The GUI passes its repaint/wakeup hook here so a global
+/// shortcut schedules a frame immediately — the consumer side
+/// (`poll_events`) only runs during frame production, and with
+/// push-driven redraws nothing else would wake the event loop while
+/// the window is idle (and likely unfocused, this being a *global*
+/// hotkey).
+pub type HotkeyWakeup = Arc<dyn Fn() + Send + Sync>;
 
 /// Persisted keyboard configuration. Lives in the hotkey module rather
 /// than `settings::Settings` because the hotkey UI editor reads/writes
@@ -323,6 +332,42 @@ pub enum HotkeyEvent {
     Released { function: HotkeyFunction, data: HotkeyData },
 }
 
+/// Push-side plumbing for the `global-hotkey` backend. The crate
+/// delivers events either to a static poll channel **or** to a
+/// process-global handler installed via
+/// `GlobalHotKeyEvent::set_event_handler` — never both, and the handler
+/// can only ever be installed once per process. We install a handler
+/// (so event arrival can poke the GUI wakeup) that forwards into this
+/// shared queue, which `poll_events` drains in place of the crate's
+/// channel.
+#[cfg(feature = "global-hotkeys")]
+mod gh_push {
+    use std::{
+        collections::VecDeque,
+        sync::{Mutex, OnceLock},
+    };
+
+    use global_hotkey::GlobalHotKeyEvent;
+
+    use super::HotkeyWakeup;
+
+    pub(super) static QUEUE: Mutex<VecDeque<GlobalHotKeyEvent>> = Mutex::new(VecDeque::new());
+    pub(super) static WAKEUP: Mutex<Option<HotkeyWakeup>> = Mutex::new(None);
+    static INSTALLED: OnceLock<()> = OnceLock::new();
+
+    pub(super) fn install_handler() {
+        INSTALLED.get_or_init(|| {
+            GlobalHotKeyEvent::set_event_handler(Some(|event: GlobalHotKeyEvent| {
+                QUEUE.lock().unwrap().push_back(event);
+                let wakeup = WAKEUP.lock().unwrap().clone();
+                if let Some(wakeup) = wakeup {
+                    wakeup();
+                }
+            }));
+        });
+    }
+}
+
 /// Manages global hotkey registration and events.
 ///
 /// On macOS this MUST be created on the main thread (a `global-hotkey`
@@ -349,6 +394,11 @@ pub struct HotkeyManager {
     /// async window between `release_all` spawning and the action map
     /// being cleared inside the spawned task.
     global_hotkeys_enabled: bool,
+    /// Wakeup hook from [`Self::set_wakeup`], retained so a portal
+    /// backend created later (`init_portal_backend` runs after the
+    /// manager is constructed) still inherits it.
+    #[cfg(all(target_os = "linux", feature = "wayland-portal"))]
+    wakeup: Option<HotkeyWakeup>,
     #[cfg(all(target_os = "linux", feature = "wayland-portal"))]
     portal_backend: Option<PortalHotkeyBackend>,
 }
@@ -374,6 +424,8 @@ impl HotkeyManager {
                 init_failed: false,
                 global_hotkeys_enabled: true,
                 #[cfg(all(target_os = "linux", feature = "wayland-portal"))]
+                wakeup: None,
+                #[cfg(all(target_os = "linux", feature = "wayland-portal"))]
                 portal_backend: None,
             };
         }
@@ -392,6 +444,8 @@ impl HotkeyManager {
                         init_failed: false,
                         global_hotkeys_enabled: true,
                         #[cfg(all(target_os = "linux", feature = "wayland-portal"))]
+                        wakeup: None,
+                        #[cfg(all(target_os = "linux", feature = "wayland-portal"))]
                         portal_backend: None,
                     }
                 }
@@ -406,6 +460,8 @@ impl HotkeyManager {
                         init_failed: true,
                         global_hotkeys_enabled: true,
                         #[cfg(all(target_os = "linux", feature = "wayland-portal"))]
+                        wakeup: None,
+                        #[cfg(all(target_os = "linux", feature = "wayland-portal"))]
                         portal_backend: None,
                     }
                 }
@@ -418,6 +474,8 @@ impl HotkeyManager {
             is_wayland: false,
             init_failed: false,
             global_hotkeys_enabled: true,
+            #[cfg(all(target_os = "linux", feature = "wayland-portal"))]
+            wakeup: None,
             #[cfg(all(target_os = "linux", feature = "wayland-portal"))]
             portal_backend: None,
         }
@@ -444,6 +502,9 @@ impl HotkeyManager {
         match PortalHotkeyBackend::new(runtime_handle).await {
             Some(backend) => {
                 tracing::info!("XDG Portal GlobalShortcuts session created (shortcuts bind lazily on settings load)");
+                if let Some(wakeup) = &self.wakeup {
+                    backend.set_wakeup(wakeup.clone());
+                }
                 self.portal_backend = Some(backend);
             }
             None => {
@@ -456,6 +517,31 @@ impl HotkeyManager {
     /// unavailable. Lets call sites stay `cfg`-free.
     #[cfg(not(all(target_os = "linux", feature = "wayland-portal")))]
     pub async fn init_portal_backend(&mut self, _runtime_handle: tokio::runtime::Handle) {}
+
+    /// Install a callback poked whenever a hotkey event arrives from a
+    /// backend thread, so an event-driven GUI can schedule a frame (and
+    /// thus a `poll_events` drain) without waiting for unrelated input.
+    /// Without this, a push-redraw GUI sits idle while events queue up —
+    /// global hotkeys mostly fire when the window is unfocused, so no
+    /// winit event is coming to flush them.
+    ///
+    /// Call order with `init_portal_backend` doesn't matter; the hook is
+    /// retained and handed to a portal backend created later.
+    pub fn set_wakeup(&mut self, wakeup: HotkeyWakeup) {
+        #[cfg(all(target_os = "linux", feature = "wayland-portal"))]
+        {
+            if let Some(portal) = &self.portal_backend {
+                portal.set_wakeup(wakeup.clone());
+            }
+            self.wakeup = Some(wakeup.clone());
+        }
+        #[cfg(feature = "global-hotkeys")]
+        if self.manager.is_some() {
+            *gh_push::WAKEUP.lock().unwrap() = Some(wakeup.clone());
+            gh_push::install_handler();
+        }
+        let _ = wakeup;
+    }
 
     /// Whether the portal-based shortcut backend is bound.
     pub fn has_portal_backend(&self) -> bool {
@@ -685,13 +771,24 @@ impl HotkeyManager {
 
         #[cfg(feature = "global-hotkeys")]
         if self.manager.is_some() {
-            while let Ok(event) = GlobalHotKeyEvent::receiver().try_recv() {
+            let mut dispatch = |event: GlobalHotKeyEvent| {
                 if let Some(&(function, data)) = self.hotkey_actions.get(&event.id) {
                     match event.state {
                         HotKeyState::Pressed => events.push(HotkeyEvent::Pressed { function, data }),
                         HotKeyState::Released => events.push(HotkeyEvent::Released { function, data }),
                     }
                 }
+            };
+            // Push handler queue (installed by `set_wakeup`). Drained
+            // first: any events the crate's channel still holds predate
+            // the handler install.
+            for event in gh_push::QUEUE.lock().unwrap().drain(..) {
+                dispatch(event);
+            }
+            // Crate poll channel — only fed while no push handler is
+            // installed (i.e. `set_wakeup` was never called).
+            while let Ok(event) = GlobalHotKeyEvent::receiver().try_recv() {
+                dispatch(event);
             }
         }
 
