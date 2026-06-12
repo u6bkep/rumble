@@ -73,13 +73,25 @@ async fn handle_mumble_client(
 
     // Phase 1: Authentication handshake. Bounded so a connection that never
     // authenticates can't pin a handler task forever.
-    let (username, session) = tokio::time::timeout(
+    let (username, session, superseded) = tokio::time::timeout(
         std::time::Duration::from_secs(30),
         mumble_auth_handshake(&mut reader, &mut writer, &bridge_state),
     )
     .await
     .map_err(|_| anyhow::anyhow!("Mumble auth handshake timed out"))??;
     info!(session, %username, "Mumble client authenticated");
+
+    // If the handshake evicted a stale same-name session, retire it *before*
+    // announcing the new one: both events go out on this task, so the event
+    // loop is guaranteed to unregister the old participant on the Rumble
+    // server before registering the new one — they never coexist there, and
+    // the username-keyed registration matching can't pair the wrong session.
+    // Dropping the old client's sender also makes its writer task (and thus
+    // its handler) exit, so the ghost connection is torn down promptly.
+    if let Some(old_session) = superseded {
+        info!(old_session, session, %username, "evicting Mumble session superseded by reconnect");
+        bridge_tx.send(BridgeEvent::MumbleClientLeft { session: old_session })?;
+    }
 
     // Register with bridge
     bridge_tx.send(BridgeEvent::MumbleClientJoined {
@@ -152,7 +164,7 @@ async fn mumble_auth_handshake(
     reader: &mut ReadHalf<TlsStream<tokio::net::TcpStream>>,
     writer: &mut WriteHalf<TlsStream<tokio::net::TcpStream>>,
     bridge_state: &Arc<RwLock<BridgeState>>,
-) -> Result<(String, u32)> {
+) -> Result<(String, u32, Option<u32>)> {
     // Wait for Version and Authenticate messages
     let username = loop {
         let msg = mumble_framing::read_message(reader).await?;
@@ -194,11 +206,38 @@ async fn mumble_auth_handshake(
         // Mumble requires unique usernames (murmur rejects with UsernameInUse).
         // Allowing duplicates would also break the bridge's username-keyed
         // registration matching and chat attribution.
-        let name_taken = state.mumble_clients.values().any(|c| c.username == username)
-            || state.rumble_users.iter().any(|u| u.username == username);
-        if name_taken {
+        //
+        // A name held by a *native* Rumble user is a real conflict — we cannot
+        // evict someone else's session. The bridge's own registered
+        // participants also appear in `rumble_users`; those are excluded here
+        // (via the reverse virtual-user map) because they are handled by the
+        // same-name takeover below and their roster entry only disappears
+        // asynchronously, once the UnregisterParticipant lands.
+        let rumble_taken = state.rumble_users.iter().any(|u| {
+            u.username == username
+                && !u
+                    .user_id
+                    .as_ref()
+                    .is_some_and(|id| state.reverse_virtual_user_map.contains_key(&id.value))
+        });
+        if rumble_taken {
             None
         } else {
+            // Same-name takeover: a reconnecting client whose previous TCP
+            // session hasn't been torn down yet (it vanished without a FIN)
+            // would otherwise be rejected until that ghost times out. Evict
+            // the old session instead — murmur does the same for matching
+            // certificates, and this bridge has no client auth, so the name
+            // is the only identity there is.
+            let superseded = state
+                .mumble_clients
+                .values()
+                .find(|c| c.username == username)
+                .map(|c| c.session);
+            if let Some(old) = superseded {
+                state.mumble_clients.remove(&old);
+            }
+
             let session = state.allocate_mumble_session();
             state.mumble_clients.insert(
                 session,
@@ -210,10 +249,10 @@ async fn mumble_auth_handshake(
                     is_deafened: false,
                 },
             );
-            Some(session)
+            Some((session, superseded))
         }
     };
-    let Some(session) = registration else {
+    let Some((session, superseded)) = registration else {
         let reject = mumble::Reject {
             r#type: Some(mumble::reject::RejectType::UsernameInUse.into()),
             reason: Some(format!("Username \"{username}\" is already in use")),
@@ -258,7 +297,7 @@ async fn mumble_auth_handshake(
     // The ChannelState/UserState snapshot, ServerSync and ServerConfig follow
     // via the client's outbound channel once the bridge event loop registers
     // the sender (see `send_initial_sync` in bridge.rs).
-    Ok((username, session))
+    Ok((username, session, superseded))
 }
 
 /// Build ChannelState messages for all known rooms.
@@ -406,6 +445,13 @@ pub(crate) fn build_user_states(state: &BridgeState, exclude_session: u32) -> Ve
     users
 }
 
+/// How long a connected Mumble client may stay silent before it is presumed
+/// dead. Clients ping every ~5s, so this is six missed pings — the same
+/// policy murmur applies. Without it, a client that vanishes without a TCP
+/// FIN holds its session (and username) until TCP itself gives up, which on
+/// an otherwise idle connection is never.
+const MUMBLE_PING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Process messages from a connected Mumble client.
 async fn mumble_message_loop(
     reader: &mut ReadHalf<TlsStream<tokio::net::TcpStream>>,
@@ -413,7 +459,11 @@ async fn mumble_message_loop(
     bridge_tx: &mpsc::UnboundedSender<BridgeEvent>,
 ) -> Result<()> {
     loop {
-        let msg = mumble_framing::read_message(reader).await?;
+        let msg = tokio::time::timeout(MUMBLE_PING_TIMEOUT, mumble_framing::read_message(reader))
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!("no traffic from Mumble client for {MUMBLE_PING_TIMEOUT:?} (ping timeout)")
+            })??;
 
         match MessageType::from_u16(msg.msg_type) {
             Some(MessageType::Ping) => {

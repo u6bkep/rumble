@@ -560,6 +560,16 @@ impl ServerState {
         self.sessions.get(&user_id).map(|r| r.user_public_key)
     }
 
+    /// Find all user_ids whose session was authenticated with the given
+    /// long-term key. Used for same-identity session takeover at auth time.
+    pub fn user_ids_with_key(&self, key: &[u8; 32]) -> Vec<u64> {
+        self.sessions
+            .iter()
+            .filter(|e| &e.value().user_public_key == key)
+            .map(|e| *e.key())
+            .collect()
+    }
+
     /// Find a session entry by its session_id.
     pub fn get_session_by_id(&self, session_id: &[u8; 32]) -> Option<(u64, SessionEntry)> {
         self.sessions_by_id.get(session_id).and_then(|uid| {

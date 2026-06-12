@@ -113,7 +113,7 @@ pub async fn handle_envelope(
             handle_client_hello(ch, sender, state, persistence).await?;
         }
         Some(Payload::Authenticate(auth)) => {
-            handle_authenticate(auth, sender, state, persistence).await?;
+            handle_authenticate(auth, sender, state, persistence, plugins, ctx).await?;
         }
         Some(Payload::ChatMessage(msg)) => {
             // Require authentication for chat
@@ -389,6 +389,8 @@ async fn handle_authenticate(
     sender: Arc<ClientHandle>,
     state: Arc<ServerState>,
     persistence: Arc<Persistence>,
+    plugins: &[Arc<dyn ServerPlugin>],
+    ctx: &ServerCtx,
 ) -> Result<()> {
     // 1. Get pending auth state
     let pending = match state.take_pending_auth(sender.user_id) {
@@ -569,6 +571,19 @@ async fn handle_authenticate(
     // 8. Set username
     sender.set_username(final_username.clone()).await;
     info!(user_id = sender.user_id, username = %final_username, "Authentication successful");
+
+    // 8b. Session takeover: evict any stale connection holding the same
+    // identity, so a reconnecting client doesn't have to wait out the QUIC
+    // idle timeout before its old ghost frees the username.
+    evict_superseded_sessions(
+        &state,
+        plugins,
+        ctx,
+        &pending.public_key,
+        &final_username,
+        sender.user_id,
+    )
+    .await;
 
     // 9. Track session (user + session keys)
     state.add_session(sender.user_id, session_entry);
@@ -1690,6 +1705,67 @@ pub async fn broadcast_state_update(state: &Arc<ServerState>, update: proto::sta
     broadcast_frame(clients, frame).await;
 
     Ok(())
+}
+
+/// Evict live connections superseded by a fresh login with the same identity.
+///
+/// A newly authenticated connection proves ownership of its long-term key, so
+/// any *other* live connection holding the same key **and** the same display
+/// name is either dead-but-undetected (the QUIC idle timeout takes up to 30s
+/// to notice a vanished peer) or a deliberate re-login — in both cases the old
+/// session is closed and cleaned up immediately instead of waiting out the
+/// timeout. Same key under a different display name is left alone, so distinct
+/// anonymous presences of one key can coexist. Evicting a stale controller
+/// also cleans up all participants it owned (see [`cleanup_client`]), which
+/// frees a restarted bridge's ghost participants without the timeout.
+async fn evict_superseded_sessions(
+    state: &Arc<ServerState>,
+    plugins: &[Arc<dyn ServerPlugin>],
+    ctx: &ServerCtx,
+    public_key: &[u8; 32],
+    username: &str,
+    new_user_id: u64,
+) {
+    for old_id in state.user_ids_with_key(public_key) {
+        if old_id == new_user_id {
+            continue;
+        }
+        let Some(old) = state.get_client(old_id) else {
+            continue;
+        };
+        if old.get_username().await != username {
+            continue;
+        }
+        // Claim teardown; if a disconnect path already won the CAS the old
+        // connection is being cleaned up right now — nothing left to do.
+        if !old.begin_teardown() {
+            continue;
+        }
+        info!(
+            old_user_id = old_id,
+            new_user_id,
+            %username,
+            "evicting session superseded by new login"
+        );
+        // Courtesy notice for a live duplicate login; a vanished peer won't
+        // read it. Time-bounded: the ghost's flow-control window may be full,
+        // and the new client's auth must not hang on it.
+        let kicked = proto::Envelope {
+            state_hash: Vec::new(),
+            payload: Some(Payload::UserKicked(proto::UserKicked {
+                user_id: old_id,
+                reason: "Superseded by a new login with the same identity".to_string(),
+                kicked_by: "server".to_string(),
+            })),
+        };
+        let frame = encode_frame(&kicked);
+        let _ = tokio::time::timeout(BROADCAST_SEND_TIMEOUT, old.send_frame(&frame)).await;
+        old.conn.close(quinn::VarInt::from_u32(3), b"superseded");
+        for plugin in plugins {
+            plugin.on_disconnect(&old, ctx).await;
+        }
+        cleanup_client(&old, state).await;
+    }
 }
 
 /// Clean up a client: remove from the member table, remove memberships, broadcast update.

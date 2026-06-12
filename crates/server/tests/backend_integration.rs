@@ -1187,6 +1187,94 @@ async fn test_client_disconnect_removes_user() {
     );
 }
 
+#[tokio::test]
+async fn test_reconnect_same_identity_evicts_old_session() {
+    let port = next_test_port();
+    let server = start_server(port);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // First session. It is never closed — it stands in for a ghost connection
+    // the server hasn't detected as dead (from the server's point of view a
+    // live-but-silent connection and an undetected-dead one are identical).
+    let client1 = TestClient::connect(&format!("127.0.0.1:{}", port), "takeover-user", &server.cert_path)
+        .await
+        .expect("client 1 should connect");
+    let user1_id = client1.user_id();
+    let signing_key = client1.signing_key().clone();
+
+    let mut observer = TestClient::connect(&format!("127.0.0.1:{}", port), "observer", &server.cert_path)
+        .await
+        .expect("observer should connect");
+
+    // Reconnect with the same key and the same username: must succeed
+    // immediately and evict the old session.
+    let client2 = TestClient::connect_with_key(
+        &format!("127.0.0.1:{}", port),
+        "takeover-user",
+        signing_key,
+        None,
+        &server.cert_path,
+    )
+    .await
+    .expect("reconnect with same identity should succeed without waiting for a timeout");
+    let user2_id = client2.user_id();
+    assert_ne!(user1_id, user2_id, "reconnect gets a fresh user id");
+
+    // The superseded connection is closed by the server promptly (not after
+    // the ~30s QUIC idle timeout).
+    tokio::time::timeout(Duration::from_secs(3), client1.conn.closed())
+        .await
+        .expect("old session should be closed promptly after takeover");
+
+    // The roster holds exactly one "takeover-user": the new session.
+    observer.process_messages(Duration::from_millis(500)).await.unwrap();
+    let takeover_ids: Vec<u64> = observer
+        .users()
+        .iter()
+        .filter(|u| u.username == "takeover-user")
+        .filter_map(|u| u.user_id.as_ref().map(|id| id.value))
+        .collect();
+    assert_eq!(
+        takeover_ids,
+        vec![user2_id],
+        "old session must be evicted and only the new one remain"
+    );
+}
+
+#[tokio::test]
+async fn test_same_key_different_username_sessions_coexist() {
+    let port = next_test_port();
+    let server = start_server(port);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Same (anonymous) key under two different display names: no takeover.
+    let client1 = TestClient::connect(&format!("127.0.0.1:{}", port), "presence-a", &server.cert_path)
+        .await
+        .expect("client 1 should connect");
+    let signing_key = client1.signing_key().clone();
+
+    let client2 = TestClient::connect_with_key(
+        &format!("127.0.0.1:{}", port),
+        "presence-b",
+        signing_key,
+        None,
+        &server.cert_path,
+    )
+    .await
+    .expect("same key under a different name should connect");
+
+    // Both are in the roster snapshot the second client received.
+    for name in ["presence-a", "presence-b"] {
+        assert!(
+            client2.users().iter().any(|u| u.username == name),
+            "{name} should be in the roster"
+        );
+    }
+
+    client1.close();
+    client2.close();
+}
+
 // =============================================================================
 // Registration Tests
 // =============================================================================
