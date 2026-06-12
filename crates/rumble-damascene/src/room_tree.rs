@@ -44,6 +44,11 @@ static SVG_MUTED_SELF: LazyLock<SvgIcon> =
 static SVG_MUTED_SERVER: LazyLock<SvgIcon> = LazyLock::new(|| {
     SvgIcon::parse(include_str!("../assets/icons/muted_server.svg")).expect("muted_server.svg parses")
 });
+static SVG_DEAFENED_SELF: LazyLock<SvgIcon> = LazyLock::new(|| {
+    SvgIcon::parse(include_str!("../assets/icons/deafened_self.svg")).expect("deafened_self.svg parses")
+});
+static SVG_MUTED_LOCAL: LazyLock<SvgIcon> =
+    LazyLock::new(|| SvgIcon::parse(include_str!("../assets/icons/muted_local.svg")).expect("muted_local.svg parses"));
 
 // ============================================================
 // Constants
@@ -401,11 +406,16 @@ fn push_room_subtree(state: &State, room_id: Uuid, depth: usize, selected_room_i
         // voice datagrams); for self we use the local capture/VAD signal.
         let is_self = state.my_user_id == Some(user_id);
         let is_talking = state.audio.talking_users.contains(&user_id) || (is_self && state.audio.is_transmitting);
-        // Mic-state glyph picks up its color from the bundled Mumble
-        // SVG itself (red self-mute, blue server-mute, blue talking,
-        // green idle), so no `.text_color(...)` override here.
-        let mic_icon: SvgIcon = if user.server_muted {
+        // Primary voice-state glyph. Color comes baked into the bundled
+        // Mumble SVG itself (red self-mute, blue server-mute/talking,
+        // green idle), so no `.text_color(...)` override here. Deafen
+        // supersedes self-mute: deafening always implies muting (see
+        // `audio_task`: deafen⇒mute), so the two glyphs would be
+        // redundant — the headphone-slash already says "mic off too".
+        let voice_icon: SvgIcon = if user.server_muted {
             SVG_MUTED_SERVER.clone()
+        } else if user.is_deafened {
+            SVG_DEAFENED_SELF.clone()
         } else if user.is_muted {
             SVG_MUTED_SELF.clone()
         } else if is_talking {
@@ -419,17 +429,28 @@ fn push_room_subtree(state: &State, room_id: Uuid, depth: usize, selected_room_i
             name_el = name_el.text_color(palette::ELEVATED);
         }
 
+        // Row glyphs: indent, the voice-state glyph, then any orthogonal
+        // status badges. Local mute is *our* private choice not to hear
+        // this peer (it persists regardless of their own state, and a
+        // muted peer never shows as talking since we drop their voice),
+        // so it rides as an additional badge rather than replacing the
+        // voice glyph. Never applies to self.
+        let mut row_children: Vec<El> = vec![
+            spacer().width(Size::Fixed(indent + tokens::SPACE_4)),
+            icon(voice_icon).icon_size(tokens::ICON_MD),
+        ];
+        if !is_self && state.audio.muted_users.contains(&user_id) {
+            row_children.push(icon(SVG_MUTED_LOCAL.clone()).icon_size(tokens::ICON_MD));
+        }
+        row_children.push(name_el);
+
         out.push(
-            row([
-                spacer().width(Size::Fixed(indent + tokens::SPACE_4)),
-                icon(mic_icon).icon_size(tokens::ICON_MD),
-                name_el,
-            ])
-            .key(user_route_key(user_id, room_id))
-            .gap(tokens::SPACE_2)
-            .align(Align::Center)
-            .padding(Sides::xy(tokens::SPACE_1, tokens::SPACE_1))
-            .focusable(),
+            row(row_children)
+                .key(user_route_key(user_id, room_id))
+                .gap(tokens::SPACE_2)
+                .align(Align::Center)
+                .padding(Sides::xy(tokens::SPACE_1, tokens::SPACE_1))
+                .focusable(),
         );
     }
 

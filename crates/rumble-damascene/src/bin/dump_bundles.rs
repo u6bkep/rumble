@@ -102,6 +102,10 @@ enum Scene {
     /// exercises the self-talking room-tree indicator path that
     /// doesn't go through `talking_users` (which is remote-only).
     ConnectedSelfTalking,
+    /// Live session exercising every per-user voice-state glyph in the
+    /// room tree at once: idle (self), talking, self-muted, server-muted,
+    /// self-deafened, and a peer we've locally muted (additive badge).
+    ConnectedUserStates,
     /// Live session that *looks* connected but whose audio devices have
     /// faulted: a hard input (microphone) failure plus a recovering
     /// output (speaker) loss. Exercises the under-toolbar fault banner
@@ -208,6 +212,7 @@ impl Scene {
         Scene::Connecting,
         Scene::Connected,
         Scene::ConnectedSelfTalking,
+        Scene::ConnectedUserStates,
         Scene::ConnectedAudioFault,
         Scene::ConnectedSlashCommands,
         Scene::ConnectedSlashCommandHighlighted,
@@ -254,6 +259,7 @@ impl Scene {
             Scene::Connecting => "connecting",
             Scene::Connected => "connected",
             Scene::ConnectedSelfTalking => "connected_self_talking",
+            Scene::ConnectedUserStates => "connected_user_states",
             Scene::ConnectedAudioFault => "connected_audio_fault",
             Scene::ConnectedSlashCommands => "connected_slash_commands",
             Scene::ConnectedSlashCommandHighlighted => "connected_slash_command_highlighted",
@@ -312,6 +318,7 @@ impl Scene {
                 s.audio.is_transmitting = true;
                 s
             }
+            Scene::ConnectedUserStates => user_states_state(),
             Scene::ConnectedAudioFault => {
                 // Session is "connected" but both audio devices have
                 // faulted: a hard mic failure (destructive badge) and a
@@ -1019,6 +1026,47 @@ fn connected_state() -> State {
         // TEXT_MESSAGE in the current room, so seed the bit so the
         // connected scene shows the active composer (not the disabled
         // hint variant).
+        effective_permissions: Permissions::TEXT_MESSAGE.bits(),
+        ..State::default()
+    };
+    state.rebuild_room_tree();
+    state
+}
+
+/// Connected state with every per-user voice-state glyph present in a
+/// single room, so the room-tree status icons each render at least once:
+/// idle (self), talking, self-muted, server-muted, self-deafened, and a
+/// locally-muted peer (whose `muted_local` badge rides alongside its idle
+/// glyph). Deafen sets `is_muted` too, mirroring the client's deafen⇒mute.
+fn user_states_state() -> State {
+    let mut audio = AudioState {
+        voice_mode: VoiceMode::Continuous,
+        ..AudioState::default()
+    };
+    audio.talking_users.insert(2); // bob is talking
+    audio.muted_users.insert(6); // we've locally muted frank
+
+    let mut state = State {
+        connection: ConnectionState::Connected {
+            server_name: "rumble.example".into(),
+            user_id: 1,
+        },
+        rooms: vec![make_room(ROOM_LOBBY, "Lobby")],
+        users: vec![
+            make_user(1, "alice", ROOM_LOBBY, |_| {}),                    // self, idle
+            make_user(2, "bob", ROOM_LOBBY, |_| {}),                      // talking (via talking_users)
+            make_user(3, "charlie", ROOM_LOBBY, |u| u.is_muted = true),   // self-muted
+            make_user(4, "diana", ROOM_LOBBY, |u| u.server_muted = true), // server-muted
+            make_user(5, "erin", ROOM_LOBBY, |u| {
+                // Self-deafened: client forces mute on deafen, so both set.
+                u.is_deafened = true;
+                u.is_muted = true;
+            }),
+            make_user(6, "frank", ROOM_LOBBY, |_| {}), // locally muted (badge via muted_users)
+        ],
+        my_user_id: Some(1),
+        my_room_id: Some(Uuid::from_u128(ROOM_LOBBY)),
+        audio,
         effective_permissions: Permissions::TEXT_MESSAGE.bits(),
         ..State::default()
     };
