@@ -14,7 +14,7 @@ use rumble_protocol::permissions::{ADMIN_PERMISSIONS, DEFAULT_PERMISSIONS};
 use serde::{Deserialize, Serialize};
 use sled::Db;
 use std::path::Path;
-use tracing::info;
+use tracing::{info, warn};
 
 /// A persisted ban record, keyed by the banned user's public key (32 bytes).
 ///
@@ -452,6 +452,18 @@ impl Persistence {
             info!("Creating default permission groups");
             self.create_group("default", DEFAULT_PERMISSIONS.bits())?;
             self.create_group("admin", ADMIN_PERMISSIONS.bits())?;
+        }
+        // Self-heal: ADMIN_PERMISSIONS used to be ALL, which includes the
+        // BANNED auth-time marker — a DB seeded in that window bans every
+        // admin at login. BANNED on the admin group is never meaningful (it
+        // locks out exactly the people it grants everything to), so strip it.
+        use rumble_protocol::permissions::Permissions;
+        if let Some(g) = self.get_group("admin") {
+            let perms = Permissions::from_bits_truncate(g.permissions);
+            if perms.contains(Permissions::BANNED) {
+                warn!("admin group carried the BANNED marker bit (seeding bug that bans admins at auth); clearing it");
+                self.modify_group("admin", perms.difference(Permissions::BANNED).bits())?;
+            }
         }
         Ok(())
     }
@@ -1073,6 +1085,28 @@ mod tests {
         persistence.ensure_default_groups().unwrap();
         let groups = persistence.list_groups();
         assert_eq!(groups.len(), 2);
+    }
+
+    /// DBs seeded while ADMIN_PERMISSIONS was ALL carry the BANNED marker on
+    /// the admin group, which bans every admin at auth. Startup must strip it.
+    #[test]
+    fn ensure_default_groups_heals_banned_admin_group() {
+        use rumble_protocol::permissions::Permissions;
+        let persistence = Persistence::in_memory().unwrap();
+        // Simulate the poisoned seeding (old ADMIN_PERMISSIONS == ALL).
+        persistence.create_group("default", DEFAULT_PERMISSIONS.bits()).unwrap();
+        persistence
+            .create_group("admin", rumble_protocol::permissions::ALL.bits())
+            .unwrap();
+
+        persistence.ensure_default_groups().unwrap();
+
+        let admin = Permissions::from_bits_truncate(persistence.get_group("admin").unwrap().permissions);
+        assert!(!admin.contains(Permissions::BANNED), "BANNED must be stripped");
+        assert!(
+            admin.contains(Permissions::SUDO),
+            "capabilities must survive the fix-up"
+        );
     }
 
     #[test]

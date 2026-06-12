@@ -69,8 +69,11 @@ pub const DEFAULT_PERMISSIONS: Permissions = Permissions::TRAVERSE
     .union(Permissions::MAKE_ROOM)
     .union(Permissions::MODIFY_ROOM);
 
-/// Admin permissions (all bits set).
-pub const ADMIN_PERMISSIONS: Permissions = ALL;
+/// Admin permissions: every grantable capability bit. Deliberately excludes
+/// `BANNED` — that flag is a marker evaluated at auth time (carried by the
+/// "banned" group), not a capability, and a group containing it bans every
+/// one of its members at login.
+pub const ADMIN_PERMISSIONS: Permissions = ALL.difference(Permissions::BANNED);
 
 /// A named permission group with a base permission set.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -206,7 +209,7 @@ mod tests {
 
     #[test]
     fn test_admin_permissions() {
-        assert_eq!(ADMIN_PERMISSIONS, ALL);
+        assert_eq!(ADMIN_PERMISSIONS, ALL.difference(Permissions::BANNED));
         assert!(ADMIN_PERMISSIONS.contains(Permissions::KICK));
         assert!(ADMIN_PERMISSIONS.contains(Permissions::SUDO));
     }
@@ -405,5 +408,18 @@ mod tests {
         let json = serde_json::to_string(&perms).unwrap();
         let deserialized: Permissions = serde_json::from_str(&json).unwrap();
         assert_eq!(perms, deserialized);
+    }
+
+    /// The seeded groups must never carry the BANNED marker: auth rejects any
+    /// identity whose group-union contains it, so an admin group with BANNED
+    /// bans every admin at login (regression: fresh DBs seeded with ALL).
+    #[test]
+    fn grantable_group_presets_exclude_banned_marker() {
+        assert!(!ADMIN_PERMISSIONS.contains(Permissions::BANNED));
+        assert!(!DEFAULT_PERMISSIONS.contains(Permissions::BANNED));
+        assert!(
+            ADMIN_PERMISSIONS.contains(Permissions::SUDO),
+            "admin keeps real capabilities"
+        );
     }
 }
