@@ -460,6 +460,29 @@ pub(crate) async fn apply_create_group(
     Ok(format!("Created group '{}'", name))
 }
 
+/// Authorize a controller key: ensure the `controllers` group exists (granting
+/// only MANAGE_PARTICIPANTS — the authority to mint participants, kept separate
+/// from the group whose permissions minted participants inherit), then add the
+/// key to it. Used by the web/admin-socket API and mirrored by the offline
+/// `add-controller` subcommand.
+pub(crate) async fn apply_add_controller(
+    state: &Arc<ServerState>,
+    persistence: &Arc<Persistence>,
+    public_key: [u8; 32],
+) -> Result<String, String> {
+    if persistence.get_group("controllers").is_none() {
+        apply_create_group(
+            state,
+            persistence,
+            "controllers".to_string(),
+            rumble_protocol::permissions::Permissions::MANAGE_PARTICIPANTS.bits(),
+        )
+        .await?;
+    }
+    apply_set_user_group_by_key(state, persistence, public_key, "controllers".to_string(), true, 0).await?;
+    Ok("Added key to controllers group (grants MANAGE_PARTICIPANTS)".to_string())
+}
+
 /// Delete a permission group, scrubbing it from every connected client and
 /// every persisted user-group list, then broadcast the deletion.
 pub(crate) async fn apply_delete_group(

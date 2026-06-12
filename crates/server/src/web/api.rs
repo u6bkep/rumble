@@ -10,8 +10,9 @@ use axum::{
 };
 use rumble_protocol::proto;
 use rumble_web_types::{
-    BanRequest, CreateGroupRequest, CreateRoomRequest, KickRequest, ModifyGroupRequest, OkMessage, SetRoomAclRequest,
-    SetUserGroupRequest, ToggleGroupPermissionRequest,
+    AddControllerRequest, BanRequest, CreateGroupRequest, CreateRoomRequest, KickRequest, ModifyGroupRequest,
+    OkMessage, SetParticipantGroupRequest, SetRoomAclRequest, SetSudoPasswordRequest, SetUserGroupRequest,
+    ToggleGroupPermissionRequest,
 };
 use uuid::Uuid;
 
@@ -194,11 +195,91 @@ pub async fn set_registered_user_group(
     ok(msg)
 }
 
+// --- Server administration (sudo password, controllers) ----------------------
+
+/// `POST /api/sudo-password` — replace the sudo elevation password (also the
+/// web-admin login credential). Requires an existing admin session; over the
+/// local admin socket, local access itself is the credential, which is what
+/// lets `server set-sudo-password` recover a lost password without downtime.
+pub async fn set_sudo_password(
+    _admin: Admin,
+    State(st): State<WebState>,
+    Json(req): Json<SetSudoPasswordRequest>,
+) -> ApiResult<OkMessage> {
+    if req.password.is_empty() {
+        return Err(ApiErrorResponse::bad_request("Password cannot be empty"));
+    }
+    // bcrypt hashing is CPU-bound and deliberately slow — keep it off the
+    // async workers that also relay voice.
+    let hash = tokio::task::spawn_blocking(move || bcrypt::hash(&req.password, bcrypt::DEFAULT_COST))
+        .await
+        .map_err(|e| ApiErrorResponse::internal(format!("Hashing task failed: {e}")))?
+        .map_err(|e| ApiErrorResponse::internal(format!("Failed to hash password: {e}")))?;
+    st.persistence
+        .set_sudo_password(&hash)
+        .map_err(|e| ApiErrorResponse::internal(format!("Failed to set sudo password: {e}")))?;
+    let _ = st.persistence.flush();
+    // A sudo password closes first-run bootstrap, so the setup token (and the
+    // file publishing it) is dead — clean it up like a completed bootstrap does.
+    if let Some(path) = st.setup_token_file.as_ref()
+        && std::fs::remove_file(path).is_ok()
+    {
+        tracing::info!("deleted setup token file {} (bootstrap closed)", path.display());
+    }
+    ok("Sudo password set".to_string())
+}
+
+/// `POST /api/controllers` — authorize a controller key (Mumble bridge, bots):
+/// ensures the `controllers` group exists and adds the key to it.
+pub async fn add_controller(
+    _admin: Admin,
+    State(st): State<WebState>,
+    Json(req): Json<AddControllerRequest>,
+) -> ApiResult<OkMessage> {
+    let key = decode_standard_public_key(&req.public_key_b64)?;
+    let msg = map_op(ops::apply_add_controller(&st.state, &st.persistence, key).await)?;
+    ok(msg)
+}
+
+/// `PUT /api/controllers/{key}/participant-group` — set (or clear with `null`)
+/// the default group that this controller's anonymous participants inherit.
+pub async fn set_participant_group(
+    _admin: Admin,
+    State(st): State<WebState>,
+    Path(key_b64): Path<String>,
+    Json(req): Json<SetParticipantGroupRequest>,
+) -> ApiResult<OkMessage> {
+    let key = decode_public_key(&key_b64)?;
+    if let Some(group) = req.group.as_deref()
+        && st.persistence.get_group(group).is_none()
+    {
+        return Err(ApiErrorResponse::bad_request(format!("Group '{group}' does not exist")));
+    }
+    st.persistence
+        .set_participant_default_group(&key, req.group.as_deref())
+        .map_err(|e| ApiErrorResponse::internal(format!("Failed to persist participant group: {e}")))?;
+    let _ = st.persistence.flush();
+    ok(match req.group {
+        Some(g) => format!("Controller participants now inherit group '{g}'"),
+        None => "Controller participant group cleared".to_string(),
+    })
+}
+
 /// Decode a URL-safe-base64 (no padding) 32-byte Ed25519 public key, the form
 /// used in the registered-user DTO and route path.
 fn decode_public_key(s: &str) -> Result<[u8; 32], ApiErrorResponse> {
     let bytes = base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, s)
         .map_err(|_| ApiErrorResponse::bad_request("Invalid public key"))?;
+    bytes
+        .try_into()
+        .map_err(|_| ApiErrorResponse::bad_request("Public key must be 32 bytes"))
+}
+
+/// Decode a standard-base64 32-byte Ed25519 public key — the form keys appear
+/// in everywhere outside URLs (bridge logs, identity exports).
+fn decode_standard_public_key(s: &str) -> Result<[u8; 32], ApiErrorResponse> {
+    let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, s.trim())
+        .map_err(|_| ApiErrorResponse::bad_request("Invalid base64 public key"))?;
     bytes
         .try_into()
         .map_err(|_| ApiErrorResponse::bad_request("Public key must be 32 bytes"))

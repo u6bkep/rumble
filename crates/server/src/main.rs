@@ -40,13 +40,160 @@ fn decode_ed25519_key(key_b64: &str) -> Result<[u8; 32]> {
     Ok(key_bytes.try_into().unwrap())
 }
 
-/// Run an admin [`Command`] against the database under `data_dir`, then return.
-/// `data_dir` is the fully-resolved server data directory, so subcommands act
-/// on the same database the running server uses.
-fn handle_subcommand(command: Command, data_dir: &std::path::Path) -> Result<()> {
+/// Outcome of attempting an admin command over the running server's unix
+/// admin socket.
+#[cfg(unix)]
+enum SocketAttempt {
+    /// The server handled it (Ok = success message, Err = server-side refusal).
+    Handled(std::result::Result<String, String>),
+    /// Couldn't talk to a server over the socket (absent/stale/unreadable) —
+    /// fall back to opening the database directly.
+    Unavailable,
+}
+
+/// Try to apply `command` against a running server via its admin socket
+/// (`<data_dir>/admin.sock`). The socket speaks the same HTTP admin API as the
+/// web admin; local access to the 0600 socket is the credential.
+#[cfg(unix)]
+async fn try_admin_socket(command: &Command, sock: &std::path::Path) -> SocketAttempt {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+    // Re-encode a CLI-provided (standard-base64) key the way route paths
+    // expect it (URL-safe, no padding). Invalid keys are rejected here so we
+    // never fall back to sled just because the key was malformed.
+    let url_key = |key_b64: &str| -> std::result::Result<String, String> {
+        decode_ed25519_key(key_b64)
+            .map(|k| base64::Engine::encode(&URL_SAFE_NO_PAD, k))
+            .map_err(|e| e.to_string())
+    };
+
+    let (method, path, body) = match command {
+        Command::AddAdmin { public_key } => match url_key(public_key) {
+            Ok(key) => (
+                "POST",
+                format!("/api/registered-users/{key}/groups"),
+                serde_json::json!({ "group": "admin", "add": true }),
+            ),
+            Err(e) => return SocketAttempt::Handled(Err(e)),
+        },
+        Command::SetSudoPassword { password } => (
+            "POST",
+            "/api/sudo-password".to_string(),
+            serde_json::json!({ "password": password }),
+        ),
+        Command::AddController { public_key } => (
+            "POST",
+            "/api/controllers".to_string(),
+            serde_json::json!({ "public_key_b64": public_key }),
+        ),
+        Command::SetParticipantGroup { public_key, group } => match url_key(public_key) {
+            Ok(key) => (
+                "PUT",
+                format!("/api/controllers/{key}/participant-group"),
+                serde_json::json!({ "group": group }),
+            ),
+            Err(e) => return SocketAttempt::Handled(Err(e)),
+        },
+    };
+
+    let (status, body) = match unix_http_request(sock, method, &path, &body).await {
+        Ok(r) => r,
+        // Connect/IO failure: no live server behind the socket (stale file).
+        Err(_) => return SocketAttempt::Unavailable,
+    };
+
+    // 2xx carries {"message": ...}, errors carry {"error": ...}.
+    let parsed: Option<serde_json::Value> = serde_json::from_str(&body).ok();
+    let field = |name: &str| {
+        parsed
+            .as_ref()
+            .and_then(|v| v.get(name))
+            .and_then(|m| m.as_str())
+            .map(str::to_string)
+    };
+    if (200..300).contains(&status) {
+        SocketAttempt::Handled(Ok(field("message").unwrap_or_else(|| "OK".to_string())))
+    } else {
+        SocketAttempt::Handled(Err(
+            field("error").unwrap_or_else(|| format!("server returned HTTP {status}"))
+        ))
+    }
+}
+
+/// Minimal one-shot HTTP/1.0 request over a unix socket. HTTP/1.0 keeps the
+/// response un-chunked and close-delimited, so "read to EOF" is the whole
+/// body — no HTTP client dependency needed for four fixed endpoints.
+#[cfg(unix)]
+async fn unix_http_request(
+    sock: &std::path::Path,
+    method: &str,
+    path: &str,
+    body: &serde_json::Value,
+) -> std::io::Result<(u16, String)> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut stream = tokio::net::UnixStream::connect(sock).await?;
+    let body = serde_json::to_vec(body)?;
+    let head = format!(
+        "{method} {path} HTTP/1.0\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: \
+         {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes()).await?;
+    stream.write_all(&body).await?;
+
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await?;
+    let text = String::from_utf8_lossy(&response);
+    let (head, body) = text.split_once("\r\n\r\n").unwrap_or((text.as_ref(), ""));
+    let status = head
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|s| s.parse::<u16>().ok())
+        .ok_or_else(|| std::io::Error::other("malformed HTTP response from admin socket"))?;
+    Ok((status, body.to_string()))
+}
+
+/// Run an admin [`Command`] against the server's data under `data_dir`.
+///
+/// If a server is running (its admin socket at `<data_dir>/admin.sock`
+/// answers), the command is applied live through it. Otherwise the database is
+/// opened directly — sled's exclusive lock makes the two paths mutually safe.
+async fn handle_subcommand(command: Command, data_dir: &std::path::Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let sock = data_dir.join("admin.sock");
+        if sock.exists() {
+            match try_admin_socket(&command, &sock).await {
+                SocketAttempt::Handled(Ok(msg)) => {
+                    println!("{msg}");
+                    println!("(applied live via admin socket {})", sock.display());
+                    return Ok(());
+                }
+                SocketAttempt::Handled(Err(e)) => anyhow::bail!("{e}"),
+                SocketAttempt::Unavailable => {} // stale socket — use the DB directly
+            }
+        }
+    }
+
     std::fs::create_dir_all(data_dir)?;
     let db_path = format!("{}/rumble.db", data_dir.display());
-    let persistence = Persistence::open(&db_path)?;
+    let persistence = Persistence::open(&db_path).map_err(|e| {
+        // sled's exclusive lock means "a server is already running here" — say
+        // that instead of surfacing a cryptic IO error.
+        let msg = e.to_string();
+        if msg.contains("lock") || msg.contains("WouldBlock") || msg.contains("Resource temporarily unavailable") {
+            anyhow::anyhow!(
+                "the database at {db_path} is locked — a server appears to be running.\nIts admin socket ({}) wasn't \
+                 reachable, so the command could not be applied live.\nEither stop the server and re-run this \
+                 command, or use the web admin.",
+                data_dir.join("admin.sock").display()
+            )
+        } else {
+            e
+        }
+    })?;
 
     match command {
         Command::AddAdmin { public_key } => {
@@ -108,9 +255,10 @@ async fn main() -> Result<()> {
     // server would use, rather than a hardcoded "./data".
     let server_config = ServerConfig::load_with_args(args)?;
 
-    // Admin subcommands mutate the database and exit before normal startup.
+    // Admin subcommands mutate the server (live via its admin socket when
+    // running, else directly in the database) and exit before normal startup.
     if let Some(command) = command {
-        return handle_subcommand(command, &server_config.data_dir);
+        return handle_subcommand(command, &server_config.data_dir).await;
     }
 
     // Initialize logging with configured level

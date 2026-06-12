@@ -58,9 +58,10 @@ struct Cli {
     /// Path to the persistent TLS certificate + key (PEM) presented to Mumble
     /// clients. Generated self-signed on first run (0600 on Unix). Mumble
     /// clients remember the cert and warn when it changes, so it must stay
-    /// stable across restarts.
-    #[arg(long, value_name = "PATH", default_value = "bridge-mumble-tls.pem")]
-    mumble_tls_file: std::path::PathBuf,
+    /// stable across restarts. Defaults to `bridge-mumble-tls.pem` next to the
+    /// identity file, so both persistent secrets live in the same directory.
+    #[arg(long, value_name = "PATH")]
+    mumble_tls_file: Option<std::path::PathBuf>,
 }
 
 /// Parse a hex SHA-256 fingerprint (colons/whitespace allowed) into 32 bytes.
@@ -185,8 +186,16 @@ async fn main() -> Result<()> {
     });
 
     // Set up TLS for Mumble server (shared across reconnects, persisted so
-    // Mumble clients don't get cert-changed warnings after each restart)
-    let tls_acceptor = mumble_tls::make_tls_acceptor(&cli.mumble_tls_file)?;
+    // Mumble clients don't get cert-changed warnings after each restart). The
+    // cert defaults to sitting next to the identity file: deployments that
+    // relocate the identity to a writable volume get the cert there too.
+    let mumble_tls_file = cli.mumble_tls_file.unwrap_or_else(|| {
+        cli.identity_file
+            .parent()
+            .map(|p| p.join("bridge-mumble-tls.pem"))
+            .unwrap_or_else(|| std::path::PathBuf::from("bridge-mumble-tls.pem"))
+    });
+    let tls_acceptor = mumble_tls::make_tls_acceptor(&mumble_tls_file)?;
 
     // Bridge state persists across reconnects so Mumble clients stay connected
     let bridge_state = Arc::new(RwLock::new(BridgeState::new()));

@@ -78,14 +78,15 @@ domain = "localhost"
 # Web Admin Control-Plane
 # =======================
 # An HTTP server for administering the running server from a browser
-# (groups, ACLs, rooms, bans, live monitoring). Authenticate with the sudo
-# password (see `server set-sudo-password`). Disabled by default.
+# (groups, ACLs, rooms, bans, live monitoring). Enabled by default on
+# loopback only — this is how you complete first-run setup (the server
+# logs a one-time bootstrap link on startup until a sudo password is set).
 #
-# Bind to loopback (the default) and front it with a reverse proxy / SSH
-# tunnel for TLS and remote access. Can be toggled via RUMBLE_WEB_ENABLED=1
+# Keep the loopback bind and front it with a reverse proxy / SSH tunnel
+# for TLS and remote access. Can be toggled via RUMBLE_WEB_ENABLED=0/1
 # and RUMBLE_WEB_BIND.
 [web]
-enabled = false
+enabled = true
 bind = "127.0.0.1:5001"
 # assets_dir = "admin-web"   # serve the wasm UI bundle from here (dev);
 #                            # omit to serve the bundle embedded in the binary.
@@ -252,9 +253,10 @@ pub struct FileConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WebFileConfig {
-    /// Enable the web admin server. Disabled by default — remote exposure is
+    /// Enable the web admin server. Enabled by default on a loopback bind:
+    /// it is the first-run bootstrap path, and loopback keeps remote exposure
     /// opt-in.
-    #[serde(default)]
+    #[serde(default = "default_web_enabled")]
     pub enabled: bool,
 
     /// Address to bind the web server to. Defaults to loopback so remote
@@ -272,6 +274,10 @@ fn default_web_bind() -> String {
     "127.0.0.1:5001".to_string()
 }
 
+fn default_web_enabled() -> bool {
+    true
+}
+
 /// Parse a boolean-ish environment variable value. Returns `None` for anything
 /// not clearly truthy or falsy, so callers can fall back rather than guess.
 /// Case-insensitive; trims surrounding whitespace.
@@ -286,7 +292,7 @@ fn parse_bool_env(v: &str) -> Option<bool> {
 impl Default for WebFileConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: default_web_enabled(),
             bind: default_web_bind(),
             assets_dir: None,
         }
@@ -417,12 +423,26 @@ impl ServerConfig {
             toml::from_str(&content)
                 .with_context(|| format!("Failed to parse config file: {}", config_path.display()))?
         } else {
+            // Creating a config (and with it a data/cert tree) in an unintended
+            // directory silently forks the deployment — make this unmissable.
+            let abs = std::env::current_dir()
+                .map(|p| p.join(config_path))
+                .unwrap_or_else(|_| config_path.clone());
             eprintln!(
-                "[config] no config at {} (cwd: {cwd}) — creating default",
-                config_path.display(),
+                "[config] ============================================================\n[config] no config file found \
+                 — creating one with defaults at\n[config]   {}\n[config] (cwd: {cwd})\n[config] data and \
+                 certificates will live next to it unless configured\n[config] otherwise. If you meant to use an \
+                 existing setup, stop the\n[config] server, delete this file, and pass --config <path>.\n[config] \
+                 ============================================================",
+                abs.display(),
             );
-            fs::write(config_path, DEFAULT_CONFIG_CONTENT)
-                .with_context(|| format!("Failed to create config file: {}", config_path.display()))?;
+            fs::write(config_path, DEFAULT_CONFIG_CONTENT).with_context(|| {
+                format!(
+                    "Failed to create config file at {} — is the directory writable? Pass --config to choose another \
+                     location",
+                    abs.display()
+                )
+            })?;
             FileConfig::default()
         };
 
@@ -638,10 +658,18 @@ pub fn generate_self_signed_cert(
     let cert_pem = ck.cert.pem();
     let key_pem = ck.signing_key.serialize_pem();
 
-    fs::write(&fullchain_path, &cert_pem)
-        .with_context(|| format!("Failed to write certificate: {}", fullchain_path.display()))?;
-    write_private_key(&privkey_path, &key_pem)
-        .with_context(|| format!("Failed to write private key: {}", privkey_path.display()))?;
+    fs::write(&fullchain_path, &cert_pem).with_context(|| {
+        format!(
+            "Failed to write certificate to {} — the cert directory must be writable by the server's user",
+            fullchain_path.display()
+        )
+    })?;
+    write_private_key(&privkey_path, &key_pem).with_context(|| {
+        format!(
+            "Failed to write private key to {} — the cert directory must be writable by the server's user",
+            privkey_path.display()
+        )
+    })?;
 
     info!(
         "Generated self-signed certificate for '{}' in {}",

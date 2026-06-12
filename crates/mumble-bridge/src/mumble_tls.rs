@@ -59,11 +59,25 @@ fn load_or_create_cert(path: &Path) -> Result<(Vec<u8>, Vec<u8>)> {
         pem_encode("PRIVATE KEY", &key_der)
     );
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        std::fs::create_dir_all(parent).with_context(|| format!("creating TLS dir {}", parent.display()))?;
+        std::fs::create_dir_all(parent).with_context(|| format!("creating TLS dir {}", absolute(parent).display()))?;
     }
-    write_private(path, &pem).with_context(|| format!("writing Mumble TLS {}", path.display()))?;
+    write_private(path, &pem).with_context(|| {
+        format!(
+            "writing Mumble TLS cert to {} — the directory must be writable by the bridge's user; pass \
+             --mumble-tls-file to relocate it (in containers, point it at the data volume)",
+            absolute(path).display()
+        )
+    })?;
 
     Ok((cert_der, key_der))
+}
+
+/// Resolve a possibly-relative path against the cwd so error messages name the
+/// real location (a bare relative path is misleading inside containers).
+fn absolute(path: &Path) -> std::path::PathBuf {
+    std::env::current_dir()
+        .map(|cwd| cwd.join(path))
+        .unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// Write `contents` owner-only (`0600` on Unix) since the file holds a private key.

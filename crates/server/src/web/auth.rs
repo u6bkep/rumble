@@ -151,15 +151,25 @@ fn session_cookie(headers: &HeaderMap) -> Option<String> {
     None
 }
 
-/// Extractor that succeeds only for requests carrying a live admin session.
-/// Protected handlers take this as an argument; the request is rejected with
-/// 401 otherwise.
+/// Request-extension marker stamped onto every request arriving over the local
+/// admin unix socket. The socket file is `0600` in the server's data directory,
+/// so being able to connect at all already proves the caller owns the server's
+/// files — filesystem permissions are the credential, no session needed.
+#[derive(Clone, Copy)]
+pub struct LocalSocket;
+
+/// Extractor that succeeds only for requests carrying a live admin session, or
+/// arriving over the local admin socket ([`LocalSocket`]). Protected handlers
+/// take this as an argument; the request is rejected with 401 otherwise.
 pub struct Admin;
 
 impl FromRequestParts<WebState> for Admin {
     type Rejection = ApiErrorResponse;
 
     async fn from_request_parts(parts: &mut Parts, state: &WebState) -> Result<Self, Self::Rejection> {
+        if parts.extensions.get::<LocalSocket>().is_some() {
+            return Ok(Admin);
+        }
         let token = session_cookie(&parts.headers).ok_or_else(ApiErrorResponse::unauthorized)?;
         if state.sessions.validate(&token) {
             Ok(Admin)
@@ -291,6 +301,21 @@ pub async fn bootstrap(State(st): State<WebState>, Json(req): Json<BootstrapRequ
             .map_err(|e| ApiErrorResponse::bad_request(format!("Failed to add admin: {e}")))?;
     }
     let _ = persist.flush();
+
+    // The token is single-use and now spent — remove the file it was published
+    // in so no stale secret lingers on disk.
+    if let Some(path) = st.setup_token_file.as_ref() {
+        match std::fs::remove_file(path) {
+            Ok(()) => tracing::info!("bootstrap complete — deleted setup token file {}", path.display()),
+            Err(e) => tracing::warn!(
+                "bootstrap complete, but failed to delete setup token file {}: {e} — delete it manually (the token is \
+                 no longer valid)",
+                path.display()
+            ),
+        }
+    } else {
+        tracing::info!("bootstrap complete");
+    }
 
     Ok(Json(OkMessage {
         message: "Bootstrap complete".to_string(),

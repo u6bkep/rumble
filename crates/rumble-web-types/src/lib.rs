@@ -65,6 +65,30 @@ pub struct BootstrapRequest {
     pub admin_public_key_b64: Option<String>,
 }
 
+/// `POST /api/sudo-password` — replace the sudo password (admin session
+/// required; also reachable over the local admin socket, where local access is
+/// the credential).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetSudoPasswordRequest {
+    pub password: String,
+}
+
+/// `POST /api/controllers` — authorize a controller: ensures the `controllers`
+/// group exists (MANAGE_PARTICIPANTS only) and adds the key to it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddControllerRequest {
+    /// Standard-base64 Ed25519 public key (as printed by the bridge logs).
+    pub public_key_b64: String,
+}
+
+/// `PUT /api/controllers/{key}/participant-group` — set (or clear, with
+/// `null`) the default group a controller's anonymous participants inherit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetParticipantGroupRequest {
+    #[serde(default)]
+    pub group: Option<String>,
+}
+
 // =============================================================================
 // Permission groups
 // =============================================================================

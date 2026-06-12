@@ -62,6 +62,10 @@ services:
       - "${RUMBLE_DOMAIN}:5000"
       - "--identity-file"
       - "/data/bridge-identity.key"
+      # Persistent self-signed cert shown to Mumble clients. Defaults to
+      # sitting next to the identity file; spelled out here for clarity.
+      - "--mumble-tls-file"
+      - "/data/bridge-mumble-tls.pem"
       - "--name"
       - "Mumble"
     ports:

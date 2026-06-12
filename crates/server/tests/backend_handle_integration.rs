@@ -87,6 +87,9 @@ fn start_server(port: u16) -> ServerGuard {
         .env("RUMBLE_PORT", port.to_string())
         .env("RUMBLE_CERT_DIR", cert_dir.to_str().unwrap())
         .env("RUMBLE_DATA_DIR", data_dir.to_str().unwrap())
+        // Web admin defaults ON; parallel test servers would all race for its
+        // fixed port. Tests that need it opt in with their own port.
+        .env("RUMBLE_WEB_ENABLED", "0")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()

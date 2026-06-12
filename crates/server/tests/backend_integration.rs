@@ -74,6 +74,8 @@ fn start_server_with_options(port: u16, data_dir_override: Option<&str>, passwor
         .env("RUMBLE_PORT", port.to_string())
         .env("RUMBLE_CERT_DIR", cert_dir.to_str().unwrap())
         .env("RUMBLE_DATA_DIR", data_dir)
+        // Web admin defaults ON; parallel test servers would race for its port.
+        .env("RUMBLE_WEB_ENABLED", "0")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 

@@ -70,6 +70,9 @@ pub struct Server {
     plugins: Vec<Arc<dyn ServerPlugin>>,
     plugin_ctx: Arc<ServerCtx>,
     web: Option<crate::config::WebSettings>,
+    /// Data directory when persistence is on disk; hosts the admin socket.
+    /// `None` for ephemeral instances (nowhere stable to put a socket).
+    data_dir: Option<PathBuf>,
 }
 
 impl Server {
@@ -122,6 +125,11 @@ impl Server {
             .collect();
         state.set_slash_commands(slash_commands);
 
+        let data_dir = match config.persistence {
+            PersistenceMode::Disk(ref dir) => Some(dir.clone()),
+            PersistenceMode::Ephemeral => None,
+        };
+
         Ok(Self {
             endpoint,
             cert_dir,
@@ -130,6 +138,7 @@ impl Server {
             plugins,
             plugin_ctx,
             web: config.web,
+            data_dir,
         })
     }
 
@@ -237,12 +246,19 @@ impl Server {
             });
         }
 
-        // Start the web admin control-plane, if enabled.
-        if let Some(web_settings) = self.web.clone() {
-            crate::web::spawn(self.state.clone(), self.persistence.clone(), web_settings);
-        } else {
-            info!("web admin disabled (set [web] enabled = true, or RUMBLE_WEB_ENABLED=1)");
+        // Start the admin control-plane: HTTP web admin (if enabled) plus the
+        // local unix admin socket (whenever there is a data dir to host it) —
+        // the latter serves the `server` CLI subcommands and local scripting.
+        if self.web.is_none() {
+            info!("web admin disabled by config (re-enable with [web] enabled = true, or RUMBLE_WEB_ENABLED=1)");
         }
+        let admin_socket = self.data_dir.as_ref().map(|d| d.join("admin.sock"));
+        crate::web::spawn(
+            self.state.clone(),
+            self.persistence.clone(),
+            self.web.clone(),
+            admin_socket,
+        );
 
         // Start plugins before accepting connections
         for plugin in &self.plugins {
