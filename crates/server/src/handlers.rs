@@ -1779,7 +1779,10 @@ pub async fn cleanup_client(client_handle: &Arc<ClientHandle>, state: &Arc<Serve
     if is_controller {
         let participant_ids = state.members_by_owner(crate::state::OwnerId::Connection(user_id));
         for vu_id in participant_ids {
-            state.remove_client(vu_id);
+            if !state.remove_client(vu_id) {
+                // Another teardown path already removed (and announced) it.
+                continue;
+            }
             state.remove_user_membership(vu_id).await;
             if let Err(e) = broadcast_state_update(
                 state,
@@ -1799,8 +1802,12 @@ pub async fn cleanup_client(client_handle: &Arc<ClientHandle>, state: &Arc<Serve
         }
     }
 
-    // Remove client from the member table (lock-free)
-    state.remove_client_by_handle(client_handle);
+    // Remove client from the member table (lock-free). `false` means another
+    // cleanup already removed it: kick/ban (ops.rs) tear the member down
+    // synchronously without claiming the teardown CAS — deliberately, so the
+    // connection task still runs plugin `on_disconnect` afterwards — and that
+    // later cleanup_client call lands here a second time.
+    let was_present = state.remove_client_by_handle(client_handle);
     // Remove membership
     state.remove_user_membership(user_id).await;
     // Remove session
@@ -1810,9 +1817,11 @@ pub async fn cleanup_client(client_handle: &Arc<ClientHandle>, state: &Arc<Serve
 
     debug!(user_id, "server: cleaned up client");
 
-    // Only broadcast if the client was authenticated and not a controller
-    // (controller's own user was already removed from visible state in ControllerHello)
-    if client_handle.authenticated.load(Ordering::SeqCst) && !is_controller {
+    // Only broadcast if this call actually removed the member (exactly one
+    // UserLeft per departure) and the client was authenticated and not a
+    // controller (controller's own user was already removed from visible
+    // state in ControllerHello).
+    if was_present && client_handle.authenticated.load(Ordering::SeqCst) && !is_controller {
         // Send incremental update about user leaving
         if let Err(e) = broadcast_state_update(
             state,

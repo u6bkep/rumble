@@ -594,14 +594,17 @@ impl ServerState {
         self.members.insert(handle.user_id, member);
     }
 
-    /// Remove a member (client or participant) by user_id.
-    pub fn remove_client(&self, user_id: u64) {
-        self.members.remove(&user_id);
+    /// Remove a member (client or participant) by user_id. Returns whether the
+    /// member was present, i.e. whether this call actually removed it — false
+    /// means another teardown path already did.
+    pub fn remove_client(&self, user_id: u64) -> bool {
+        self.members.remove(&user_id).is_some()
     }
 
-    /// Remove a member by the handle's user_id.
-    pub fn remove_client_by_handle(&self, handle: &Arc<ClientHandle>) {
-        self.members.remove(&handle.user_id);
+    /// Remove a member by the handle's user_id. Returns whether the member was
+    /// present (see [`Self::remove_client`]).
+    pub fn remove_client_by_handle(&self, handle: &Arc<ClientHandle>) -> bool {
+        self.members.remove(&handle.user_id).is_some()
     }
 
     /// Get the connection handle for a user_id, if that member is a live client.
