@@ -111,6 +111,18 @@ impl BridgeLoopState {
 /// Returns when the shutdown signal fires or the event channel closes.
 /// `loop_state` persists across reconnects to preserve client senders and
 /// sequence counters.
+/// Why [`run_bridge`] returned (beyond hard errors).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BridgeExit {
+    /// Event loop ended: shutdown signal, connection loss, or channel close.
+    EventLoopEnded,
+    /// The server rejected our ControllerHello (bridge key not authorized as a
+    /// controller). The connection is still alive but useless as a bridge —
+    /// the caller must tear it down and retry, so a later `add-controller` on
+    /// the server is picked up without restarting the bridge.
+    ControllerRejected,
+}
+
 pub async fn run_bridge(
     config: Arc<BridgeConfig>,
     bridge_state: Arc<RwLock<BridgeState>>,
@@ -119,7 +131,7 @@ pub async fn run_bridge(
     rumble_send: &mut rumble_desktop::QuinnTransport,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     loop_state: &mut BridgeLoopState,
-) -> (Result<()>, mpsc::UnboundedReceiver<BridgeEvent>) {
+) -> (Result<BridgeExit>, mpsc::UnboundedReceiver<BridgeEvent>) {
     let client_senders = &mut loop_state.client_senders;
     let rumble_outbound_seq = &mut loop_state.rumble_outbound_seq;
     let mumble_to_rumble_seq = &mut loop_state.mumble_to_rumble_seq;
@@ -131,6 +143,7 @@ pub async fn run_bridge(
     info!("Bridge event loop started");
 
     let mut shutdown_requested = false;
+    let mut exit_reason = BridgeExit::EventLoopEnded;
 
     loop {
         let event = tokio::select! {
@@ -525,7 +538,7 @@ pub async fn run_bridge(
             }
 
             BridgeEvent::RumbleEnvelope(env) => {
-                handle_rumble_envelope(
+                let controller_rejected = handle_rumble_envelope(
                     env,
                     &bridge_state,
                     client_senders,
@@ -533,6 +546,15 @@ pub async fn run_bridge(
                     &mut pending_join_rooms,
                     &mut pending_unregister,
                 );
+                if controller_rejected {
+                    // Connected but not authorized as a controller: staying on
+                    // this connection would leave the bridge visible as a
+                    // plain user and it would never re-attempt ControllerHello.
+                    // Hand control back so the caller reconnects periodically
+                    // until the operator runs `server add-controller`.
+                    exit_reason = BridgeExit::ControllerRejected;
+                    break;
+                }
 
                 // Process any pending join-room requests from ParticipantRegistered
                 for (vid, session) in pending_join_rooms.drain(..) {
@@ -600,7 +622,7 @@ pub async fn run_bridge(
     }
 
     info!("Bridge event loop ended");
-    (Ok(()), bridge_rx)
+    (Ok(exit_reason), bridge_rx)
 }
 
 /// Send the post-handshake state snapshot (channels, users, self, ServerSync,
@@ -678,6 +700,9 @@ fn send_initial_sync(
 }
 
 /// Handle a Rumble server envelope and forward relevant events to Mumble clients.
+///
+/// Returns `true` when the server rejected our ControllerHello — the caller
+/// must tear the connection down and retry (see [`BridgeExit::ControllerRejected`]).
 fn handle_rumble_envelope(
     env: proto::Envelope,
     bridge_state: &Arc<RwLock<BridgeState>>,
@@ -685,7 +710,7 @@ fn handle_rumble_envelope(
     rumble_outbound_seq: &mut HashMap<u64, u64>,
     pending_join_rooms: &mut Vec<(u64, u32)>,
     pending_unregister: &mut Vec<u64>,
-) {
+) -> bool {
     match env.payload {
         Some(Payload::ServerEvent(se)) => {
             if let Some(kind) = se.kind {
@@ -919,10 +944,14 @@ fn handle_rumble_envelope(
                 // controller protocol (e.g. ControllerHello rejected because the
                 // bridge key lacks MANAGE_PARTICIPANTS) — never swallow them.
                 warn!(command = %cr.command, message = %cr.message, "Rumble command failed");
+                if cr.command == "ControllerHello" {
+                    return true;
+                }
             }
         }
         _ => {}
     }
+    false
 }
 
 /// Handle a Rumble StateUpdate and forward to Mumble clients.

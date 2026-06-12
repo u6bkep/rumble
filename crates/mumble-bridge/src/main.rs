@@ -400,6 +400,10 @@ async fn main() -> Result<()> {
             let _ = rumble_bridge_tx.send(BridgeEvent::RumbleReceiverDied);
         });
 
+        // Kept so the ControllerRejected path below can close the (still
+        // healthy) connection after run_bridge hands control back.
+        let conn_for_teardown = rumble_conn_handle.clone();
+
         // Run the bridge event loop (blocks until shutdown or connection loss).
         // run_bridge returns the bridge_rx so we can reuse it across reconnects.
         let (result, returned_rx) = bridge::run_bridge(
@@ -428,7 +432,33 @@ async fn main() -> Result<()> {
         }
 
         match result {
-            Ok(()) => {
+            Ok(bridge::BridgeExit::ControllerRejected) => {
+                // Connected and authenticated, but the server refused to make
+                // us a controller. The recv task is already aborted (no stale
+                // RumbleReceiverDied can leak into the next session), so close
+                // the otherwise-healthy connection and retry on a slow fixed
+                // cadence — each attempt re-sends ControllerHello, so a
+                // server-side `add-controller` is picked up within one cycle,
+                // no bridge restart needed.
+                conn_for_teardown.close(0u32.into(), b"controller authorization pending");
+                const AUTHORIZATION_RETRY_SECS: u64 = 15;
+                error!(
+                    public_key = %controller_key_b64,
+                    "Rumble server refused controller authorization (key lacks MANAGE_PARTICIPANTS). Authorize this \
+                     bridge once on the server:  server add-controller '{controller_key_b64}'  — retrying every \
+                     {AUTHORIZATION_RETRY_SECS}s"
+                );
+                let mut shutdown_wait = shutdown_rx.clone();
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(AUTHORIZATION_RETRY_SECS)) => {}
+                    _ = shutdown_wait.changed() => {
+                        info!("Shutdown while waiting for controller authorization");
+                        break;
+                    }
+                }
+                continue;
+            }
+            Ok(bridge::BridgeExit::EventLoopEnded) => {
                 warn!("Bridge event loop ended unexpectedly, reconnecting");
             }
             Err(e) => {
