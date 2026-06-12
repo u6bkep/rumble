@@ -3072,9 +3072,9 @@ fn voice_mode_trigger(mode_icon: SvgIcon, tooltip_text: &str) -> El {
 fn voice_mode_menu(current: VoiceMode) -> El {
     use damascene_core::widgets::popover::{Anchor, menu_item, popover, popover_panel};
     let cont_label = if current == VoiceMode::Continuous {
-        "Continuous (VAD) ✓"
+        "Continuous (voice-gated) ✓"
     } else {
-        "Continuous (VAD)"
+        "Continuous (voice-gated)"
     };
     let ptt_label = if current == VoiceMode::PushToTalk {
         "Push-to-Talk ✓"

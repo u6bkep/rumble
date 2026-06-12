@@ -430,18 +430,21 @@ impl Scene {
 
     /// Live per-stage pipeline outputs the MockBackend hands to the UI on
     /// `outputs()`. The Processing scene seeds a representative RNNoise VAD
-    /// probability (and an open gate) so the dumped meter shows a filled
-    /// bar past the trigger; other scenes use the empty frame. Slot order
-    /// matches `OutputLayout::derive` for the default pipeline: the gain
-    /// stage declares no outputs, so denoise's `vad_probability` is slot 0
-    /// and `voice_active` is slot 1.
+    /// probability (and an open gate) plus a noise-gate level so the dumped
+    /// meters show filled bars past their triggers; other scenes use the
+    /// empty frame. Slot order matches `OutputLayout::derive` for the
+    /// default pipeline: the gain stage declares no outputs, so denoise's
+    /// `vad_probability` is slot 0 and `voice_active` slot 1, then the
+    /// noise gate's `level_db` is slot 2 and `gate_open` slot 3.
     fn build_outputs(self) -> rumble_client::OutputFrame {
         match self {
             Scene::SettingsProcessing => {
                 let mut frame = rumble_client::OutputFrame::default();
                 frame.values[0] = 0.72; // voice probability → green zone
                 frame.values[1] = 1.0; // gate open
-                frame.len = 2;
+                frame.values[2] = -22.0; // noise-gate level (dB) → above trigger
+                frame.values[3] = 1.0; // noise gate open
+                frame.len = 4;
                 frame
             }
             _ => rumble_client::OutputFrame::default(),
@@ -1139,10 +1142,15 @@ fn processing_state() -> AudioState {
     let mut registry = ProcessorRegistry::new();
     register_builtin_processors(&mut registry);
     let mut tx_pipeline = build_default_tx_pipeline(&registry);
-    // Flip VAD on so the level meter renders its threshold-break
-    // colouring; otherwise the fixture would show the no-VAD fallback.
-    if let Some(vad) = tx_pipeline.processors.iter_mut().find(|p| p.type_id == "builtin.vad") {
-        vad.enabled = true;
+    // Flip the noise gate on so the level meter renders its
+    // threshold-break colouring (and the stage's own live meter);
+    // otherwise the fixture would show the no-gate fallback.
+    if let Some(gate) = tx_pipeline
+        .processors
+        .iter_mut()
+        .find(|p| p.type_id == rumble_client::processors::type_ids::NOISE_GATE)
+    {
+        gate.enabled = true;
     }
     AudioState {
         tx_pipeline,

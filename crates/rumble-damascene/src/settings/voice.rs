@@ -21,7 +21,8 @@ pub(super) fn render_voice(pending: &PendingSettings) -> El {
                 paragraph(match pending.voice_mode {
                     PersistentVoiceMode::PushToTalk => "Hold the configured PTT key (default: Space) to transmit.",
                     PersistentVoiceMode::Continuous => {
-                        "Always transmitting. Add a VAD processor to gate on voice activity."
+                        "Always transmitting. Enable a gate stage (RNNoise voice gate or noise gate) in the Processing \
+                         tab to suppress silence."
                     }
                 })
                 .muted()

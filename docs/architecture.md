@@ -19,7 +19,7 @@ deferred to the sibling docs listed at the end. Source lives under `crates/`.
 | `rumble-client-traits` | Platform-agnostic traits the engine depends on (`Transport`, `AudioBackend`, `KeySigning`, `FileTransferPlugin`, storage) — no platform code. |
 | `rumble-desktop` | Native desktop `Platform` implementation: quinn (QUIC), cpal (audio I/O), opus, ed25519. |
 | `rumble-desktop-shell` | Desktop shell concerns: persistent settings store, encrypted-at-rest identity files (Argon2 + ChaCha20Poly1305), ssh-agent identity, cross-platform + XDG-portal global hotkeys. |
-| `rumble-audio` | Pluggable audio-processor framework (denoise, VAD, gain control). |
+| `rumble-audio` | Pluggable audio-processor framework (denoise, noise gate, gain control). |
 | `rumble-damascene` | The GUI client, built on the damascene UI library; projects `(State, ui_state) → El` tree per frame, wraps `BackendHandle` via a `UiBackend` adapter. |
 | `rumble-video` | Thin safe wrapper over libmpv (player + software-render) for damascene's video lightbox. |
 | `server` | Server binary: room tree, member/identity roster, ACL evaluation, voice/chat relay, sled persistence. |

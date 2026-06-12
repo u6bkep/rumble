@@ -17,7 +17,7 @@ use damascene_core::{Color, prelude::*};
 
 use rumble_client::{
     AudioSettings, AudioState, AudioStats, Level, MeterSnapshot, OutputFrame, OutputKind, OutputLayout, OutputSpec,
-    PipelineConfig, ProcessorConfig, ProcessorRegistry, Role, SfxKind, State,
+    PipelineConfig, ProcessorConfig, ProcessorRegistry, Role, SfxKind, State, processors::type_ids,
 };
 use rumble_desktop_shell::{
     AutoDownloadRule, HotkeyBinding, HotkeyData, HotkeyFunction, HotkeyManager, HotkeyModifiers, KeyboardSettings,
@@ -854,49 +854,53 @@ fn vu_normalize(db: f32) -> f32 {
 /// Processing passes `meter.input_post`. `Level::Unmeasured` paints an
 /// empty bar and shows "—" for the readout.
 ///
-/// `vad_overlay` controls the Mumble-style split colouring. When `Some`,
-/// the meter probes the pipeline config for an enabled `builtin.vad`
+/// `gate_overlay` controls the Mumble-style split colouring. When `Some`,
+/// the meter probes the pipeline config for an enabled noise gate
 /// processor and, if found, paints "won't transmit" / "will transmit"
-/// zones either side of its threshold. When the VAD processor isn't
-/// present (or `vad_overlay` is `None`) the meter falls back to a plain
+/// zones either side of its threshold. When the noise gate isn't
+/// present (or `gate_overlay` is `None`) the meter falls back to a plain
 /// green/yellow/red loudness display.
 ///
 /// This is the only place the meter's visual contract is defined —
 /// callers just pass a level and decide whether the overlay applies.
-fn vu_meter(level: Level, vad_overlay: Option<&PipelineConfig>) -> El {
+fn vu_meter(level: Level, gate_overlay: Option<&PipelineConfig>) -> El {
     let level_db = level.as_db();
     let value_n = level.normalized(VU_MIN_DB, VU_MAX_DB);
 
-    // Resolve VAD overlay state. With no pipeline provided (Devices
-    // tab), or no enabled VAD processor in it, the meter degrades to
+    // Resolve gate overlay state. With no pipeline provided (Devices
+    // tab), or no enabled noise gate in it, the meter degrades to
     // plain loudness — that's the whole point of letting the caller
     // opt out of the overlay.
-    let vad_proc = vad_overlay.and_then(|p| p.processors.iter().find(|p| p.type_id == "builtin.vad" && p.enabled));
-    let vad_threshold_db = vad_proc
+    let gate_proc = gate_overlay.and_then(|p| {
+        p.processors
+            .iter()
+            .find(|p| p.type_id == type_ids::NOISE_GATE && p.enabled)
+    });
+    let gate_threshold_db = gate_proc
         .and_then(|p| p.settings.get("threshold_db"))
         .and_then(|v| v.as_f64())
         .map(|t| t as f32);
     // Only surface a separate release tick when hysteresis is actually
     // configured (release strictly below trigger); equal/above collapses
     // to the no-hysteresis case the processor clamps to at runtime.
-    let vad_release_db = vad_proc
+    let gate_release_db = gate_proc
         .and_then(|p| p.settings.get("release_threshold_db"))
         .and_then(|v| v.as_f64())
         .map(|t| t as f32)
-        .zip(vad_threshold_db)
+        .zip(gate_threshold_db)
         .filter(|(release, trigger)| release < trigger)
         .map(|(release, _)| release);
 
     // The denoise stage runs its own voice gate (RNNoise probability),
     // which doesn't map onto the dB meter's axis. We still want users
     // to know it's the one gating, so label it but skip the threshold
-    // tick. Energy VAD wins the visualization if both are enabled.
-    let rnnoise_vad_gating = vad_threshold_db.is_none()
-        && vad_overlay
+    // tick. The noise gate wins the visualization if both are enabled.
+    let rnnoise_vad_gating = gate_threshold_db.is_none()
+        && gate_overlay
             .map(|p| {
                 p.processors
                     .iter()
-                    .any(|p| p.type_id == "builtin.denoise" && p.enabled && processing::bool_setting(p, "vad_enabled"))
+                    .any(|p| p.type_id == type_ids::DENOISE && p.enabled && processing::bool_setting(p, "vad_enabled"))
             })
             .unwrap_or(false);
 
@@ -905,11 +909,11 @@ fn vu_meter(level: Level, vad_overlay: Option<&PipelineConfig>) -> El {
         None => "—".to_string(),
     };
 
-    let bar = match vad_threshold_db {
+    let bar = match gate_threshold_db {
         Some(t_db) => threshold_bar(
             value_n,
             vu_normalize(t_db),
-            vad_release_db.map(vu_normalize),
+            gate_release_db.map(vu_normalize),
             VU_BAR_W,
             VU_BAR_H,
         ),
@@ -934,16 +938,16 @@ fn vu_meter(level: Level, vad_overlay: Option<&PipelineConfig>) -> El {
             .align(Align::Center),
     ];
     // Threshold-label sub-line: only printed when the caller opted into
-    // the VAD overlay. The Devices meter is just "is your mic alive?"
-    // — adding a VAD comment there would be noise.
-    if vad_overlay.is_some() {
-        let threshold_label = match (vad_threshold_db, vad_release_db, rnnoise_vad_gating) {
+    // the gate overlay. The Devices meter is just "is your mic alive?"
+    // — adding a gate comment there would be noise.
+    if gate_overlay.is_some() {
+        let threshold_label = match (gate_threshold_db, gate_release_db, rnnoise_vad_gating) {
             (Some(trigger), Some(release), _) => {
-                format!("VAD: trigger {trigger:.0} dB · release {release:.0} dB")
+                format!("Noise gate: trigger {trigger:.0} dB · release {release:.0} dB")
             }
-            (Some(trigger), None, _) => format!("VAD threshold: {trigger:.0} dB"),
+            (Some(trigger), None, _) => format!("Noise gate threshold: {trigger:.0} dB"),
             (None, _, true) => "Voice gate active (RNNoise) — bar shows post-pipeline level".to_string(),
-            (None, _, false) => "VAD disabled — bar shows post-pipeline level only".to_string(),
+            (None, _, false) => "No transmit gate enabled — bar shows post-pipeline level only".to_string(),
         };
         children.push(text(threshold_label).muted().font_size(tokens::TEXT_XS.size));
     }
@@ -956,7 +960,7 @@ fn vu_meter(level: Level, vad_overlay: Option<&PipelineConfig>) -> El {
 /// track from `threshold..max`, plus brighter fills painted on top
 /// proportional to the current level. The colour change at the
 /// threshold position is the user's main visual cue when tuning the
-/// VAD.
+/// noise gate.
 ///
 /// When `release_n` is `Some` (hysteresis configured, release < trigger)
 /// a thin vertical tick is drawn at the release position inside the
@@ -1249,10 +1253,14 @@ fn zone_label_strip(zones: &[(f32, f32, Role, Option<String>)], min: f32, max: f
         }
         let w = (hi_n - lo_n) * bar_w;
         let label = label.clone().unwrap_or_default();
+        // Clipped: band width tracks live settings, so a label can be
+        // wider than its band (e.g. "hold" over a narrow hysteresis
+        // band). Truncating beats bleeding into the neighbor zone.
         cells.push(
             row([text(label).muted().font_size(tokens::TEXT_XS.size)])
                 .width(Size::Fixed(w))
-                .justify(Justify::Center),
+                .justify(Justify::Center)
+                .clip(),
         );
         cursor = hi_n.max(cursor);
     }

@@ -130,8 +130,8 @@ pub(crate) mod preroll;
 // Audio processing pipeline - processors
 pub mod processors;
 pub use processors::{
-    DenoiseProcessor, DenoiseProcessorFactory, GainProcessor, GainProcessorFactory, VadProcessor, VadProcessorFactory,
-    build_default_tx_pipeline, merge_with_default_tx_pipeline, register_builtin_processors,
+    DenoiseProcessor, DenoiseProcessorFactory, GainProcessor, GainProcessorFactory, NoiseGateProcessor,
+    NoiseGateProcessorFactory, build_default_tx_pipeline, merge_with_default_tx_pipeline, register_builtin_processors,
 };
 
 // Re-export pipeline crate types

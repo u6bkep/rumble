@@ -13,7 +13,7 @@ pub(super) fn render_devices(pending: &PendingSettings, audio: &AudioState, mete
                 select_trigger(KEY_INPUT_DEVICE, input_label).width(Size::Fill(1.0)),
                 // Pre-pipeline level: lets the user confirm the selected
                 // mic is actually capturing before they ever open the
-                // Processing tab. No VAD overlay here — the threshold
+                // Processing tab. No gate overlay here — the threshold
                 // belongs to the processing chain, not to device choice.
                 vu_meter(meter.input_pre, None),
             ],

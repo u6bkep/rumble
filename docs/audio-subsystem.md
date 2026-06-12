@@ -110,9 +110,9 @@ Built-in processors:
 |---|---|---|
 | `builtin.gain` | `processors/gain.rs` | dB volume adjust |
 | `builtin.denoise` | `processors/denoise.rs` | RNNoise (nnnoiseless) denoise **+** ML voice gate; when `vad_enabled` (default true) it drives `suppress` from the RNNoise VAD score |
-| `builtin.vad` | `processors/vad.rs` | legacy energy-only VAD (`threshold_db`/`release_threshold_db` + hangover); registered but **disabled** by default |
+| `builtin.vad` | `processors/noise_gate.rs` | energy-only **Noise Gate** (`threshold_db`/`release_threshold_db` + hangover); registered but **disabled** by default. The type id keeps its historical `vad` value because it is persisted in user pipeline configs |
 
-Default TX pipeline (`DEFAULT_TX_PIPELINE`, `processors/mod.rs`): `gain` (on) → `denoise` (on) → `vad` (off). So fresh users get RNNoise as their gate, with the energy VAD available ML-free.
+Default TX pipeline (`DEFAULT_TX_PIPELINE`, `processors/mod.rs`): `gain` (on) → `denoise` (on) → `noise gate` (off). So fresh users get RNNoise as their gate, with the energy noise gate available ML-free.
 
 - **TX pipeline** is one shared pipeline (built from `tx_pipeline_config`) run in the capture callback.
 - **RX pipeline** is per-peer (`UserAudioState.rx_pipeline`), built from `rx_pipeline_defaults` or a per-user `UserRxConfig::pipeline_override`; on RX, `suppress` drops that playback frame (noise gate). Per-user `volume_db` is applied separately, outside the pipeline.

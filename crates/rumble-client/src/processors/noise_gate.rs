@@ -1,14 +1,20 @@
-//! Voice Activity Detection (VAD) processor.
+//! Energy-based noise gate processor.
 //!
-//! This processor detects when voice is present in the audio stream and
-//! sets the `suppress` flag when no voice is detected. When enabled in the
-//! TX pipeline, it provides voice-activated transmission in Continuous mode.
-//! It can also be used in PTT mode to avoid transmitting silence/noise.
+//! This processor measures the RMS level of each frame and sets the
+//! `suppress` flag when the level falls below a configurable threshold.
+//! When enabled in the TX pipeline, it provides level-gated transmission
+//! in Continuous mode. It can also be used in PTT mode to avoid
+//! transmitting silence/noise.
 //!
-//! The current implementation uses energy-based detection with a configurable
-//! threshold and holdoff timer to avoid cutting off speech endings.
+//! Historically this stage was called "Voice Activity Detection", but it
+//! makes no attempt to distinguish speech from other sound — it is a
+//! plain amplitude gate with hysteresis and attack/holdoff shaping. The
+//! ML voice gate lives in the RNNoise stage (`super::denoise`).
 
-use rumble_audio::{AudioProcessor, ProcessorFactory, ProcessorResult, calculate_rms_db};
+use rumble_audio::{
+    Anchor, AudioProcessor, OutputKind, OutputSink, OutputSpec, ProcessorFactory, ProcessorResult, Role, Zone,
+    calculate_rms_db,
+};
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -16,18 +22,23 @@ use super::{
     vad_shaper::{VadShaper, VadShaperSettings},
 };
 
-/// Settings for the VAD processor.
+/// Floor of the gate's level meter in dB; also the silence clamp for the
+/// published `level_db` output (RMS of digital silence is -inf, which
+/// would render as "-inf dB"). Matches the UI's VU meter floor.
+const METER_MIN_DB: f32 = -60.0;
+
+/// Settings for the noise gate processor.
 ///
 /// Field defaults live in `Default::default()` and **must match** the
-/// `default` values in [`VadProcessorFactory::settings_schema`] — the
-/// schema is the single source of truth, and persisted configs are
+/// `default` values in [`NoiseGateProcessorFactory::settings_schema`] —
+/// the schema is the single source of truth, and persisted configs are
 /// backfilled against it (see `ProcessorRegistry::backfill_settings`)
 /// before they reach this struct. The struct-level `#[serde(default)]`
 /// is a defensive belt-and-braces fallback for the create-from-raw-JSON
 /// paths.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
-pub struct VadSettings {
+pub struct NoiseGateSettings {
     /// Trigger threshold in dB RMS. Signal must exceed this (for at least
     /// `attack_ms`) to activate transmission.
     /// Typical values: -40 to -30 dB for quiet environments,
@@ -60,7 +71,7 @@ pub struct VadSettings {
     pub holdoff_ms: u32,
 }
 
-impl Default for VadSettings {
+impl Default for NoiseGateSettings {
     fn default() -> Self {
         Self {
             threshold_db: -40.0,
@@ -71,34 +82,40 @@ impl Default for VadSettings {
     }
 }
 
-/// Voice Activity Detection processor.
+/// Energy-based noise gate.
 ///
-/// Detects voice presence using energy-based analysis. When no voice is
-/// detected, sets `suppress = true` in the result, signaling that the
-/// frame should not be transmitted.
+/// Measures frame RMS against a threshold. When the level is below it,
+/// sets `suppress = true` in the result, signaling that the frame should
+/// not be transmitted.
 ///
 /// Features:
-/// - Energy-based detection with configurable threshold
+/// - Energy-based gating with configurable threshold
+/// - Hysteresis via a separate release threshold
 /// - Holdoff timer to avoid cutting off speech endings
-/// - Smooth transitions to prevent abrupt start/stop
-pub struct VadProcessor {
-    settings: VadSettings,
+pub struct NoiseGateProcessor {
+    settings: NoiseGateSettings,
     enabled: bool,
     shaper: VadShaper,
+    /// RMS level of the most-recent frame, cached for the live UI meter.
+    /// This is the exact value the gate compares against its thresholds —
+    /// measured at this stage's position in the chain, unlike the audio
+    /// task's fixed pre/post taps.
+    last_level_db: f32,
 }
 
-impl VadProcessor {
-    /// Create a new VAD processor with default settings.
+impl NoiseGateProcessor {
+    /// Create a new noise gate with default settings.
     pub fn new() -> Self {
-        Self::with_settings(VadSettings::default())
+        Self::with_settings(NoiseGateSettings::default())
     }
 
-    /// Create a new VAD processor with custom settings.
-    pub fn with_settings(settings: VadSettings) -> Self {
+    /// Create a new noise gate with custom settings.
+    pub fn with_settings(settings: NoiseGateSettings) -> Self {
         Self {
             settings,
             enabled: true,
             shaper: VadShaper::new(),
+            last_level_db: f32::NEG_INFINITY,
         }
     }
 
@@ -142,8 +159,8 @@ impl VadProcessor {
         self.settings.attack_ms = attack_ms;
     }
 
-    /// Check if voice is currently detected as active.
-    pub fn is_voice_active(&self) -> bool {
+    /// Check if the gate is currently open (signal considered active).
+    pub fn is_gate_open(&self) -> bool {
         self.shaper.is_active()
     }
 
@@ -157,18 +174,21 @@ impl VadProcessor {
     }
 }
 
-impl Default for VadProcessor {
+impl Default for NoiseGateProcessor {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl AudioProcessor for VadProcessor {
+impl AudioProcessor for NoiseGateProcessor {
     fn process(&mut self, samples: &mut [f32], sample_rate: u32) -> ProcessorResult {
-        // RMS is still needed internally to feed the shaper's
-        // trigger/release decision, but is no longer reported back to
-        // the pipeline — metering taps live in the audio task instead.
+        // The RMS level feeds the shaper's trigger/release decision and is
+        // cached for the stage's live `level_db` output. Signal-level
+        // metering at fixed tap points still lives in the audio task —
+        // this value is the gate's *decision input*, on the same dB axis
+        // as its threshold sliders.
         let level_db = calculate_rms_db(samples);
+        self.last_level_db = level_db;
         let active = self
             .shaper
             .update(level_db, samples.len() as u32, sample_rate, &self.shaper_settings());
@@ -176,11 +196,12 @@ impl AudioProcessor for VadProcessor {
     }
 
     fn name(&self) -> &'static str {
-        "Voice Activity Detection"
+        "Noise Gate"
     }
 
     fn reset(&mut self) {
         self.shaper.reset();
+        self.last_level_db = f32::NEG_INFINITY;
     }
 
     fn config(&self) -> serde_json::Value {
@@ -188,7 +209,7 @@ impl AudioProcessor for VadProcessor {
     }
 
     fn set_config(&mut self, config: &serde_json::Value) {
-        if let Ok(settings) = serde_json::from_value::<VadSettings>(config.clone()) {
+        if let Ok(settings) = serde_json::from_value::<NoiseGateSettings>(config.clone()) {
             self.settings = settings;
         }
     }
@@ -203,29 +224,36 @@ impl AudioProcessor for VadProcessor {
             self.reset();
         }
     }
+
+    fn write_outputs(&self, sink: &mut OutputSink) {
+        // Cached from the most-recent frame; no recomputation here. Silence
+        // (-inf dB) clamps to the meter floor so the readout stays finite.
+        sink.set("level_db", self.last_level_db.max(METER_MIN_DB));
+        sink.set("gate_open", if self.is_gate_open() { 1.0 } else { 0.0 });
+    }
 }
 
-/// Factory for creating VadProcessor instances.
-pub struct VadProcessorFactory;
+/// Factory for creating [`NoiseGateProcessor`] instances.
+pub struct NoiseGateProcessorFactory;
 
-impl ProcessorFactory for VadProcessorFactory {
+impl ProcessorFactory for NoiseGateProcessorFactory {
     fn type_id(&self) -> &'static str {
-        type_ids::VAD
+        type_ids::NOISE_GATE
     }
 
     fn display_name(&self) -> &'static str {
-        "Voice Activity Detection"
+        "Noise Gate"
     }
 
     fn create_default(&self) -> Box<dyn AudioProcessor> {
-        Box::new(VadProcessor::new())
+        Box::new(NoiseGateProcessor::new())
     }
 
     fn create_from_config(&self, config: &serde_json::Value) -> Result<Box<dyn AudioProcessor>, String> {
-        let settings: VadSettings =
-            serde_json::from_value(config.clone()).map_err(|e| format!("Invalid VAD settings: {}", e))?;
+        let settings: NoiseGateSettings =
+            serde_json::from_value(config.clone()).map_err(|e| format!("Invalid noise gate settings: {}", e))?;
 
-        Ok(Box::new(VadProcessor::with_settings(settings)))
+        Ok(Box::new(NoiseGateProcessor::with_settings(settings)))
     }
 
     fn settings_schema(&self) -> serde_json::Value {
@@ -268,8 +296,53 @@ impl ProcessorFactory for VadProcessorFactory {
         })
     }
 
+    fn outputs(&self) -> Vec<OutputSpec> {
+        vec![
+            // Live input level on the same dB axis the trigger/release
+            // sliders act on — the value the gate actually compares,
+            // measured at this stage's slot in the chain. The coloured
+            // bands ARE the gate thresholds: their edges track
+            // `release_threshold_db`/`threshold_db`, so dragging a slider
+            // grows or shrinks a zone directly. Below release the gate is
+            // closed; between release and trigger is the hysteresis band
+            // where it holds its state; above trigger it opens.
+            OutputSpec {
+                key: "level_db".to_string(),
+                title: "Input level".to_string(),
+                kind: OutputKind::Meter {
+                    min: METER_MIN_DB,
+                    max: 0.0,
+                    unit: Some("dB".to_string()),
+                    zones: vec![
+                        Zone::new(
+                            Anchor::fixed(METER_MIN_DB),
+                            Anchor::setting("release_threshold_db"),
+                            Role::Inactive,
+                        )
+                        .label("closed"),
+                        Zone::new(
+                            Anchor::setting("release_threshold_db"),
+                            Anchor::setting("threshold_db"),
+                            Role::Warning,
+                        )
+                        .label("hold"),
+                        Zone::new(Anchor::setting("threshold_db"), Anchor::fixed(0.0), Role::Active).label("open"),
+                    ],
+                    marks: vec![],
+                },
+            },
+            // Whether the shaper currently holds the gate open (after
+            // attack/holdoff). A lamp, not a meter.
+            OutputSpec {
+                key: "gate_open".to_string(),
+                title: "Gate open".to_string(),
+                kind: OutputKind::Indicator,
+            },
+        ]
+    }
+
     fn description(&self) -> &'static str {
-        "Detects voice activity and suppresses silence for automatic transmission control"
+        "Simple amplitude-based gate that suppresses transmission while the input level is below a threshold"
     }
 }
 
@@ -278,10 +351,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_vad_creation() {
-        let processor = VadProcessor::new();
+    fn test_noise_gate_creation() {
+        let processor = NoiseGateProcessor::new();
         assert!(processor.is_enabled());
-        assert!(!processor.is_voice_active());
+        assert!(!processor.is_gate_open());
         assert_eq!(processor.threshold_db(), -40.0);
         assert_eq!(processor.release_threshold_db(), -45.0);
         assert_eq!(processor.attack_ms(), 0);
@@ -289,34 +362,34 @@ mod tests {
     }
 
     #[test]
-    fn test_vad_detects_silence() {
-        let mut processor = VadProcessor::new();
+    fn test_noise_gate_suppresses_silence() {
+        let mut processor = NoiseGateProcessor::new();
 
         // Very quiet samples (essentially silence)
         let mut samples = vec![0.0001f32; 960];
         let result = processor.process(&mut samples, 48000);
 
-        // Should be suppressed (no voice)
+        // Should be suppressed (below threshold)
         assert!(result.suppress);
-        assert!(!processor.is_voice_active());
+        assert!(!processor.is_gate_open());
     }
 
     #[test]
-    fn test_vad_detects_voice() {
-        let mut processor = VadProcessor::new();
+    fn test_noise_gate_opens_on_signal() {
+        let mut processor = NoiseGateProcessor::new();
 
-        // Loud samples (voice-like level)
+        // Loud samples (speech-like level)
         let mut samples = vec![0.3f32; 960];
         let result = processor.process(&mut samples, 48000);
 
-        // Should NOT be suppressed (voice detected)
+        // Should NOT be suppressed (above threshold)
         assert!(!result.suppress);
-        assert!(processor.is_voice_active());
+        assert!(processor.is_gate_open());
     }
 
     #[test]
-    fn test_vad_holdoff() {
-        let mut processor = VadProcessor::with_settings(VadSettings {
+    fn test_noise_gate_holdoff() {
+        let mut processor = NoiseGateProcessor::with_settings(NoiseGateSettings {
             threshold_db: -40.0,
             release_threshold_db: -40.0, // disable hysteresis for this test
             attack_ms: 0,
@@ -326,13 +399,13 @@ mod tests {
         // First: loud samples to activate
         let mut samples = vec![0.3f32; 960];
         processor.process(&mut samples, 48000);
-        assert!(processor.is_voice_active());
+        assert!(processor.is_gate_open());
 
         // Second: quiet samples, but still in holdoff
         let mut samples = vec![0.0001f32; 960];
         let result = processor.process(&mut samples, 48000);
         assert!(!result.suppress); // Still active due to holdoff
-        assert!(processor.is_voice_active());
+        assert!(processor.is_gate_open());
 
         // Process more quiet frames until holdoff expires
         for _ in 0..10 {
@@ -344,44 +417,67 @@ mod tests {
         let mut samples = vec![0.0001f32; 960];
         let result = processor.process(&mut samples, 48000);
         assert!(result.suppress);
-        assert!(!processor.is_voice_active());
+        assert!(!processor.is_gate_open());
     }
 
     #[test]
-    fn test_vad_reset() {
-        let mut processor = VadProcessor::new();
+    fn test_noise_gate_reset() {
+        let mut processor = NoiseGateProcessor::new();
 
-        // Activate voice
+        // Open the gate
         let mut samples = vec![0.3f32; 960];
         processor.process(&mut samples, 48000);
-        assert!(processor.is_voice_active());
+        assert!(processor.is_gate_open());
 
         // Reset
         processor.reset();
-        assert!(!processor.is_voice_active());
+        assert!(!processor.is_gate_open());
     }
 
-    // Note: VAD used to report `result.level_db` so the UI meter could
-    // read it. Metering has moved into the audio task (RMS taps before
-    // and after the pipeline), so VAD now only reports `suppress`. The
-    // shaper still uses an internal RMS computation for its trigger
-    // decision — see `test_vad_suppress_with_loud_signal`.
+    /// The stage publishes its decision-input RMS and gate state as live
+    /// outputs for the UI meter. Silence clamps to the meter floor so the
+    /// readout never shows "-inf".
+    #[test]
+    fn test_noise_gate_outputs() {
+        let factory = NoiseGateProcessorFactory;
+        let specs = factory.outputs();
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].key, "level_db");
+        assert_eq!(specs[1].key, "gate_open");
+
+        let mut processor = NoiseGateProcessor::new();
+
+        // Before any frame: level clamps to the meter floor, gate closed.
+        let mut slots = [123.0f32; 2];
+        processor.write_outputs(&mut OutputSink::new(&specs, &mut slots));
+        assert_eq!(slots[0], METER_MIN_DB);
+        assert_eq!(slots[1], 0.0);
+
+        // Loud frame: level is the frame's RMS (0.3 ≈ -10.5 dB), gate open.
+        let mut samples = vec![0.3f32; 960];
+        processor.process(&mut samples, 48000);
+        let mut slots = [0.0f32; 2];
+        processor.write_outputs(&mut OutputSink::new(&specs, &mut slots));
+        assert!((slots[0] - calculate_rms_db(&samples)).abs() < 0.01);
+        assert!(slots[0] > -20.0 && slots[0] < 0.0);
+        assert_eq!(slots[1], 1.0);
+    }
 
     #[test]
     fn test_factory_create() {
-        let factory = VadProcessorFactory;
+        let factory = NoiseGateProcessorFactory;
         let config = serde_json::json!({
             "threshold_db": -35.0,
             "holdoff_ms": 200
         });
 
         let processor = factory.create_from_config(&config).unwrap();
-        assert_eq!(processor.name(), "Voice Activity Detection");
+        assert_eq!(processor.name(), "Noise Gate");
     }
 
     #[test]
     fn test_config_roundtrip() {
-        let processor = VadProcessor::with_settings(VadSettings {
+        let processor = NoiseGateProcessor::with_settings(NoiseGateSettings {
             threshold_db: -45.0,
             release_threshold_db: -52.0,
             attack_ms: 40,
@@ -389,7 +485,7 @@ mod tests {
         });
         let config = processor.config();
 
-        let mut processor2 = VadProcessor::new();
+        let mut processor2 = NoiseGateProcessor::new();
         processor2.set_config(&config);
 
         assert!((processor2.threshold_db() - (-45.0)).abs() < 0.001);
@@ -401,12 +497,12 @@ mod tests {
     /// Old configs (saved before hysteresis/attack were added) should
     /// deserialize cleanly with sensible defaults for the new fields.
     #[test]
-    fn test_vad_legacy_config_compat() {
+    fn test_legacy_config_compat() {
         let config = serde_json::json!({
             "threshold_db": -38.0,
             "holdoff_ms": 250
         });
-        let mut processor = VadProcessor::new();
+        let mut processor = NoiseGateProcessor::new();
         processor.set_config(&config);
 
         assert!((processor.threshold_db() - (-38.0)).abs() < 0.001);
@@ -419,8 +515,8 @@ mod tests {
     /// the trigger but stay above the release threshold and remain active
     /// indefinitely (holdoff never starts counting down).
     #[test]
-    fn test_vad_hysteresis_holds_between_thresholds() {
-        let mut processor = VadProcessor::with_settings(VadSettings {
+    fn test_hysteresis_holds_between_thresholds() {
+        let mut processor = NoiseGateProcessor::with_settings(NoiseGateSettings {
             threshold_db: -20.0,
             release_threshold_db: -40.0,
             attack_ms: 0,
@@ -430,7 +526,7 @@ mod tests {
         // Activate with a loud frame (~0 dB).
         let mut loud = vec![0.5f32; 960];
         processor.process(&mut loud, 48000);
-        assert!(processor.is_voice_active());
+        assert!(processor.is_gate_open());
 
         // Frame between thresholds: ~-26 dB (above -40 release, below -20 trigger).
         // Should stay active across many frames without the holdoff expiring.
@@ -438,7 +534,7 @@ mod tests {
             let mut mid = vec![0.05f32; 960];
             let r = processor.process(&mut mid, 48000);
             assert!(!r.suppress, "frame above release threshold must not suppress");
-            assert!(processor.is_voice_active());
+            assert!(processor.is_gate_open());
         }
 
         // Now drop below release: holdoff begins, then deactivates.
@@ -449,16 +545,16 @@ mod tests {
         let mut quiet = vec![0.0001f32; 960];
         let r = processor.process(&mut quiet, 48000);
         assert!(r.suppress);
-        assert!(!processor.is_voice_active());
+        assert!(!processor.is_gate_open());
     }
 
     /// A loud frame shorter than `attack_ms` must not trigger activation;
     /// activation requires the level to stay above trigger across the
     /// full attack window.
     #[test]
-    fn test_vad_attack_rejects_short_transient() {
+    fn test_attack_rejects_short_transient() {
         // attack_ms = 50ms ≈ 2400 samples at 48kHz → needs ~3 frames of 960.
-        let mut processor = VadProcessor::with_settings(VadSettings {
+        let mut processor = NoiseGateProcessor::with_settings(NoiseGateSettings {
             threshold_db: -40.0,
             release_threshold_db: -45.0,
             attack_ms: 50,
@@ -469,12 +565,12 @@ mod tests {
         let mut loud = vec![0.3f32; 960];
         let r = processor.process(&mut loud, 48000);
         assert!(r.suppress, "single short transient must not activate");
-        assert!(!processor.is_voice_active());
+        assert!(!processor.is_gate_open());
 
         // Followed by quiet: accumulator resets.
         let mut quiet = vec![0.0001f32; 960];
         processor.process(&mut quiet, 48000);
-        assert!(!processor.is_voice_active());
+        assert!(!processor.is_gate_open());
 
         // Now sustained loud across multiple frames — should activate
         // once cumulative loud time crosses the attack window.
@@ -482,7 +578,7 @@ mod tests {
             let mut loud = vec![0.3f32; 960];
             processor.process(&mut loud, 48000);
         }
-        assert!(processor.is_voice_active());
+        assert!(processor.is_gate_open());
     }
 
     /// A release threshold configured above the trigger threshold would
@@ -490,8 +586,8 @@ mod tests {
     /// clamps it to the trigger, which collapses to the no-hysteresis
     /// (original) behavior.
     #[test]
-    fn test_vad_release_clamped_to_trigger() {
-        let mut processor = VadProcessor::with_settings(VadSettings {
+    fn test_release_clamped_to_trigger() {
+        let mut processor = NoiseGateProcessor::with_settings(NoiseGateSettings {
             threshold_db: -40.0,
             release_threshold_db: -20.0, // nonsensical: above trigger
             attack_ms: 0,
@@ -500,12 +596,12 @@ mod tests {
 
         let mut loud = vec![0.3f32; 960];
         processor.process(&mut loud, 48000);
-        assert!(processor.is_voice_active());
+        assert!(processor.is_gate_open());
 
         // With release clamped to -40, a frame just below trigger deactivates.
         let mut quiet = vec![0.0001f32; 960];
         let r = processor.process(&mut quiet, 48000);
         assert!(r.suppress);
-        assert!(!processor.is_voice_active());
+        assert!(!processor.is_gate_open());
     }
 }

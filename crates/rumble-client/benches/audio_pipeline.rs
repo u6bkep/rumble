@@ -1,5 +1,5 @@
 //! TX audio-processing pipeline microbenchmarks — the per-frame cost of the
-//! capture-side processor chain (gain → VAD → RNNoise denoise). Pure functions
+//! capture-side processor chain (gain → noise gate → RNNoise denoise). Pure functions
 //! of a PCM frame; no async runtime or device.
 //!
 //! `denoise_frame` isolates the dominant TX cost (RNNoise inference);
@@ -14,7 +14,9 @@
 use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use rumble_client::{AudioPipeline, AudioProcessor, DenoiseProcessor, GainProcessor, OPUS_FRAME_SIZE, VadProcessor};
+use rumble_client::{
+    AudioPipeline, AudioProcessor, DenoiseProcessor, GainProcessor, NoiseGateProcessor, OPUS_FRAME_SIZE,
+};
 
 const SAMPLE_RATE: u32 = 48_000;
 
@@ -30,8 +32,8 @@ fn build_pipeline(spec: &str) -> AudioPipeline {
     if spec.contains("gain") {
         p.add(Box::new(GainProcessor::new(6.0)));
     }
-    if spec.contains("vad") {
-        p.add(Box::new(VadProcessor::new()));
+    if spec.contains("gate") {
+        p.add(Box::new(NoiseGateProcessor::new()));
     }
     if spec.contains("denoise") {
         p.add(Box::new(DenoiseProcessor::new()));
@@ -42,7 +44,7 @@ fn build_pipeline(spec: &str) -> AudioPipeline {
 fn bench_tx_pipeline(c: &mut Criterion) {
     let input = tone();
     let mut group = c.benchmark_group("tx_pipeline");
-    for spec in ["gain", "gain+vad", "gain+denoise", "gain+vad+denoise"] {
+    for spec in ["gain", "gain+gate", "gain+denoise", "gain+gate+denoise"] {
         let mut pipeline = build_pipeline(spec);
         let mut buf = input.clone();
         group.bench_function(spec, |b| {

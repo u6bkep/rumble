@@ -8,8 +8,8 @@
 //!
 //! - [`GainProcessor`] (`builtin.gain`) — Volume adjustment
 //! - [`DenoiseProcessor`] (`builtin.denoise`) — RNNoise denoise + ML voice gate
-//! - [`VadProcessor`] (`builtin.vad`) — Energy-only voice activity detection
-//!   (legacy; kept for users who want zero ML in the chain)
+//! - [`NoiseGateProcessor`] (`builtin.vad`) — Energy-only noise gate
+//!   (kept for users who want zero ML in the chain)
 //!
 //! # Usage
 //!
@@ -23,14 +23,14 @@
 
 mod denoise;
 mod gain;
-mod vad;
+mod noise_gate;
 // `pub(crate)`: the pre-roll ring's tests (`crate::preroll`) drive a real
 // `VadShaper` to pin the gate↔ring interaction.
 pub(crate) mod vad_shaper;
 
 pub use denoise::{DenoiseProcessor, DenoiseProcessorFactory};
 pub use gain::{GainProcessor, GainProcessorFactory};
-pub use vad::{VadProcessor, VadProcessorFactory};
+pub use noise_gate::{NoiseGateProcessor, NoiseGateProcessorFactory};
 
 use rumble_audio::{PipelineConfig, ProcessorConfig, ProcessorRegistry};
 
@@ -38,7 +38,7 @@ use rumble_audio::{PipelineConfig, ProcessorConfig, ProcessorRegistry};
 pub fn register_builtin_processors(registry: &mut ProcessorRegistry) {
     registry.register(Box::new(GainProcessorFactory));
     registry.register(Box::new(DenoiseProcessorFactory));
-    registry.register(Box::new(VadProcessorFactory));
+    registry.register(Box::new(NoiseGateProcessorFactory));
 }
 
 /// Default TX pipeline processor configuration.
@@ -49,12 +49,12 @@ pub fn register_builtin_processors(registry: &mut ProcessorRegistry) {
 /// The denoise stage handles both noise suppression and voice gating (its
 /// `vad_enabled` setting defaults to true for fresh configs), so new users
 /// get RNNoise as their voice gate out of the box. The standalone energy
-/// VAD stays registered and listed in the pipeline but disabled, available
-/// for users who want an ML-free gate.
+/// noise gate stays registered and listed in the pipeline but disabled,
+/// available for users who want an ML-free gate.
 pub const DEFAULT_TX_PIPELINE: &[(&str, bool)] = &[
     (type_ids::GAIN, true),
     (type_ids::DENOISE, true),
-    (type_ids::VAD, false),
+    (type_ids::NOISE_GATE, false),
 ];
 
 /// Build the default TX pipeline configuration.
@@ -121,7 +121,11 @@ pub fn merge_with_default_tx_pipeline(persisted: &PipelineConfig, registry: &Pro
 pub mod type_ids {
     pub const GAIN: &str = "builtin.gain";
     pub const DENOISE: &str = "builtin.denoise";
-    pub const VAD: &str = "builtin.vad";
+    /// The energy noise gate. The id keeps its historical "vad" value —
+    /// type_ids are persisted in user pipeline configs, and an unknown id
+    /// is silently dropped at load (see `merge_with_default_tx_pipeline`),
+    /// so renaming the value would delete the stage from existing setups.
+    pub const NOISE_GATE: &str = "builtin.vad";
 }
 
 #[cfg(test)]
@@ -193,7 +197,7 @@ mod merge_tests {
         let persisted = PipelineConfig {
             // Reversed from the default order.
             processors: vec![
-                cfg(type_ids::VAD, true, json!({})),
+                cfg(type_ids::NOISE_GATE, true, json!({})),
                 cfg(type_ids::DENOISE, true, json!({})),
                 cfg(type_ids::GAIN, true, json!({})),
             ],
@@ -203,7 +207,7 @@ mod merge_tests {
         let merged = merge_with_default_tx_pipeline(&persisted, &registry);
 
         let ids: Vec<&str> = merged.processors.iter().map(|p| p.type_id.as_str()).collect();
-        assert_eq!(ids, [type_ids::VAD, type_ids::DENOISE, type_ids::GAIN]);
+        assert_eq!(ids, [type_ids::NOISE_GATE, type_ids::DENOISE, type_ids::GAIN]);
     }
 
     /// Duplicate type_ids are legitimate (gain pre- and post-denoise is
@@ -263,7 +267,7 @@ mod merge_tests {
     #[test]
     fn missing_default_is_not_added() {
         let registry = registry_with_builtins();
-        // Persist only gain — denoise + vad are "new" relative to this
+        // Persist only gain — denoise + noise gate are "new" relative to this
         // config.
         let persisted = PipelineConfig {
             processors: vec![cfg(type_ids::GAIN, true, json!({}))],
@@ -283,21 +287,21 @@ mod merge_tests {
     #[test]
     fn missing_schema_fields_are_backfilled() {
         let registry = registry_with_builtins();
-        // VAD with an empty settings object — every field is missing.
+        // Noise gate with an empty settings object — every field is missing.
         let persisted = PipelineConfig {
-            processors: vec![cfg(type_ids::VAD, true, json!({}))],
+            processors: vec![cfg(type_ids::NOISE_GATE, true, json!({}))],
             ..Default::default()
         };
 
         let merged = merge_with_default_tx_pipeline(&persisted, &registry);
 
-        let vad = &merged.processors[0];
-        assert_eq!(vad.type_id, type_ids::VAD);
-        // The VAD schema declares a `threshold_db` field with a numeric
+        let gate = &merged.processors[0];
+        assert_eq!(gate.type_id, type_ids::NOISE_GATE);
+        // The noise gate schema declares a `threshold_db` field with a numeric
         // default; after backfill, that key must be populated.
         assert!(
-            vad.settings.get("threshold_db").is_some(),
-            "VAD threshold_db must be backfilled from schema default"
+            gate.settings.get("threshold_db").is_some(),
+            "noise gate threshold_db must be backfilled from schema default"
         );
     }
 
@@ -310,7 +314,7 @@ mod merge_tests {
         // Seed each persisted entry with its schema defaults, so
         // backfill is a no-op and we can compare structures directly.
         let mut persisted = PipelineConfig::default();
-        for type_id in [type_ids::DENOISE, type_ids::GAIN, type_ids::VAD] {
+        for type_id in [type_ids::DENOISE, type_ids::GAIN, type_ids::NOISE_GATE] {
             persisted
                 .processors
                 .push(registry.default_config(type_id).expect("registered"));
@@ -332,38 +336,40 @@ mod pipeline_exec_tests {
     use super::*;
     use rumble_client_traits::codec::{OPUS_FRAME_SIZE, OPUS_SAMPLE_RATE};
 
-    /// A pipeline of [Gain, VAD] must (a) apply the gain to the samples in
-    /// chain order and (b) gate transmission via the aggregated suppress flag.
+    /// A pipeline of [Gain, NoiseGate] must (a) apply the gain to the samples
+    /// in chain order and (b) gate transmission via the aggregated suppress flag.
     ///
     /// This is the only test that drives a real processor *chain* end to end.
     /// It pins inter-processor ordering and the suppress-OR aggregation the
     /// audio task depends on — without constraining how any single processor
     /// is implemented internally.
     #[test]
-    fn gain_then_vad_applies_gain_and_gates_on_level() {
+    fn gain_then_noise_gate_applies_gain_and_gates_on_level() {
         let gain_db = 6.0;
         let mut pipeline = rumble_audio::AudioPipeline::new(OPUS_FRAME_SIZE);
         pipeline.add(Box::new(GainProcessor::new(gain_db)));
-        pipeline.add(Box::new(VadProcessor::with_settings(super::vad::VadSettings {
-            threshold_db: -30.0,
-            release_threshold_db: -30.0, // == threshold: disable hysteresis
-            attack_ms: 0,                // gate per-frame: no attack delay...
-            holdoff_ms: 0,               // ...and no release hold
-        })));
+        pipeline.add(Box::new(NoiseGateProcessor::with_settings(
+            super::noise_gate::NoiseGateSettings {
+                threshold_db: -30.0,
+                release_threshold_db: -30.0, // == threshold: disable hysteresis
+                attack_ms: 0,                // gate per-frame: no attack delay...
+                holdoff_ms: 0,               // ...and no release hold
+            },
+        )));
 
         let gain = rumble_audio::db_to_linear(gain_db);
 
-        // Loud frames sit above the VAD threshold after gain (→ pass); the
+        // Loud frames sit above the gate threshold after gain (→ pass); the
         // quiet frame sits below it (→ gated). Either way, the samples leaving
         // the pipeline must equal input * gain — proof the gain stage ran in
-        // the chain ahead of the (non-mutating) VAD stage.
+        // the chain ahead of the (non-mutating) noise gate stage.
         for (amp, expect_suppress) in [(0.2f32, false), (0.001f32, true), (0.2f32, false)] {
             let mut samples = vec![amp; OPUS_FRAME_SIZE];
             let result = pipeline.process(&mut samples, OPUS_SAMPLE_RATE);
 
             assert_eq!(
                 result.suppress, expect_suppress,
-                "VAD gate decision for amplitude {amp}"
+                "noise gate decision for amplitude {amp}"
             );
 
             let expected = (amp * gain).clamp(-1.0, 1.0);

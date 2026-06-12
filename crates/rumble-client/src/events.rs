@@ -532,9 +532,9 @@ impl ConnectionState {
 /// Note: This is separate from mute state. A user can be in Continuous mode
 /// but still muted - mute is an orthogonal toggle.
 ///
-/// Note: Voice Activity Detection (VAD) is not a voice mode but a pipeline
-/// processor. To achieve "voice activated" transmission, use Continuous mode
-/// with the VAD processor enabled in the TX pipeline.
+/// Note: voice gating is not a voice mode but a pipeline concern. To achieve
+/// "voice activated" transmission, use Continuous mode with a gate stage
+/// (RNNoise voice gate or noise gate) enabled in the TX pipeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VoiceMode {
@@ -542,7 +542,7 @@ pub enum VoiceMode {
     #[default]
     PushToTalk,
     /// Always transmitting when connected (unless muted or suppressed by pipeline).
-    /// When VAD processor is enabled, this provides voice-activated behavior.
+    /// When a gate processor is enabled, this provides voice-activated behavior.
     Continuous,
 }
 
