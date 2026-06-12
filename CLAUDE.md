@@ -95,7 +95,7 @@ Authoritative subsystem docs live in `docs/`. Start with the overview, then dril
 - **`docs/audio-subsystem.md`** — Opus codec, the audio task, jitter buffers, the processor pipeline, and the per-peer decoder-lifetime invariant (see also below).
 - **`docs/audio-playback-redesign.md`** — *design note*: why the playback path underruns (wall-clock-timer producer vs hardware-clock consumer), what to keep, and the device-pulls / SPSC-ring / timestamp-driven rebuild shape. Rationale, not current API.
 - **`docs/testing-strategy.md`** — server integration tests and the damascene `dump_bundles` lint/snapshot pipeline.
-- **`docs/deployment.md`** — docker-compose + host-certbot deployment: cert mounting, SIGHUP hot-reload on renewal, web-admin bootstrap over SSH tunnel, bridge authorization, and the sled exclusive-lock caveat.
+- **`docs/deployment.md`** — docker-compose + host-certbot deployment: cert mounting, SIGHUP hot-reload on renewal, web-admin bootstrap over SSH tunnel, bridge authorization, and the unix admin socket (`<data_dir>/admin.sock`) the CLI subcommands use against a running server.
 - **`docs/v2-architecture.md`** — *historical* design doc for the platform-trait decoupling; kept for rationale, not as a current API reference.
 
 ## Key Architecture Patterns

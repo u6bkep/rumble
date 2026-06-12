@@ -66,28 +66,35 @@ RUN cargo build --release -p server --bin server \
  && cargo build --release -p mumble-bridge --bin mumble-bridge \
  && strip target/release/server target/release/mumble-bridge
 
+# Both runtime images start as root so the entrypoint can take ownership of
+# the bind-mounted volumes (/data, /certs), then drop to the `rumble` user
+# (uid 10001) via su-exec before exec'ing the binary — no manual
+# `chown -R 10001:10001` host ritual. See docker/docker-entrypoint.sh.
+
 # ---- server image ----
 FROM alpine:3 AS server
 
-RUN apk add --no-cache ca-certificates tini \
+RUN apk add --no-cache ca-certificates tini su-exec \
  && adduser -D -H -u 10001 rumble
 
 COPY --from=builder /src/target/release/server /usr/local/bin/server
+COPY docker/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
-USER rumble
 # QUIC voice/control (UDP) + web admin (TCP). tini (PID 1) forwards SIGHUP to
 # the server so a certbot deploy-hook can trigger a live cert reload.
 EXPOSE 5000/udp 5001/tcp
-ENTRYPOINT ["/sbin/tini", "--", "/usr/local/bin/server"]
+ENTRYPOINT ["/sbin/tini", "--", "/usr/local/bin/docker-entrypoint.sh", "/usr/local/bin/server"]
 
 # ---- bridge image ----
 FROM alpine:3 AS bridge
 
-RUN apk add --no-cache ca-certificates tini \
+RUN apk add --no-cache ca-certificates tini su-exec \
  && adduser -D -H -u 10001 rumble
 
 COPY --from=builder /src/target/release/mumble-bridge /usr/local/bin/mumble-bridge
+COPY docker/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
-USER rumble
 EXPOSE 64738/tcp 64738/udp
-ENTRYPOINT ["/sbin/tini", "--", "/usr/local/bin/mumble-bridge"]
+ENTRYPOINT ["/sbin/tini", "--", "/usr/local/bin/docker-entrypoint.sh", "/usr/local/bin/mumble-bridge"]

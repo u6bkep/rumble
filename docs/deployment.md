@@ -49,27 +49,30 @@ git clone <repo> /srv/rumble && cd /srv/rumble
 cp .env.example .env
 # edit .env: set RUMBLE_DOMAIN=voice.example.com
 
-mkdir -p certs data bridge-data
-# Containers run as uid 10001 (non-root); the bind mounts must be writable by it.
-sudo chown -R 10001:10001 certs data bridge-data
-
-# Seed the cert (also wires up renewals — see "TLS renewal" below).
-sudo cp docker/certbot-deploy-hook.sh /etc/letsencrypt/renewal-hooks/deploy/rumble.sh
-sudo sed -i 's/voice.example.com/YOUR_DOMAIN/; s#/srv/rumble#/srv/rumble#' \
-    /etc/letsencrypt/renewal-hooks/deploy/rumble.sh
-sudo chmod +x /etc/letsencrypt/renewal-hooks/deploy/rumble.sh
-sudo /etc/letsencrypt/renewal-hooks/deploy/rumble.sh   # copy current cert into ./certs now
-
 docker compose up -d --build
 ```
 
-If `certs/` is still empty on first boot (you haven't issued a cert yet), the
-server generates a temporary self-signed cert so it can start; run the
-deploy-hook once after issuing the real cert to replace it.
+That's it for the containers: the image entrypoint creates and takes ownership
+of the bind-mounted `certs/`, `data/`, and `bridge-data/` dirs itself (it
+starts as root, fixes ownership for uid 10001, then drops privileges), and the
+server generates a temporary self-signed cert so it can start before a real
+one exists.
+
+Then wire up the real cert (also handles all future renewals — see "TLS
+renewal" below). The hook needs no editing; it finds the compose dir and the
+domain on its own:
+
+```bash
+sudo ln -s /srv/rumble/docker/certbot-deploy-hook.sh \
+    /etc/letsencrypt/renewal-hooks/deploy/rumble.sh
+sudo /etc/letsencrypt/renewal-hooks/deploy/rumble.sh   # copy current cert into ./certs now
+```
 
 ## First-run web-admin bootstrap
 
-The web admin requires a one-time bootstrap to set the sudo password.
+The web admin requires a one-time bootstrap to set the sudo password. The
+server log prints a `FIRST-RUN SETUP` banner with these exact steps (check
+`docker compose logs rumble-server`):
 
 1. **Tunnel to the admin** from your workstation:
    ```bash
@@ -88,12 +91,8 @@ The web admin requires a one-time bootstrap to set the sudo password.
    password, and optionally paste your admin Ed25519 public key (base64) to be
    added to the `admin` group.
 
-4. **Delete the token file** once bootstrapped:
-   ```bash
-   rm /srv/rumble/data/web-setup-token.txt
-   ```
-
-After this, log in at the same URL with the sudo password.
+The token file is deleted automatically once bootstrap completes. After this,
+log in at the same URL with the sudo password.
 
 ## Authorizing the Mumble bridge
 
@@ -104,12 +103,14 @@ on first start). It must be authorized once as a controller.
    ```bash
    docker compose logs mumble-bridge | grep "Bridge identity ready"
    ```
-2. Authorize it. Easiest is via the **web admin**: add that public key to the
-   `controllers` group (Users → add by key). The bridge retries with backoff and
-   connects automatically once authorized.
+2. Authorize it — either through the **web admin** (add the key to the
+   `controllers` group: Users → add by key), or from the host shell against the
+   *running* server (applied live over its admin socket, no restart needed):
+   ```bash
+   docker compose exec rumble-server server add-controller '<base64-key>'
+   ```
 
-   The CLI subcommand `server add-controller <base64-key>` does the same, but see
-   the caveat below — it needs the server stopped.
+   The bridge retries with backoff and connects automatically once authorized.
 
 ## TLS renewal
 
@@ -143,20 +144,28 @@ docker compose logs rumble-server | grep -i "certificate reloaded"
   `docker compose restart rumble-server` also picks up a renewed cert, at the
   cost of dropping live connections.
 
-### Caveat: offline CLI subcommands
+### CLI subcommands and the admin socket
 
 `server add-admin`, `server set-sudo-password`, `server add-controller`, and
-`server set-participant-group` open the sled database directly, which takes an
-**exclusive lock**. They cannot run while the server is up. Either:
+`server set-participant-group` work whether or not the server is running:
 
-- do the equivalent through the **web admin** while the server runs (preferred:
-  bootstrap sets the sudo password and admin key; group membership covers
-  controllers), or
-- stop the server first:
+- **Server running:** the running server exposes its full admin REST API on a
+  unix socket at `<data_dir>/admin.sock` (mode `0600` — local file access *is*
+  the credential). The subcommands detect it and apply the change live:
   ```bash
-  docker compose stop rumble-server
+  docker compose exec rumble-server server set-sudo-password 'hunter2'
+  ```
+  Scripts can use the same socket directly; with the data dir bind-mounted it
+  also works from the host without entering the container:
+  ```bash
+  curl --unix-socket data/admin.sock http://localhost/api/state
+  curl --unix-socket data/admin.sock -X POST http://localhost/api/groups \
+      -H 'Content-Type: application/json' -d '{"name":"vip","permissions":3}'
+  ```
+- **Server stopped:** the subcommands fall back to opening the sled database
+  directly (it takes an exclusive lock, so the two paths can never collide).
+  ```bash
   docker compose run --rm rumble-server set-sudo-password 'hunter2'
-  docker compose start rumble-server
   ```
 
 ## Configuration reference
@@ -169,8 +178,8 @@ The server is configured entirely via environment variables in
 | `RUMBLE_BIND` | `[::]:5000` | QUIC bind address (dual-stack). |
 | `RUMBLE_DOMAIN` | from `.env` | Public domain; SAN for the self-signed fallback and the bridge's dial target. |
 | `RUMBLE_CERT_DIR` | `/certs` | Where `fullchain.pem`/`privkey.pem` are read (and reloaded) from. |
-| `RUMBLE_DATA_DIR` | `/data` | sled DB + web setup-token file. |
-| `RUMBLE_WEB_ENABLED` | `1` | Enable the web admin. |
+| `RUMBLE_DATA_DIR` | `/data` | sled DB, web setup-token file, and the `admin.sock` admin socket. |
+| `RUMBLE_WEB_ENABLED` | `1` | Web admin (on by default; set `0` to disable). |
 | `RUMBLE_WEB_BIND` | `0.0.0.0:5001` | Admin bind *inside* the container (host exposure is restricted to loopback by the compose `ports` mapping). |
 | `RUMBLE_WEB_SETUP_TOKEN` | _(unset)_ | Optionally pin the bootstrap token instead of reading the generated file. |
 | `RUMBLE_LOG_LEVEL` | `info` | Log verbosity. |

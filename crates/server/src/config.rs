@@ -422,6 +422,14 @@ impl ServerConfig {
                 .with_context(|| format!("Failed to read config file: {}", config_path.display()))?;
             toml::from_str(&content)
                 .with_context(|| format!("Failed to parse config file: {}", config_path.display()))?
+        } else if args.command.is_some() {
+            // One-shot admin subcommands must not seed a server config (or a
+            // data/cert tree) as a side effect — run on defaults quietly.
+            eprintln!(
+                "[config] no config at {} — using defaults (admin subcommand; not creating one)",
+                config_path.display()
+            );
+            FileConfig::default()
         } else {
             // Creating a config (and with it a data/cert tree) in an unintended
             // directory silently forks the deployment — make this unmissable.

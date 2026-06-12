@@ -4,9 +4,11 @@
 #
 # Quick start:
 #   cp .env.example .env          # set RUMBLE_DOMAIN
-#   mkdir -p certs data bridge-data
-#   sudo chown -R 10001:10001 certs data bridge-data   # containers run as uid 10001
 #   docker compose up -d --build
+#
+# That's it — the entrypoint creates/chowns the bind-mounted volume dirs
+# itself, the server generates a self-signed cert until certbot provides a
+# real one, and the log prints a first-run bootstrap banner for the web admin.
 
 services:
   rumble-server:

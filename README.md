@@ -55,10 +55,16 @@ defaults) and accepts CLI overrides (`--bind`, `--data-dir`, `--cert-dir`, `--do
 `--log-level`) and a few environment variables (e.g. `RUMBLE_SERVER_PASSWORD`,
 `RUMBLE_WELCOME_MESSAGE`).
 
+On first start the server prints a `FIRST-RUN SETUP` banner: the **web admin**
+(on by default at <http://127.0.0.1:5001/>) walks you through choosing the sudo
+password and seeding your admin key, after which you administer the server from
+the browser.
+
 ## Server administration
 
-The `server` binary has admin subcommands that operate on the sled database and exit. Each
-takes an optional trailing data directory (default `data`):
+The `server` binary has admin subcommands. While the server is **running** they
+apply live through its admin socket (`<data_dir>/admin.sock`); otherwise they
+operate on the sled database directly and exit:
 
 ```bash
 server add-admin <base64-public-key>                  # add a key to the admin group
@@ -67,7 +73,11 @@ server add-controller <base64-public-key>             # grant MANAGE_PARTICIPANT
 server set-participant-group <base64-public-key> <group>  # default group for a controller's participants
 ```
 
-See [`docs/acl-system.md`](docs/acl-system.md) for the permission model behind these.
+The admin socket speaks the full web-admin REST API, so it also works for local
+scripting: `curl --unix-socket data/admin.sock http://localhost/api/state`.
+
+See [`docs/acl-system.md`](docs/acl-system.md) for the permission model behind these,
+and [`docs/deployment.md`](docs/deployment.md) for production setup.
 
 ## Architecture
 
