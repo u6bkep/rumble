@@ -156,10 +156,12 @@ docker compose logs rumble-server | grep -i "certificate reloaded"
   docker compose exec rumble-server server set-sudo-password 'hunter2'
   ```
   Scripts can use the same socket directly; with the data dir bind-mounted it
-  also works from the host without entering the container:
+  also works from the host without entering the container (as root — the
+  socket is 0600 and owned by the container uid, and the server additionally
+  verifies the peer's uid via `SO_PEERCRED`):
   ```bash
-  curl --unix-socket data/admin.sock http://localhost/api/state
-  curl --unix-socket data/admin.sock -X POST http://localhost/api/groups \
+  sudo curl --unix-socket data/admin.sock http://localhost/api/state
+  sudo curl --unix-socket data/admin.sock -X POST http://localhost/api/groups \
       -H 'Content-Type: application/json' -d '{"name":"vip","permissions":3}'
   ```
 - **Server stopped:** the subcommands fall back to opening the sled database

@@ -96,10 +96,24 @@ async fn try_admin_socket(command: &Command, sock: &std::path::Path) -> SocketAt
         },
     };
 
-    let (status, body) = match unix_http_request(sock, method, &path, &body).await {
-        Ok(r) => r,
+    // Bounded so a wedged server can't hang a provisioning script forever
+    // (the slowest legitimate request is a ~300ms bcrypt hash).
+    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    let attempt = tokio::time::timeout(TIMEOUT, unix_http_request(sock, method, &path, &body)).await;
+    let (status, body) = match attempt {
+        Ok(Ok(r)) => r,
         // Connect/IO failure: no live server behind the socket (stale file).
-        Err(_) => return SocketAttempt::Unavailable,
+        Ok(Err(_)) => return SocketAttempt::Unavailable,
+        // Connected but no answer: a live-but-unresponsive server. Don't fall
+        // back to sled — it holds the DB lock, and "unavailable" would lie.
+        Err(_) => {
+            return SocketAttempt::Handled(Err(format!(
+                "the admin socket at {} accepted the connection but did not respond within {}s — the server appears \
+                 to be running but unresponsive",
+                sock.display(),
+                TIMEOUT.as_secs()
+            )));
+        }
     };
 
     // 2xx carries {"message": ...}, errors carry {"error": ...}.
@@ -234,6 +248,12 @@ async fn handle_subcommand(command: Command, data_dir: &std::path::Path) -> Resu
         }
         Command::SetParticipantGroup { public_key, group } => {
             let key = decode_ed25519_key(&public_key)?;
+            persistence.ensure_default_groups()?;
+            // Match the live endpoint's validation: a typo'd group would
+            // otherwise be persisted silently and never match anything.
+            if persistence.get_group(&group).is_none() {
+                anyhow::bail!("Group '{group}' does not exist");
+            }
             persistence.set_participant_default_group(&key, Some(&group))?;
             persistence.flush()?;
             println!("Set default participant group for controller to '{group}'.");

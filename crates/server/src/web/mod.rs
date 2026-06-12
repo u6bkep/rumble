@@ -146,18 +146,27 @@ pub fn spawn(
     // 0600 file in the data dir and log only the (absolute) path. Only the
     // browser flow needs the token at all, so skip it when HTTP is disabled.
     let mut setup_token_file = None;
-    if needs_bootstrap
-        && !token_is_pinned
-        && let Some(settings) = &settings
-    {
+    if let Some(settings) = &settings {
         let token_path = absolute(&settings.data_dir.join("web-setup-token.txt"));
-        match write_token_file(&token_path, &setup_token) {
-            Ok(()) => setup_token_file = Some(token_path),
-            Err(e) => warn!(
-                "web admin: failed to write setup token to {}: {e} — the data directory must be writable by the \
-                 server's user. Set RUMBLE_WEB_SETUP_TOKEN to provide a token explicitly instead.",
-                token_path.display()
-            ),
+        if !needs_bootstrap {
+            // Bootstrap was completed some other way (offline subcommand, a
+            // run with a failed deletion) — garbage-collect any stale token
+            // file; the token in it is dead.
+            if std::fs::remove_file(&token_path).is_ok() {
+                info!(
+                    "removed stale setup token file {} (already bootstrapped)",
+                    token_path.display()
+                );
+            }
+        } else if !token_is_pinned {
+            match write_token_file(&token_path, &setup_token) {
+                Ok(()) => setup_token_file = Some(token_path),
+                Err(e) => warn!(
+                    "web admin: failed to write setup token to {}: {e} — the data directory must be writable by the \
+                     server's user. Set RUMBLE_WEB_SETUP_TOKEN to provide a token explicitly instead.",
+                    token_path.display()
+                ),
+            }
         }
     }
 
@@ -204,14 +213,33 @@ pub fn spawn(
     let _ = admin_socket;
 }
 
+/// Peer identity of a unix-socket connection, captured at accept time.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug)]
+struct UdsPeer {
+    uid: Option<u32>,
+}
+
+#[cfg(unix)]
+impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, tokio::net::UnixListener>> for UdsPeer {
+    fn connect_info(stream: axum::serve::IncomingStream<'_, tokio::net::UnixListener>) -> Self {
+        Self {
+            uid: stream.io().peer_cred().ok().map(|c| c.uid()),
+        }
+    }
+}
+
 /// Serve the same admin API over a unix socket in the data directory, for the
 /// `server` CLI subcommands and local scripting (`curl --unix-socket`). Every
-/// request over it is implicitly authorized ([`auth::LocalSocket`]): the socket
-/// is `0600`, so reaching it at all requires owning the server's files.
+/// authorized request gets the [`auth::LocalSocket`] marker (implicit admin).
+///
+/// Authorization is by peer credential, not just file permissions: each
+/// connection's `SO_PEERCRED` uid must be the server's own (or root). The
+/// socket is additionally chmod'd 0600, but the cred check is what makes the
+/// brief bind→chmod window (default-umask socket, connects queued in the
+/// backlog) and any loose data-dir permissions harmless.
 #[cfg(unix)]
 fn spawn_admin_socket(web_state: WebState, sock_path: std::path::PathBuf) {
-    // No assets and the LocalSocket marker on every request.
-    let app = router(web_state, None).layer(axum::Extension(auth::LocalSocket));
     tokio::spawn(async move {
         // A pre-existing socket file is necessarily stale: we already hold the
         // database's exclusive lock, so no other live server owns this data dir.
@@ -235,7 +263,7 @@ fn spawn_admin_socket(web_state: WebState, sock_path: std::path::PathBuf) {
             }
         };
         // Owner-only: connecting to this socket is full admin.
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
         if let Err(e) = std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o600)) {
             warn!(
                 "admin socket: failed to set 0600 on {}: {e} — admin socket disabled",
@@ -243,8 +271,38 @@ fn spawn_admin_socket(web_state: WebState, sock_path: std::path::PathBuf) {
             );
             return;
         }
+        // The server's own uid, read off the socket file it just created —
+        // std has no geteuid, but we own this inode by construction.
+        let server_uid = match std::fs::metadata(&sock_path) {
+            Ok(m) => m.uid(),
+            Err(e) => {
+                warn!(
+                    "admin socket: failed to stat {}: {e} — admin socket disabled",
+                    sock_path.display()
+                );
+                return;
+            }
+        };
+
+        let app = router(web_state, None).layer(axum::middleware::from_fn(
+            move |mut req: axum::extract::Request, next: axum::middleware::Next| async move {
+                let peer_uid = req
+                    .extensions()
+                    .get::<axum::extract::ConnectInfo<UdsPeer>>()
+                    .and_then(|ci| ci.0.uid);
+                if !peer_uid.is_some_and(|uid| uid == server_uid || uid == 0) {
+                    warn!(?peer_uid, "admin socket: rejected connection from foreign uid");
+                    return ApiErrorResponse::new(StatusCode::FORBIDDEN, "admin socket: peer uid not authorized")
+                        .into_response();
+                }
+                req.extensions_mut().insert(auth::LocalSocket);
+                next.run(req).await
+            },
+        ));
+
         info!("admin socket listening at {}", sock_path.display());
-        if let Err(e) = axum::serve(listener, app.into_make_service()).await {
+        let make_service = app.into_make_service_with_connect_info::<UdsPeer>();
+        if let Err(e) = axum::serve(listener, make_service).await {
             warn!("admin socket server error: {e}");
         }
     });
