@@ -176,6 +176,14 @@ pub struct RumbleApp<B: UiBackend = crate::backend::NativeUiBackend> {
     /// Incremental chat-row render cache (issue #16 phase 2). RefCell
     /// because it's synced inside `build(&self)`.
     chat_history: RefCell<chat::ChatHistory>,
+    /// Per-message markdown render memo (damascene `MdCache`, #97).
+    /// Markdown parsing is full-document per call, so a stable backlog
+    /// message would re-parse on every realization; the cache turns
+    /// repeated renders into cheap tree clones and only re-parses changed
+    /// bodies. `Arc<Mutex<…>>` because the chat history's `'static +
+    /// Send + Sync` row closures call it at realization time (visible
+    /// rows only); locks are brief and uncontended on the UI thread.
+    chat_md_cache: Arc<Mutex<damascene_markdown::MdCache>>,
 
     /// The three mutually-exclusive media lightboxes (image / video /
     /// 3D model). See [`crate::lightbox::Lightboxes`].
@@ -341,6 +349,9 @@ impl<B: UiBackend> RumbleApp<B> {
                 media_cache_repaint,
             ))),
             chat_history: RefCell::new(chat::ChatHistory::default()),
+            chat_md_cache: Arc::new(Mutex::new(damascene_markdown::MdCache::new(
+                damascene_markdown::MarkdownOptions::default(),
+            ))),
             lightboxes: crate::lightbox::Lightboxes::default(),
             file_context_menu: None,
             pending_save_as: None,
@@ -613,6 +624,7 @@ impl<B: UiBackend> App for RumbleApp<B> {
                     &shell.chat,
                     &self.chat_history,
                     &self.media_cache,
+                    &self.chat_md_cache,
                     &transfers,
                     &self.pending_cancel_confirm,
                     &self.composer.input,
