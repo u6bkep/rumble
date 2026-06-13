@@ -1497,6 +1497,12 @@ pub fn handle_event(
         // Switching tabs implicitly closes any open dropdown so its
         // popover doesn't outlive the surface it was anchored to.
         state.open_select = OpenSelect::None;
+        // Opening the Admin tab pulls the registered-user roster (offline
+        // members + memberships). It's not part of synced state — a
+        // permission-gated admin query refreshed each time the tab is shown.
+        if *tab == SettingsTab::Admin {
+            return SettingsOutcome::Dispatch(vec![rumble_client::Command::RequestRegisteredUsers]);
+        }
         return SettingsOutcome::Handled;
     }
 

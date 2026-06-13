@@ -40,7 +40,9 @@ use rumble_desktop_shell::{KeyInfo, RecentServer, SettingsStore};
 use rumble_protocol::{
     ChatAttachment, Uuid,
     permissions::{ADMIN_PERMISSIONS, DEFAULT_PERMISSIONS, Permissions},
-    proto::{GroupInfo, RelayFileSharePayload, RoomAclEntry, RoomInfo, User, UserId},
+    proto::{
+        GroupInfo, GroupMembership, RegisteredUserInfo, RelayFileSharePayload, RoomAclEntry, RoomInfo, User, UserId,
+    },
     room_id_from_uuid,
 };
 
@@ -810,10 +812,41 @@ fn admin_state() -> State {
                 is_builtin: false,
             },
         ],
+        // Admin tab member chips read the registered-user roster (offline
+        // included), keyed by public key. Mirrors the connected users above
+        // plus one offline registered member ("frank") so the dump exercises
+        // the offline-chip path. Memberships are permanent (expires_at: 0) to
+        // keep the golden deterministic — the expiry display path depends on
+        // wall-clock and is covered by unit tests instead.
+        registered_users: vec![
+            reg_user(1, "alice", true, &["admin", "moderators"]),
+            reg_user(2, "bob", true, &["moderators"]),
+            reg_user(3, "charlie", true, &["moderators", "streamers"]),
+            reg_user(4, "diana", true, &["streamers"]),
+            reg_user(6, "frank", false, &["moderators"]),
+        ],
         ..State::default()
     };
     state.rebuild_room_tree();
     state
+}
+
+/// Deterministic registered-user fixture. `key_byte` seeds a distinct 32-byte
+/// public key; all memberships are permanent so no wall-clock expiry text
+/// leaks into goldens.
+fn reg_user(key_byte: u8, username: &str, online: bool, groups: &[&str]) -> RegisteredUserInfo {
+    RegisteredUserInfo {
+        public_key: vec![key_byte; 32],
+        username: username.into(),
+        groups: groups
+            .iter()
+            .map(|g| GroupMembership {
+                group: (*g).into(),
+                expires_at: 0,
+            })
+            .collect(),
+        online,
+    }
 }
 
 /// Fixture for the per-room ACL editor scene. Three-level room tree

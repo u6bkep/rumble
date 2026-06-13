@@ -21,11 +21,130 @@
 
 use damascene_core::prelude::*;
 
+use base64::Engine as _;
 use rumble_client::{Command, State};
 use rumble_protocol::{
     permissions::{ALL_ROOM_SCOPED, ALL_SERVER_SCOPED, Permissions},
-    proto::{GroupInfo, User},
+    proto::{GroupInfo, RegisteredUserInfo},
 };
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// URL-safe-base64 of a 32-byte public key — the route-safe identity token used
+/// in member routes (no `:`, the route separator). Mirrors the web admin's key
+/// path-segment encoding.
+fn key_to_token(key: &[u8]) -> String {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key)
+}
+
+/// Inverse of [`key_to_token`].
+fn token_to_key(token: &str) -> Option<[u8; 32]> {
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(token).ok()?;
+    <[u8; 32]>::try_from(bytes.as_slice()).ok()
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Preset durations offered when adding a user to a group. The membership's
+/// expiry is a general property (any group, not just `banned`); `Never` maps to
+/// `expires_at = 0` (permanent).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum ExpiryChoice {
+    #[default]
+    Never,
+    Day,
+    Week,
+    Month,
+}
+
+impl ExpiryChoice {
+    const ALL: &'static [ExpiryChoice] = &[
+        ExpiryChoice::Never,
+        ExpiryChoice::Day,
+        ExpiryChoice::Week,
+        ExpiryChoice::Month,
+    ];
+
+    fn slug(self) -> &'static str {
+        match self {
+            ExpiryChoice::Never => "never",
+            ExpiryChoice::Day => "1d",
+            ExpiryChoice::Week => "1w",
+            ExpiryChoice::Month => "30d",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            ExpiryChoice::Never => "Never",
+            ExpiryChoice::Day => "1 day",
+            ExpiryChoice::Week => "1 week",
+            ExpiryChoice::Month => "30 days",
+        }
+    }
+
+    fn from_slug(s: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|c| c.slug() == s)
+    }
+
+    /// Absolute Unix-seconds expiry for this choice, or `0` for `Never`.
+    fn expires_at(self, now: u64) -> u64 {
+        let secs = match self {
+            ExpiryChoice::Never => return 0,
+            ExpiryChoice::Day => 86_400,
+            ExpiryChoice::Week => 604_800,
+            ExpiryChoice::Month => 2_592_000,
+        };
+        now + secs
+    }
+}
+
+/// Human-readable remaining time for a membership expiry, or `None` when the
+/// membership is permanent (`expires_at == 0`).
+fn format_expiry(expires_at: u64, now: u64) -> Option<String> {
+    if expires_at == 0 {
+        return None;
+    }
+    if expires_at <= now {
+        return Some("expired".to_string());
+    }
+    let rem = expires_at - now;
+    let s = if rem >= 86_400 {
+        format!("{}d left", rem / 86_400)
+    } else if rem >= 3_600 {
+        format!("{}h left", rem / 3_600)
+    } else if rem >= 60 {
+        format!("{}m left", rem / 60)
+    } else {
+        format!("{rem}s left")
+    };
+    Some(s)
+}
+
+/// Members of `group` drawn from the registered-user roster (includes offline
+/// identities). The roster is the single source of truth — group membership is
+/// keyed by long-term public key, so connected-but-unregistered users can't be
+/// members anyway.
+fn group_members<'a>(app_state: &'a State, group: &str) -> Vec<&'a RegisteredUserInfo> {
+    app_state
+        .registered_users
+        .iter()
+        .filter(|u| u.groups.iter().any(|m| m.group == group))
+        .collect()
+}
+
+/// Expiry of `user`'s membership in `group` (0 = permanent / not a member).
+fn membership_expiry(user: &RegisteredUserInfo, group: &str) -> u64 {
+    user.groups
+        .iter()
+        .find(|m| m.group == group)
+        .map(|m| m.expires_at)
+        .unwrap_or(0)
+}
 
 // ============================================================
 // Constants
@@ -112,6 +231,8 @@ pub struct NewGroupForm {
 pub struct AddUserPopover {
     pub group_name: String,
     pub query: String,
+    /// Selected membership duration for the next pick. Defaults to permanent.
+    expiry: ExpiryChoice,
 }
 
 // ============================================================
@@ -132,6 +253,21 @@ impl AdminOutcome {
     fn one(cmd: Command) -> Self {
         AdminOutcome::Dispatch(vec![cmd])
     }
+}
+
+/// A key-addressed membership change followed by a roster re-pull. The server
+/// doesn't push an updated `RegisteredUsers` after an offline-capable edit, so
+/// the Admin tab refreshes explicitly to reflect the change.
+fn membership_edit(public_key: [u8; 32], group: String, add: bool, expires_at: u64) -> AdminOutcome {
+    AdminOutcome::Dispatch(vec![
+        Command::SetRegisteredUserGroup {
+            public_key,
+            group,
+            add,
+            expires_at,
+        },
+        Command::RequestRegisteredUsers,
+    ])
 }
 
 // ============================================================
@@ -162,8 +298,8 @@ fn key_action_delete(group: &str) -> String {
 fn key_action_dismiss(group: &str) -> String {
     format!("admin:g:{group}:action:dismiss")
 }
-fn key_remove_member(group: &str, user_id: u64) -> String {
-    format!("admin:g:{group}:remove:{user_id}")
+fn key_remove_member(group: &str, key_token: &str) -> String {
+    format!("admin:g:{group}:remove:{key_token}")
 }
 fn key_add_user_open(group: &str) -> String {
     format!("admin:g:{group}:adduser:open")
@@ -171,11 +307,14 @@ fn key_add_user_open(group: &str) -> String {
 fn key_add_user_query(group: &str) -> String {
     format!("admin:g:{group}:adduser:query")
 }
+fn key_add_user_expiry(group: &str) -> String {
+    format!("admin:g:{group}:expiry")
+}
 fn key_add_user_dismiss(group: &str) -> String {
     format!("admin:g:{group}:adduser:dismiss")
 }
-fn key_add_user_pick(group: &str, user_id: u64) -> String {
-    format!("admin:g:{group}:adduser:pick:{user_id}")
+fn key_add_user_pick(group: &str, key_token: &str) -> String {
+    format!("admin:g:{group}:adduser:pick:{key_token}")
 }
 fn key_perm_toggle(group: &str, bits: u32) -> String {
     format!("admin:g:{group}:perm:{bits:08x}")
@@ -318,7 +457,7 @@ fn render_header(state: &AdminState, selection: &Selection) -> El {
 
 fn render_group_list(state: &AdminState, app_state: &State, selection: &Selection) -> El {
     let query = state.search_query.trim().to_lowercase();
-    let groups: Vec<&GroupInfo> = filtered_groups(&app_state.group_definitions, &app_state.users, &query);
+    let groups: Vec<&GroupInfo> = filtered_groups(&app_state.group_definitions, &app_state.registered_users, &query);
 
     if groups.is_empty() {
         return paragraph(if query.is_empty() {
@@ -350,7 +489,7 @@ fn render_group_list(state: &AdminState, app_state: &State, selection: &Selectio
     accordion(items)
 }
 
-fn filtered_groups<'a>(groups: &'a [GroupInfo], users: &[User], query: &str) -> Vec<&'a GroupInfo> {
+fn filtered_groups<'a>(groups: &'a [GroupInfo], users: &[RegisteredUserInfo], query: &str) -> Vec<&'a GroupInfo> {
     if query.is_empty() {
         return groups.iter().collect();
     }
@@ -364,7 +503,7 @@ fn filtered_groups<'a>(groups: &'a [GroupInfo], users: &[User], query: &str) -> 
             // jump to "which group is alice in".
             users
                 .iter()
-                .any(|u| u.groups.contains(&g.name) && u.username.to_lowercase().contains(query))
+                .any(|u| u.groups.iter().any(|m| m.group == g.name) && u.username.to_lowercase().contains(query))
         })
         .collect()
 }
@@ -392,11 +531,7 @@ fn render_group_card(
 ) -> El {
     let is_builtin = group.is_builtin;
     let perms = Permissions::from_bits_truncate(group.permissions);
-    let members: Vec<&User> = app_state
-        .users
-        .iter()
-        .filter(|u| u.groups.contains(&group.name))
-        .collect();
+    let members = group_members(app_state, &group.name);
 
     let header = render_group_header(group, perms, &members, is_builtin, open);
 
@@ -419,7 +554,13 @@ fn render_group_card(
     column(children).gap(0.0).width(Size::Fill(1.0)).height(Size::Hug)
 }
 
-fn render_group_header(group: &GroupInfo, perms: Permissions, members: &[&User], is_builtin: bool, open: bool) -> El {
+fn render_group_header(
+    group: &GroupInfo,
+    perms: Permissions,
+    members: &[&RegisteredUserInfo],
+    is_builtin: bool,
+    open: bool,
+) -> El {
     let chevron = if open { "chevron-down" } else { "chevron-right" };
 
     let mut name_row: Vec<El> = Vec::new();
@@ -468,20 +609,22 @@ fn render_members_section(
     _selection: &Selection,
     group: &GroupInfo,
     is_builtin: bool,
-    members: &[&User],
+    members: &[&RegisteredUserInfo],
 ) -> El {
-    // `_state` / `_app_state` / `_selection` are reserved for the
-    // upcoming "current user highlighting" + popover wiring; threading
-    // them in now keeps the call site stable as those land.
+    let now = now_secs();
     let mut chips: Vec<El> = members
         .iter()
         .map(|u| {
-            // A `User` without an id (shouldn't happen, but the proto
-            // field is optional) renders as a plain, non-actionable
-            // chip — dispatching `SetUserGroup { target_user_id: 0 }`
-            // would misdirect the command at whoever id 0 resolves to.
-            let uid = u.user_id.as_ref().map(|i| i.value);
-            chip(&u.username, uid, &group.name, is_builtin)
+            let expiry = membership_expiry(u, &group.name);
+            chip(
+                &u.username,
+                &u.public_key,
+                &group.name,
+                is_builtin,
+                u.online,
+                expiry,
+                now,
+            )
         })
         .collect();
 
@@ -515,7 +658,7 @@ fn render_members_section(
         .width(Size::Fill(1.0))
 }
 
-fn chip(username: &str, user_id: Option<u64>, group: &str, is_builtin: bool) -> El {
+fn chip(username: &str, public_key: &[u8], group: &str, is_builtin: bool, online: bool, expiry: u64, now: u64) -> El {
     let initial = username
         .chars()
         .next()
@@ -523,16 +666,27 @@ fn chip(username: &str, user_id: Option<u64>, group: &str, is_builtin: bool) -> 
         .to_uppercase()
         .next()
         .unwrap_or('?');
-    let mut parts: Vec<El> = vec![
-        avatar_initials(initial.to_string()),
-        text(username).font_size(tokens::TEXT_XS.size),
-    ];
-    if !is_builtin && let Some(user_id) = user_id {
+    let name_el = if online {
+        text(username).font_size(tokens::TEXT_XS.size)
+    } else {
+        // Offline registered members are dimmed — they still hold the
+        // membership, they just have no live connection right now.
+        text(username).muted().font_size(tokens::TEXT_XS.size)
+    };
+    let mut parts: Vec<El> = vec![avatar_initials(initial.to_string()), name_el];
+
+    // Timed membership: show the remaining time so admins can see (and
+    // the `banned` group can show) expiries uniformly.
+    if let Some(remaining) = format_expiry(expiry, now) {
+        parts.push(text(remaining).muted().mono().font_size(tokens::TEXT_XS.size));
+    }
+
+    if !is_builtin {
         // Match the chip's pill radius so the × button's fill follows
         // the parent curve instead of stamping a flat corner into it.
         parts.push(
             button("×")
-                .key(key_remove_member(group, user_id))
+                .key(key_remove_member(group, &key_to_token(public_key)))
                 .secondary()
                 .radius(tokens::RADIUS_PILL),
         );
@@ -630,13 +784,12 @@ fn render_action_menu(group: &str, is_builtin: bool) -> El {
 fn render_add_user_popover(popover_state: &AddUserPopover, app_state: &State, selection: &Selection) -> El {
     let group = &popover_state.group_name;
     let query = popover_state.query.trim().to_lowercase();
-    let mut candidates: Vec<&User> = app_state
-        .users
+    // Candidates are registered identities (incl. offline) not already in the
+    // group — membership is keyed by long-term public key.
+    let mut candidates: Vec<&RegisteredUserInfo> = app_state
+        .registered_users
         .iter()
-        // Id-less users can't be targeted by SetUserGroup — picking
-        // one would dispatch against user id 0. Don't offer them.
-        .filter(|u| u.user_id.is_some())
-        .filter(|u| !u.groups.contains(group))
+        .filter(|u| !u.groups.iter().any(|m| m.group == *group))
         .filter(|u| query.is_empty() || u.username.to_lowercase().contains(&query))
         .collect();
     candidates.sort_by_key(|u| u.username.to_lowercase());
@@ -652,10 +805,23 @@ fn render_add_user_popover(popover_state: &AddUserPopover, app_state: &State, se
     )
     .width(Size::Fill(1.0));
 
+    // Membership-duration picker — applies to the next pick. Expiry is a
+    // general property of any membership (e.g. a timed `banned` grant).
+    let expiry_tabs = tabs_list(
+        key_add_user_expiry(group),
+        &popover_state.expiry.slug(),
+        ExpiryChoice::ALL.iter().map(|c| (c.slug(), c.label())),
+    )
+    .width(Size::Fill(1.0));
+    let expiry_row = column([text("Expires").muted().font_size(tokens::TEXT_XS.size), expiry_tabs])
+        .gap(tokens::SPACE_1)
+        .padding(Sides::xy(tokens::SPACE_2, tokens::SPACE_1))
+        .width(Size::Fill(1.0));
+
     let list: Vec<El> = if candidates.is_empty() {
         vec![
-            text(if app_state.users.is_empty() {
-                "No connected users"
+            text(if app_state.registered_users.is_empty() {
+                "No registered users"
             } else if query.is_empty() {
                 "Everyone is already a member"
             } else {
@@ -668,16 +834,20 @@ fn render_add_user_popover(popover_state: &AddUserPopover, app_state: &State, se
     } else {
         candidates
             .iter()
-            .filter_map(|u| {
-                let uid = u.user_id.as_ref().map(|i| i.value)?;
-                Some(menu_item(u.username.clone()).key(key_add_user_pick(group, uid)))
+            .map(|u| {
+                let label = if u.online {
+                    u.username.clone()
+                } else {
+                    format!("{} · offline", u.username)
+                };
+                menu_item(label).key(key_add_user_pick(group, &key_to_token(&u.public_key)))
             })
             .collect()
     };
 
     let panel = popover_panel(
-        std::iter::once(search)
-            .chain(std::iter::once(divider()))
+        [search, expiry_row, divider()]
+            .into_iter()
             .chain(list)
             .collect::<Vec<_>>(),
     );
@@ -890,6 +1060,16 @@ fn handle_add_user_query_event(
     if damascene_core::widgets::text_input::apply_event(&mut popover.query, selection, &key, event) {
         return Some(AdminOutcome::Handled);
     }
+    // Expiry-duration tabs. Handled here (before the generic group-route
+    // parser) so the `{key}:tab:{slug}` route isn't misread as a member action.
+    if damascene_core::widgets::tabs::apply_event(
+        &mut popover.expiry,
+        event,
+        &key_add_user_expiry(&popover.group_name),
+        ExpiryChoice::from_slug,
+    ) {
+        return Some(AdminOutcome::Handled);
+    }
     let dismiss_key = key_add_user_dismiss(&popover.group_name);
     if event.is_route(&dismiss_key) && event.kind == UiEventKind::Click {
         state.add_user_popover = None;
@@ -965,38 +1145,34 @@ fn handle_group_action(
             AdminOutcome::Handled
         }
         "remove" => {
-            let Some(uid_str) = payload else {
+            let Some(token) = payload else {
                 return AdminOutcome::Handled;
             };
-            let Ok(uid) = uid_str.parse::<u64>() else {
+            let Some(key) = token_to_key(token) else {
                 return AdminOutcome::Handled;
             };
-            AdminOutcome::one(Command::SetUserGroup {
-                target_user_id: uid,
-                group: group.to_string(),
-                add: false,
-                expires_at: 0,
-            })
+            // Key-addressed so offline members (e.g. a banned user) can be
+            // removed; removing from "banned" is exactly an unban. Re-pull the
+            // roster afterward since offline edits don't broadcast back to us.
+            membership_edit(key, group.to_string(), false, 0)
         }
         "adduser" => match payload {
             Some("open") => {
                 state.add_user_popover = Some(AddUserPopover {
                     group_name: group.to_string(),
                     query: String::new(),
+                    expiry: ExpiryChoice::default(),
                 });
                 AdminOutcome::Handled
             }
             Some(rest) => {
-                if let Some(uid_str) = rest.strip_prefix("pick:")
-                    && let Ok(uid) = uid_str.parse::<u64>()
+                if let Some(token) = rest.strip_prefix("pick:")
+                    && let Some(key) = token_to_key(token)
                 {
+                    let expiry = state.add_user_popover.as_ref().map(|p| p.expiry).unwrap_or_default();
+                    let expires_at = expiry.expires_at(now_secs());
                     state.add_user_popover = None;
-                    return AdminOutcome::one(Command::SetUserGroup {
-                        target_user_id: uid,
-                        group: group.to_string(),
-                        add: true,
-                        expires_at: 0,
-                    });
+                    return membership_edit(key, group.to_string(), true, expires_at);
                 }
                 AdminOutcome::Handled
             }
