@@ -455,7 +455,7 @@ fn lightbox_body(active: &ActiveVideo) -> El {
     // resized away) drop out of the redraw aggregator
     // automatically.
     let inner: El = match active.gpu.as_ref() {
-        Some(gpu) => surface(gpu.app_texture().clone())
+        Some(gpu) => surface(gpu.app_texture())
             .surface_alpha(SurfaceAlpha::Opaque)
             .surface_fit(ImageFit::Contain)
             .radius(tokens::RADIUS_MD)
