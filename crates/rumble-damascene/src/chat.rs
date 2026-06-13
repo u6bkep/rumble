@@ -28,7 +28,7 @@ use std::{
 };
 
 use damascene_core::prelude::*;
-use damascene_markdown::md;
+use damascene_markdown::MdCache;
 use linkify::{LinkFinder, LinkKind};
 use rumble_client::{ChatMessage, ChatMessageKind, State};
 use rumble_client_traits::file_transfer::TransferStatus;
@@ -226,6 +226,7 @@ pub fn render(
     chat_settings: &ChatSettings,
     history_cache: &RefCell<ChatHistory>,
     media_cache: &Arc<Mutex<MediaCache>>,
+    md_cache: &Arc<Mutex<MdCache>>,
     transfers: &Arc<TransferMap>,
     pending_cancel_confirm: &HashMap<String, Instant>,
     chat_input: &str,
@@ -244,6 +245,7 @@ pub fn render(
             chat_settings,
             history_cache,
             media_cache,
+            md_cache,
             transfers,
             pending_cancel_confirm,
             my_user_id,
@@ -326,6 +328,7 @@ fn history(
     chat_settings: &ChatSettings,
     history_cache: &RefCell<ChatHistory>,
     media_cache: &Arc<Mutex<MediaCache>>,
+    md_cache: &Arc<Mutex<MdCache>>,
     transfers: &Arc<TransferMap>,
     pending_cancel_confirm: &HashMap<String, Instant>,
     my_user_id: Option<u64>,
@@ -366,6 +369,7 @@ fn history(
     let rows_for_key = rows.clone();
     let settings = chat_settings.clone();
     let media = media_cache.clone();
+    let md_cache = md_cache.clone();
     let transfers = transfers.clone();
     let pending_cancel_confirm = Arc::new(pending_cancel_confirm.clone());
 
@@ -380,7 +384,7 @@ fn history(
                 .attachment
                 .as_ref()
                 .map(|att| attachment_el(att, &media, &transfers, row.is_own, &pending_cancel_confirm));
-            render_chat_row(row, &settings, attachment)
+            render_chat_row(row, &settings, &md_cache, attachment)
         },
     )
     .key(CHAT_HISTORY_KEY)
@@ -388,6 +392,14 @@ fn history(
     // messages don't shift what the user is reading. Stick-to-bottom on new
     // messages is driven separately via `ScrollRequest::ToRowKey(.., End)`.
     .virtual_anchor_policy(VirtualAnchorPolicy::LastVisible)
+    // The log only ever grows at the tail (issue #16 unbounded append-at-bottom
+    // feed; the `chat_epoch` contract guarantees same-epoch growth is pure
+    // append). Opt into damascene's O(visible) append-only height index (#107):
+    // the persistent DynHeightIndex reconciles trim-then-append per frame
+    // instead of the general O(n) walk. An epoch bump (history merge re-sort,
+    // connect-time clear) re-keys the rows; reconcile detects the violation and
+    // cold-rebuilds that one frame, so geometry stays correct.
+    .append_only()
     .padding(Sides::xy(tokens::SPACE_4, tokens::SPACE_2))
     .gap(tokens::SPACE_1)
 }
@@ -475,7 +487,12 @@ impl ChatRow {
     }
 }
 
-fn render_chat_row(entry: &ChatRow, chat_settings: &ChatSettings, attachment: Option<El>) -> El {
+fn render_chat_row(
+    entry: &ChatRow,
+    chat_settings: &ChatSettings,
+    md_cache: &Mutex<MdCache>,
+    attachment: Option<El>,
+) -> El {
     let msg_key = entry.msg_key;
     let prefix = if chat_settings.show_timestamps {
         format!("[{}] ", chat_settings.timestamp_format.format(entry.timestamp))
@@ -510,8 +527,16 @@ fn render_chat_row(entry: &ChatRow, chat_settings: &ChatSettings, attachment: Op
 
     // Messages that use markdown syntax go through the markdown renderer.
     // Everything else takes a plain-text path that linkifies bare URLs.
+    //
+    // Markdown parsing is full-document per call (no incremental API), so a
+    // stable backlog message would re-parse on every realization. Route it
+    // through the per-list `MdCache` (#97): a stable message hits the memo
+    // (cheap tree clone), only a just-edited/changed body re-parses. The
+    // returned subtree is width-neutral; `.width(Fill)` is applied to the
+    // clone here. Entry text is the cache key, so identical-text messages
+    // share one parse and the path-scoped row key keeps their ids distinct.
     let body = if looks_like_markdown(&entry.text) {
-        md(&entry.text).width(Size::Fill(1.0))
+        md_cache.lock().unwrap().get(&entry.text).width(Size::Fill(1.0))
     } else {
         plain_with_links(&entry.text, msg_key).width(Size::Fill(1.0))
     };
