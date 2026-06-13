@@ -307,6 +307,7 @@ impl<P: Platform> BackendHandle<P> {
             kicked: None,
             group_definitions: vec![],
             slash_commands: vec![],
+            registered_users: vec![],
         };
 
         let state = Arc::new(RwLock::new(state));
@@ -2113,6 +2114,34 @@ async fn run_connection_task<P: Platform>(
                             send_tracked(&mut transport, &local_close, &env, &bus, &audio_task).await;
                         }
                     }
+                    Command::RequestRegisteredUsers => {
+                        if transport.is_some() {
+                            let env = proto::Envelope {
+                                state_hash: vec![],
+                                payload: Some(Payload::RequestRegisteredUsers(proto::RequestRegisteredUsers {})),
+                            };
+                            send_tracked(&mut transport, &local_close, &env, &bus, &audio_task).await;
+                        }
+                    }
+                    Command::SetRegisteredUserGroup {
+                        public_key,
+                        group,
+                        add,
+                        expires_at,
+                    } => {
+                        if transport.is_some() {
+                            let env = proto::Envelope {
+                                state_hash: vec![],
+                                payload: Some(Payload::SetRegisteredUserGroup(proto::SetRegisteredUserGroup {
+                                    public_key: public_key.to_vec(),
+                                    group,
+                                    add,
+                                    expires_at,
+                                })),
+                            };
+                            send_tracked(&mut transport, &local_close, &env, &bus, &audio_task).await;
+                        }
+                    }
                     // PlaySfx is intercepted in BackendHandle::send() and never reaches here
                     Command::PlaySfx { .. } => {}
                 }
@@ -2710,6 +2739,13 @@ fn handle_server_message(
                 // Another user was kicked - they'll get a UserLeft event too
                 info!("User {} was kicked by {}", uk.user_id, uk.kicked_by);
             }
+        }
+        Some(Payload::RegisteredUsers(ru)) => {
+            // Reply to a Command::RequestRegisteredUsers pull (admin only).
+            // Pure delta to the projection — the sole State writer.
+            let _ = bus
+                .room
+                .send(crate::RoomEvent::RegisteredUsersReplaced { users: ru.users });
         }
         _ => {}
     }

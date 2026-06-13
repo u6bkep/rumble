@@ -32,7 +32,7 @@ use rumble_audio::{PipelineConfig, UserRxConfig};
 use rumble_client_traits::file_transfer::{TransferDirection, TransferId, TransferStage};
 use rumble_protocol::{
     Uuid,
-    proto::{GroupInfo, RoomAclEntry, RoomInfo, SlashCommand, User},
+    proto::{GroupInfo, RegisteredUserInfo, RoomAclEntry, RoomInfo, SlashCommand, User},
 };
 
 use crate::events::{AudioDeviceInfo, AudioSettings, ChatMessage, PendingCertificate, VoiceMode};
@@ -330,6 +330,14 @@ pub enum RoomEvent {
         user_id: u64,
         group: String,
         added: bool,
+    },
+
+    /// Admin registered-user roster replaced wholesale, as delivered by the
+    /// `RegisteredUsers` reply to a `RequestRegisteredUsers` pull. Projection
+    /// overwrites [`State::registered_users`]. Not part of the synced/hashed
+    /// server state — a pulled admin view. `None`/empty on the disconnect reset.
+    RegisteredUsersReplaced {
+        users: Vec<RegisteredUserInfo>,
     },
 
     GroupAdded {

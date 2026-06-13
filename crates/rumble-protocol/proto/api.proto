@@ -152,6 +152,13 @@ message Envelope {
     UnregisterUser unregister_user = 41;
     CommandResult command_result = 42;
 
+    // Admin: registered-user management (28-30)
+    // Client -> Server
+    RequestRegisteredUsers request_registered_users = 28;
+    SetRegisteredUserGroup set_registered_user_group = 29;
+    // Server -> Client
+    RegisteredUsers registered_users = 30;
+
     // ACL Messages (80-93)
     // Client -> Server
     KickUser kick_user = 80;
@@ -513,6 +520,48 @@ message RegisterUser {
 // Unregister a user (unbinds username from public key).
 message UnregisterUser {
   UserId user_id = 1;
+}
+
+// =============================================================================
+// Admin: Registered-User Management
+// =============================================================================
+
+// Admin request for the full roster of registered identities and their group
+// memberships — including offline users. Gated on MANAGE_ACL. The server
+// replies with a RegisteredUsers message on the same reliable stream.
+message RequestRegisteredUsers {}
+
+// Server -> Client: reply to RequestRegisteredUsers. Admin-only snapshot of
+// every registered identity, addressed by long-term public key rather than
+// session id, so offline users are included.
+message RegisteredUsers {
+  repeated RegisteredUserInfo users = 1;
+}
+
+// One registered identity and its persisted group memberships.
+message RegisteredUserInfo {
+  bytes public_key = 1;            // 32-byte Ed25519 public key
+  string username = 2;
+  repeated GroupMembership groups = 3;
+  bool online = 4;                 // true if this identity has a live connection
+}
+
+// A single group membership with its optional expiry. Expiry is a property of
+// the membership itself (applies to any group, not just "banned"); 0 = permanent.
+message GroupMembership {
+  string group = 1;
+  uint64 expires_at = 2;           // Unix seconds, 0 = permanent
+}
+
+// Admin: add/remove a registered user to/from a group, addressed by public key
+// so the target need not be connected. Gated on MANAGE_ACL. Mirrors SetUserGroup
+// but for offline-capable, key-addressed membership edits (e.g. unban = remove
+// from the "banned" group).
+message SetRegisteredUserGroup {
+  bytes public_key = 1;            // 32-byte Ed25519 public key
+  string group = 2;
+  bool add = 3;
+  uint64 expires_at = 4;           // Unix seconds, 0 = permanent
 }
 
 // =============================================================================

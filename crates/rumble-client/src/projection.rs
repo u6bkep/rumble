@@ -574,6 +574,9 @@ fn apply_connection(
             s.my_room_id = None;
             s.my_session_public_key = None;
             s.my_session_id = None;
+            // Admin roster is a pulled view tied to this session's perms;
+            // drop it so it can't leak across connections.
+            s.registered_users.clear();
         }
         ConnectionEvent::ConnectionLost { error } => {
             s.connection = crate::events::ConnectionState::ConnectionLost { error };
@@ -584,6 +587,7 @@ fn apply_connection(
             s.my_room_id = None;
             s.my_session_public_key = None;
             s.my_session_id = None;
+            s.registered_users.clear();
         }
         ConnectionEvent::Kicked { reason } => {
             s.kicked = Some(reason);
@@ -895,6 +899,11 @@ fn apply_room(
         RoomEvent::GroupRemoved { name } => {
             s.group_definitions.retain(|g| g.name != name);
             recompute_perms = true;
+        }
+        RoomEvent::RegisteredUsersReplaced { users } => {
+            // Pulled admin view, not synced state — a wholesale overwrite.
+            // No permission recompute: this doesn't change our own perms.
+            s.registered_users = users;
         }
         RoomEvent::SelfMovedToRoom { room_id } => {
             s.my_room_id = Some(room_id);

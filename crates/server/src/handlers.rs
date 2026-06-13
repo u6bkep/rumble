@@ -291,6 +291,18 @@ pub async fn handle_envelope(
             }
             handle_set_room_acl(sra, sender, state, persistence).await?;
         }
+        Some(Payload::RequestRegisteredUsers(_)) => {
+            if !sender.authenticated.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            handle_request_registered_users(sender, state, persistence).await?;
+        }
+        Some(Payload::SetRegisteredUserGroup(srug)) => {
+            if !sender.authenticated.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            handle_set_registered_user_group(srug, sender, state, persistence).await?;
+        }
         // Server-to-client messages or empty - ignore
         Some(
             Payload::ServerHello(_)
@@ -298,6 +310,7 @@ pub async fn handle_envelope(
             | Payload::AuthFailed(_)
             | Payload::CommandResult(_)
             | Payload::ParticipantRegistered(_)
+            | Payload::RegisteredUsers(_)
             | Payload::PermissionDenied(_)
             | Payload::UserKicked(_),
         )
@@ -2452,6 +2465,96 @@ async fn handle_set_user_group(
     {
         Ok(msg) => send_command_result(&sender, "SetUserGroup", true, &msg).await,
         Err(msg) => send_command_result(&sender, "SetUserGroup", false, &msg).await,
+    }
+}
+
+/// Handle RequestRegisteredUsers — reply with an admin snapshot of every
+/// registered identity and its (non-expired) group memberships, addressed by
+/// public key so offline users are included. Gated on MANAGE_ACL.
+async fn handle_request_registered_users(
+    sender: Arc<ClientHandle>,
+    state: Arc<ServerState>,
+    persistence: Arc<Persistence>,
+) -> Result<()> {
+    if let Err(denied) =
+        acl::check_permission(&state, &sender, Uuid::nil(), Permissions::MANAGE_ACL, &persistence).await
+    {
+        send_permission_denied(&sender, denied).await?;
+        return Ok(());
+    }
+
+    // Registered identities that currently hold a live connection.
+    let online_keys: std::collections::HashSet<[u8; 32]> = state
+        .snapshot_clients()
+        .iter()
+        .filter_map(|c| state.get_user_public_key(c.user_id))
+        .collect();
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let users: Vec<proto::RegisteredUserInfo> = persistence
+        .list_registered_users()
+        .into_iter()
+        .map(|(key, user)| {
+            // active_user_groups drops (and lazily sweeps) expired memberships,
+            // so the admin view matches what the user effectively holds.
+            let groups = persistence
+                .active_user_groups(&key, now)
+                .into_iter()
+                .map(|g| {
+                    let expires_at = persistence.get_group_expiry(&key, &g);
+                    proto::GroupMembership { group: g, expires_at }
+                })
+                .collect();
+            proto::RegisteredUserInfo {
+                public_key: key.to_vec(),
+                username: user.username,
+                groups,
+                online: online_keys.contains(&key),
+            }
+        })
+        .collect();
+
+    let reply = proto::Envelope {
+        state_hash: Vec::new(),
+        payload: Some(Payload::RegisteredUsers(proto::RegisteredUsers { users })),
+    };
+    let _ = sender.send_frame(&encode_frame(&reply)).await;
+    Ok(())
+}
+
+/// Handle SetRegisteredUserGroup — key-addressed group membership edit so an
+/// offline registered user can be added/removed (e.g. unban = remove from the
+/// "banned" group). Gated on MANAGE_ACL. Mirrors `handle_set_user_group` but
+/// targets a public key rather than a live session id.
+async fn handle_set_registered_user_group(
+    srug: proto::SetRegisteredUserGroup,
+    sender: Arc<ClientHandle>,
+    state: Arc<ServerState>,
+    persistence: Arc<Persistence>,
+) -> Result<()> {
+    if let Err(denied) =
+        acl::check_permission(&state, &sender, Uuid::nil(), Permissions::MANAGE_ACL, &persistence).await
+    {
+        send_permission_denied(&sender, denied).await?;
+        return Ok(());
+    }
+
+    let key: [u8; 32] = match <[u8; 32]>::try_from(srug.public_key.as_slice()) {
+        Ok(k) => k,
+        Err(_) => {
+            return send_command_result(&sender, "SetRegisteredUserGroup", false, "Invalid public key").await;
+        }
+    };
+
+    match crate::ops::apply_set_user_group_by_key(&state, &persistence, key, srug.group, srug.add, srug.expires_at)
+        .await
+    {
+        Ok(msg) => send_command_result(&sender, "SetRegisteredUserGroup", true, &msg).await,
+        Err(msg) => send_command_result(&sender, "SetRegisteredUserGroup", false, &msg).await,
     }
 }
 

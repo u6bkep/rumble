@@ -1120,6 +1120,13 @@ pub struct State {
     /// Slash commands the server advertises (synced from ServerState), for
     /// composer autocomplete. Static for a connection; cleared on disconnect.
     pub slash_commands: Vec<rumble_protocol::proto::SlashCommand>,
+    /// Admin-only roster of registered identities (incl. offline) with their
+    /// group memberships and expiries. Populated on demand by
+    /// [`Command::RequestRegisteredUsers`] (gated server-side on MANAGE_ACL),
+    /// NOT part of the synced/hashed server state — it's a pulled admin view,
+    /// refreshed when the admin UI opens and after a membership edit, and
+    /// cleared on disconnect. Empty for non-admins and before the first pull.
+    pub registered_users: Vec<rumble_protocol::proto::RegisteredUserInfo>,
 }
 
 impl State {
@@ -1433,6 +1440,20 @@ pub enum Command {
         add: bool,
         expires_at: u64,
     },
+    /// Admin: request the roster of registered identities (incl. offline) and
+    /// their group memberships. Gated server-side on MANAGE_ACL; the reply
+    /// populates [`State::registered_users`].
+    RequestRegisteredUsers,
+    /// Admin: add or remove a registered user — addressed by long-term public
+    /// key, so the target need not be connected — to/from a group. Gated on
+    /// MANAGE_ACL. Used for offline membership edits and unban (remove from the
+    /// "banned" group).
+    SetRegisteredUserGroup {
+        public_key: [u8; 32],
+        group: String,
+        add: bool,
+        expires_at: u64,
+    },
     /// Set room ACL entries. `base_version` is the
     /// [`rumble_protocol::room_acl_version`] of the configuration the editor
     /// loaded before editing — the server rejects the save if the room's ACL
@@ -1625,6 +1646,19 @@ impl std::fmt::Debug for Command {
                 .field("inherit_acl", inherit_acl)
                 .field("entries_count", &entries.len())
                 .field("base_version", base_version)
+                .finish(),
+            Command::RequestRegisteredUsers => write!(f, "RequestRegisteredUsers"),
+            Command::SetRegisteredUserGroup {
+                public_key,
+                group,
+                add,
+                expires_at,
+            } => f
+                .debug_struct("SetRegisteredUserGroup")
+                .field("public_key", &format!("{:02x?}...", &public_key[..4]))
+                .field("group", group)
+                .field("add", add)
+                .field("expires_at", expires_at)
                 .finish(),
         }
     }
