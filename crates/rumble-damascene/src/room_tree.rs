@@ -220,6 +220,9 @@ pub enum RoomTreeOutcome {
     /// User picked "Edit…" on a room — App should open the room editor
     /// modal (rename + per-room ACL) for this room.
     OpenRoomEditor(Uuid),
+    /// User picked "Kick…" / "Ban…" on a connected user — App should open
+    /// the moderation modal (reason + ban duration) for this user.
+    OpenKickBan { user_id: u64, username: String, ban: bool },
 }
 
 impl RoomTreeOutcome {
@@ -253,6 +256,8 @@ const KEY_USER_CTX_MUTE_LOCAL: &str = "user_ctx:mute_local";
 const KEY_USER_CTX_UNMUTE_LOCAL: &str = "user_ctx:unmute_local";
 const KEY_USER_CTX_SERVER_MUTE: &str = "user_ctx:server_mute";
 const KEY_USER_CTX_SERVER_UNMUTE: &str = "user_ctx:server_unmute";
+const KEY_USER_CTX_KICK: &str = "user_ctx:kick";
+const KEY_USER_CTX_BAN: &str = "user_ctx:ban";
 
 const KEY_MOVE_DISMISS: &str = "move_room:dismiss";
 const KEY_MOVE_CANCEL: &str = "move_room:cancel";
@@ -306,7 +311,10 @@ pub fn render_overlays(state: &RoomTreeState, app_state: &State) -> RoomTreeOver
             .room_context_menu
             .as_ref()
             .map(|m| render_room_context_menu(m, app_state)),
-        user_context_menu: state.user_context_menu.as_ref().map(render_user_context_menu),
+        user_context_menu: state
+            .user_context_menu
+            .as_ref()
+            .map(|m| render_user_context_menu(m, app_state)),
         move_room_modal: state.move_room_modal.as_ref().map(render_move_room_modal),
         delete_room_modal: state.delete_room_modal.as_ref().map(render_delete_room_modal),
     }
@@ -521,7 +529,7 @@ fn render_room_context_menu(menu: &RoomContextMenu, app_state: &State) -> El {
     context_menu("room_ctx", menu.point, items)
 }
 
-fn render_user_context_menu(menu: &UserContextMenu) -> El {
+fn render_user_context_menu(menu: &UserContextMenu, app_state: &State) -> El {
     let mut items: Vec<El> = vec![
         text(format!("User: {}", menu.username))
             .semibold()
@@ -573,6 +581,19 @@ fn render_user_context_menu(menu: &UserContextMenu) -> El {
                 KEY_USER_CTX_SERVER_MUTE
             }),
         );
+
+        // Moderation — gated on the root-scoped KICK / BAN bits. Both target a
+        // live session, so they only appear for connected remote users.
+        let perms = Permissions::from_bits_truncate(app_state.effective_permissions);
+        if perms.contains(Permissions::KICK) || perms.contains(Permissions::BAN) {
+            items.push(divider());
+        }
+        if perms.contains(Permissions::KICK) {
+            items.push(menu_item("Kick…").key(KEY_USER_CTX_KICK));
+        }
+        if perms.contains(Permissions::BAN) {
+            items.push(menu_item("Ban…").key(KEY_USER_CTX_BAN));
+        }
     }
 
     context_menu("user_ctx", menu.point, items)
@@ -842,10 +863,15 @@ fn handle_user_context_menu_event(state: &mut RoomTreeState, event: &UiEvent) ->
                 muted: key == KEY_USER_CTX_SERVER_MUTE,
             })
         }
+        KEY_USER_CTX_KICK | KEY_USER_CTX_BAN => RoomTreeOutcome::OpenKickBan {
+            user_id,
+            username: menu.username.clone(),
+            ban: key == KEY_USER_CTX_BAN,
+        },
         _ => return None,
     };
     state.user_context_menu = None;
-    let _ = room_id; // reserved for future per-room actions (e.g. kick reason)
+    let _ = room_id; // reserved for future per-room actions
     Some(outcome)
 }
 

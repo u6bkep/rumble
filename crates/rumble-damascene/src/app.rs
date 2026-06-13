@@ -34,7 +34,9 @@ use crate::{
     chat,
     elevate::{self, ElevateOutcome, ElevateState},
     identity::Identity,
-    lightbox, model, room_acl,
+    lightbox, model,
+    moderation::{self, KickBanModal, ModerationOutcome},
+    room_acl,
     room_tree::{self, RoomTreeOutcome, RoomTreeState},
     server_picker::{self, ServerForm, ServerPickerOutcome, ServerPickerState},
     settings::{self, SettingsOutcome, SettingsState},
@@ -73,6 +75,10 @@ pub struct RumbleApp<B: UiBackend = crate::backend::NativeUiBackend> {
     /// asynchronously as a `CommandResult` chat line and (on success)
     /// a `UserStatusChanged.is_elevated=true` broadcast.
     elevate: Option<ElevateState>,
+    /// Kick / ban prompt. `Some` while the modal is open; cleared on
+    /// Cancel/Escape/scrim or on submit. Opened from a connected user's
+    /// context menu (gated on KICK / BAN).
+    kick_ban: Option<KickBanModal>,
     /// In-flight ssh-agent op spawned on `runtime`.
     pending_agent_op: Option<PendingAgentOp>,
 
@@ -310,6 +316,7 @@ impl<B: UiBackend> RumbleApp<B> {
             wizard,
             unlock: UnlockState::default(),
             elevate: None,
+            kick_ban: None,
             pending_agent_op: None,
             server_picker: ServerPickerState::default(),
             settings_state: SettingsState::default(),
@@ -473,6 +480,7 @@ impl<B: UiBackend> App for RumbleApp<B> {
             self.room_tree = RoomTreeState::default();
             self.room_acl_modal = None;
             self.elevate = None;
+            self.kick_ban = None;
             self.voice_mode_menu_open = false;
             // Re-arm chat seeding: the next connect clears chat_messages and
             // delivers the new server's history, which must be absorbed as
@@ -792,6 +800,12 @@ impl<B: UiBackend> App for RumbleApp<B> {
             None
         };
 
+        let kick_ban_layer = if session_gate_clear && let Some(m) = self.kick_ban.as_ref() {
+            Some(moderation::render(m, &self.selection))
+        } else {
+            None
+        };
+
         // Always wrap in `overlays(...)` — even with no app layers, the
         // root must be an `Axis::Overlay` container so damascene's runtime
         // tooltip layer overlays the main view instead of competing for
@@ -822,6 +836,7 @@ impl<B: UiBackend> App for RumbleApp<B> {
                 room_acl_modal_layer,
                 room_acl_popover_layer,
                 elevate_layer,
+                kick_ban_layer,
                 cert_layer,
                 unlock_layer,
                 wizard_layer,
@@ -923,6 +938,28 @@ impl<B: UiBackend> App for RumbleApp<B> {
                 ElevateOutcome::Submit { password } => {
                     self.backend.send(Command::Elevate { password });
                     self.elevate = None;
+                    return;
+                }
+            }
+        }
+
+        // Kick / ban prompt — same modal-first capture rule as elevate so
+        // the reason keystrokes don't fall through to the chat composer.
+        if self.kick_ban.is_some() {
+            let outcome = {
+                let m = self.kick_ban.as_mut().expect("checked");
+                moderation::handle_event(m, &event, &mut self.selection)
+            };
+            match outcome {
+                ModerationOutcome::Ignored => return,
+                ModerationOutcome::Handled => return,
+                ModerationOutcome::Cancel => {
+                    self.kick_ban = None;
+                    return;
+                }
+                ModerationOutcome::Submit(cmd) => {
+                    self.backend.send(cmd);
+                    self.kick_ban = None;
                     return;
                 }
             }
@@ -1240,6 +1277,13 @@ impl<B: UiBackend> App for RumbleApp<B> {
                 if let Some(modal) = room_acl::RoomAclModalState::open_for(&room_tree_state, room_id) {
                     self.room_acl_modal = Some(modal);
                 }
+            }
+            RoomTreeOutcome::OpenKickBan { user_id, username, ban } => {
+                self.kick_ban = Some(if ban {
+                    KickBanModal::ban(user_id, username)
+                } else {
+                    KickBanModal::kick(user_id, username)
+                });
             }
         }
     }
@@ -2740,6 +2784,16 @@ impl<B: UiBackend> RumbleApp<B> {
     /// Test/scene-dump hook for the sudo elevation prompt.
     pub fn set_elevate_state_for_test(&mut self, state: ElevateState) {
         self.elevate = Some(state);
+    }
+
+    /// Test/scene-dump hook: open the kick/ban moderation modal for a fixed
+    /// remote user so the dump renders the reason + (ban) duration surface.
+    pub fn open_kick_ban_for_test(&mut self, ban: bool) {
+        self.kick_ban = Some(if ban {
+            KickBanModal::ban(2, "bob".to_string())
+        } else {
+            KickBanModal::kick(2, "bob".to_string())
+        });
     }
 
     /// Test/scene-dump hook for the toolbar transmission-mode dropdown.

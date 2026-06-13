@@ -181,6 +181,9 @@ enum Scene {
     /// Sudo elevation modal with a populated password field + an
     /// error message — exercises the form-message treatment.
     ElevatePrompt,
+    /// Kick/ban moderation modal (ban variant) — reason field + the
+    /// ban-duration tabs.
+    ModerationBan,
     /// Settings → Connection while the local user holds [`SUDO`] but
     /// hasn't elevated yet — the "Elevate to superuser…" button is
     /// visible.
@@ -244,6 +247,7 @@ impl Scene {
         Scene::SettingsAbout,
         Scene::RoomAclModal,
         Scene::ElevatePrompt,
+        Scene::ModerationBan,
         Scene::SettingsConnectionSudo,
         Scene::SettingsConnectionElevated,
         Scene::SettingsConnectionLocalKey,
@@ -291,6 +295,7 @@ impl Scene {
             Scene::SettingsAbout => "settings_about",
             Scene::RoomAclModal => "room_acl_modal",
             Scene::ElevatePrompt => "elevate_prompt",
+            Scene::ModerationBan => "moderation_ban",
             Scene::SettingsConnectionSudo => "settings_connection_sudo",
             Scene::SettingsConnectionElevated => "settings_connection_elevated",
             Scene::SettingsConnectionLocalKey => "settings_connection_local_key",
@@ -406,6 +411,7 @@ impl Scene {
             Scene::SettingsAdmin => admin_state(),
             Scene::RoomAclModal => room_acl_state(),
             Scene::ElevatePrompt | Scene::SettingsConnectionSudo => sudo_capable_state(false),
+            Scene::ModerationBan => connected_state(),
             Scene::SettingsConnectionElevated => sudo_capable_state(true),
             Scene::FileSharePending | Scene::FileShareFailed => file_share_state(self),
         }
@@ -603,6 +609,7 @@ impl Scene {
                     error: Some("Incorrect password".to_string()),
                 });
             }
+            Scene::ModerationBan => app.open_kick_ban_for_test(true),
             Scene::SettingsConnectionSudo | Scene::SettingsConnectionElevated => {
                 app.open_settings_for_test(SettingsTab::Connection);
             }

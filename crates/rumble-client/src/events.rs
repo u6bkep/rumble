@@ -1753,6 +1753,7 @@ mod tests {
             kicked: None,
             group_definitions: vec![],
             slash_commands: vec![],
+            registered_users: vec![],
         };
 
         let users_in_room1 = state.users_in_room(room1_uuid);
