@@ -242,6 +242,13 @@ pub struct RoomAclModalState {
     /// Editable buffer for the room name. Bound to the "Room name" text
     /// input; only mutable when `can_modify` is set.
     pub name_input: String,
+    /// The room's description at open time (empty when unset). Compared
+    /// against `description_input` on save to decide whether a
+    /// `SetRoomDescription` command is emitted.
+    pub room_description: String,
+    /// Editable buffer for the room description. Only mutable when
+    /// `can_modify` is set (same `MODIFY_ROOM` gate as rename).
+    pub description_input: String,
     /// Local user holds `MODIFY_ROOM` on this room — gates the editable
     /// name field and whether a rename is sent on save. Mirrors the
     /// server's `handle_rename_room` permission check.
@@ -283,6 +290,7 @@ impl RoomAclModalState {
     pub fn open_for(app_state: &State, room_id: Uuid) -> Option<Self> {
         let room = app_state.get_room(room_id)?;
         let room_name = room.name.clone();
+        let room_description = room.description.clone().unwrap_or_default();
 
         // Per-room permissions trump effective when the server has
         // computed an entry for this room — same rule the context menu
@@ -316,6 +324,8 @@ impl RoomAclModalState {
             room_id,
             name_input: room_name.clone(),
             room_name,
+            description_input: room_description.clone(),
+            room_description,
             can_modify,
             can_write_acl,
             path,
@@ -335,11 +345,10 @@ impl RoomAclModalState {
         self.room_id == ROOT_ROOM_UUID
     }
 
-    /// Build the commands the Save button should fire, in order. A
-    /// `RenameRoom` is emitted first when the name was changed to a
-    /// non-empty value and the user holds `MODIFY_ROOM`; a `SetRoomAcl`
-    /// follows when the user holds `WRITE`. Either may be absent, so the
-    /// list can hold zero, one, or two commands.
+    /// Build the commands the Save button should fire, in order. With
+    /// `MODIFY_ROOM`: a `RenameRoom` when the name changed to a non-empty
+    /// value, then a `SetRoomDescription` when the description changed
+    /// (including cleared). With `WRITE`: a `SetRoomAcl`. Any may be absent.
     pub fn to_commands(&self) -> Vec<Command> {
         let mut cmds = Vec::new();
 
@@ -348,6 +357,16 @@ impl RoomAclModalState {
             cmds.push(Command::RenameRoom {
                 room_id: self.room_id,
                 new_name: new_name.to_string(),
+            });
+        }
+
+        // Description may be deliberately cleared, so an empty value is a
+        // valid change — compare trimmed against the original.
+        let new_desc = self.description_input.trim();
+        if self.can_modify && new_desc != self.room_description.trim() {
+            cmds.push(Command::SetRoomDescription {
+                room_id: self.room_id,
+                description: new_desc.to_string(),
             });
         }
 
@@ -382,6 +401,7 @@ pub enum RoomAclOutcome {
 // ============================================================
 
 const KEY_NAME_INPUT: &str = "room_acl:name";
+const KEY_DESC_INPUT: &str = "room_acl:desc";
 const KEY_DISMISS: &str = "room_acl:dismiss";
 const KEY_CLOSE: &str = "room_acl:close";
 const KEY_CANCEL: &str = "room_acl:cancel";
@@ -455,12 +475,13 @@ pub fn render(state: &RoomAclModalState, app_state: &State, selection: &Selectio
 fn render_modal(state: &RoomAclModalState, app_state: &State, selection: &Selection) -> El {
     let header = render_header(state);
     let name_field = render_name_field(state, selection);
+    let desc_field = render_description_field(state, selection);
     let footer = render_footer();
 
-    // The name field is always present; the ACL editor only appears when
-    // the user holds WRITE. A MODIFY_ROOM-only user sees just the rename
-    // box plus a note.
-    let mut body_children: Vec<El> = vec![name_field];
+    // Name + description are always present; the ACL editor only appears when
+    // the user holds WRITE. A MODIFY_ROOM-only user sees just the rename +
+    // description boxes plus a note.
+    let mut body_children: Vec<El> = vec![name_field, desc_field];
     if state.can_write_acl {
         let inherited = render_inherited_block(state, app_state);
         let local = render_local_rules(state);
@@ -528,6 +549,27 @@ fn render_name_field(state: &RoomAclModalState, selection: &Selection) -> El {
     };
 
     field_row("Room name", control)
+}
+
+fn render_description_field(state: &RoomAclModalState, selection: &Selection) -> El {
+    let control: El = if state.can_modify {
+        text_input_with(
+            &state.description_input,
+            selection,
+            KEY_DESC_INPUT,
+            TextInputOpts {
+                placeholder: Some("Shown on hover in the room tree"),
+                ..Default::default()
+            },
+        )
+        .width(Size::Fill(1.0))
+    } else if state.room_description.is_empty() {
+        text("—").muted().width(Size::Fill(1.0))
+    } else {
+        text(state.room_description.clone()).width(Size::Fill(1.0))
+    };
+
+    field_row("Description", control)
 }
 
 // ---- Header / breadcrumb ------------------------------------------
@@ -990,9 +1032,19 @@ pub fn handle_event(
         return RoomAclOutcome::Save(state.to_commands());
     }
 
-    // Room-name text input — only editable when the user can rename.
+    // Room-name + description text inputs — only editable with MODIFY_ROOM.
     if state.can_modify
         && damascene_core::widgets::text_input::apply_event(&mut state.name_input, selection, KEY_NAME_INPUT, event)
+    {
+        return RoomAclOutcome::Handled;
+    }
+    if state.can_modify
+        && damascene_core::widgets::text_input::apply_event(
+            &mut state.description_input,
+            selection,
+            KEY_DESC_INPUT,
+            event,
+        )
     {
         return RoomAclOutcome::Handled;
     }
@@ -1152,6 +1204,8 @@ mod tests {
             room_id: Uuid::nil(),
             room_name: String::new(),
             name_input: String::new(),
+            room_description: String::new(),
+            description_input: String::new(),
             can_modify: true,
             can_write_acl: true,
             path: vec![(Uuid::nil(), String::new())],

@@ -396,6 +396,10 @@ fn push_room_subtree(state: &State, room_id: Uuid, depth: usize, selected_room_i
     .padding(Sides::xy(tokens::SPACE_1, tokens::SPACE_1))
     .radius(tokens::RADIUS_SM)
     .focusable();
+    // Room description surfaces as a hover tooltip on the row.
+    if let Some(desc) = node.description.as_ref().map(|d| d.trim()).filter(|d| !d.is_empty()) {
+        row_el = row_el.tooltip(desc.to_string());
+    }
     if is_selected {
         // Subtle pill so single-click selection is visible without
         // looking like the active-room indicator.

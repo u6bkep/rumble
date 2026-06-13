@@ -909,6 +909,7 @@ fn room_acl_state() -> State {
                         apply_subs: false,
                     },
                 ],
+                description: Some("Match planning and raids. Keep it civil.".into()),
                 ..make_room_with_parent(ROOM_STAGE, "Strategy", Some(ROOM_WORK))
             },
         ],
@@ -922,7 +923,12 @@ fn room_acl_state() -> State {
         ],
         my_user_id: Some(1),
         my_room_id: Some(stage_uuid),
-        effective_permissions: (Permissions::WRITE | Permissions::TEXT_MESSAGE | Permissions::SPEAK).bits(),
+        // WRITE (ACL editor) + MODIFY_ROOM (editable name/description inputs).
+        effective_permissions: (Permissions::WRITE
+            | Permissions::MODIFY_ROOM
+            | Permissions::TEXT_MESSAGE
+            | Permissions::SPEAK)
+            .bits(),
         group_definitions: vec![
             GroupInfo {
                 name: "default".into(),
