@@ -942,8 +942,10 @@ impl<B: UiBackend> App for RumbleApp<B> {
                     self.room_acl_modal = None;
                     return;
                 }
-                room_acl::RoomAclOutcome::Save(cmd) => {
-                    self.backend.send(cmd);
+                room_acl::RoomAclOutcome::Save(cmds) => {
+                    for cmd in cmds {
+                        self.backend.send(cmd);
+                    }
                     self.room_acl_modal = None;
                     return;
                 }
@@ -1234,7 +1236,7 @@ impl<B: UiBackend> App for RumbleApp<B> {
                     self.backend.send(cmd);
                 }
             }
-            RoomTreeOutcome::OpenAclEditor(room_id) => {
+            RoomTreeOutcome::OpenRoomEditor(room_id) => {
                 if let Some(modal) = room_acl::RoomAclModalState::open_for(&room_tree_state, room_id) {
                     self.room_acl_modal = Some(modal);
                 }

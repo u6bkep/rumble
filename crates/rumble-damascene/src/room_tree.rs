@@ -217,9 +217,9 @@ pub enum RoomTreeOutcome {
     /// thin wrapper over the command surface, and paired commands
     /// like `(JoinRoom, RequestChatHistory)` fit naturally as a list.
     Dispatch(Vec<Command>),
-    /// User picked "Permissions…" on a room — App should open the
-    /// per-room ACL editor modal for this room.
-    OpenAclEditor(Uuid),
+    /// User picked "Edit…" on a room — App should open the room editor
+    /// modal (rename + per-room ACL) for this room.
+    OpenRoomEditor(Uuid),
 }
 
 impl RoomTreeOutcome {
@@ -240,7 +240,7 @@ impl RoomTreeOutcome {
 
 const KEY_ROOM_CTX_DISMISS: &str = "room_ctx:dismiss";
 const KEY_ROOM_CTX_JOIN: &str = "room_ctx:join";
-const KEY_ROOM_CTX_PERMS: &str = "room_ctx:perms";
+const KEY_ROOM_CTX_EDIT: &str = "room_ctx:edit";
 const KEY_ROOM_CTX_ADD_CHILD: &str = "room_ctx:add_child";
 const KEY_ROOM_CTX_DELETE: &str = "room_ctx:delete";
 
@@ -509,8 +509,10 @@ fn render_room_context_menu(menu: &RoomContextMenu, app_state: &State) -> El {
     if perms.contains(Permissions::MAKE_ROOM) {
         items.push(menu_item("Add child room").key(KEY_ROOM_CTX_ADD_CHILD));
     }
-    if perms.contains(Permissions::WRITE) {
-        items.push(menu_item("Permissions…").key(KEY_ROOM_CTX_PERMS));
+    // "Edit…" opens a combined modal: rename the room (needs MODIFY_ROOM)
+    // and/or edit its ACL (needs WRITE). Show it if the user holds either.
+    if perms.contains(Permissions::WRITE) || perms.contains(Permissions::MODIFY_ROOM) {
+        items.push(menu_item("Edit…").key(KEY_ROOM_CTX_EDIT));
     }
     if perms.contains(Permissions::MODIFY_ROOM) && !menu.is_root {
         items.push(menu_item("Delete room…").key(KEY_ROOM_CTX_DELETE));
@@ -786,9 +788,9 @@ fn handle_room_context_menu_event(state: &mut RoomTreeState, event: &UiEvent) ->
             state.room_context_menu = None;
             Some(RoomTreeOutcome::Handled)
         }
-        KEY_ROOM_CTX_PERMS => {
+        KEY_ROOM_CTX_EDIT => {
             state.room_context_menu = None;
-            Some(RoomTreeOutcome::OpenAclEditor(room_id))
+            Some(RoomTreeOutcome::OpenRoomEditor(room_id))
         }
         _ => None,
     }

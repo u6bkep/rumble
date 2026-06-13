@@ -1,14 +1,22 @@
-//! Per-room Permissions modal.
+//! Per-room "Edit room" modal — rename + permissions.
 //!
-//! Opened from the room context menu when the connected user has
-//! `Permissions::WRITE` for the target room. Edits the room's
-//! `inherit_acl` flag and `Vec<RoomAclEntry>` and saves through
-//! `Command::SetRoomAcl`. Read-only sister surface to the Admin tab in
-//! the Settings dialog — that tab edits per-group base permissions,
-//! this modal edits how those base perms are sliced per room.
+//! Opened from the room context menu's "Edit…" item when the connected
+//! user holds `Permissions::WRITE` (ACL editing) or
+//! `Permissions::MODIFY_ROOM` (rename) for the target room. Carries two
+//! independent edits, each gated on its own permission:
+//! - **Rename** — the "Room name" field; saved through
+//!   `Command::RenameRoom` (server requires `MODIFY_ROOM`).
+//! - **ACL** — the room's `inherit_acl` flag and `Vec<RoomAclEntry>`;
+//!   saved through `Command::SetRoomAcl` (server requires `WRITE`).
+//!
+//! Save fires whichever commands apply (see [`RoomAclModalState::to_commands`]).
+//! The ACL surface is the read-only sister of the Admin tab in the
+//! Settings dialog — that tab edits per-group base permissions, this
+//! modal edits how those base perms are sliced per room.
 //!
 //! Visual model (matches `reference/ACL wireframes/`):
 //! - Title + breadcrumb of the room path (Root › Lobby › Gaming).
+//! - `Room name` text input (editable with `MODIFY_ROOM`).
 //! - `Inherit ACL` checkbox bound to `inherit_acl`.
 //! - **Inherited from parent chain** — a collapsible block that lists
 //!   read-only synthetic rules: first each group's base permissions
@@ -227,7 +235,21 @@ impl AclEditEntry {
 #[derive(Debug)]
 pub struct RoomAclModalState {
     pub room_id: Uuid,
+    /// The room's name as it was at open time. Compared against
+    /// `name_input` on save to decide whether a `RenameRoom` command is
+    /// emitted.
     pub room_name: String,
+    /// Editable buffer for the room name. Bound to the "Room name" text
+    /// input; only mutable when `can_modify` is set.
+    pub name_input: String,
+    /// Local user holds `MODIFY_ROOM` on this room — gates the editable
+    /// name field and whether a rename is sent on save. Mirrors the
+    /// server's `handle_rename_room` permission check.
+    pub can_modify: bool,
+    /// Local user holds `WRITE` on this room — gates the ACL-editing
+    /// portion of the modal (inherit toggle, inherited block, local
+    /// rules) and whether a `SetRoomAcl` is sent on save.
+    pub can_write_acl: bool,
     /// Breadcrumb path from root down to this room (inclusive). Each
     /// element is `(uuid, name)` so we don't re-walk the room tree on
     /// every frame; computed at open time and held until close.
@@ -262,6 +284,18 @@ impl RoomAclModalState {
         let room = app_state.get_room(room_id)?;
         let room_name = room.name.clone();
 
+        // Per-room permissions trump effective when the server has
+        // computed an entry for this room — same rule the context menu
+        // gate follows.
+        let perms_bits = app_state
+            .per_room_permissions
+            .get(&room_id)
+            .copied()
+            .unwrap_or(app_state.effective_permissions);
+        let perms = Permissions::from_bits_truncate(perms_bits);
+        let can_modify = perms.contains(Permissions::MODIFY_ROOM);
+        let can_write_acl = perms.contains(Permissions::WRITE);
+
         // Walk parent-to-root and reverse to get root-down for the
         // breadcrumb. Then append self.
         let mut path: Vec<(Uuid, String)> = app_state
@@ -280,7 +314,10 @@ impl RoomAclModalState {
 
         Some(RoomAclModalState {
             room_id,
+            name_input: room_name.clone(),
             room_name,
+            can_modify,
+            can_write_acl,
             path,
             inherit_acl: room.inherit_acl,
             entries,
@@ -298,14 +335,32 @@ impl RoomAclModalState {
         self.room_id == ROOT_ROOM_UUID
     }
 
-    /// Build a `Command::SetRoomAcl` from the current pending state.
-    pub fn to_command(&self) -> Command {
-        Command::SetRoomAcl {
-            room_id: self.room_id,
-            inherit_acl: self.inherit_acl,
-            entries: self.entries.iter().map(AclEditEntry::to_proto).collect(),
-            base_version: self.base_version,
+    /// Build the commands the Save button should fire, in order. A
+    /// `RenameRoom` is emitted first when the name was changed to a
+    /// non-empty value and the user holds `MODIFY_ROOM`; a `SetRoomAcl`
+    /// follows when the user holds `WRITE`. Either may be absent, so the
+    /// list can hold zero, one, or two commands.
+    pub fn to_commands(&self) -> Vec<Command> {
+        let mut cmds = Vec::new();
+
+        let new_name = self.name_input.trim();
+        if self.can_modify && !new_name.is_empty() && new_name != self.room_name {
+            cmds.push(Command::RenameRoom {
+                room_id: self.room_id,
+                new_name: new_name.to_string(),
+            });
         }
+
+        if self.can_write_acl {
+            cmds.push(Command::SetRoomAcl {
+                room_id: self.room_id,
+                inherit_acl: self.inherit_acl,
+                entries: self.entries.iter().map(AclEditEntry::to_proto).collect(),
+                base_version: self.base_version,
+            });
+        }
+
+        cmds
     }
 }
 
@@ -317,14 +372,16 @@ pub enum RoomAclOutcome {
     Ignored,
     Handled,
     Close,
-    /// Save + close. The carried command is `Command::SetRoomAcl`.
-    Save(Command),
+    /// Save + close. Carries the commands to fire in order — a
+    /// `RenameRoom` and/or `SetRoomAcl` (see [`RoomAclModalState::to_commands`]).
+    Save(Vec<Command>),
 }
 
 // ============================================================
 // Routed-key constants
 // ============================================================
 
+const KEY_NAME_INPUT: &str = "room_acl:name";
 const KEY_DISMISS: &str = "room_acl:dismiss";
 const KEY_CLOSE: &str = "room_acl:close";
 const KEY_CANCEL: &str = "room_acl:cancel";
@@ -395,23 +452,40 @@ pub fn render(state: &RoomAclModalState, app_state: &State, selection: &Selectio
     }
 }
 
-fn render_modal(state: &RoomAclModalState, app_state: &State, _selection: &Selection) -> El {
+fn render_modal(state: &RoomAclModalState, app_state: &State, selection: &Selection) -> El {
     let header = render_header(state);
-    let sub = render_subheader(state);
-    let inherited = render_inherited_block(state, app_state);
-    let local = render_local_rules(state);
-    let add_rule = button("+ add group rule").key(KEY_ADD_RULE_OPEN).secondary();
+    let name_field = render_name_field(state, selection);
     let footer = render_footer();
 
-    let body = column([inherited, local, add_rule])
-        .gap(tokens::SPACE_3)
-        .width(Size::Fill(1.0));
+    // The name field is always present; the ACL editor only appears when
+    // the user holds WRITE. A MODIFY_ROOM-only user sees just the rename
+    // box plus a note.
+    let mut body_children: Vec<El> = vec![name_field];
+    if state.can_write_acl {
+        let inherited = render_inherited_block(state, app_state);
+        let local = render_local_rules(state);
+        let add_rule = button("+ add group rule").key(KEY_ADD_RULE_OPEN).secondary();
+        body_children.push(render_subheader(state));
+        body_children.push(divider());
+        body_children.push(
+            column([inherited, local, add_rule])
+                .gap(tokens::SPACE_3)
+                .width(Size::Fill(1.0)),
+        );
+    } else {
+        body_children.push(
+            paragraph("You can rename this room, but you don't have permission to edit its ACL.")
+                .muted()
+                .font_size(tokens::TEXT_XS.size),
+        );
+    }
+
+    let body = column(body_children).gap(tokens::SPACE_3).width(Size::Fill(1.0));
 
     let panel = modal_panel(
-        "Permissions",
+        "Edit room",
         [
             header,
-            sub,
             scroll([column([body])
                 .padding(Sides::xy(tokens::SPACE_3, 0.0))
                 .width(Size::Fill(1.0))])
@@ -427,6 +501,33 @@ fn render_modal(state: &RoomAclModalState, app_state: &State, _selection: &Selec
     .height(Size::Fixed(640.0));
 
     overlay([scrim(KEY_DISMISS), panel.block_pointer()])
+}
+
+// ---- Room-name field ----------------------------------------------
+
+fn render_name_field(state: &RoomAclModalState, selection: &Selection) -> El {
+    let control: El = if state.can_modify {
+        text_input_with(
+            &state.name_input,
+            selection,
+            KEY_NAME_INPUT,
+            TextInputOpts {
+                placeholder: Some("Room name"),
+                ..Default::default()
+            },
+        )
+        .width(Size::Fill(1.0))
+    } else {
+        // Read-only: show the current name, no input affordance.
+        text(if state.room_name.is_empty() {
+            "Root".to_string()
+        } else {
+            state.room_name.clone()
+        })
+        .width(Size::Fill(1.0))
+    };
+
+    field_row("Room name", control)
 }
 
 // ---- Header / breadcrumb ------------------------------------------
@@ -458,7 +559,7 @@ fn render_header(state: &RoomAclModalState) -> El {
     };
 
     column([
-        row([text("Permissions").semibold(), scope_tag])
+        row([text("Edit room").semibold(), scope_tag])
             .gap(tokens::SPACE_2)
             .align(Align::Center)
             .width(Size::Fill(1.0)),
@@ -873,7 +974,7 @@ pub fn handle_event(
     state: &mut RoomAclModalState,
     event: &UiEvent,
     app_state: &State,
-    _selection: &mut Selection,
+    selection: &mut Selection,
 ) -> RoomAclOutcome {
     // Dismiss (scrim click / Cancel / Close / Esc).
     if event.kind == UiEventKind::Escape
@@ -886,7 +987,14 @@ pub fn handle_event(
 
     // Save.
     if event.is_click_or_activate(KEY_SAVE) {
-        return RoomAclOutcome::Save(state.to_command());
+        return RoomAclOutcome::Save(state.to_commands());
+    }
+
+    // Room-name text input — only editable when the user can rename.
+    if state.can_modify
+        && damascene_core::widgets::text_input::apply_event(&mut state.name_input, selection, KEY_NAME_INPUT, event)
+    {
+        return RoomAclOutcome::Handled;
     }
 
     if !matches!(event.kind, UiEventKind::Click | UiEventKind::Activate) {
@@ -1043,6 +1151,9 @@ mod tests {
         RoomAclModalState {
             room_id: Uuid::nil(),
             room_name: String::new(),
+            name_input: String::new(),
+            can_modify: true,
+            can_write_acl: true,
             path: vec![(Uuid::nil(), String::new())],
             inherit_acl: true,
             entries: vec![AclEditEntry {
