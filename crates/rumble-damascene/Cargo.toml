@@ -34,7 +34,10 @@ bench = false
 
 [dependencies]
 # Damascene UI. Pin lives in the workspace [workspace.dependencies] block.
-damascene-core = { workspace = true }
+# Workspace sets default-features=false for damascene-core so rumble-admin-web
+# can drop NotoColorEmoji. Re-enable the full font set (inter + jetbrains-mono +
+# emoji + symbols) here — the desktop client uses color emoji.
+damascene-core = { workspace = true, features = ["default_fonts"] }
 damascene-markdown = { workspace = true }
 damascene-winit-wgpu = { workspace = true }
 damascene-wgpu = { workspace = true }

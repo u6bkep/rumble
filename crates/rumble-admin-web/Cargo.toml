@@ -19,8 +19,14 @@ rumble-web-types = { path = "../rumble-web-types" }
 # Damascene UI. `damascene-web` carries a native stub, so the crate still
 # type-checks on the host target; the real browser host activates under
 # `cfg(target_arch = "wasm32")`.
-damascene-core = { workspace = true }
-damascene-web = { workspace = true }
+#
+# Font opt-out: keep Inter + JetBrains Mono + Symbols but drop NotoColorEmoji
+# (~10 MB incompressible CBDT bitmaps, ~9.5 MB brotli). The admin SPA has no
+# use for color emoji. Set default-features = false on both this crate and
+# damascene-core (which would otherwise union in `emoji` through its own
+# defaults). See damascene issue #49 / upstream commit e4237ca.
+damascene-core = { workspace = true, default-features = false, features = ["inter", "jetbrains-mono", "symbols"] }
+damascene-web = { workspace = true, default-features = false, features = ["inter", "jetbrains-mono", "symbols"] }
 
 serde = { workspace = true }
 serde_json = { workspace = true }
