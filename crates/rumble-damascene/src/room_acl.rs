@@ -507,13 +507,21 @@ fn render_modal(state: &RoomAclModalState, app_state: &State, selection: &Select
         "Edit room",
         [
             header,
-            scroll([column([body])
-                .padding(Sides::xy(tokens::SPACE_3, 0.0))
-                .width(Size::Fill(1.0))])
-            .padding(Sides::xy(0.0, tokens::SPACE_2))
-            .gap(tokens::SPACE_3)
-            .width(Size::Fill(1.0))
-            .height(Size::Fill(1.0)),
+            // `.scrollbar_gutter()` reserves a thumb-width band on the right
+            // (CSS `scrollbar-gutter: stable`); the gutter is additive on top
+            // of `padding.right`, so left/vertical padding sits on the scroll
+            // node and the gutter owns the right inset.
+            scroll([column([body]).width(Size::Fill(1.0))])
+                .padding(Sides {
+                    left: tokens::SPACE_3,
+                    right: 0.0,
+                    top: tokens::SPACE_2,
+                    bottom: tokens::SPACE_2,
+                })
+                .scrollbar_gutter()
+                .gap(tokens::SPACE_3)
+                .width(Size::Fill(1.0))
+                .height(Size::Fill(1.0)),
             divider(),
             footer,
         ],

@@ -96,12 +96,14 @@ const KEY_AGENT_COMMENT: &str = "wizard:comment";
 const KEY_UNLOCK_PWD: &str = "unlock:pwd";
 const KEY_UNLOCK_SUBMIT: &str = "unlock:submit";
 
+const AGENT_ROW_PREFIX: &str = "wizard:agent-row";
+
 pub fn agent_row_key(idx: usize) -> String {
-    format!("wizard:agent-row:{idx}")
+    damascene_core::key::indexed(AGENT_ROW_PREFIX, idx)
 }
 
 pub fn parse_agent_row_key(key: &str) -> Option<usize> {
-    key.strip_prefix("wizard:agent-row:").and_then(|s| s.parse().ok())
+    damascene_core::key::index(key, AGENT_ROW_PREFIX)
 }
 
 /// Render the wizard.
