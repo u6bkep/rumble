@@ -955,9 +955,9 @@ impl AdminApp {
 
     fn login_view(&self) -> El {
         let pw = text_input_with(
+            KEY_LOGIN_PW,
             &self.login_password,
             &self.selection,
-            KEY_LOGIN_PW,
             TextInputOpts::default().placeholder("Sudo password").password(),
         )
         .fill_width();
@@ -981,18 +981,18 @@ impl AdminApp {
         let token = labeled_input(
             "Setup token",
             text_input_with(
+                KEY_BOOT_TOKEN,
                 &self.bootstrap.setup_token,
                 &self.selection,
-                KEY_BOOT_TOKEN,
                 TextInputOpts::default().placeholder("From the server log"),
             ),
         );
         let pw = labeled_input(
             "Sudo password",
             text_input_with(
+                KEY_BOOT_PW,
                 &self.bootstrap.sudo_password,
                 &self.selection,
-                KEY_BOOT_PW,
                 TextInputOpts::default()
                     .placeholder("Choose a sudo password")
                     .password(),
@@ -1001,9 +1001,9 @@ impl AdminApp {
         let key = labeled_input(
             "Admin public key (base64, optional)",
             text_input_with(
+                KEY_BOOT_KEY,
                 &self.bootstrap.admin_key,
                 &self.selection,
-                KEY_BOOT_KEY,
                 TextInputOpts::default().placeholder("Ed25519 public key to seed the admin group"),
             ),
         );
@@ -1064,16 +1064,16 @@ impl AdminApp {
             "Create room",
             [row([
                 text_input_with(
+                    KEY_ROOM_NAME,
                     &self.room_name,
                     &self.selection,
-                    KEY_ROOM_NAME,
                     TextInputOpts::default().placeholder("Room name"),
                 )
                 .fill_width(),
                 text_input_with(
+                    KEY_ROOM_DESC,
                     &self.room_desc,
                     &self.selection,
-                    KEY_ROOM_DESC,
                     TextInputOpts::default().placeholder("Description (optional)"),
                 )
                 .fill_width(),
@@ -1125,9 +1125,9 @@ impl AdminApp {
             [
                 row([
                     text_input_with(
+                        KEY_GROUP_NAME,
                         &self.group_name,
                         &self.selection,
-                        KEY_GROUP_NAME,
                         TextInputOpts::default().placeholder("Group name"),
                     )
                     .fill_width(),
@@ -1244,7 +1244,7 @@ impl AdminApp {
             .fill_width();
 
         let inherit = row([
-            checkbox(ae.inherit_acl).key(KEY_AE_INHERIT),
+            checkbox(KEY_AE_INHERIT, ae.inherit_acl),
             text("Inherit ACL from parent room"),
         ])
         .gap(tokens::SPACE_2)
@@ -1356,7 +1356,7 @@ impl AdminApp {
                         ])
                         .gap(0.0)
                         .fill_width(),
-                        switch(member).key(format!("{KEY_UG_TOGGLE}{}", g.name)),
+                        switch(format!("{KEY_UG_TOGGLE}{}", g.name), member),
                     ])
                     .gap(tokens::SPACE_3)
                     .align(Align::Center)
@@ -1380,7 +1380,7 @@ fn perm_switch_row(bit: u32, label: &str, desc: &str, on: bool) -> El {
         column([text(label.to_string()).small(), text(desc.to_string()).muted().small()])
             .gap(0.0)
             .fill_width(),
-        switch(on).key(format!("{KEY_GE_PERM}{bit:08x}")),
+        switch(format!("{KEY_GE_PERM}{bit:08x}"), on),
     ])
     .gap(tokens::SPACE_3)
     .align(Align::Center)

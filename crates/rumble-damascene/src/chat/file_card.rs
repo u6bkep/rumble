@@ -247,9 +247,9 @@ fn transfer_progress_block(status: &TransferStatus, confirm_pending: bool) -> El
     };
 
     let bar: El = if status.size == 0 {
-        progress(1.0, tokens::PRIMARY)
+        progress(1.0)
     } else {
-        progress(progress_frac, tokens::PRIMARY)
+        progress(progress_frac)
     };
 
     let direction_label = match status.direction {

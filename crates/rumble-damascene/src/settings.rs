@@ -926,7 +926,7 @@ fn vu_meter(level: Level, gate_overlay: Option<&PipelineConfig>) -> El {
                 Some(_) => tokens::SUCCESS,
                 None => tokens::MUTED,
             };
-            progress(value_n, color)
+            progress_with_color(value_n, color)
                 .width(Size::Fixed(VU_BAR_W))
                 .height(Size::Fixed(VU_BAR_H))
         }

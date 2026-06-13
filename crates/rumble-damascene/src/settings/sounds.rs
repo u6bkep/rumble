@@ -6,12 +6,10 @@ pub(super) fn render_sounds(pending: &PendingSettings) -> El {
     let master = section_card(
         "Master",
         [
-            field_row("Enable sound effects", switch(pending.sfx_enabled).key(KEY_SFX_ENABLED)),
+            field_row("Enable sound effects", switch(KEY_SFX_ENABLED, pending.sfx_enabled)),
             field_row(
                 format!("Volume ({}%)", (pending.sfx_volume * 100.0).round() as i32),
-                slider(pending.sfx_volume, tokens::PRIMARY)
-                    .key(KEY_SFX_VOLUME)
-                    .width(Size::Fixed(280.0)),
+                slider(KEY_SFX_VOLUME, pending.sfx_volume).width(Size::Fixed(280.0)),
             ),
         ],
     );
@@ -24,7 +22,7 @@ pub(super) fn render_sounds(pending: &PendingSettings) -> El {
                 text(kind.label().to_string()).label(),
                 spacer(),
                 button("Preview").key(sfx_preview_key(idx)).secondary(),
-                switch(enabled).key(sfx_kind_key(idx)),
+                switch(sfx_kind_key(idx), enabled),
             ])
             .gap(tokens::SPACE_2)
             .align(Align::Center)

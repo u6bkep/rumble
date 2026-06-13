@@ -622,7 +622,7 @@ fn composer(state: &State, chat_input: &str, selection: &Selection, cmd_selected
         Some(p) => text_area::TextAreaOpts::default().placeholder(p),
         None => text_area::TextAreaOpts::default(),
     };
-    let mut input = text_area::text_area_with(chat_input, selection, KEY_INPUT, opts).width(Size::Fill(1.0));
+    let mut input = text_area::text_area_with(KEY_INPUT, chat_input, selection, opts).width(Size::Fill(1.0));
     if !connected || !can_chat {
         input = input.disabled();
     }

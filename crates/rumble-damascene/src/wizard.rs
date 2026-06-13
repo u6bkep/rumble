@@ -296,7 +296,7 @@ fn render_generate_agent_key(comment: &str, busy: bool, selection: &Selection) -
         paragraph("A new Ed25519 key will be generated and added to your ssh-agent.").muted(),
         form_item([
             form_label("Comment"),
-            form_control(text_input(comment, selection, KEY_AGENT_COMMENT)),
+            form_control(text_input(KEY_AGENT_COMMENT, comment, selection)),
         ]),
     ];
     if let Some(busy_row) = busy_indicator {

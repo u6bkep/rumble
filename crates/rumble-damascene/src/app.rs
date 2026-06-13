@@ -622,7 +622,7 @@ impl<B: UiBackend> App for RumbleApp<B> {
                     own_username,
                 )
                 .width(Size::Fill(self.chat_weights[0])),
-                resize_handle(Axis::Row).key(CHAT_SIDEBAR_HANDLE),
+                resize_handle(CHAT_SIDEBAR_HANDLE, Axis::Row),
                 center_area(&state, &shell.recent_servers, &self.room_tree).width(Size::Fill(self.chat_weights[1])),
             ])
             .width(Size::Fill(1.0))

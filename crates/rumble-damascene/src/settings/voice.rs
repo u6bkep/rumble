@@ -48,8 +48,7 @@ pub(super) fn render_voice(pending: &PendingSettings) -> El {
                 ),
                 field_row(
                     format!("Complexity ({})", pending.audio.encoder_complexity),
-                    slider(pending.audio.encoder_complexity as f32 / 10.0, tokens::PRIMARY)
-                        .key(KEY_VOICE_COMPLEXITY)
+                    slider(KEY_VOICE_COMPLEXITY, pending.audio.encoder_complexity as f32 / 10.0)
                         .width(Size::Fixed(280.0)),
                 ),
                 paragraph("Higher complexity = better quality, more CPU. Range 0–10.")
@@ -62,7 +61,7 @@ pub(super) fn render_voice(pending: &PendingSettings) -> El {
             [
                 field_row(
                     "Forward Error Correction",
-                    switch(pending.audio.fec_enabled).key(KEY_VOICE_FEC),
+                    switch(KEY_VOICE_FEC, pending.audio.fec_enabled),
                 ),
                 field_row(
                     format!(
@@ -71,16 +70,14 @@ pub(super) fn render_voice(pending: &PendingSettings) -> El {
                         pending.audio.jitter_buffer_delay_packets * 20
                     ),
                     slider(
+                        KEY_VOICE_JITTER,
                         (pending.audio.jitter_buffer_delay_packets as f32 - 1.0) / 9.0,
-                        tokens::PRIMARY,
                     )
-                    .key(KEY_VOICE_JITTER)
                     .width(Size::Fixed(280.0)),
                 ),
                 field_row(
                     format!("Expected packet loss ({}%)", pending.audio.packet_loss_percent),
-                    slider(pending.audio.packet_loss_percent as f32 / 25.0, tokens::PRIMARY)
-                        .key(KEY_VOICE_PACKET_LOSS)
+                    slider(KEY_VOICE_PACKET_LOSS, pending.audio.packet_loss_percent as f32 / 25.0)
                         .width(Size::Fixed(280.0)),
                 ),
             ],

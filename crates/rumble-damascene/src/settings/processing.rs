@@ -80,7 +80,7 @@ pub(super) fn render_processing(
                 move_down_btn,
                 remove_btn,
                 spacer(),
-                switch(proc_config.enabled).key(proc_enabled_key(idx)),
+                switch(proc_enabled_key(idx), proc_config.enabled),
             ])
             .gap(tokens::SPACE_2)
             .align(Align::Center)
@@ -172,9 +172,7 @@ fn render_schema_field(
             };
             field_row(
                 format!("{title} ({:.2})", value),
-                slider(normalized, tokens::PRIMARY)
-                    .key(&route)
-                    .width(Size::Fixed(220.0)),
+                slider(&route, normalized).width(Size::Fixed(220.0)),
             )
         }
         "integer" => {
@@ -186,15 +184,13 @@ fn render_schema_field(
             let normalized = ((value - min) as f32 / span).clamp(0.0, 1.0);
             field_row(
                 format!("{title} ({value})"),
-                slider(normalized, tokens::PRIMARY)
-                    .key(&route)
-                    .width(Size::Fixed(220.0)),
+                slider(&route, normalized).width(Size::Fixed(220.0)),
             )
         }
         "boolean" => {
             let default = schema.get("default").and_then(|d| d.as_bool()).unwrap_or(false);
             let value = settings.get(key).and_then(|v| v.as_bool()).unwrap_or(default);
-            field_row(title, switch(value).key(&route))
+            field_row(title, switch(&route, value))
         }
         _ => {
             let default = schema.get("default").and_then(|d| d.as_str()).unwrap_or("");
@@ -203,7 +199,7 @@ fn render_schema_field(
                 .and_then(|v| v.as_str())
                 .unwrap_or(default)
                 .to_string();
-            field_row(title, text_input(&value, selection, &route).width(Size::Fixed(220.0)))
+            field_row(title, text_input(&route, &value, selection).width(Size::Fixed(220.0)))
         }
     }
 }

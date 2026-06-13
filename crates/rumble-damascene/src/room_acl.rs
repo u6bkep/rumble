@@ -529,9 +529,9 @@ fn render_modal(state: &RoomAclModalState, app_state: &State, selection: &Select
 fn render_name_field(state: &RoomAclModalState, selection: &Selection) -> El {
     let control: El = if state.can_modify {
         text_input_with(
+            KEY_NAME_INPUT,
             &state.name_input,
             selection,
-            KEY_NAME_INPUT,
             TextInputOpts {
                 placeholder: Some("Room name"),
                 ..Default::default()
@@ -554,9 +554,9 @@ fn render_name_field(state: &RoomAclModalState, selection: &Selection) -> El {
 fn render_description_field(state: &RoomAclModalState, selection: &Selection) -> El {
     let control: El = if state.can_modify {
         text_input_with(
+            KEY_DESC_INPUT,
             &state.description_input,
             selection,
-            KEY_DESC_INPUT,
             TextInputOpts {
                 placeholder: Some("Shown on hover in the room tree"),
                 ..Default::default()
@@ -589,7 +589,7 @@ fn render_header(state: &RoomAclModalState) -> El {
         let crumb_el: El = if i == last {
             breadcrumb_page(display)
         } else {
-            breadcrumb_link(display)
+            breadcrumb_link(format!("room_acl:crumb:{i}"), display)
         };
         crumbs.push(breadcrumb_item(crumb_el));
     }
@@ -629,7 +629,7 @@ fn render_subheader(state: &RoomAclModalState) -> El {
         .join(" / ");
 
     row([
-        checkbox(state.inherit_acl).key(KEY_INHERIT_TOGGLE),
+        checkbox(KEY_INHERIT_TOGGLE, state.inherit_acl),
         text("Inherit ACL from "),
         mono(format!("/{parent_path}")).font_size(tokens::TEXT_XS.size),
     ])

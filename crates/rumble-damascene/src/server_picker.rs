@@ -273,16 +273,16 @@ pub fn render_form_modal(state: &ServerPickerState, selection: &Selection) -> Op
     let mut fields: Vec<El> = vec![
         form_item([
             form_label("Address"),
-            form_control(text_input(&state_form.addr, selection, KEY_FORM_ADDR).width(Size::Fill(1.0))),
+            form_control(text_input(KEY_FORM_ADDR, &state_form.addr, selection).width(Size::Fill(1.0))),
             form_description("host:port — e.g. 127.0.0.1:5000"),
         ]),
         form_item([
             form_label("Label (optional)"),
-            form_control(text_input(&state_form.label, selection, KEY_FORM_LABEL).width(Size::Fill(1.0))),
+            form_control(text_input(KEY_FORM_LABEL, &state_form.label, selection).width(Size::Fill(1.0))),
         ]),
         form_item([
             form_label("Username"),
-            form_control(text_input(&state_form.username, selection, KEY_FORM_USER).width(Size::Fill(1.0))),
+            form_control(text_input(KEY_FORM_USER, &state_form.username, selection).width(Size::Fill(1.0))),
         ]),
     ];
     if let Some(err) = &state_form.error {

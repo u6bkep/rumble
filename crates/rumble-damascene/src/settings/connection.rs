@@ -161,10 +161,7 @@ pub(super) fn render_connection(pending: &PendingSettings, identity: &Identity, 
 
 fn render_autoconnect_rows(pending: &PendingSettings) -> Vec<El> {
     vec![
-        field_row(
-            "Autoconnect on launch",
-            switch(pending.autoconnect).key(KEY_AUTOCONNECT),
-        ),
+        field_row("Autoconnect on launch", switch(KEY_AUTOCONNECT, pending.autoconnect)),
         paragraph(
             "Reconnects to the most recently used server on startup. Effective once you've connected to at least one \
              server.",

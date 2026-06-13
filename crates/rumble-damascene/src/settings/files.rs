@@ -7,7 +7,7 @@ pub(super) fn render_files(pending: &PendingSettings, selection: &Selection) -> 
     let mut auto_dl: Vec<El> = vec![
         field_row(
             "Enable auto-download",
-            switch(pending.auto_download_enabled).key(KEY_FILES_AUTO_DOWNLOAD),
+            switch(KEY_FILES_AUTO_DOWNLOAD, pending.auto_download_enabled),
         ),
         paragraph(
             "Auto-download offers whose MIME type matches a rule below, up to the per-rule size limit. Set a size of \
@@ -60,19 +60,17 @@ pub(super) fn render_files(pending: &PendingSettings, selection: &Selection) -> 
             field_row(
                 format!("Download limit ({})", speed_label(pending.download_speed_kbps)),
                 slider(
+                    KEY_FILES_DL_LIMIT,
                     pending.download_speed_kbps as f32 / MAX_SPEED_KBPS as f32,
-                    tokens::PRIMARY,
                 )
-                .key(KEY_FILES_DL_LIMIT)
                 .width(Size::Fixed(280.0)),
             ),
             field_row(
                 format!("Upload limit ({})", speed_label(pending.upload_speed_kbps)),
                 slider(
+                    KEY_FILES_UL_LIMIT,
                     pending.upload_speed_kbps as f32 / MAX_SPEED_KBPS as f32,
-                    tokens::PRIMARY,
                 )
-                .key(KEY_FILES_UL_LIMIT)
                 .width(Size::Fixed(280.0)),
             ),
         ],
@@ -132,16 +130,16 @@ fn download_dir_row(pending: &PendingSettings) -> El {
 /// rule list is currently inert.
 fn rule_row(idx: usize, rule: &PendingAutoDownloadRule, selection: &Selection, enabled: bool) -> El {
     let mime_input = text_input_with(
+        &rule_mime_key(idx),
         &rule.mime_pattern,
         selection,
-        &rule_mime_key(idx),
         TextInputOpts::default().placeholder("e.g. image/*"),
     )
     .width(Size::Fill(1.0));
     let size_input = text_input_with(
+        &rule_size_key(idx),
         &rule.size_mb_text,
         selection,
-        &rule_size_key(idx),
         TextInputOpts::default().placeholder("0"),
     )
     .width(Size::Fixed(110.0));

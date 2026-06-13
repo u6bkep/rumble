@@ -13,7 +13,7 @@ pub(super) fn render_shortcuts(pending: &PendingSettings, state: &SettingsState,
 
     shortcut_rows.push(field_row(
         "Enable global shortcuts",
-        switch(pending.keyboard.global_hotkeys_enabled).key(KEY_SHORTCUTS_GLOBAL_ENABLE),
+        switch(KEY_SHORTCUTS_GLOBAL_ENABLE, pending.keyboard.global_hotkeys_enabled),
     ));
 
     let is_wayland = hotkeys.is_wayland();

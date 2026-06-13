@@ -9,7 +9,7 @@ use damascene_core::prelude::*;
 
 /// Render a password field with `value` masked as bullets.
 pub fn password_input(value: &str, selection: &Selection, key: &str) -> El {
-    text_input_with(value, selection, key, TextInputOpts::default().password())
+    text_input_with(key, value, selection, TextInputOpts::default().password())
 }
 
 /// Apply a routed `UiEvent` to a password field. Mirrors

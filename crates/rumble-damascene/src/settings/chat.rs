@@ -9,7 +9,7 @@ pub(super) fn render_chat(pending: &PendingSettings) -> El {
             [
                 field_row(
                     "Show timestamps",
-                    switch(pending.show_timestamps).key(KEY_CHAT_SHOW_TIMESTAMPS),
+                    switch(KEY_CHAT_SHOW_TIMESTAMPS, pending.show_timestamps),
                 ),
                 field_row(
                     "Timestamp format",
@@ -22,7 +22,7 @@ pub(super) fn render_chat(pending: &PendingSettings) -> El {
             [
                 field_row(
                     "Auto-sync history on join",
-                    switch(pending.auto_sync_history).key(KEY_CHAT_AUTO_SYNC),
+                    switch(KEY_CHAT_AUTO_SYNC, pending.auto_sync_history),
                 ),
                 paragraph(
                     "Asks peers for backlog when joining a room so you can read what was said before you arrived.",
@@ -36,7 +36,7 @@ pub(super) fn render_chat(pending: &PendingSettings) -> El {
             [
                 field_row(
                     "Auto-play animated images",
-                    switch(pending.gif_autoplay).key(KEY_CHAT_GIF_AUTOPLAY),
+                    switch(KEY_CHAT_GIF_AUTOPLAY, pending.gif_autoplay),
                 ),
                 paragraph("Off shows the first frame with a play button overlay until you start it.")
                     .muted()

@@ -39,11 +39,11 @@ rand = "0.10.0-rc.3"
 # computer-whisperer/damascene. Override locally with
 # `[patch."https://github.com/computer-whisperer/damascene"]` (or
 # `scripts/damascene-local.sh`) if iterating on damascene alongside rumble.
-damascene-core = { git = "https://github.com/computer-whisperer/damascene", rev = "eb094b7d7e25f4cd4d03212b1dd3f1adbe4fabc7" }
-damascene-markdown = { git = "https://github.com/computer-whisperer/damascene", rev = "eb094b7d7e25f4cd4d03212b1dd3f1adbe4fabc7" }
-damascene-wgpu = { git = "https://github.com/computer-whisperer/damascene", rev = "eb094b7d7e25f4cd4d03212b1dd3f1adbe4fabc7" }
-damascene-web = { git = "https://github.com/computer-whisperer/damascene", rev = "eb094b7d7e25f4cd4d03212b1dd3f1adbe4fabc7" }
-damascene-winit-wgpu = { git = "https://github.com/computer-whisperer/damascene", rev = "eb094b7d7e25f4cd4d03212b1dd3f1adbe4fabc7" }
+damascene-core = { git = "https://github.com/computer-whisperer/damascene", rev = "4b6c0dcf2ff360a009f5c114c87c3cd47fc46041" }
+damascene-markdown = { git = "https://github.com/computer-whisperer/damascene", rev = "4b6c0dcf2ff360a009f5c114c87c3cd47fc46041" }
+damascene-wgpu = { git = "https://github.com/computer-whisperer/damascene", rev = "4b6c0dcf2ff360a009f5c114c87c3cd47fc46041" }
+damascene-web = { git = "https://github.com/computer-whisperer/damascene", rev = "4b6c0dcf2ff360a009f5c114c87c3cd47fc46041" }
+damascene-winit-wgpu = { git = "https://github.com/computer-whisperer/damascene", rev = "4b6c0dcf2ff360a009f5c114c87c3cd47fc46041" }
 
 # Shared third-party deps. Per-crate feature picks live at each consumer
 # so the workspace stays neutral about what each crate actually uses;

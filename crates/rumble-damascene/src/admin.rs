@@ -431,9 +431,9 @@ fn render_header(state: &AdminState, selection: &Selection) -> El {
     .font_size(tokens::TEXT_XS.size);
 
     let search = text_input_with(
+        KEY_SEARCH,
         &state.search_query,
         selection,
-        KEY_SEARCH,
         TextInputOpts {
             placeholder: Some("Search groups or users…"),
             ..Default::default()
@@ -750,7 +750,7 @@ fn perm_row(group: &str, perm: Permissions, label: &str, description: &str, enab
         ])
         .gap(0.0)
         .width(Size::Fill(1.0)),
-        switch(enabled).key(key_perm_toggle(group, perm.bits())),
+        switch(key_perm_toggle(group, perm.bits()), enabled),
     ])
     .gap(tokens::SPACE_3)
     .align(Align::Center)
@@ -795,9 +795,9 @@ fn render_add_user_popover(popover_state: &AddUserPopover, app_state: &State, se
     candidates.sort_by_key(|u| u.username.to_lowercase());
 
     let search = text_input_with(
+        &key_add_user_query(group),
         &popover_state.query,
         selection,
-        &key_add_user_query(group),
         TextInputOpts {
             placeholder: Some("Filter users…"),
             ..Default::default()
@@ -866,9 +866,9 @@ fn render_new_group_dialog(form: &NewGroupForm, selection: &Selection) -> El {
         field_row(
             "Name",
             text_input_with(
+                KEY_NEW_GROUP_NAME,
                 &form.name,
                 selection,
-                KEY_NEW_GROUP_NAME,
                 TextInputOpts {
                     placeholder: Some("e.g. moderators"),
                     ..Default::default()

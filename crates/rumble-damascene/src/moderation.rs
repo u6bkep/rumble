@@ -154,9 +154,9 @@ pub fn render(state: &KickBanModal, selection: &Selection) -> El {
         field_row(
             "Reason (optional)",
             text_input_with(
+                KEY_REASON,
                 &state.reason,
                 selection,
-                KEY_REASON,
                 TextInputOpts {
                     placeholder: Some("Shown to the user"),
                     ..Default::default()

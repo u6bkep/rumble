@@ -509,9 +509,7 @@ fn lightbox_controls(active: &ActiveVideo) -> El {
         .muted()
         .font_size(tokens::TEXT_XS.size);
 
-    let scrub = slider(active.scrub_value, tokens::PRIMARY)
-        .key(KEY_SCRUB)
-        .width(Size::Fill(1.0));
+    let scrub = slider(KEY_SCRUB, active.scrub_value).width(Size::Fill(1.0));
 
     row([play_btn, time_label, scrub, mute_btn])
         .gap(tokens::SPACE_2)
