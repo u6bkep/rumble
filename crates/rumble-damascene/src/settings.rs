@@ -460,12 +460,14 @@ const RULE_PRESETS: &[(&str, &str, u64)] = &[
     ("Audio", "audio/*", 25),
     ("Documents", "application/pdf", 5),
 ];
-const KEY_FILES_PRESET_PREFIX: &str = "settings:files:preset:";
+// `damascene_core::key::{indexed, index}` supply the `:` separator, so the
+// prefix is stored without a trailing colon (keys are still `…preset:0`).
+const KEY_FILES_PRESET_PREFIX: &str = "settings:files:preset";
 fn preset_key(idx: usize) -> String {
-    format!("{KEY_FILES_PRESET_PREFIX}{idx}")
+    damascene_core::key::indexed(KEY_FILES_PRESET_PREFIX, idx)
 }
 fn parse_preset_route(route: &str) -> Option<usize> {
-    route.strip_prefix(KEY_FILES_PRESET_PREFIX).and_then(|s| s.parse().ok())
+    damascene_core::key::index(route, KEY_FILES_PRESET_PREFIX)
 }
 
 const KEY_FILES_AUTO_DOWNLOAD: &str = "settings:files:auto-download";
@@ -725,21 +727,23 @@ pub fn render(
         [
             row([
                 nav,
-                // Horizontal padding has to live on a wrapper *inside* the
-                // scroll, not on the scroll itself: the scrollbar thumb is
-                // anchored to `scroll.inner.right() - 8`, so padding on
-                // scroll moves the thumb and content together and the
-                // thumb keeps painting on top of full-width children.
-                // Wrapping the body lets content stop short of the
-                // scrollbar gutter (active thumb = 10 px + 2 px track
-                // inset = 12 px).
-                scroll([column([body])
-                    .padding(Sides::xy(tokens::SPACE_3, 0.0))
-                    .width(Size::Fill(1.0))])
-                .padding(Sides::xy(0.0, tokens::SPACE_2))
-                .gap(tokens::SPACE_3)
-                .width(Size::Fill(1.0))
-                .height(Size::Fill(1.0)),
+                // `.scrollbar_gutter()` reserves a thumb-width band on the
+                // right edge (CSS `scrollbar-gutter: stable`) so the thumb
+                // never paints over full-width content. The gutter is
+                // additive on top of the node's `padding.right`, so we set
+                // only the left/vertical padding here and let the gutter own
+                // the right inset.
+                scroll([column([body]).width(Size::Fill(1.0))])
+                    .padding(Sides {
+                        left: tokens::SPACE_3,
+                        right: 0.0,
+                        top: tokens::SPACE_2,
+                        bottom: tokens::SPACE_2,
+                    })
+                    .scrollbar_gutter()
+                    .gap(tokens::SPACE_3)
+                    .width(Size::Fill(1.0))
+                    .height(Size::Fill(1.0)),
             ])
             .gap(tokens::SPACE_3)
             .width(Size::Fill(1.0))
