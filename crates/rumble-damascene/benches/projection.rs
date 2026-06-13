@@ -4,14 +4,31 @@
 //! Run: `cargo bench -p rumble-damascene --bench projection`
 //!
 //! The chat log is unbounded (issue #16 phase 2), so these benches answer:
-//! how does a frame scale with backlog size? Three groups:
+//! how does a frame scale with backlog size? Groups (the `*_warm`, `scroll_*`,
+//! and `resize` ones thread one persistent `UiState` across frames, which is
+//! what lets the append-only virtual-list fast path reuse its height index):
 //!
 //! - `projection_build/<n>`: steady-state build over an n-message backlog.
 //!   With the incremental `ChatHistory` row cache this should be ~flat in n
 //!   (the per-frame `State` clone is an Arc bump; rows are cached).
-//! - `projection_layout/<n>`: build + measure/layout. The damascene
-//!   `virtual_list_dyn` walk is O(n) per frame upstream (row keys + height
-//!   prefix sums), so this group tracks the library-side ceiling.
+//! - `projection_layout/<n>`: build + measure/layout with a fresh `UiState`
+//!   each iteration — i.e. a COLD layout. The append-only height index can't
+//!   help here (it has nothing to reuse), so this tracks the cold/epoch-change
+//!   ceiling; with `.append_only()` it is slightly *slower* than the general
+//!   path (the index build is extra work on a frame that's thrown away).
+//! - `projection_layout_warm/<n>`: build + measure/layout threading one
+//!   persistent `UiState` across frames (warmed by an untimed first frame) —
+//!   the repainted-frame case the append-only fast path (#107) optimizes. With
+//!   `.append_only()` this is ~flat O(visible) in n; without it the general
+//!   path stays O(n) per frame even though `UiState` persists.
+//! - `projection_scroll_end/<n>`: warm frames with the chat list pinned to the
+//!   bottom — the stick-to-bottom case where the general path's visible-range
+//!   scan walks from row 0 (O(n)) and append-only resolves it in O(√n).
+//! - `projection_scroll_drag/<n>`: warm frames jumping the scroll offset across
+//!   the whole range each frame (thumb-drag), stressing the √n block index at
+//!   arbitrary positions and the offset-correction pass.
+//! - `projection_resize/<n>`: warm frames alternating the viewport width, so
+//!   every frame reflows + re-measures the realized rows.
 //! - `projection_append/<n>`: the frame that absorbs one newly-arrived
 //!   message at backlog size n — the incremental extend path (epoch
 //!   unchanged, length grown ⇒ only the tail row is built).
@@ -30,7 +47,7 @@
 use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, criterion_group};
-use damascene_core::prelude::*;
+use damascene_core::{UiState, layout::assign_ids, prelude::*};
 use rumble_client::{
     AudioState, AudioStats, ChatMessage, ChatMessageKind, ChatMessageVisibility, Command, ConnectionState,
     MeterSnapshot, State, VoiceMode,
@@ -179,6 +196,16 @@ fn make_app(
     (app, shared, dir)
 }
 
+/// Recursively find the `computed_id` of the first node carrying `key`
+/// (populated by [`assign_ids`]). Used to seed a virtual list's scroll
+/// offset before layout, since offsets are keyed by `computed_id`.
+fn find_computed_id(el: &El, key: &str) -> Option<String> {
+    if el.key.as_deref() == Some(key) {
+        return Some(el.computed_id.clone());
+    }
+    el.children.iter().find_map(|c| find_computed_id(c, key))
+}
+
 fn bench_projection(c: &mut Criterion) {
     let viewport = Rect::new(0.0, 0.0, 1280.0, 800.0);
 
@@ -206,6 +233,127 @@ fn bench_projection(c: &mut Criterion) {
         });
     }
     layout.finish();
+
+    // Warm steady-state layout: the same persistent `UiState` is threaded
+    // through `render_bundle_with` across frames, so the chat list's
+    // `virtual_list_dyn` keeps its per-list height index between frames. This
+    // is the case the append-only fast path (#107) optimizes — a *repainted*
+    // frame whose row sequence is unchanged. (`projection_layout` above builds
+    // a fresh `UiState` per iteration, so it measures the COLD rebuild, where
+    // append-only's persistent index can't help and the general path is the
+    // ceiling.) `UiState` is warmed with one untimed frame before measuring so
+    // the first cold rebuild is excluded; scroll sits at the default (top)
+    // position — the from-end O(n)→O(√n) range-scan win is additional on top of
+    // this and not isolated here.
+    let mut layout_warm = c.benchmark_group("projection_layout_warm");
+    for &n in &[10usize, 100, 1000, 10_000, 100_000] {
+        let (app, _shared, _dir) = make_app(n);
+        let theme = app.theme();
+        let cx = BuildCx::new(&theme);
+        let mut ui_state = UiState::new();
+        // Untimed warm-up: build the persistent per-list height index once.
+        {
+            let mut tree = app.build(&cx);
+            let _ = render_bundle_with(&mut tree, &mut ui_state, viewport);
+        }
+        layout_warm.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
+            b.iter(|| {
+                let mut tree = app.build(&cx);
+                black_box(render_bundle_with(&mut tree, &mut ui_state, viewport));
+            });
+        });
+    }
+    layout_warm.finish();
+
+    // Warm interaction frames: persistent `UiState`, with the scroll position
+    // or viewport varied per frame to exercise the paths the append-only fast
+    // path (#107) is meant to keep cheap. Each warms one untimed frame, then
+    // every timed frame is a painted interaction frame. Scroll offsets are
+    // keyed by the chat list's `computed_id` (resolved once via `assign_ids` +
+    // `find_computed_id`); an over-large offset is clamped to the end on layout.
+    // Sizes start at 1k — below the viewport's worth of rows there is nothing to
+    // scroll and `max_offset` is 0.
+    const CHAT_LIST_KEY: &str = rumble_damascene::chat::CHAT_HISTORY_KEY;
+
+    // Stick-to-bottom: scroll pinned to the end every frame. This is the
+    // worst case from the report — the general path's visible-range scan walks
+    // from row 0 to the end (O(n)); append-only resolves it in O(√n).
+    let mut scroll_end = c.benchmark_group("projection_scroll_end");
+    for &n in &[1000usize, 10_000, 100_000] {
+        let (app, _shared, _dir) = make_app(n);
+        let theme = app.theme();
+        let cx = BuildCx::new(&theme);
+        let mut ui_state = UiState::new();
+        let mut tree = app.build(&cx);
+        assign_ids(&mut tree);
+        let list_id = find_computed_id(&tree, CHAT_LIST_KEY).expect("chat history scroll node");
+        ui_state.set_scroll_offset(list_id.as_str(), f32::MAX); // clamped to end on layout
+        let _ = render_bundle_with(&mut tree, &mut ui_state, viewport);
+        scroll_end.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
+            b.iter(|| {
+                let mut tree = app.build(&cx);
+                black_box(render_bundle_with(&mut tree, &mut ui_state, viewport));
+            });
+        });
+    }
+    scroll_end.finish();
+
+    // Thumb-drag: jump the offset to a different position across the full range
+    // each frame — stresses the √n block index at arbitrary positions plus the
+    // offset-correction pass, the case the maintainer flagged as the one that
+    // might want a Fenwick tree if √n is short.
+    let mut scroll_drag = c.benchmark_group("projection_scroll_drag");
+    for &n in &[1000usize, 10_000, 100_000] {
+        let (app, _shared, _dir) = make_app(n);
+        let theme = app.theme();
+        let cx = BuildCx::new(&theme);
+        let mut ui_state = UiState::new();
+        let mut tree = app.build(&cx);
+        assign_ids(&mut tree);
+        let list_id = find_computed_id(&tree, CHAT_LIST_KEY).expect("chat history scroll node");
+        // One layout at MAX clamps and writes back the true max offset.
+        ui_state.set_scroll_offset(list_id.as_str(), f32::MAX);
+        let _ = render_bundle_with(&mut tree, &mut ui_state, viewport);
+        let max_offset = ui_state.scroll_offset(&list_id);
+        // Spread successive frames far apart across the range.
+        let fracs = [0.07f32, 0.61, 0.23, 0.83, 0.41, 0.97, 0.13, 0.53];
+        let mut frame = 0usize;
+        scroll_drag.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
+            b.iter(|| {
+                ui_state.set_scroll_offset(list_id.as_str(), fracs[frame % fracs.len()] * max_offset);
+                frame += 1;
+                let mut tree = app.build(&cx);
+                black_box(render_bundle_with(&mut tree, &mut ui_state, viewport));
+            });
+        });
+    }
+    scroll_drag.finish();
+
+    // Resize: alternate the viewport width every frame, so each timed frame is
+    // a width change ⇒ every realized row reflows and re-measures, folding fresh
+    // heights back into the persistent index.
+    let mut resize = c.benchmark_group("projection_resize");
+    let narrow = Rect::new(0.0, 0.0, 960.0, 800.0);
+    for &n in &[1000usize, 10_000, 100_000] {
+        let (app, _shared, _dir) = make_app(n);
+        let theme = app.theme();
+        let cx = BuildCx::new(&theme);
+        let mut ui_state = UiState::new();
+        {
+            let mut tree = app.build(&cx);
+            let _ = render_bundle_with(&mut tree, &mut ui_state, viewport);
+        }
+        let mut frame = 0usize;
+        resize.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
+            b.iter(|| {
+                let vp = if frame % 2 == 0 { narrow } else { viewport };
+                frame += 1;
+                let mut tree = app.build(&cx);
+                black_box(render_bundle_with(&mut tree, &mut ui_state, vp));
+            });
+        });
+    }
+    resize.finish();
 
     // The frame that absorbs one new message at backlog size n: push one
     // message, build. Exercises the incremental `ChatHistory` extend (same
