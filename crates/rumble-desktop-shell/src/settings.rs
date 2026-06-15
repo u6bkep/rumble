@@ -695,7 +695,7 @@ mod tests {
     #[test]
     fn modify_saves() {
         let dir = tempdir_for_test();
-        let path = dir.join("settings.json");
+        let path = dir.path().join("settings.json");
         {
             let mut store = SettingsStore::load_from_path(Some(path.clone()));
             store.modify(|s| {
@@ -713,7 +713,7 @@ mod tests {
         // Audio settings written by one session must come back intact
         // — the entire restore-on-startup path depends on this.
         let dir = tempdir_for_test();
-        let path = dir.join("settings.json");
+        let path = dir.path().join("settings.json");
         {
             let mut store = SettingsStore::load_from_path(Some(path.clone()));
             store.modify(|s| {
@@ -790,7 +790,7 @@ mod tests {
     #[test]
     fn atomic_save_produces_parseable_file_no_tmp_leftover() {
         let dir = tempdir_for_test();
-        let path = dir.join("settings.json");
+        let path = dir.path().join("settings.json");
         let mut store = SettingsStore::load_from_path(Some(path.clone()));
         store.modify(|s| {
             s.dark = true;
@@ -815,7 +815,7 @@ mod tests {
     #[test]
     fn parse_failure_preserves_original_as_backup_and_returns_defaults() {
         let dir = tempdir_for_test();
-        let path = dir.join("settings.json");
+        let path = dir.path().join("settings.json");
         fs::write(&path, b"not valid json {{{").unwrap();
 
         let store = SettingsStore::load_from_path(Some(path.clone()));
@@ -843,16 +843,13 @@ mod tests {
         );
     }
 
-    fn tempdir_for_test() -> PathBuf {
-        let mut p = std::env::temp_dir();
-        p.push(format!(
-            "rumble-desktop-shell-test-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&p).unwrap();
-        p
+    /// A self-cleaning temp dir for settings-store tests. The returned
+    /// [`tempfile::TempDir`] removes the directory and its contents when
+    /// dropped, so callers must hold the binding for the test's duration.
+    fn tempdir_for_test() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("rumble-desktop-shell-test-")
+            .tempdir()
+            .unwrap()
     }
 }

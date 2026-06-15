@@ -5288,6 +5288,7 @@ dependencies = [
  "sha2 0.11.0",
  "ssh-agent-lib",
  "ssh-key",
+ "tempfile",
  "tokio",
  "tracing",
  "uuid",
