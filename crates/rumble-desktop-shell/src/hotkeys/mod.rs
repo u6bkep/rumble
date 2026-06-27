@@ -49,6 +49,13 @@ pub type HotkeyWakeup = Arc<dyn Fn() + Send + Sync>;
 pub struct KeyboardSettings {
     /// Whether global hotkeys are enabled (work when window unfocused).
     pub global_hotkeys_enabled: bool,
+    /// Whether the desktop client binds the Unix-socket RPC server at
+    /// startup. Off by default — the socket lets any local process mute,
+    /// disconnect, share files, etc., so it only opens when the user opts
+    /// in (here, or via the `--rpc-server` CLI flag). Read once at
+    /// startup; toggling it takes effect on the next launch. The
+    /// Wayland-shortcuts fallback path documents the socket commands.
+    pub rpc_server_enabled: bool,
     /// User-configured shortcut rows. Order is preserved for stable UI
     /// rendering; ordering carries no semantic meaning.
     pub shortcuts: Vec<ShortcutEntry>,
@@ -73,6 +80,7 @@ impl Default for KeyboardSettings {
         // from the Shortcuts settings tab.
         Self {
             global_hotkeys_enabled: true,
+            rpc_server_enabled: false,
             shortcuts: Vec::new(),
             legacy_ptt: None,
             legacy_toggle_mute: None,
@@ -1048,6 +1056,7 @@ mod tests {
         // because the legacy slot is now None.
         let mut kb = KeyboardSettings {
             global_hotkeys_enabled: true,
+            rpc_server_enabled: false,
             shortcuts: Vec::new(),
             legacy_ptt: Some(HotkeyBinding {
                 modifiers: HotkeyModifiers::default(),

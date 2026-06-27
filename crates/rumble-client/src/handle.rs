@@ -140,10 +140,15 @@ pub struct BackendHandle<P: Platform> {
     /// Held in an `Option` so `Drop` can `take()` and `join()` it after
     /// signalling the connection task to send a graceful disconnect.
     runtime_thread: Option<std::thread::JoinHandle<()>>,
+    /// Handle to the connection-task runtime, captured from the runtime
+    /// thread at construction. Lets methods invoked on the UI thread
+    /// (outside any reactor) — notably [`Self::start_rpc_server`] — enter
+    /// this runtime's context to bind sockets and spawn tasks.
+    runtime_handle: tokio::runtime::Handle,
     /// Connection configuration (certificates, etc.). stored incase we want to inspect it later.
     _connect_config: ConnectConfig,
     /// Pre-generated sound effects library.
-    sfx_library: crate::sfx::SfxLibrary,
+    sfx_library: std::sync::Arc<crate::sfx::SfxLibrary>,
     /// Reader for the live metering snapshot. The audio task publishes a
     /// fresh value per capture frame; the UI samples it each repaint.
     /// Decoupled from the projection path so 50 Hz updates don't ride
@@ -368,6 +373,11 @@ impl<P: Platform> BackendHandle<P> {
         // The projection task is spawned on this same runtime so it
         // can subscribe to the broadcast channels in scope.
         let key_signer_for_task = key_signer.clone();
+        // The runtime is built and owned inside the thread (it must, so
+        // `block_on` drives it). Ferry a clone of its `Handle` back out so
+        // the constructor can store it — UI-thread methods need it to enter
+        // the reactor context. Bounded so the send never blocks the thread.
+        let (rt_handle_tx, rt_handle_rx) = std::sync::mpsc::sync_channel::<tokio::runtime::Handle>(1);
         let runtime_thread = std::thread::spawn(move || {
             // This runtime carries only I/O-bound work: the projection task,
             // the connection select-loop, the per-connection receiver/dispatch
@@ -383,6 +393,9 @@ impl<P: Platform> BackendHandle<P> {
                 .enable_all()
                 .build()
                 .expect("create tokio runtime");
+            // Hand the handle to the constructor before parking on
+            // `block_on` for the lifetime of the connection task.
+            let _ = rt_handle_tx.send(rt.handle().clone());
             rt.block_on(async move {
                 // Projection task: drains every domain channel (via the
                 // receivers subscribed up front) and maintains `State`. Sole
@@ -410,6 +423,14 @@ impl<P: Platform> BackendHandle<P> {
             });
         });
 
+        // Block until the runtime thread has built its runtime and sent
+        // the handle. This is the thread's first action, so the wait is
+        // momentary; a disconnected channel would mean the thread panicked
+        // before sending, which is unrecoverable.
+        let runtime_handle = rt_handle_rx
+            .recv()
+            .expect("runtime thread sends its handle before block_on");
+
         Self {
             state,
             command_tx,
@@ -417,8 +438,9 @@ impl<P: Platform> BackendHandle<P> {
             file_transfer,
             bus,
             runtime_thread: Some(runtime_thread),
+            runtime_handle,
             _connect_config: connect_config,
-            sfx_library: crate::sfx::SfxLibrary::new(),
+            sfx_library: std::sync::Arc::new(crate::sfx::SfxLibrary::new()),
             meter,
             stats,
             outputs,
@@ -531,9 +553,17 @@ impl<P: Platform> BackendHandle<P> {
     }
 
     /// Start the RPC server on the given Unix socket path.
+    ///
+    /// [`crate::rpc::RpcServer::start`] binds a tokio `UnixListener` and
+    /// spawns the accept loop, both of which require a runtime context.
+    /// This method is typically called on the UI thread (outside any
+    /// reactor), so we enter the backend's connection-task runtime for the
+    /// duration of the call. The spawned accept loop then lives on that
+    /// runtime independently of this guard.
     #[cfg(unix)]
     pub fn start_rpc_server(&self, socket_path: std::path::PathBuf) -> anyhow::Result<crate::rpc::RpcServer> {
-        crate::rpc::RpcServer::start(socket_path, self.state.clone(), self.command_tx.clone())
+        let _guard = self.runtime_handle.enter();
+        crate::rpc::RpcServer::start(socket_path, self.state.clone(), self.command_sink())
     }
 
     /// Send a command to the backend.
@@ -541,107 +571,136 @@ impl<P: Platform> BackendHandle<P> {
     /// Commands are fire-and-forget. The backend will update state
     /// asynchronously and call the repaint callback.
     pub fn send(&self, command: Command) {
+        route_command(&self.audio_task, &self.sfx_library, &self.command_tx, command);
+    }
+
+    /// Build a fire-and-forget command sink that routes through
+    /// [`route_command`] — the same path [`Self::send`] uses. Handed to the
+    /// RPC server so external callers reach the audio task exactly as the
+    /// UI does, rather than dumping raw `Command`s into the connection-task
+    /// channel (which silently drops audio-domain commands).
+    #[cfg(unix)]
+    fn command_sink(&self) -> crate::rpc::CommandSink {
+        let audio_task = self.audio_task.clone();
+        let sfx_library = self.sfx_library.clone();
+        let command_tx = self.command_tx.clone();
+        std::sync::Arc::new(move |command| route_command(&audio_task, &sfx_library, &command_tx, command))
+    }
+}
+
+/// Route a fire-and-forget [`Command`] to the right subsystem: audio-domain
+/// commands go straight to the audio task (SFX via the library), everything
+/// else falls through to the connection task. Single source of truth shared
+/// by [`BackendHandle::send`] and the RPC server's command sink — any caller
+/// that bypasses this (e.g. sending raw into `command_tx`) will have audio
+/// commands like mute/deafen/transmit silently never reach the audio task.
+fn route_command(
+    audio_task: &AudioTaskHandle,
+    sfx_library: &crate::sfx::SfxLibrary,
+    command_tx: &mpsc::UnboundedSender<Command>,
+    command: Command,
+) {
+    {
         // Route audio-related commands to the audio task
         match &command {
             Command::RefreshAudioDevices => {
-                self.audio_task.send(AudioCommand::RefreshDevices);
+                audio_task.send(AudioCommand::RefreshDevices);
                 return;
             }
             Command::SetInputDevice { device_id } => {
-                self.audio_task.send(AudioCommand::SetInputDevice {
+                audio_task.send(AudioCommand::SetInputDevice {
                     device_id: device_id.clone(),
                 });
                 return;
             }
             Command::SetOutputDevice { device_id } => {
-                self.audio_task.send(AudioCommand::SetOutputDevice {
+                audio_task.send(AudioCommand::SetOutputDevice {
                     device_id: device_id.clone(),
                 });
                 return;
             }
             Command::SetVoiceMode { mode } => {
-                self.audio_task.send(AudioCommand::SetVoiceMode { mode: *mode });
+                audio_task.send(AudioCommand::SetVoiceMode { mode: *mode });
                 return;
             }
             Command::SetMuted { muted } => {
-                self.audio_task.send(AudioCommand::SetMuted { muted: *muted });
+                audio_task.send(AudioCommand::SetMuted { muted: *muted });
                 // Also notify connection task to inform server
                 // (don't return - let it fall through to send to connection task)
             }
             Command::SetDeafened { deafened } => {
-                self.audio_task.send(AudioCommand::SetDeafened { deafened: *deafened });
+                audio_task.send(AudioCommand::SetDeafened { deafened: *deafened });
                 // Also notify connection task to inform server
                 // (don't return - let it fall through to send to connection task)
             }
             Command::MuteUser { user_id } => {
-                self.audio_task.send(AudioCommand::MuteUser { user_id: *user_id });
+                audio_task.send(AudioCommand::MuteUser { user_id: *user_id });
                 return;
             }
             Command::UnmuteUser { user_id } => {
-                self.audio_task.send(AudioCommand::UnmuteUser { user_id: *user_id });
+                audio_task.send(AudioCommand::UnmuteUser { user_id: *user_id });
                 return;
             }
             Command::StartTransmit => {
-                self.audio_task.send(AudioCommand::StartTransmit);
+                audio_task.send(AudioCommand::StartTransmit);
                 return;
             }
             Command::StopTransmit => {
-                self.audio_task.send(AudioCommand::StopTransmit);
+                audio_task.send(AudioCommand::StopTransmit);
                 return;
             }
             Command::UpdateAudioSettings { settings } => {
-                self.audio_task.send(AudioCommand::UpdateSettings {
+                audio_task.send(AudioCommand::UpdateSettings {
                     settings: settings.clone(),
                 });
                 return;
             }
             Command::ResetAudioStats => {
-                self.audio_task.send(AudioCommand::ResetStats);
+                audio_task.send(AudioCommand::ResetStats);
                 return;
             }
             Command::UpdateTxPipeline { config } => {
-                self.audio_task
-                    .send(AudioCommand::UpdateTxPipeline { config: config.clone() });
+                audio_task.send(AudioCommand::UpdateTxPipeline { config: config.clone() });
                 return;
             }
             Command::UpdateRxPipelineDefaults { config } => {
-                self.audio_task
-                    .send(AudioCommand::UpdateRxPipelineDefaults { config: config.clone() });
+                audio_task.send(AudioCommand::UpdateRxPipelineDefaults { config: config.clone() });
                 return;
             }
             Command::UpdateUserRxConfig { user_id, config } => {
-                self.audio_task.send(AudioCommand::UpdateUserRxConfig {
+                audio_task.send(AudioCommand::UpdateUserRxConfig {
                     user_id: *user_id,
                     config: config.clone(),
                 });
                 return;
             }
             Command::ClearUserRxOverride { user_id } => {
-                self.audio_task
-                    .send(AudioCommand::ClearUserRxOverride { user_id: *user_id });
+                audio_task.send(AudioCommand::ClearUserRxOverride { user_id: *user_id });
                 return;
             }
             Command::SetUserVolume { user_id, volume_db } => {
-                self.audio_task.send(AudioCommand::SetUserVolume {
+                audio_task.send(AudioCommand::SetUserVolume {
                     user_id: *user_id,
                     volume_db: *volume_db,
                 });
                 return;
             }
             Command::PlaySfx { kind, volume } => {
-                if let Some(samples) = self.sfx_library.get(*kind) {
+                if let Some(samples) = sfx_library.get(*kind) {
                     let scaled: Vec<f32> = samples.iter().map(|s| s * volume).collect();
-                    self.audio_task.send(AudioCommand::PlaySfx { samples: scaled });
+                    audio_task.send(AudioCommand::PlaySfx { samples: scaled });
                 }
                 return;
             }
             _ => {}
         }
-
-        // Forward non-audio commands to connection task
-        let _ = self.command_tx.send(command);
     }
 
+    // Forward non-audio commands to connection task
+    let _ = command_tx.send(command);
+}
+
+impl<P: Platform> BackendHandle<P> {
     /// Check if we are currently connected.
     pub fn is_connected(&self) -> bool {
         read_state(&self.state).connection.is_connected()

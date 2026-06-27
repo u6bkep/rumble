@@ -508,6 +508,7 @@ const KEY_STATS_RESET: &str = "settings:stats:reset";
 // ---------- Shortcuts tab ----------
 
 const KEY_SHORTCUTS_GLOBAL_ENABLE: &str = "settings:shortcuts:global-enable";
+const KEY_SHORTCUTS_RPC_ENABLE: &str = "settings:shortcuts:rpc-enable";
 const KEY_SHORTCUTS_ADD: &str = "settings:shortcuts:add";
 const SHORTCUTS_ROW_PREFIX: &str = "settings:shortcuts:row:";
 
@@ -1721,6 +1722,11 @@ pub fn handle_event(
 
     // Switches.
     if switch::apply_event(&mut pending.autoconnect, event, KEY_AUTOCONNECT)
+        || switch::apply_event(
+            &mut pending.keyboard.rpc_server_enabled,
+            event,
+            KEY_SHORTCUTS_RPC_ENABLE,
+        )
         || switch::apply_event(&mut pending.audio.fec_enabled, event, KEY_VOICE_FEC)
         || switch::apply_event(&mut pending.sfx_enabled, event, KEY_SFX_ENABLED)
         || switch::apply_event(&mut pending.show_timestamps, event, KEY_CHAT_SHOW_TIMESTAMPS)

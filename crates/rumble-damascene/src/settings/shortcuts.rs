@@ -85,16 +85,37 @@ pub(super) fn render_shortcuts(pending: &PendingSettings, state: &SettingsState,
                 )
                 .muted()
                 .font_size(tokens::TEXT_XS.size),
+                field_row(
+                    "Enable control socket",
+                    switch(KEY_SHORTCUTS_RPC_ENABLE, pending.keyboard.rpc_server_enabled),
+                ),
                 paragraph(
-                    "Start damascene with `--rpc-server` to enable the socket at \
-                     $XDG_RUNTIME_DIR/rumble/damascene.sock.",
+                    "Binds a local control socket at $XDG_RUNTIME_DIR/rumble/damascene.sock (any local process can \
+                     then mute / disconnect / share files, so it stays off by default). Takes effect after you save \
+                     and restart Rumble. Equivalent to launching with the `--rpc-server` flag.",
                 )
                 .muted()
                 .font_size(tokens::TEXT_XS.size),
-                rpc_example_row("Toggle mute", RPC_EXAMPLE_TOGGLE_MUTE),
-                rpc_example_row("Toggle deafen", RPC_EXAMPLE_TOGGLE_DEAFEN),
-                rpc_example_row("Start transmit (PTT)", RPC_EXAMPLE_START_TRANSMIT),
-                rpc_example_row("Stop transmit (PTT)", RPC_EXAMPLE_STOP_TRANSMIT),
+                rpc_example_row(
+                    "Toggle mute",
+                    RPC_EXAMPLE_TOGGLE_MUTE,
+                    "settings:shortcuts:rpc-example:toggle-mute",
+                ),
+                rpc_example_row(
+                    "Toggle deafen",
+                    RPC_EXAMPLE_TOGGLE_DEAFEN,
+                    "settings:shortcuts:rpc-example:toggle-deafen",
+                ),
+                rpc_example_row(
+                    "Start transmit (PTT)",
+                    RPC_EXAMPLE_START_TRANSMIT,
+                    "settings:shortcuts:rpc-example:start-transmit",
+                ),
+                rpc_example_row(
+                    "Stop transmit (PTT)",
+                    RPC_EXAMPLE_STOP_TRANSMIT,
+                    "settings:shortcuts:rpc-example:stop-transmit",
+                ),
             ],
         ));
     }
@@ -103,21 +124,29 @@ pub(super) fn render_shortcuts(pending: &PendingSettings, state: &SettingsState,
 }
 
 /// Example shell commands the user can paste into their DE's custom-
-/// shortcut configuration. `nc -U` is widely available and matches the
-/// RPC server's newline-delimited JSON protocol.
+/// shortcut configuration. We use `socat` rather than `nc`: the Unix-
+/// socket `nc -U` flag is OpenBSD-netcat-only, so it's broken on the many
+/// distros that ship gnu-netcat or nmap's `ncat` as `nc` (Arch/Manjaro,
+/// Fedora, …). `socat` supports Unix sockets everywhere and exits on its
+/// own once the server replies. The protocol is newline-delimited JSON
+/// and the server acts on the newline `echo` appends, so no explicit
+/// half-close is needed. `ncat -U <sock>` works too if socat is absent.
 const RPC_EXAMPLE_TOGGLE_MUTE: &str =
-    r#"echo '{"method":"set_muted","muted":true}' | nc -UN "$XDG_RUNTIME_DIR/rumble/damascene.sock""#;
+    r#"echo '{"method":"toggle_muted"}' | socat - UNIX-CONNECT:"$XDG_RUNTIME_DIR/rumble/damascene.sock""#;
 const RPC_EXAMPLE_TOGGLE_DEAFEN: &str =
-    r#"echo '{"method":"set_deafened","deafened":true}' | nc -UN "$XDG_RUNTIME_DIR/rumble/damascene.sock""#;
+    r#"echo '{"method":"toggle_deafened"}' | socat - UNIX-CONNECT:"$XDG_RUNTIME_DIR/rumble/damascene.sock""#;
 const RPC_EXAMPLE_START_TRANSMIT: &str =
-    r#"echo '{"method":"start_transmit"}' | nc -UN "$XDG_RUNTIME_DIR/rumble/damascene.sock""#;
+    r#"echo '{"method":"start_transmit"}' | socat - UNIX-CONNECT:"$XDG_RUNTIME_DIR/rumble/damascene.sock""#;
 const RPC_EXAMPLE_STOP_TRANSMIT: &str =
-    r#"echo '{"method":"stop_transmit"}' | nc -UN "$XDG_RUNTIME_DIR/rumble/damascene.sock""#;
+    r#"echo '{"method":"stop_transmit"}' | socat - UNIX-CONNECT:"$XDG_RUNTIME_DIR/rumble/damascene.sock""#;
 
 /// One example row in the RPC hint: a label on the left, the command
-/// text in monospace on the right (ellipsised; the user can read it in
-/// the labels.txt dump if it wraps off-screen).
-fn rpc_example_row(label: &str, command: &str) -> El {
+/// text in monospace on the right. The command wraps rather than
+/// ellipsising so the full one-liner is visible (the Settings panel
+/// scrolls vertically to reveal it), and it's `.selectable()` so the user
+/// can drag-select and copy it straight into their DE's shortcut config.
+/// `key` gives the node the stable identity the selection system needs.
+fn rpc_example_row(label: &str, command: &str, key: &str) -> El {
     row([
         text(label)
             .muted()
@@ -125,11 +154,13 @@ fn rpc_example_row(label: &str, command: &str) -> El {
             .width(Size::Fixed(160.0)),
         mono(command)
             .font_size(tokens::TEXT_XS.size)
-            .ellipsis()
+            .wrap_text()
+            .key(key)
+            .selectable()
             .width(Size::Fill(1.0)),
     ])
     .gap(tokens::SPACE_2)
-    .align(Align::Center)
+    .align(Align::Start)
     .width(Size::Fill(1.0))
 }
 

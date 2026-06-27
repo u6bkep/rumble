@@ -62,14 +62,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Optional Unix-socket RPC server for external process control —
-    // notably the "system DE shortcut → rumble-ctl command" path on
-    // Wayland. Opt-in via `--rpc-server [path]`; if no path is given
-    // we use `$XDG_RUNTIME_DIR/rumble/damascene.sock` so we don't clobber
+    // notably the "system DE shortcut → shell command" path on Wayland.
+    // Opt-in two ways: the `--rpc-server [path]` CLI flag (for headless /
+    // scripted launches) or the persisted `keyboard.rpc_server_enabled`
+    // setting (the Shortcuts tab toggle). When neither names a path we use
+    // `$XDG_RUNTIME_DIR/rumble/damascene.sock` so we don't clobber
     // rumble-egui's default socket when both are installed. Held in a
     // local until `run_host_app_with_config` returns so the listener
     // outlives the GUI.
     #[cfg(unix)]
-    let _rpc_server = match rpc_server_socket_path() {
+    let _rpc_server = match rpc_server_socket_path(&settings) {
         Some(path) => match backend.start_rpc_server(path) {
             Ok(server) => {
                 tracing::info!("RPC server started");
@@ -162,15 +164,21 @@ fn build_connect_config(settings: &SettingsStore) -> ConnectConfig {
     config
 }
 
-/// Parse `--rpc-server [path]` out of the process arguments. Returns
-/// `Some(path)` when the flag is present (using the explicit path or
-/// the damascene default), or `None` when the user hasn't opted in.
+/// Decide whether — and where — to bind the RPC socket. Returns
+/// `Some(path)` when the user has opted in (so the caller should bind it),
+/// or `None` when they haven't.
+///
+/// Two opt-in paths, flag taking precedence over the setting:
+/// - `--rpc-server [path]` CLI flag — an explicit path overrides the
+///   default; a bare flag uses the default socket.
+/// - `keyboard.rpc_server_enabled` persisted setting — the Shortcuts-tab
+///   toggle; always uses the default socket.
 ///
 /// Default socket: `$XDG_RUNTIME_DIR/rumble/damascene.sock` (falling back to
 /// `/tmp/rumble/damascene.sock`). Distinct from rumble-egui's `rpc.sock` so
 /// both clients can run side-by-side without one clobbering the other.
 #[cfg(unix)]
-fn rpc_server_socket_path() -> Option<std::path::PathBuf> {
+fn rpc_server_socket_path(settings: &SettingsStore) -> Option<std::path::PathBuf> {
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         if arg == "--rpc-server" {
@@ -184,7 +192,12 @@ fn rpc_server_socket_path() -> Option<std::path::PathBuf> {
             return Some(std::path::PathBuf::from(p));
         }
     }
-    None
+    // No CLI flag — fall back to the persisted setting.
+    settings
+        .settings()
+        .keyboard
+        .rpc_server_enabled
+        .then(default_damascene_rpc_socket)
 }
 
 #[cfg(unix)]

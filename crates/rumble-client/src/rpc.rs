@@ -11,10 +11,18 @@ use std::{
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::UnixListener,
-    sync::{broadcast, mpsc},
+    sync::broadcast,
 };
 use tracing::{debug, info, warn};
 use uuid::Uuid;
+
+/// Fire-and-forget command sink shared with the backend. Routes a
+/// [`Command`] exactly as `BackendHandle::send` does (audio commands to the
+/// audio task, the rest to the connection task) — see
+/// `BackendHandle::command_sink`. The RPC server issues every command
+/// through this rather than a raw channel, so external callers reach the
+/// audio subsystem the same way the GUI does.
+pub type CommandSink = Arc<dyn Fn(Command) + Send + Sync>;
 
 /// Get the default socket path for the RPC server.
 ///
@@ -39,26 +47,59 @@ pub enum RpcRequest {
     Disconnect,
 
     // Rooms
-    JoinRoom { room_id: String },
-    CreateRoom { name: String, parent_id: Option<String> },
-    DeleteRoom { room_id: String },
-    RenameRoom { room_id: String, new_name: String },
+    JoinRoom {
+        room_id: String,
+    },
+    CreateRoom {
+        name: String,
+        parent_id: Option<String>,
+    },
+    DeleteRoom {
+        room_id: String,
+    },
+    RenameRoom {
+        room_id: String,
+        new_name: String,
+    },
 
     // Chat
-    SendChat { text: String },
+    SendChat {
+        text: String,
+    },
 
     // Audio
-    SetMuted { muted: bool },
-    SetDeafened { deafened: bool },
-    SetVoiceMode { mode: String },
+    SetMuted {
+        muted: bool,
+    },
+    SetDeafened {
+        deafened: bool,
+    },
+    /// Flip the current self-mute state. Reads the live value and sends
+    /// its inverse — the single-shot equivalent for DE shortcut keys,
+    /// which only fire on press and can't carry an explicit on/off.
+    ToggleMuted,
+    /// Flip the current self-deafen state (see [`RpcRequest::ToggleMuted`]).
+    ToggleDeafened,
+    SetVoiceMode {
+        mode: String,
+    },
     StartTransmit,
     StopTransmit,
-    MuteUser { user_id: u64 },
-    UnmuteUser { user_id: u64 },
-    SetUserVolume { user_id: u64, volume_db: f32 },
+    MuteUser {
+        user_id: u64,
+    },
+    UnmuteUser {
+        user_id: u64,
+    },
+    SetUserVolume {
+        user_id: u64,
+        volume_db: f32,
+    },
 
     // Files
-    ShareFile { path: String },
+    ShareFile {
+        path: String,
+    },
 
     // Events
     Subscribe,
@@ -122,11 +163,7 @@ pub struct RpcServer {
 
 impl RpcServer {
     /// Start the RPC server on the given socket path.
-    pub fn start(
-        socket_path: PathBuf,
-        state: Arc<RwLock<State>>,
-        command_tx: mpsc::UnboundedSender<Command>,
-    ) -> anyhow::Result<Self> {
+    pub fn start(socket_path: PathBuf, state: Arc<RwLock<State>>, command_sink: CommandSink) -> anyhow::Result<Self> {
         // Create parent directory if needed
         if let Some(parent) = socket_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -145,7 +182,7 @@ impl RpcServer {
         let socket_path_clone = socket_path.clone();
 
         let handle = tokio::spawn(async move {
-            Self::accept_loop(listener, state, command_tx, event_tx_clone).await;
+            Self::accept_loop(listener, state, command_sink, event_tx_clone).await;
             debug!(path = %socket_path_clone.display(), "RPC server stopped");
         });
 
@@ -165,17 +202,17 @@ impl RpcServer {
     async fn accept_loop(
         listener: UnixListener,
         state: Arc<RwLock<State>>,
-        command_tx: mpsc::UnboundedSender<Command>,
+        command_sink: CommandSink,
         event_tx: broadcast::Sender<StateEvent>,
     ) {
         loop {
             match listener.accept().await {
                 Ok((stream, _addr)) => {
                     let state = state.clone();
-                    let command_tx = command_tx.clone();
+                    let command_sink = command_sink.clone();
                     let event_rx = event_tx.subscribe();
                     tokio::spawn(async move {
-                        if let Err(e) = Self::handle_connection(stream, state, command_tx, event_rx).await {
+                        if let Err(e) = Self::handle_connection(stream, state, command_sink, event_rx).await {
                             debug!("RPC connection ended: {}", e);
                         }
                     });
@@ -191,7 +228,7 @@ impl RpcServer {
     async fn handle_connection(
         stream: tokio::net::UnixStream,
         state: Arc<RwLock<State>>,
-        command_tx: mpsc::UnboundedSender<Command>,
+        command_sink: CommandSink,
         mut event_rx: broadcast::Receiver<StateEvent>,
     ) -> anyhow::Result<()> {
         let (reader, mut writer) = stream.into_split();
@@ -209,7 +246,7 @@ impl RpcServer {
                         Ok(request) => {
                             let is_subscribe = matches!(request, RpcRequest::Subscribe);
                             let is_unsubscribe = matches!(request, RpcRequest::Unsubscribe);
-                            let resp = Self::handle_request(request, &state, &command_tx);
+                            let resp = Self::handle_request(request, &state, &command_sink);
                             if is_subscribe && resp.status == "ok" {
                                 subscribed = true;
                             }
@@ -246,11 +283,7 @@ impl RpcServer {
         Ok(())
     }
 
-    fn handle_request(
-        request: RpcRequest,
-        state: &Arc<RwLock<State>>,
-        command_tx: &mpsc::UnboundedSender<Command>,
-    ) -> RpcResponse {
+    fn handle_request(request: RpcRequest, state: &Arc<RwLock<State>>, command_sink: &CommandSink) -> RpcResponse {
         match request {
             RpcRequest::GetState => {
                 // Clone, then serialize OUTSIDE the lock: the clone is
@@ -302,12 +335,12 @@ impl RpcServer {
                 RpcResponse::ok_with_data(status)
             }
             RpcRequest::Disconnect => {
-                let _ = command_tx.send(Command::Disconnect);
+                command_sink(Command::Disconnect);
                 RpcResponse::ok()
             }
             RpcRequest::JoinRoom { room_id } => match room_id.parse::<Uuid>() {
                 Ok(uuid) => {
-                    let _ = command_tx.send(Command::JoinRoom { room_id: uuid });
+                    command_sink(Command::JoinRoom { room_id: uuid });
                     RpcResponse::ok()
                 }
                 Err(e) => RpcResponse::error(format!("Invalid room UUID: {}", e)),
@@ -320,7 +353,7 @@ impl RpcServer {
                     },
                     None => None,
                 };
-                let _ = command_tx.send(Command::CreateRoom {
+                command_sink(Command::CreateRoom {
                     name,
                     parent_id: parent_uuid,
                 });
@@ -328,14 +361,14 @@ impl RpcServer {
             }
             RpcRequest::DeleteRoom { room_id } => match room_id.parse::<Uuid>() {
                 Ok(uuid) => {
-                    let _ = command_tx.send(Command::DeleteRoom { room_id: uuid });
+                    command_sink(Command::DeleteRoom { room_id: uuid });
                     RpcResponse::ok()
                 }
                 Err(e) => RpcResponse::error(format!("Invalid room UUID: {}", e)),
             },
             RpcRequest::RenameRoom { room_id, new_name } => match room_id.parse::<Uuid>() {
                 Ok(uuid) => {
-                    let _ = command_tx.send(Command::RenameRoom {
+                    command_sink(Command::RenameRoom {
                         room_id: uuid,
                         new_name,
                     });
@@ -344,16 +377,26 @@ impl RpcServer {
                 Err(e) => RpcResponse::error(format!("Invalid room UUID: {}", e)),
             },
             RpcRequest::SendChat { text } => {
-                let _ = command_tx.send(Command::SendChat { text });
+                command_sink(Command::SendChat { text });
                 RpcResponse::ok()
             }
             RpcRequest::SetMuted { muted } => {
-                let _ = command_tx.send(Command::SetMuted { muted });
+                command_sink(Command::SetMuted { muted });
                 RpcResponse::ok()
             }
             RpcRequest::SetDeafened { deafened } => {
-                let _ = command_tx.send(Command::SetDeafened { deafened });
+                command_sink(Command::SetDeafened { deafened });
                 RpcResponse::ok()
+            }
+            RpcRequest::ToggleMuted => {
+                let muted = !state.read().unwrap_or_else(|e| e.into_inner()).audio.self_muted;
+                command_sink(Command::SetMuted { muted });
+                RpcResponse::ok_with_data(serde_json::json!({ "muted": muted }))
+            }
+            RpcRequest::ToggleDeafened => {
+                let deafened = !state.read().unwrap_or_else(|e| e.into_inner()).audio.self_deafened;
+                command_sink(Command::SetDeafened { deafened });
+                RpcResponse::ok_with_data(serde_json::json!({ "deafened": deafened }))
             }
             RpcRequest::SetVoiceMode { mode } => {
                 let voice_mode = match mode.as_str() {
@@ -361,31 +404,31 @@ impl RpcServer {
                     "continuous" => VoiceMode::Continuous,
                     _ => return RpcResponse::error(format!("Unknown voice mode: {}", mode)),
                 };
-                let _ = command_tx.send(Command::SetVoiceMode { mode: voice_mode });
+                command_sink(Command::SetVoiceMode { mode: voice_mode });
                 RpcResponse::ok()
             }
             RpcRequest::StartTransmit => {
-                let _ = command_tx.send(Command::StartTransmit);
+                command_sink(Command::StartTransmit);
                 RpcResponse::ok()
             }
             RpcRequest::StopTransmit => {
-                let _ = command_tx.send(Command::StopTransmit);
+                command_sink(Command::StopTransmit);
                 RpcResponse::ok()
             }
             RpcRequest::MuteUser { user_id } => {
-                let _ = command_tx.send(Command::MuteUser { user_id });
+                command_sink(Command::MuteUser { user_id });
                 RpcResponse::ok()
             }
             RpcRequest::UnmuteUser { user_id } => {
-                let _ = command_tx.send(Command::UnmuteUser { user_id });
+                command_sink(Command::UnmuteUser { user_id });
                 RpcResponse::ok()
             }
             RpcRequest::SetUserVolume { user_id, volume_db } => {
-                let _ = command_tx.send(Command::SetUserVolume { user_id, volume_db });
+                command_sink(Command::SetUserVolume { user_id, volume_db });
                 RpcResponse::ok()
             }
             RpcRequest::ShareFile { path } => {
-                let _ = command_tx.send(Command::ShareFile {
+                command_sink(Command::ShareFile {
                     path: PathBuf::from(path),
                 });
                 RpcResponse::ok()
