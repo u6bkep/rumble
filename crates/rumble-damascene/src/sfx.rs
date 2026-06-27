@@ -1,7 +1,8 @@
 //! Sound-effect edge detector. Diffs each frame's `State` against the
 //! previous frame to fire event cues once per change (new remote chat
-//! messages, connect/disconnect, server-mute, room join/leave, our own
-//! channel switches). The first observation of each tracked value seeds
+//! messages, connect/disconnect, server-mute, our own self-mute /
+//! self-deafen, room join/leave, our own channel switches). The first
+//! observation of each tracked value seeds
 //! the baseline without firing, so connecting to a populated server
 //! doesn't dump a flurry of beeps.
 //!
@@ -21,6 +22,8 @@ use uuid::Uuid;
 pub struct SfxEngine {
     prev_connected: bool,
     prev_server_muted: bool,
+    prev_self_muted: bool,
+    prev_self_deafened: bool,
     prev_room_id: Option<Uuid>,
     prev_room_members: HashSet<u64>,
     /// Room id of a locally-initiated `JoinRoom` awaiting confirmation,
@@ -83,6 +86,29 @@ impl SfxEngine {
             sounds.push(SfxKind::ServerMute);
         }
         self.prev_server_muted = server_muted;
+
+        // Our own self-mute / self-deafen, fired on both edges. Source-
+        // agnostic by design: toolbar, hotkey, room-tree context menu and
+        // the RPC control socket all converge on `SetMuted` / `SetDeafened`,
+        // so detecting the state edge here is the single cue trigger for all
+        // of them. Distinct from `server_muted` above (different field), so
+        // no double-fire.
+        if snapshot.audio.self_muted != self.prev_self_muted {
+            sounds.push(if snapshot.audio.self_muted {
+                SfxKind::Mute
+            } else {
+                SfxKind::Unmute
+            });
+            self.prev_self_muted = snapshot.audio.self_muted;
+        }
+        if snapshot.audio.self_deafened != self.prev_self_deafened {
+            sounds.push(if snapshot.audio.self_deafened {
+                SfxKind::Deafen
+            } else {
+                SfxKind::Undeafen
+            });
+            self.prev_self_deafened = snapshot.audio.self_deafened;
+        }
 
         // Our own room changes (SelfChannelJoin / SelfChannelMoved) and
         // remote users entering / leaving our room (UserJoin / UserLeave).

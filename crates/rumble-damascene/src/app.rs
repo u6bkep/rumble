@@ -1216,13 +1216,13 @@ impl<B: UiBackend> App for RumbleApp<B> {
         // Top toolbar.
         if event.is_click_or_activate("toolbar:mute") {
             let muted = self.backend.state().audio.self_muted;
-            self.play_sfx(if muted { SfxKind::Unmute } else { SfxKind::Mute });
+            // Cue is fired reactively by `SfxEngine` off the state edge, so
+            // every mute path (this, hotkey, context menu, RPC socket) sounds.
             self.backend.send(Command::SetMuted { muted: !muted });
             return;
         }
         if event.is_click_or_activate("toolbar:deafen") {
             let deafened = self.backend.state().audio.self_deafened;
-            self.play_sfx(if deafened { SfxKind::Undeafen } else { SfxKind::Deafen });
             self.backend.send(Command::SetDeafened { deafened: !deafened });
             return;
         }
@@ -2297,9 +2297,7 @@ impl<B: UiBackend> RumbleApp<B> {
                         HotkeyData::Off => false,
                         HotkeyData::Hold => continue,
                     };
-                    if muted != state.audio.self_muted {
-                        self.play_sfx(if muted { SfxKind::Mute } else { SfxKind::Unmute });
-                    }
+                    // Cue fired reactively by `SfxEngine` off the state edge.
                     self.backend.send(Command::SetMuted { muted });
                 }
                 HotkeyEvent::Pressed {
@@ -2312,9 +2310,7 @@ impl<B: UiBackend> RumbleApp<B> {
                         HotkeyData::Off => false,
                         HotkeyData::Hold => continue,
                     };
-                    if deafened != state.audio.self_deafened {
-                        self.play_sfx(if deafened { SfxKind::Deafen } else { SfxKind::Undeafen });
-                    }
+                    // Cue fired reactively by `SfxEngine` off the state edge.
                     self.backend.send(Command::SetDeafened { deafened });
                 }
                 HotkeyEvent::Pressed { .. } | HotkeyEvent::Released { .. } => {
