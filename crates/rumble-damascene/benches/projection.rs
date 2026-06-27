@@ -346,7 +346,7 @@ fn bench_projection(c: &mut Criterion) {
         let mut frame = 0usize;
         resize.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
             b.iter(|| {
-                let vp = if frame % 2 == 0 { narrow } else { viewport };
+                let vp = if frame.is_multiple_of(2) { narrow } else { viewport };
                 frame += 1;
                 let mut tree = app.build(&cx);
                 black_box(render_bundle_with(&mut tree, &mut ui_state, vp));
