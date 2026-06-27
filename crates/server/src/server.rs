@@ -182,6 +182,15 @@ impl Server {
             if count > 0 {
                 info!("Loaded {} persisted room(s)", count);
             }
+
+            // Hydrate ACLs into the in-memory room mirror so `get_rooms()`
+            // returns complete rooms (incl. `inherit_acl`/`acls`). Without
+            // this, those fields are cold after a restart and the incremental
+            // `StateUpdate` hash (built from `get_rooms()`) diverges from the
+            // full-state hash, resync-looping any verifying client on every
+            // update. The load-at-startup half of the `set_room_acl`
+            // write-through that `ops::apply_set_room_acl` drives on live edits.
+            self.state.hydrate_room_acls(persist).await;
         }
     }
 

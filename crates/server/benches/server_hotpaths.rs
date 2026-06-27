@@ -9,7 +9,7 @@
 //!    checks, the membership snapshot, server-authoritative re-encode, and
 //!    recipient gather. Scales with room size.
 //! 2. **State sync** (`state_rebuild` + `state_hash`) — the per-state-change
-//!    cost: the full `build_room_list` + `build_user_list` projection and the
+//!    cost: the full `get_rooms` + `build_user_list` projection and the
 //!    BLAKE3 rehash over the assembled `ServerState`. O(rooms × users), paid on
 //!    every join/leave/mute/room op.
 //! 3. **ACL evaluation** (`acl_eval`) — `evaluate_member_permissions` for one
@@ -113,11 +113,6 @@ fn bench_state_sync(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
     let grid = [(10usize, 4usize), (50, 8), (200, 16)];
 
-    // Persistence is mandatory since the Option→Arc cutover; an in-memory
-    // store with the default groups exercises the real ACL-eval path.
-    let persist: Arc<Persistence> = Arc::new(Persistence::in_memory().unwrap());
-    persist.ensure_default_groups().unwrap();
-
     let mut rebuild = c.benchmark_group("state_rebuild");
     for &(users, rooms) in &grid {
         let state = populated_state(&rt, users, rooms);
@@ -125,7 +120,7 @@ fn bench_state_sync(c: &mut Criterion) {
         rebuild.bench_with_input(BenchmarkId::from_parameter(&id), &(), |b, _| {
             b.iter(|| {
                 rt.block_on(async {
-                    let r = state.build_room_list(&persist).await;
+                    let r = state.get_rooms().await;
                     let u = state.build_user_list().await;
                     black_box((r, u))
                 })
@@ -139,7 +134,7 @@ fn bench_state_sync(c: &mut Criterion) {
         let state = populated_state(&rt, users, rooms);
         let proto = rt.block_on(async {
             ProtoServerState {
-                rooms: state.build_room_list(&persist).await,
+                rooms: state.get_rooms().await,
                 users: state.build_user_list().await,
                 groups: vec![],
                 slash_commands: vec![],

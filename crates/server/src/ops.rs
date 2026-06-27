@@ -772,13 +772,13 @@ pub(crate) async fn sweep_expired_memberships(
 pub(crate) const ACL_CONFLICT_MSG: &str =
     "Room ACL changed while you were editing — reopen the editor to load the latest rules and retry";
 
-/// Compute the room's *current* ACL version from the authoritative source.
+/// Compute the room's *current* ACL version for the optimistic-concurrency
+/// check, reading the durable record.
 ///
-/// Persistence is the source of truth for room ACLs (in-memory `ServerState`
-/// rooms only carry ACLs touched since startup — see
-/// [`ServerState::build_room_list`]); a room with no persisted record has the
-/// default configuration `(inherit_acl = true, no entries)`, which is exactly
-/// what clients see in `RoomInfo`.
+/// In-memory `ServerState` rooms and persistence are kept in lockstep by the
+/// `set_room_acl` write-through, so this matches what clients see in
+/// `RoomInfo`. A room with no persisted record has the default configuration
+/// `(inherit_acl = true, no entries)`.
 fn current_room_acl_version(persistence: &Persistence, room_uuid: Uuid) -> u64 {
     match persistence.get_room_acl(room_uuid.as_bytes()) {
         Some(acl) => {

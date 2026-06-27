@@ -941,7 +941,16 @@ impl ServerState {
         false
     }
 
-    /// Update a room's ACL data in-memory. Returns true if the room was found.
+    /// Apply a room's ACL to the in-memory mirror (`data.rooms`).
+    ///
+    /// `data.rooms` is the single source of truth for the room state clients
+    /// sync — including `inherit_acl`/`acls` — so `get_rooms()` always returns
+    /// complete rooms and the full-state and incremental hashes agree. This is
+    /// the *only* writer that keeps the ACL fields current: every room-ACL
+    /// change must flow through here (live edits via `ops::apply_set_room_acl`,
+    /// the load-at-startup pass in `Server::load_persisted_rooms`). Persistence
+    /// is durability only; nothing on the read/broadcast path consults it for
+    /// ACLs anymore. Returns false if no room has `room_uuid`.
     pub async fn set_room_acl(
         &self,
         room_uuid: Uuid,
@@ -957,6 +966,33 @@ impl ServerState {
             }
         }
         false
+    }
+
+    /// Load persisted room ACLs into the in-memory mirror for every known room
+    /// (Root included), so `get_rooms()` returns complete rooms from the first
+    /// request after a restart. The load-at-startup half of the
+    /// [`Self::set_room_acl`] write-through; persistence stays durability-only.
+    /// Idempotent — re-running it reproduces the same in-memory state.
+    pub async fn hydrate_room_acls(&self, persistence: &crate::persistence::Persistence) {
+        for room in self.get_rooms().await {
+            let Some(uuid) = room.id.as_ref().and_then(uuid_from_room_id) else {
+                continue;
+            };
+            if let Some(acl) = persistence.get_room_acl(uuid.as_bytes()) {
+                let entries = acl
+                    .entries
+                    .iter()
+                    .map(|e| rumble_protocol::proto::RoomAclEntry {
+                        group: e.group.clone(),
+                        grant: e.grant,
+                        deny: e.deny,
+                        apply_here: e.apply_here,
+                        apply_subs: e.apply_subs,
+                    })
+                    .collect();
+                self.set_room_acl(uuid, acl.inherit_acl, entries).await;
+            }
+        }
     }
 
     /// Set a room's description. Returns true if the room was found.
@@ -978,34 +1014,6 @@ impl ServerState {
     /// Get current room list.
     pub async fn get_rooms(&self) -> Vec<RoomInfo> {
         self.state_data.read().await.rooms.clone()
-    }
-
-    /// Build the room list with ACL data populated from persistence.
-    pub async fn build_room_list(
-        &self,
-        persistence: &std::sync::Arc<crate::persistence::Persistence>,
-    ) -> Vec<RoomInfo> {
-        let mut rooms = self.get_rooms().await;
-        let persist = persistence;
-        for room in &mut rooms {
-            if let Some(uuid) = room.id.as_ref().and_then(uuid_from_room_id)
-                && let Some(acl) = persist.get_room_acl(uuid.as_bytes())
-            {
-                room.inherit_acl = acl.inherit_acl;
-                room.acls = acl
-                    .entries
-                    .iter()
-                    .map(|e| rumble_protocol::proto::RoomAclEntry {
-                        group: e.group.clone(),
-                        grant: e.grant,
-                        deny: e.deny,
-                        apply_here: e.apply_here,
-                        apply_subs: e.apply_subs,
-                    })
-                    .collect();
-            }
-        }
-        rooms
     }
 
     /// Get a snapshot of state data for building messages.
@@ -1467,9 +1475,8 @@ mod tests {
                 .await;
         }
 
-        let persist = std::sync::Arc::new(crate::persistence::Persistence::in_memory().unwrap());
         let hash_now = || async {
-            let rooms = state.build_room_list(&persist).await;
+            let rooms = state.get_rooms().await;
             let users = state.build_user_list().await;
             compute_server_state_hash(&rumble_protocol::proto::ServerState {
                 rooms,
@@ -1483,5 +1490,61 @@ mod tests {
         let h2 = hash_now().await;
         assert!(!h1.is_empty());
         assert_eq!(h1, h2, "rebuilding the same logical state must hash identically");
+    }
+
+    /// Regression: after a restart the in-memory room mirror starts with cold
+    /// ACL fields, while persistence still holds the real rules. Before the
+    /// fix the full-state path hydrated ACLs from persistence but the
+    /// incremental `broadcast_state_update` path hashed the cold `get_rooms()`,
+    /// so the two hashes disagreed and any verifying client resync-looped on
+    /// every state change (e.g. a mute toggle). `hydrate_room_acls` makes
+    /// `get_rooms()` authoritative so both paths read the same complete rooms.
+    #[tokio::test]
+    async fn hydrate_room_acls_makes_get_rooms_authoritative_after_restart() {
+        use crate::persistence::{PersistedAclEntry, PersistedRoomAcl, Persistence};
+
+        // A prior session persisted a non-default ACL on Root.
+        let persist = Persistence::in_memory().unwrap();
+        persist
+            .set_room_acl(
+                ROOT_ROOM_UUID.as_bytes(),
+                &PersistedRoomAcl {
+                    inherit_acl: false,
+                    entries: vec![PersistedAclEntry {
+                        group: "default".to_string(),
+                        grant: 1,
+                        deny: 0,
+                        apply_here: true,
+                        apply_subs: true,
+                    }],
+                },
+            )
+            .unwrap();
+
+        // Fresh state == "just restarted": ACL fields are cold.
+        let state = ServerState::new();
+        let root_of = |rooms: &[RoomInfo]| {
+            rooms
+                .iter()
+                .find(|r| r.id.as_ref().and_then(uuid_from_room_id) == Some(ROOT_ROOM_UUID))
+                .cloned()
+                .expect("root room present")
+        };
+        assert!(
+            root_of(&state.get_rooms().await).acls.is_empty(),
+            "precondition: in-memory ACLs are cold before hydration"
+        );
+
+        state.hydrate_room_acls(&persist).await;
+
+        let warm = state.get_rooms().await;
+        let root = root_of(&warm);
+        assert!(!root.inherit_acl, "inherit_acl hydrated from persistence");
+        assert_eq!(root.acls.len(), 1, "ACL entries hydrated from persistence");
+        assert_eq!(root.acls[0].group, "default");
+
+        // Idempotent: the live write-through and a second startup pass converge.
+        state.hydrate_room_acls(&persist).await;
+        assert_eq!(state.get_rooms().await, warm, "hydration is idempotent");
     }
 }

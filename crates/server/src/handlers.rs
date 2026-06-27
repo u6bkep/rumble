@@ -1547,7 +1547,10 @@ async fn send_server_state_to_client(
     state: &ServerState,
     persistence: &Arc<Persistence>,
 ) -> Result<()> {
-    let mut rooms = state.build_room_list(persistence).await;
+    // `get_rooms()` already carries ACLs (hydrated at startup, kept current by
+    // the `set_room_acl` write-through) — the same complete room list the
+    // incremental `broadcast_state_update` hashes, so the two hashes agree.
+    let mut rooms = state.get_rooms().await;
     let users = state.build_user_list().await;
 
     // Build group definitions for client-side ACL evaluation

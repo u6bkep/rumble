@@ -44,16 +44,10 @@ fn room_dto(r: &rumble_protocol::proto::RoomInfo) -> RoomDto {
 
 /// `GET /api/state` — snapshot of connected users, rooms, and groups.
 pub async fn state_snapshot(_admin: Admin, State(st): State<WebState>) -> Json<StateSnapshot> {
-    // `build_room_list` hydrates each room's ACL entries from persistence, so
-    // the ACL editor opens with authoritative rules (in-memory `get_rooms`
-    // only carries ACLs touched since startup).
-    let rooms: Vec<RoomDto> = st
-        .state
-        .build_room_list(&st.persistence)
-        .await
-        .iter()
-        .map(room_dto)
-        .collect();
+    // `get_rooms()` carries each room's authoritative ACL entries (hydrated at
+    // startup, kept current by the `set_room_acl` write-through), so the ACL
+    // editor opens with the real rules.
+    let rooms: Vec<RoomDto> = st.state.get_rooms().await.iter().map(room_dto).collect();
 
     let groups: Vec<GroupDto> = st
         .persistence
@@ -138,12 +132,6 @@ pub async fn list_groups(_admin: Admin, State(st): State<WebState>) -> ApiResult
 
 /// `GET /api/rooms` — list rooms.
 pub async fn list_rooms(_admin: Admin, State(st): State<WebState>) -> ApiResult<Vec<RoomDto>> {
-    let rooms = st
-        .state
-        .build_room_list(&st.persistence)
-        .await
-        .iter()
-        .map(room_dto)
-        .collect();
+    let rooms = st.state.get_rooms().await.iter().map(room_dto).collect();
     Ok(Json(rooms))
 }
