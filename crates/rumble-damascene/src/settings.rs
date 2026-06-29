@@ -20,8 +20,8 @@ use rumble_client::{
     PipelineConfig, ProcessorConfig, ProcessorRegistry, Role, SfxKind, State, processors::type_ids,
 };
 use rumble_desktop_shell::{
-    AutoDownloadRule, HotkeyBinding, HotkeyData, HotkeyFunction, HotkeyManager, HotkeyModifiers, KeyboardSettings,
-    PersistentVoiceMode, Settings, ShortcutEntry, TimestampFormat,
+    AutoDownloadRule, HotkeyBinding, HotkeyData, HotkeyFunction, HotkeyManager, HotkeyModifiers,
+    HotkeyRegistrationStatus, KeyboardSettings, PersistentVoiceMode, Settings, ShortcutEntry, TimestampFormat,
 };
 use rumble_protocol::permissions::Permissions;
 use serde_json::Value as JsonValue;

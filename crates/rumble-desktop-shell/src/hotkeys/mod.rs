@@ -325,10 +325,36 @@ pub struct HotkeyModifiers {
 pub enum HotkeyRegistrationStatus {
     /// Hotkey registered successfully.
     Registered,
-    /// Registration failed.
+    /// The OS refused the registration because the key combination is
+    /// already held by another application (or reserved by the system).
+    Conflict,
+    /// We don't have a mapping from this key to a global-hotkey code, so
+    /// it can never be registered. Surfaced to the user as "unsupported
+    /// key" rather than a generic failure.
+    Unsupported,
+    /// Registration failed for some other reason — see logs.
     Failed,
     /// No binding configured for this entry.
     NotConfigured,
+}
+
+impl HotkeyRegistrationStatus {
+    /// True for any state where the shortcut will not fire and the user
+    /// should be told why.
+    pub fn is_problem(self) -> bool {
+        matches!(self, Self::Conflict | Self::Unsupported | Self::Failed)
+    }
+
+    /// Short, user-facing explanation for the problem states. `None` for
+    /// the healthy / unconfigured states (nothing to explain).
+    pub fn problem_message(self) -> Option<&'static str> {
+        match self {
+            Self::Conflict => Some("This key is already in use by another application — pick a different one."),
+            Self::Unsupported => Some("Rumble can't bind this key yet. Try a letter, number, or F-key."),
+            Self::Failed => Some("Couldn't register this shortcut — see the logs for details."),
+            Self::Registered | Self::NotConfigured => None,
+        }
+    }
 }
 
 /// Result of polling the manager. The (function, data) pair describes
@@ -715,27 +741,46 @@ impl HotkeyManager {
                 match Self::binding_to_hotkey(binding) {
                     Ok(hotkey) => {
                         let id = hotkey.id();
-                        if let Err(e) = manager.register(hotkey) {
-                            tracing::warn!("Failed to register {:?}/{:?}: {e}", entry.function, entry.data);
-                            self.registration_status
-                                .insert(entry.id.clone(), HotkeyRegistrationStatus::Failed);
-                        } else {
-                            self.hotkey_actions.insert(id, (entry.function, entry.data));
-                            self.registered_hotkeys.push(hotkey);
-                            self.registration_status
-                                .insert(entry.id.clone(), HotkeyRegistrationStatus::Registered);
-                            tracing::info!(
-                                "Registered {:?}/{:?}: {}",
-                                entry.function,
-                                entry.data,
-                                binding.display()
-                            );
+                        match manager.register(hotkey) {
+                            Ok(()) => {
+                                self.hotkey_actions.insert(id, (entry.function, entry.data));
+                                self.registered_hotkeys.push(hotkey);
+                                self.registration_status
+                                    .insert(entry.id.clone(), HotkeyRegistrationStatus::Registered);
+                                tracing::info!(
+                                    "Registered {:?}/{:?}: {}",
+                                    entry.function,
+                                    entry.data,
+                                    binding.display()
+                                );
+                            }
+                            // The OS already has this combo (e.g. another
+                            // running app grabbed it). Distinguished so the
+                            // UI can say "in use" rather than a vague error.
+                            Err(global_hotkey::Error::AlreadyRegistered(_)) => {
+                                tracing::warn!(
+                                    "Hotkey already in use {:?}/{:?}: {}",
+                                    entry.function,
+                                    entry.data,
+                                    binding.display()
+                                );
+                                self.registration_status
+                                    .insert(entry.id.clone(), HotkeyRegistrationStatus::Conflict);
+                            }
+                            Err(e) => {
+                                tracing::warn!("Failed to register {:?}/{:?}: {e}", entry.function, entry.data);
+                                self.registration_status
+                                    .insert(entry.id.clone(), HotkeyRegistrationStatus::Failed);
+                            }
                         }
                     }
+                    // We don't know this key — it has no global-hotkey code
+                    // mapping (e.g. a key not in `key_string_to_code`, or a
+                    // numpad/symbol key the capture path can't yet express).
                     Err(e) => {
-                        tracing::warn!("Invalid {:?}/{:?} binding: {e}", entry.function, entry.data);
+                        tracing::warn!("Unsupported {:?}/{:?} binding: {e}", entry.function, entry.data);
                         self.registration_status
-                            .insert(entry.id.clone(), HotkeyRegistrationStatus::Failed);
+                            .insert(entry.id.clone(), HotkeyRegistrationStatus::Unsupported);
                     }
                 }
             }
@@ -875,6 +920,21 @@ impl HotkeyManager {
             "f10" => Ok(Code::F10),
             "f11" => Ok(Code::F11),
             "f12" => Ok(Code::F12),
+            // Extended function keys — common on programmable (QMK/VIA)
+            // keyboards, which often map spare keys to F13–F24. Windows
+            // has VK_F13..VK_F24; X11/macOS back them too.
+            "f13" => Ok(Code::F13),
+            "f14" => Ok(Code::F14),
+            "f15" => Ok(Code::F15),
+            "f16" => Ok(Code::F16),
+            "f17" => Ok(Code::F17),
+            "f18" => Ok(Code::F18),
+            "f19" => Ok(Code::F19),
+            "f20" => Ok(Code::F20),
+            "f21" => Ok(Code::F21),
+            "f22" => Ok(Code::F22),
+            "f23" => Ok(Code::F23),
+            "f24" => Ok(Code::F24),
 
             "a" | "keya" => Ok(Code::KeyA),
             "b" | "keyb" => Ok(Code::KeyB),
@@ -970,8 +1030,16 @@ mod tests {
         assert!(matches!(HotkeyManager::key_string_to_code("Space"), Ok(Code::Space)));
         assert!(matches!(HotkeyManager::key_string_to_code("space"), Ok(Code::Space)));
         assert!(matches!(HotkeyManager::key_string_to_code("F1"), Ok(Code::F1)));
+        // Extended function keys (QMK/VIA keyboards bind these).
+        assert!(matches!(HotkeyManager::key_string_to_code("F14"), Ok(Code::F14)));
+        assert!(matches!(HotkeyManager::key_string_to_code("f24"), Ok(Code::F24)));
         assert!(matches!(HotkeyManager::key_string_to_code("a"), Ok(Code::KeyA)));
         assert!(HotkeyManager::key_string_to_code("InvalidKey").is_err());
+        // Numpad operators still can't be expressed by the logical-key
+        // capture path: it stores the produced character ("*"), which is
+        // ambiguous with Shift+8 and has no code mapping. Tracked upstream
+        // (damascene physical-key exposure).
+        assert!(HotkeyManager::key_string_to_code("*").is_err());
     }
 
     #[cfg(feature = "global-hotkeys")]

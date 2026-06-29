@@ -24,6 +24,20 @@ pub(super) fn render_shortcuts(pending: &PendingSettings, state: &SettingsState,
     };
     shortcut_rows.push(paragraph(helper).muted().font_size(tokens::TEXT_XS.size));
 
+    // Surface a hard backend failure up front: on X11/Win/macOS the
+    // global-hotkey manager can fail to initialise (no usable backend),
+    // in which case no row will ever fire no matter what's bound.
+    if !is_wayland && hotkeys.init_failed() {
+        shortcut_rows.push(
+            paragraph(
+                "Global shortcuts couldn't be initialized on this system — bindings below won't fire. See the logs \
+                 for details.",
+            )
+            .warning()
+            .font_size(tokens::TEXT_XS.size),
+        );
+    }
+
     // Column header. Width budgets match the row body below so the
     // labels line up against the dropdown triggers / shortcut buttons.
     shortcut_rows.push(
@@ -40,6 +54,8 @@ pub(super) fn render_shortcuts(pending: &PendingSettings, state: &SettingsState,
                 .muted()
                 .font_size(tokens::TEXT_XS.size)
                 .width(Size::Fill(1.0)),
+            // Status-icon column + remove-button column.
+            spacer().width(Size::Fixed(SHORTCUT_STATUS_COL_W)),
             spacer().width(Size::Fixed(28.0)),
         ])
         .gap(tokens::SPACE_2)
@@ -169,6 +185,8 @@ fn rpc_example_row(label: &str, command: &str, key: &str) -> El {
 /// ellipsis.
 const SHORTCUT_FN_COL_W: f32 = 160.0;
 const SHORTCUT_DATA_COL_W: f32 = 110.0;
+/// Width of the per-row registration-status icon column.
+const SHORTCUT_STATUS_COL_W: f32 = 20.0;
 
 /// One row of the Shortcuts table. The trailing icon-only button
 /// removes this specific row — there's no separate row-selection step,
@@ -200,14 +218,66 @@ fn shortcut_row(entry: &ShortcutEntry, state: &SettingsState, hotkeys: &HotkeyMa
     }
     let binding_cell = binding_btn.width(Size::Fill(1.0));
 
+    // Registration status drives the trailing icon + an inline reason
+    // line. Wayland owns key assignment through the portal, so there's no
+    // meaningful per-row OS-registration state to show there; only the
+    // X11/Win/macOS (global-hotkey) path reports it. We also suppress it
+    // mid-capture (the binding is in flux until the key lands).
+    let status = (!is_wayland && !capturing).then(|| hotkeys.get_registration_status(&entry.id));
+    let status_cell = status_icon_cell(status);
+
     let remove = icon_button(IconName::X)
         .key(shortcut_remove_key(&entry.id))
         .ghost()
         .tooltip("Remove shortcut");
 
-    row([function_trigger, data_trigger, binding_cell, remove])
+    let main = row([function_trigger, data_trigger, binding_cell, status_cell, remove])
         .gap(tokens::SPACE_2)
         .align(Align::Center)
+        .width(Size::Fill(1.0));
+
+    // A failed/unsupported/conflicting binding gets a plain-language line
+    // beneath the row so the user isn't left guessing why a key they set
+    // does nothing.
+    match status.and_then(|s| s.problem_message()) {
+        Some(msg) => column([
+            main,
+            paragraph(msg)
+                .warning()
+                .font_size(tokens::TEXT_XS.size)
+                .width(Size::Fill(1.0)),
+        ])
+        .gap(tokens::SPACE_1)
         .width(Size::Fill(1.0))
-        .key(shortcuts_row_key(&entry.id))
+        .key(shortcuts_row_key(&entry.id)),
+        None => main.key(shortcuts_row_key(&entry.id)),
+    }
+}
+
+/// Fixed-width trailing cell holding the registration-status glyph: a
+/// green check when the shortcut is live, a destructive alert (with a
+/// hover tooltip) when it won't fire, and empty otherwise (unconfigured,
+/// Wayland, or mid-capture). Always occupies the same width so the rows
+/// and header stay column-aligned.
+fn status_icon_cell(status: Option<HotkeyRegistrationStatus>) -> El {
+    let glyph = match status {
+        Some(HotkeyRegistrationStatus::Registered) => Some(
+            icon(IconName::Check)
+                .icon_size(tokens::ICON_XS)
+                .color(crate::theme::TALKING)
+                .tooltip("Shortcut active"),
+        ),
+        Some(s) if s.is_problem() => Some(
+            icon(IconName::AlertCircle)
+                .icon_size(tokens::ICON_XS)
+                .color(tokens::DESTRUCTIVE)
+                .tooltip(s.problem_message().unwrap_or("This shortcut won't fire.")),
+        ),
+        _ => None,
+    };
+    // Fixed width whether or not a glyph is present, so columns stay
+    // aligned across rows.
+    row(glyph.into_iter().collect::<Vec<_>>())
+        .align(Align::Center)
+        .width(Size::Fixed(SHORTCUT_STATUS_COL_W))
 }
