@@ -209,14 +209,14 @@ pub fn handle_event(state: &mut KickBanModal, event: &UiEvent, selection: &mut S
     }
     if let UiEventKind::KeyDown = event.kind
         && let Some(kp) = event.key_press.as_ref()
-        && matches!(kp.key, UiKey::Escape)
+        && kp.logical.named() == Some(NamedKey::Escape)
     {
         return ModerationOutcome::Cancel;
     }
 
     // Reason text input.
     if event.target_key() == Some(KEY_REASON) {
-        damascene_core::widgets::text_input::apply_event(&mut state.reason, selection, KEY_REASON, event);
+        damascene_core::widgets::text_input::apply_event(&mut state.reason, selection, event, KEY_REASON);
         return ModerationOutcome::Handled;
     }
 

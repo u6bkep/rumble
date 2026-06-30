@@ -131,25 +131,25 @@ pub fn handle_event(
             let n = suggestions.len();
             // Clamp any stale highlight (defensive) so the index is in range.
             let sel = state.command_selected.filter(|i| *i < n);
-            match kp.key {
-                UiKey::ArrowDown if !kp.modifiers.shift => {
+            match &kp.logical {
+                LogicalKey::Named(NamedKey::ArrowDown) if !kp.modifiers.shift => {
                     state.command_selected = Some(sel.map_or(0, |i| (i + 1) % n));
                     return ComposerOutcome::Handled;
                 }
-                UiKey::ArrowUp if !kp.modifiers.shift => {
+                LogicalKey::Named(NamedKey::ArrowUp) if !kp.modifiers.shift => {
                     state.command_selected = Some(sel.map_or(n - 1, |i| (i + n - 1) % n));
                     return ComposerOutcome::Handled;
                 }
-                UiKey::Escape if sel.is_some() => {
+                LogicalKey::Named(NamedKey::Escape) if sel.is_some() => {
                     state.command_selected = None;
                     return ComposerOutcome::Handled;
                 }
-                UiKey::Tab if !kp.modifiers.shift => {
+                LogicalKey::Named(NamedKey::Tab) if !kp.modifiers.shift => {
                     let name = suggestions[sel.unwrap_or(0)].0.clone();
                     complete(state, selection, &name);
                     return ComposerOutcome::Handled;
                 }
-                UiKey::Enter
+                LogicalKey::Named(NamedKey::Enter)
                     if sel.is_some()
                         && !kp.modifiers.shift
                         && !kp.modifiers.ctrl
@@ -169,7 +169,7 @@ pub fn handle_event(
     // `text_area::apply_event` for newline insertion.
     if let UiEventKind::KeyDown = event.kind
         && let Some(kp) = event.key_press.as_ref()
-        && matches!(kp.key, UiKey::Enter)
+        && kp.logical.named() == Some(NamedKey::Enter)
         && !kp.modifiers.shift
         && !kp.modifiers.ctrl
         && !kp.modifiers.alt
@@ -191,7 +191,7 @@ pub fn handle_event(
     // so reaching here means no text — let the App try an image paste.
     if let UiEventKind::KeyDown = event.kind
         && let Some(kp) = event.key_press.as_ref()
-        && let UiKey::Character(c) = &kp.key
+        && let LogicalKey::Character(c) = &kp.logical
         && c.eq_ignore_ascii_case("v")
         && (kp.modifiers.ctrl || kp.modifiers.logo)
         && !kp.modifiers.shift
@@ -200,7 +200,7 @@ pub fn handle_event(
         return ComposerOutcome::PasteImage;
     }
 
-    text_area::apply_event(&mut state.input, selection, KEY_INPUT, event);
+    text_area::apply_event(&mut state.input, selection, event, KEY_INPUT);
     // The text (and thus the suggestion list) just changed; drop any
     // arrow-key highlight so a stale index never points at the wrong row.
     state.command_selected = None;

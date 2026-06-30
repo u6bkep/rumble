@@ -617,7 +617,7 @@ impl AdminApp {
         } else {
             TextInputOpts::default()
         };
-        text_input::apply_event_with(value, &mut self.selection, target, event, &opts);
+        text_input::apply_event_with(value, &mut self.selection, event, target, &opts);
         true
     }
 

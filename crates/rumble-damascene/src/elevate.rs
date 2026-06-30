@@ -67,7 +67,7 @@ pub fn handle_event(state: &mut ElevateState, event: &UiEvent, selection: &mut S
     }
     if let UiEventKind::KeyDown = event.kind
         && let Some(kp) = event.key_press.as_ref()
-        && matches!(kp.key, UiKey::Escape)
+        && kp.logical.named() == Some(NamedKey::Escape)
     {
         return ElevateOutcome::Cancel;
     }
@@ -75,7 +75,7 @@ pub fn handle_event(state: &mut ElevateState, event: &UiEvent, selection: &mut S
         // Submit on bare Enter — matches the unlock prompt's UX.
         if let UiEventKind::KeyDown = event.kind
             && let Some(kp) = event.key_press.as_ref()
-            && matches!(kp.key, UiKey::Enter)
+            && kp.logical.named() == Some(NamedKey::Enter)
             && !kp.modifiers.shift
             && !state.password.is_empty()
         {
@@ -83,7 +83,7 @@ pub fn handle_event(state: &mut ElevateState, event: &UiEvent, selection: &mut S
                 password: state.password.clone(),
             };
         }
-        password_input::apply_event(&mut state.password, selection, KEY_PWD, event);
+        password_input::apply_event(&mut state.password, selection, event, KEY_PWD);
         return ElevateOutcome::Handled;
     }
     if event.is_click_or_activate(KEY_SUBMIT) && !state.password.is_empty() {

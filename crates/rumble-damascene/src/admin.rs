@@ -985,7 +985,7 @@ pub fn handle_event(
 }
 
 fn handle_search_event(state: &mut AdminState, event: &UiEvent, selection: &mut Selection) -> Option<AdminOutcome> {
-    if damascene_core::widgets::text_input::apply_event(&mut state.search_query, selection, KEY_SEARCH, event) {
+    if damascene_core::widgets::text_input::apply_event(&mut state.search_query, selection, event, KEY_SEARCH) {
         Some(AdminOutcome::Handled)
     } else {
         None
@@ -1010,7 +1010,7 @@ fn handle_new_group_event(
     }
 
     if let Some(form) = state.new_group.as_mut()
-        && damascene_core::widgets::text_input::apply_event(&mut form.name, selection, KEY_NEW_GROUP_NAME, event)
+        && damascene_core::widgets::text_input::apply_event(&mut form.name, selection, event, KEY_NEW_GROUP_NAME)
     {
         form.error = None;
         return Some(AdminOutcome::Handled);
@@ -1057,7 +1057,7 @@ fn handle_add_user_query_event(
 ) -> Option<AdminOutcome> {
     let popover = state.add_user_popover.as_mut()?;
     let key = key_add_user_query(&popover.group_name);
-    if damascene_core::widgets::text_input::apply_event(&mut popover.query, selection, &key, event) {
+    if damascene_core::widgets::text_input::apply_event(&mut popover.query, selection, event, &key) {
         return Some(AdminOutcome::Handled);
     }
     // Expiry-duration tabs. Handled here (before the generic group-route

@@ -1042,7 +1042,7 @@ pub fn handle_event(
 
     // Room-name + description text inputs — only editable with MODIFY_ROOM.
     if state.can_modify
-        && damascene_core::widgets::text_input::apply_event(&mut state.name_input, selection, KEY_NAME_INPUT, event)
+        && damascene_core::widgets::text_input::apply_event(&mut state.name_input, selection, event, KEY_NAME_INPUT)
     {
         return RoomAclOutcome::Handled;
     }
@@ -1050,8 +1050,8 @@ pub fn handle_event(
         && damascene_core::widgets::text_input::apply_event(
             &mut state.description_input,
             selection,
-            KEY_DESC_INPUT,
             event,
+            KEY_DESC_INPUT,
         )
     {
         return RoomAclOutcome::Handled;

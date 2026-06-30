@@ -15,6 +15,6 @@ pub fn password_input(value: &str, selection: &Selection, key: &str) -> El {
 /// Apply a routed `UiEvent` to a password field. Mirrors
 /// `text_input::apply_event` but sets the password mask so paste / max-
 /// length behave consistently with the rendered field.
-pub fn apply_event(value: &mut String, selection: &mut Selection, key: &str, event: &UiEvent) -> bool {
-    text_input::apply_event_with(value, selection, key, event, &TextInputOpts::default().password())
+pub fn apply_event(value: &mut String, selection: &mut Selection, event: &UiEvent, key: &str) -> bool {
+    text_input::apply_event_with(value, selection, event, key, &TextInputOpts::default().password())
 }

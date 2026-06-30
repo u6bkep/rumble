@@ -357,7 +357,7 @@ pub fn handle_event(state: &mut ServerPickerState, event: &UiEvent, selection: &
             FormField::Label => &mut form.label,
             FormField::Username => &mut form.username,
         };
-        text_input::apply_event(buf, selection, field.key(), event);
+        text_input::apply_event(buf, selection, event, field.key());
         return ServerPickerOutcome::Handled;
     }
 

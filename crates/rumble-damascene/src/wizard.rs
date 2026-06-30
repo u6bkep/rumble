@@ -378,11 +378,11 @@ pub fn handle_event(state: &mut WizardState, event: &UiEvent, selection: &mut Se
             error,
         } => {
             if event.target_key() == Some(KEY_PWD) {
-                password_input::apply_event(password, selection, KEY_PWD, event);
+                password_input::apply_event(password, selection, event, KEY_PWD);
                 return WizardOutcome::Handled;
             }
             if event.target_key() == Some(KEY_CONFIRM) {
-                password_input::apply_event(confirm, selection, KEY_CONFIRM, event);
+                password_input::apply_event(confirm, selection, event, KEY_CONFIRM);
                 return WizardOutcome::Handled;
             }
             if event.is_click_or_activate(KEY_BACK) {
@@ -433,7 +433,7 @@ pub fn handle_event(state: &mut WizardState, event: &UiEvent, selection: &mut Se
         }
         WizardState::GenerateAgentKey { comment } => {
             if event.target_key() == Some(KEY_AGENT_COMMENT) {
-                text_input::apply_event(comment, selection, KEY_AGENT_COMMENT, event);
+                text_input::apply_event(comment, selection, event, KEY_AGENT_COMMENT);
                 return WizardOutcome::Handled;
             }
             if event.is_click_or_activate(KEY_BACK) {
@@ -460,7 +460,7 @@ pub fn handle_unlock_event(state: &mut UnlockState, event: &UiEvent, selection: 
         // Submit on bare Enter (no shift) — matches rumble-next's UX.
         if let UiEventKind::KeyDown = event.kind
             && let Some(kp) = event.key_press.as_ref()
-            && matches!(kp.key, UiKey::Enter)
+            && kp.logical.named() == Some(NamedKey::Enter)
             && !kp.modifiers.shift
             && !state.password.is_empty()
         {
@@ -468,7 +468,7 @@ pub fn handle_unlock_event(state: &mut UnlockState, event: &UiEvent, selection: 
                 password: state.password.clone(),
             };
         }
-        password_input::apply_event(&mut state.password, selection, KEY_UNLOCK_PWD, event);
+        password_input::apply_event(&mut state.password, selection, event, KEY_UNLOCK_PWD);
         return WizardOutcome::Handled;
     }
     if event.is_click_or_activate(KEY_UNLOCK_SUBMIT) && !state.password.is_empty() {

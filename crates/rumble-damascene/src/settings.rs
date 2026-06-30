@@ -1279,41 +1279,14 @@ fn zone_label_strip(zones: &[(f32, f32, Role, Option<String>)], min: f32, max: f
 /// keys we don't have a stable name for — those can't be bound as a
 /// global shortcut and capture mode stays open waiting for a real key.
 fn keypress_to_binding(press: &KeyPress) -> Option<HotkeyBinding> {
-    let key = match &press.key {
-        UiKey::Enter => "Enter".to_string(),
-        UiKey::Tab => "Tab".to_string(),
-        UiKey::Space => "Space".to_string(),
-        UiKey::ArrowUp => "ArrowUp".to_string(),
-        UiKey::ArrowDown => "ArrowDown".to_string(),
-        UiKey::ArrowLeft => "ArrowLeft".to_string(),
-        UiKey::ArrowRight => "ArrowRight".to_string(),
-        UiKey::Backspace => "Backspace".to_string(),
-        UiKey::Delete => "Delete".to_string(),
-        UiKey::Home => "Home".to_string(),
-        UiKey::End => "End".to_string(),
-        UiKey::PageUp => "PageUp".to_string(),
-        UiKey::PageDown => "PageDown".to_string(),
-        UiKey::Escape => return None, // Escape is the cancel shortcut.
-        UiKey::Character(s) => {
-            // Strip stray whitespace and normalise to uppercase so
-            // "a"/"A" both round-trip through key_string_to_code.
-            let trimmed = s.trim();
-            if trimmed.is_empty() {
-                return None;
-            }
-            trimmed.to_string()
-        }
-        UiKey::Other(name) => {
-            // F-keys, media keys, etc. show up here as winit-style
-            // names. Pass through verbatim — global-hotkey's
-            // key_string_to_code matches case-insensitively for F1..F12
-            // and we don't try to handle the long tail of media keys.
-            if name.is_empty() {
-                return None;
-            }
-            name.clone()
-        }
-    };
+    // Bind the *physical* key: a global hotkey is a board position, not a
+    // layout-/modifier-dependent meaning. This is what makes numpad keys
+    // and duplicate keys (numpad vs main row) bindable at all, and keeps
+    // a binding made on one layout firing on another. The physical-key
+    // variant names mirror the W3C `code` vocabulary, which is exactly
+    // what `HotkeyManager::key_string_to_code` consumes, so they
+    // round-trip without a second mapping table here.
+    let key = physical_key_to_binding_string(press.physical)?;
     let modifiers = HotkeyModifiers {
         ctrl: press.modifiers.ctrl,
         shift: press.modifiers.shift,
@@ -1321,6 +1294,64 @@ fn keypress_to_binding(press: &KeyPress) -> Option<HotkeyBinding> {
         super_key: press.modifiers.logo,
     };
     Some(HotkeyBinding { modifiers, key })
+}
+
+/// Map a physical key to the string `HotkeyManager::key_string_to_code`
+/// consumes. Returns `None` for keys that can't stand alone as a global
+/// hotkey's main key: bare modifiers, the lock keys, Escape (our
+/// capture-cancel key), and `Unidentified` — capture stays open until a
+/// real key lands. Letters and digits get their friendly single-char name
+/// ("A", "7") so the display stays as it was; everything else uses the
+/// W3C `code` name (`Debug`), which `key_string_to_code` accepts
+/// (`NumpadMultiply`, `F14`, `ArrowUp`, …) or reports as Unsupported.
+fn physical_key_to_binding_string(physical: PhysicalKey) -> Option<String> {
+    use PhysicalKey::*;
+    let s = match physical {
+        KeyA => "A",
+        KeyB => "B",
+        KeyC => "C",
+        KeyD => "D",
+        KeyE => "E",
+        KeyF => "F",
+        KeyG => "G",
+        KeyH => "H",
+        KeyI => "I",
+        KeyJ => "J",
+        KeyK => "K",
+        KeyL => "L",
+        KeyM => "M",
+        KeyN => "N",
+        KeyO => "O",
+        KeyP => "P",
+        KeyQ => "Q",
+        KeyR => "R",
+        KeyS => "S",
+        KeyT => "T",
+        KeyU => "U",
+        KeyV => "V",
+        KeyW => "W",
+        KeyX => "X",
+        KeyY => "Y",
+        KeyZ => "Z",
+        Digit0 => "0",
+        Digit1 => "1",
+        Digit2 => "2",
+        Digit3 => "3",
+        Digit4 => "4",
+        Digit5 => "5",
+        Digit6 => "6",
+        Digit7 => "7",
+        Digit8 => "8",
+        Digit9 => "9",
+        // Modifiers, locks, the capture-cancel key, and unknown positions
+        // can't be a standalone hotkey.
+        AltLeft | AltRight | ControlLeft | ControlRight | ShiftLeft | ShiftRight | MetaLeft | MetaRight | CapsLock
+        | NumLock | ScrollLock | Escape | Unidentified => return None,
+        // Everything else: the W3C `code` name round-trips through
+        // key_string_to_code (or surfaces as Unsupported in the UI).
+        other => return Some(format!("{other:?}")),
+    };
+    Some(s.to_string())
 }
 
 // ---- view helpers ---------------------------------------------------
@@ -1700,12 +1731,12 @@ pub fn handle_event(
     {
         match field {
             "mime" => {
-                text_input::apply_event(&mut rule.mime_pattern, selection, &rule_mime_key(idx), event);
+                text_input::apply_event(&mut rule.mime_pattern, selection, event, &rule_mime_key(idx));
                 return SettingsOutcome::Handled;
             }
             "size" => {
                 let key = rule_size_key(idx);
-                text_input::apply_event(&mut rule.size_mb_text, selection, &key, event);
+                text_input::apply_event(&mut rule.size_mb_text, selection, event, &key);
                 return SettingsOutcome::Handled;
             }
             _ => {}
@@ -1979,7 +2010,7 @@ pub fn handle_event(
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .to_string();
-        text_input::apply_event(&mut value, selection, &route, event);
+        text_input::apply_event(&mut value, selection, event, &route);
         ensure_object(&mut proc_config.settings)[field] = JsonValue::String(value);
         return SettingsOutcome::Handled;
     }
@@ -2167,4 +2198,63 @@ fn ensure_object(value: &mut JsonValue) -> &mut JsonValue {
         *value = JsonValue::Object(serde_json::Map::new());
     }
     value
+}
+
+#[cfg(test)]
+mod hotkey_capture_tests {
+    use rumble_desktop_shell::HotkeyManager;
+
+    use super::*;
+
+    fn binding(physical: PhysicalKey) -> Option<HotkeyBinding> {
+        keypress_to_binding(&KeyPress::new(
+            LogicalKey::Unidentified,
+            physical,
+            KeyModifiers::default(),
+            false,
+        ))
+    }
+
+    #[test]
+    fn captures_physical_key_so_numpad_round_trips() {
+        // The whole point of binding the physical key: numpad keys (whose
+        // logical value is ambiguous — `*` collides with Shift+8, `/ - .`
+        // collapse onto the main row) now produce a stable code that
+        // round-trips through the global-hotkey mapping.
+        for (physical, expected) in [
+            (PhysicalKey::NumpadMultiply, "NumpadMultiply"),
+            (PhysicalKey::NumpadDivide, "NumpadDivide"),
+            (PhysicalKey::NumpadSubtract, "NumpadSubtract"),
+            (PhysicalKey::Numpad7, "Numpad7"),
+            (PhysicalKey::F14, "F14"),
+            (PhysicalKey::KeyA, "A"),
+            (PhysicalKey::Digit7, "7"),
+        ] {
+            let b = binding(physical).unwrap_or_else(|| panic!("{physical:?} should bind"));
+            assert_eq!(b.key, expected, "{physical:?}");
+            // And the produced string must map back to a global-hotkey Code.
+            assert!(
+                HotkeyManager::key_string_to_code(&b.key).is_ok(),
+                "{:?} -> {:?} is not a known hotkey code",
+                physical,
+                b.key
+            );
+        }
+    }
+
+    #[test]
+    fn modifiers_and_escape_do_not_bind() {
+        // Bare modifiers, locks, Escape (capture-cancel) and unknown
+        // positions leave capture open rather than binding junk.
+        for physical in [
+            PhysicalKey::ShiftLeft,
+            PhysicalKey::ControlRight,
+            PhysicalKey::MetaLeft,
+            PhysicalKey::CapsLock,
+            PhysicalKey::Escape,
+            PhysicalKey::Unidentified,
+        ] {
+            assert!(binding(physical).is_none(), "{physical:?} should not bind");
+        }
+    }
 }

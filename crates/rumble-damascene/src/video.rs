@@ -310,30 +310,30 @@ pub fn handle_lightbox_key(active: &mut ActiveVideo, event: &UiEvent) -> bool {
         return false;
     }
 
-    match &kp.key {
-        UiKey::Space if !mods.shift => {
+    match &kp.logical {
+        LogicalKey::Named(NamedKey::Space) if !mods.shift => {
             active.toggle_play();
             true
         }
-        UiKey::ArrowLeft => {
+        LogicalKey::Named(NamedKey::ArrowLeft) => {
             let step = if mods.shift { SEEK_STEP_LARGE } else { SEEK_STEP_SMALL };
             active.seek_relative(-step);
             true
         }
-        UiKey::ArrowRight => {
+        LogicalKey::Named(NamedKey::ArrowRight) => {
             let step = if mods.shift { SEEK_STEP_LARGE } else { SEEK_STEP_SMALL };
             active.seek_relative(step);
             true
         }
-        UiKey::Home if !mods.shift => {
+        LogicalKey::Named(NamedKey::Home) if !mods.shift => {
             active.seek_to_edge(false);
             true
         }
-        UiKey::End if !mods.shift => {
+        LogicalKey::Named(NamedKey::End) if !mods.shift => {
             active.seek_to_edge(true);
             true
         }
-        UiKey::Character(s) if s.eq_ignore_ascii_case("m") && !mods.shift => {
+        LogicalKey::Character(s) if s.eq_ignore_ascii_case("m") && !mods.shift => {
             active.toggle_mute();
             true
         }
