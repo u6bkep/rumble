@@ -1374,6 +1374,7 @@ dependencies = [
  "lyon_tessellation",
  "naga",
  "nalgebra",
+ "rayon",
  "roxmltree 0.21.1",
  "rustc-hash 2.1.2",
  "swash",

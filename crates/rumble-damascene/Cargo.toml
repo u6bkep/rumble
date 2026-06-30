@@ -40,7 +40,20 @@ bench = false
 damascene-core = { workspace = true, features = ["default_fonts"] }
 damascene-markdown = { workspace = true }
 damascene-winit-wgpu = { workspace = true }
-damascene-wgpu = { workspace = true }
+# Startup-perf opt-ins (desktop only — NOT enabled for the wasm
+# rumble-admin-web crate, where binary size matters). Both features are
+# defined in damascene-core and forwarded by damascene-wgpu, whose
+# `warm_default_glyphs` carries the gated prebaked-import path; enabling
+# them here cascades to damascene-core. Upstream measured cold start
+# 438ms -> 98ms with these on.
+#   parallel-raster        — rasterize the MSDF atlas warmup across rayon.
+#   prebaked-default-fonts — embed the compile-time-baked default-font
+#                            atlas (~1-2MB) so warmup is a memcpy/repack
+#                            instead of regenerating ~190 glyphs at launch.
+damascene-wgpu = { workspace = true, features = [
+    "parallel-raster",
+    "prebaked-default-fonts",
+] }
 wgpu = { workspace = true }
 
 # Rumble client backend.
