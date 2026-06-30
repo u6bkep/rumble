@@ -123,11 +123,9 @@ enum Scene {
     /// inline preview in the chat sidebar.
     ConnectedImagePreview,
     /// Live session with the click-to-enlarge image lightbox open.
+    /// (Zoom/pan now live in damascene's `viewport()` state, not app
+    /// state, so there's no separate "zoomed" fixture to snapshot.)
     ImageLightbox,
-    /// Lightbox at 200% zoom with a non-zero pan, exercising the
-    /// `−` / `+` / Fit buttons + zoom-percent label in their
-    /// "non-default" state and showing the zoomed paint transform.
-    ImageLightboxZoomed,
     /// Live session with a completed 3D-model transfer rendered as an
     /// inline poster preview (the offscreen render is seeded directly).
     ConnectedModelPreview,
@@ -223,7 +221,6 @@ impl Scene {
         Scene::ConnectedSlashCommandHighlighted,
         Scene::ConnectedImagePreview,
         Scene::ImageLightbox,
-        Scene::ImageLightboxZoomed,
         Scene::ConnectedModelPreview,
         Scene::ModelLightbox,
         Scene::ConnectionLost,
@@ -271,7 +268,6 @@ impl Scene {
             Scene::ConnectedSlashCommandHighlighted => "connected_slash_command_highlighted",
             Scene::ConnectedImagePreview => "connected_image_preview",
             Scene::ImageLightbox => "image_lightbox",
-            Scene::ImageLightboxZoomed => "image_lightbox_zoomed",
             Scene::ConnectedModelPreview => "connected_model_preview",
             Scene::ModelLightbox => "model_lightbox",
             Scene::ConnectionLost => "connection_lost",
@@ -316,9 +312,7 @@ impl Scene {
                 },
                 ..State::default()
             },
-            Scene::Connected | Scene::ConnectedImagePreview | Scene::ImageLightbox | Scene::ImageLightboxZoomed => {
-                connected_state()
-            }
+            Scene::Connected | Scene::ConnectedImagePreview | Scene::ImageLightbox => connected_state(),
             Scene::ConnectedModelPreview | Scene::ModelLightbox => connected_state_with_model(),
             Scene::ConnectedSelfTalking => {
                 let mut s = connected_state();
@@ -635,14 +629,6 @@ impl Scene {
                 // makes the modal scrim's contrast visible.
                 app.insert_image_preview_for_test("demo-offer", demo_preview_image());
                 app.open_lightbox_for_test("demo-offer", "deploy_notes.md");
-            }
-            Scene::ImageLightboxZoomed => {
-                // 200% zoom + a small downward-right pan, so the
-                // header zoom controls render with `+` / `−` / Fit
-                // all enabled and the percentage label reads "200%".
-                app.insert_image_preview_for_test("demo-offer", demo_preview_image());
-                app.open_lightbox_for_test("demo-offer", "deploy_notes.md");
-                app.set_lightbox_zoom_for_test(2.0, (40.0, 30.0));
             }
             Scene::ConnectedModelPreview => {
                 // Seed a poster directly (no GPU in bundle dumps) so the

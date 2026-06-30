@@ -266,37 +266,6 @@ fn svg_contain_preview(icon: SvgIcon, height: f32) -> El {
     preview_card(inner, nat_w, nat_h, height, None).radius(tokens::RADIUS_SM)
 }
 
-/// Fit-to-window SVG variant for the lightbox body.
-///
-/// Unlike [`svg_contain_preview`] we can't swap the layout override for
-/// the nested-`Size::Aspect` pattern here: that pattern needs a static
-/// cap on at least one axis to anchor the outer rect, and the lightbox
-/// body's actual size is only known at layout time.
-pub(super) fn svg_contain_fill(icon: SvgIcon) -> El {
-    let [_, _, vw, vh] = icon.vector_asset().view_box;
-    let nat_w = vw.max(1.0);
-    let nat_h = vh.max(1.0);
-    let asset = icon.vector_asset().clone();
-    let vec_el = vector(asset).width(Size::Fixed(nat_w)).height(Size::Fixed(nat_h));
-    stack([vec_el])
-        .width(Size::Fill(1.0))
-        .height(Size::Fill(1.0))
-        .radius(tokens::RADIUS_MD)
-        .layout(move |ctx: LayoutCtx| {
-            let cw = ctx.container.w.max(0.0);
-            let ch = ctx.container.h.max(0.0);
-            if cw <= 0.0 || ch <= 0.0 {
-                return vec![Rect::new(ctx.container.x, ctx.container.y, 0.0, 0.0)];
-            }
-            let scale = (cw / nat_w).min(ch / nat_h);
-            let w = nat_w * scale;
-            let h = nat_h * scale;
-            let x = ctx.container.x + (cw - w) * 0.5;
-            let y = ctx.container.y + (ch - h) * 0.5;
-            vec![Rect::new(x, y, w, h)]
-        })
-}
-
 /// Inline preview card for a downloaded video: poster thumbnail
 /// (first frame extracted via libmpv) with a centered play overlay.
 pub(super) fn video_preview(offer: &RelayFileSharePayload, thumb: &Image) -> El {

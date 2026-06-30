@@ -68,6 +68,12 @@ pub enum LightboxAction {
     OpenVideo(String),
     OpenModel(String),
     ToggleGif(String),
+    /// "Fit" pressed in the image lightbox — the App queues a
+    /// `FitContent` viewport request.
+    FitImageView,
+    /// "100%" pressed in the image lightbox — the App queues a
+    /// `ResetView` viewport request.
+    ResetImageView,
 }
 
 /// Dispatch a UI event to whichever lightbox owns it. Returns
@@ -76,7 +82,7 @@ pub enum LightboxAction {
 pub fn handle_event(
     lb: &mut Lightboxes,
     event: &UiEvent,
-    cx: &EventCx,
+    _cx: &EventCx,
     media_cache: &mut MediaCache,
 ) -> LightboxAction {
     // Per-GIF play/pause and explicit-open-lightbox icons live on
@@ -114,60 +120,16 @@ pub fn handle_event(
         lb.close_image(media_cache);
         return LightboxAction::Handled;
     }
-    let lightbox_image_size = lb.image.as_ref().and_then(|lightbox| {
-        let cached = media_cache.lightbox_image_for(&lightbox.transfer_id)?;
-        let playback = media_cache.gif_playback_for(&lightbox.transfer_id);
-        Some(cached.current_frame_size(playback))
-    });
-    let lightbox_body_size = cx.rect_of_key(chat::KEY_LIGHTBOX_IMAGE).map(|r| (r.w, r.h));
-    if let Some(lightbox) = lb.image.as_mut() {
-        if event.is_click_or_activate(chat::KEY_LIGHTBOX_ZOOM_IN) {
-            lightbox.zoom_in(lightbox_body_size, lightbox_image_size);
-            return LightboxAction::Handled;
-        }
-        if event.is_click_or_activate(chat::KEY_LIGHTBOX_ZOOM_OUT) {
-            lightbox.zoom_out(lightbox_body_size, lightbox_image_size);
-            return LightboxAction::Handled;
-        }
+    // Pan + zoom are owned by the body `viewport()` (drag-pan, cursor-
+    // anchored wheel-zoom, `Contain` bounds — all native), so the only
+    // image-lightbox controls left here are the two framing buttons,
+    // which the App turns into one-shot viewport requests.
+    if lb.image.is_some() {
         if event.is_click_or_activate(chat::KEY_LIGHTBOX_ZOOM_FIT) {
-            lightbox.fit();
-            return LightboxAction::Handled;
+            return LightboxAction::FitImageView;
         }
         if event.is_click_or_activate(chat::KEY_LIGHTBOX_ZOOM_NATURAL) {
-            lightbox.natural_size();
-            return LightboxAction::Handled;
-        }
-        // Drag-to-pan on the image surface. Gated on "scaled image
-        // overflows the body" rather than `zoom > 1.0`: a large
-        // image at <100% can still extend past the viewport, and
-        // the user expects to be able to pan it in that case.
-        let overflows = lightbox_image_size
-            .is_some_and(|(w, h)| lightbox.image_overflows_body((w as f32, h as f32), lightbox_body_size));
-        if event.route() == Some(chat::KEY_LIGHTBOX_IMAGE) && overflows {
-            match event.kind {
-                UiEventKind::PointerDown => {
-                    if let Some(pos) = event.pointer {
-                        lightbox.drag.anchor = Some((pos, lightbox.pan));
-                    }
-                    return LightboxAction::Handled;
-                }
-                UiEventKind::Drag => {
-                    if let Some((anchor_pos, start_pan)) = lightbox.drag.anchor
-                        && let Some(pos) = event.pointer
-                    {
-                        lightbox.pan = (
-                            start_pan.0 + (pos.0 - anchor_pos.0),
-                            start_pan.1 + (pos.1 - anchor_pos.1),
-                        );
-                    }
-                    return LightboxAction::Handled;
-                }
-                UiEventKind::PointerUp => {
-                    lightbox.drag.anchor = None;
-                    return LightboxAction::Handled;
-                }
-                _ => {}
-            }
+            return LightboxAction::ResetImageView;
         }
     }
 

@@ -124,6 +124,16 @@ pub struct RumbleApp<B: UiBackend = crate::backend::NativeUiBackend> {
     /// refresh it without requiring `&mut self`.
     chat_row_w: Cell<f32>,
 
+    /// Pending one-shot view request for the image-lightbox `viewport()`
+    /// (fit on open / resize, reset on "100%"), drained into a
+    /// `ViewportRequest` each frame. `Cell` so `build(&self)` can set it
+    /// when it detects a body resize.
+    lightbox_view_request: Cell<Option<chat::LightboxViewReq>>,
+    /// Lightbox `viewport()` body size last seen in `build`, used to
+    /// detect window resizes and re-fit. `None` whenever the image
+    /// lightbox isn't being rendered, so reopening always re-fits.
+    lightbox_last_body: Cell<Option<(f32, f32)>>,
+
     /// Audio-processor factory registry. Owned by the App so the
     /// settings dialog can read each processor's display name,
     /// description and JSON schema when rendering the Processing tab.
@@ -336,6 +346,8 @@ impl<B: UiBackend> RumbleApp<B> {
             chat_weights: [1.0, 2.5],
             chat_sidebar_drag: ResizeWeightsDrag::default(),
             chat_row_w: Cell::new(0.0),
+            lightbox_view_request: Cell::new(None),
+            lightbox_last_body: Cell::new(None),
             processor_registry,
             room_tree: RoomTreeState::default(),
             chat_seen: None,
@@ -735,14 +747,28 @@ impl<B: UiBackend> App for RumbleApp<B> {
             && let Some(lightbox_state) = self.lightboxes.image.as_ref()
             && let Some(cached) = media.lightbox_image_for(&lightbox_state.transfer_id)
         {
+            // The `viewport()` zoom is an absolute factor persisted by
+            // key, so a window resize would leave the image at its old
+            // on-screen size instead of fit. Watch the laid-out body rect
+            // and queue a re-fit whenever it changes (covers the first
+            // post-open layout too). A pending Reset ("100%") this frame
+            // wins — it doesn't change the body size, so it's never
+            // clobbered here.
+            if let Some(body) = cx.rect_of_key(chat::KEY_LIGHTBOX_IMAGE).map(|r| (r.w, r.h))
+                && self.lightbox_last_body.get() != Some(body)
+            {
+                self.lightbox_last_body.set(Some(body));
+                if self.lightbox_view_request.get().is_none() {
+                    self.lightbox_view_request.set(Some(chat::LightboxViewReq::Fit));
+                }
+            }
             let playback = media.gif_playback_for(&lightbox_state.transfer_id);
             let gpu = media.animated_gpu_for(&lightbox_state.transfer_id);
-            // Previous frame's laid-out body rect (one frame stale, fine
-            // for the grab-cursor decision); event-time zoom re-queries
-            // it live via `EventCx::rect_of_key`.
-            let body_size = cx.rect_of_key(chat::KEY_LIGHTBOX_IMAGE).map(|r| (r.w, r.h));
-            Some(chat::render_lightbox(lightbox_state, body_size, cached, playback, gpu))
+            Some(chat::render_lightbox(lightbox_state, cached, playback, gpu))
         } else {
+            // Not showing the image lightbox — forget the tracked body so
+            // the next open re-fits from scratch.
+            self.lightbox_last_body.set(None);
             None
         };
         drop(media);
@@ -1211,6 +1237,14 @@ impl<B: UiBackend> App for RumbleApp<B> {
                 self.toggle_gif_playback(&id);
                 return;
             }
+            lightbox::LightboxAction::FitImageView => {
+                self.lightbox_view_request.set(Some(chat::LightboxViewReq::Fit));
+                return;
+            }
+            lightbox::LightboxAction::ResetImageView => {
+                self.lightbox_view_request.set(Some(chat::LightboxViewReq::Reset));
+                return;
+            }
         }
 
         // Top toolbar.
@@ -1300,49 +1334,25 @@ impl<B: UiBackend> App for RumbleApp<B> {
         }
     }
 
-    /// Image lightbox claims the wheel: dy < 0 zooms in, dy > 0 zooms
-    /// out. Consumes the event so damascene's default scroll routing
-    /// doesn't move the chat list underneath the overlay. Other modes
-    /// fall through to the default (forward to `on_event`, no consume),
-    /// so chat / room-tree / settings scrolling all keep working.
-    ///
-    /// Keyed off actual lightbox *visibility*, not just
-    /// `lightboxes.image.is_some()`: `build` suppresses the overlay
-    /// under session-gate modals / settings and when the backing cache
-    /// entry is missing, and an invisible lightbox must not silently
-    /// swallow scrolling (issue #37).
-    fn on_wheel_event(&mut self, event: UiEvent, cx: &EventCx) -> bool {
-        let connection = self.backend.state().connection.clone();
-        let image_lightbox_visible = self.lightboxes.image.is_some()
-            && self.content_layers_clear_for(&connection)
-            && self.lightboxes.image.as_ref().is_some_and(|lb| {
-                self.media_cache
-                    .lock()
-                    .unwrap()
-                    .lightbox_image_for(&lb.transfer_id)
-                    .is_some()
-            });
-        if image_lightbox_visible {
-            let image_size = self.lightboxes.image.as_ref().and_then(|lightbox| {
-                let media = self.media_cache.lock().unwrap();
-                let cached = media.lightbox_image_for(&lightbox.transfer_id)?;
-                let playback = media.gif_playback_for(&lightbox.transfer_id);
-                Some(cached.current_frame_size(playback))
-            });
-            let body_size = cx.rect_of_key(chat::KEY_LIGHTBOX_IMAGE).map(|r| (r.w, r.h));
-            if let Some(lightbox) = self.lightboxes.image.as_mut()
-                && let Some((_, dy)) = event.wheel_delta
-            {
-                if dy < 0.0 {
-                    lightbox.zoom_in(body_size, image_size);
-                } else if dy > 0.0 {
-                    lightbox.zoom_out(body_size, image_size);
-                }
-            }
-            return true;
+    /// The image lightbox no longer overrides `on_wheel_event`: its body
+    /// is a `viewport()`, which the damascene runtime zooms natively
+    /// (cursor-anchored) when the default `on_wheel_event` returns false.
+    /// The `block_pointer` panel already occludes the chat list, so the
+    /// wheel never falls through to scroll it.
+    fn drain_viewport_requests(&mut self) -> Vec<damascene_core::viewport::ViewportRequest> {
+        use damascene_core::viewport::ViewportRequest;
+        let Some(req) = self.lightbox_view_request.take() else {
+            return Vec::new();
+        };
+        // The request only makes sense while the image lightbox is open.
+        if self.lightboxes.image.is_none() {
+            return Vec::new();
         }
-        self.on_event(event, cx);
-        false
+        let key = chat::KEY_LIGHTBOX_IMAGE.to_string();
+        vec![match req {
+            chat::LightboxViewReq::Fit => ViewportRequest::FitContent { key, padding: 0.0 },
+            chat::LightboxViewReq::Reset => ViewportRequest::ResetView { key },
+        }]
     }
 }
 
@@ -1960,6 +1970,11 @@ impl<B: UiBackend> RumbleApp<B> {
         self.close_video_lightbox();
         self.close_model_lightbox();
         self.lightboxes.image = Some(chat::Lightbox::new(transfer_id, name));
+        // Fit the freshly-opened image to the body on the first frame
+        // (overriding any zoom the shared viewport key kept from a
+        // previously-viewed image).
+        self.lightbox_view_request.set(Some(chat::LightboxViewReq::Fit));
+        self.lightbox_last_body.set(None);
         self.media_cache.lock().unwrap().force_resume_playback(transfer_id);
 
         // Look up the local file path from the live transfer set; if
@@ -2889,19 +2904,8 @@ impl<B: UiBackend> RumbleApp<B> {
     /// scene can target a synthetic offer directly.
     pub fn open_lightbox_for_test(&mut self, transfer_id: impl Into<String>, name: impl Into<String>) {
         self.lightboxes.image = Some(chat::Lightbox::new(transfer_id, name));
-    }
-
-    /// Test/scene-dump hook to set the lightbox's zoom + pan directly,
-    /// for snapshotting the controls in non-default state. Caller is
-    /// responsible for setting them to plausible values; the runtime
-    /// path goes through `Lightbox::set_zoom` / drag handlers and so
-    /// always stays in range.
-    pub fn set_lightbox_zoom_for_test(&mut self, zoom: f32, pan: (f32, f32)) {
-        if let Some(lb) = self.lightboxes.image.as_mut() {
-            lb.fit_to_window = false;
-            lb.zoom = zoom;
-            lb.pan = pan;
-        }
+        self.lightbox_view_request.set(Some(chat::LightboxViewReq::Fit));
+        self.lightbox_last_body.set(None);
     }
 
     /// Test/scene-dump hook to seed a model poster thumbnail. The runtime

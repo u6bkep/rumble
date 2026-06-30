@@ -18,7 +18,7 @@ pub use file_card::{FileContextMenu, render_file_context_menu};
 pub use image_preview::{
     AnimatedTextureMap, CachedImage, GifPlayback, ImageCache, VideoThumbMap, is_image_name, is_svg_name,
 };
-pub use lightbox::{Lightbox, PanDrag, ZoomDirection, render_lightbox};
+pub use lightbox::{Lightbox, LightboxViewReq, render_lightbox};
 
 use std::{
     cell::RefCell,
@@ -113,16 +113,13 @@ pub const KEY_FILE_CTX_OPEN: &str = "chat:file_ctx:open";
 /// Routed keys for the image lightbox overlay.
 pub const KEY_LIGHTBOX_DISMISS: &str = "chat:lightbox:dismiss";
 pub const KEY_LIGHTBOX_CLOSE: &str = "chat:lightbox:close";
-pub const KEY_LIGHTBOX_ZOOM_IN: &str = "chat:lightbox:zoom-in";
-pub const KEY_LIGHTBOX_ZOOM_OUT: &str = "chat:lightbox:zoom-out";
 pub const KEY_LIGHTBOX_ZOOM_FIT: &str = "chat:lightbox:zoom-fit";
 pub const KEY_LIGHTBOX_ZOOM_NATURAL: &str = "chat:lightbox:zoom-natural";
 pub const KEY_LIGHTBOX_IMAGE: &str = "chat:lightbox:image";
 
-/// Zoom range and step used by the lightbox controls.
+/// Zoom range the lightbox `viewport()` may reach by wheel or fit.
 pub const LIGHTBOX_ZOOM_MIN: f32 = 0.25;
 pub const LIGHTBOX_ZOOM_MAX: f32 = 10.0;
-pub const LIGHTBOX_ZOOM_STEP: f32 = 0.20;
 
 static SVG_CLIPBOARD: LazyLock<SvgIcon> = LazyLock::new(|| {
     SvgIcon::parse_current_color(include_str!("../assets/icons/clipboard.svg")).expect("clipboard.svg parses")
