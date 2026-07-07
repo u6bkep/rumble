@@ -12,6 +12,7 @@ pub mod composer;
 pub mod file_card;
 pub mod image_preview;
 pub mod lightbox;
+pub mod msg_menu;
 
 pub use composer::{ChatComposerState, ComposerOutcome};
 pub use file_card::{FileContextMenu, render_file_context_menu};
@@ -19,6 +20,10 @@ pub use image_preview::{
     AnimatedTextureMap, CachedImage, GifPlayback, ImageCache, VideoThumbMap, is_image_name, is_svg_name,
 };
 pub use lightbox::{Lightbox, PanDrag, ZoomDirection, render_lightbox};
+pub use msg_menu::{
+    KEY_MSG_CTX_COPY, KEY_MSG_CTX_DISMISS, KEY_MSG_CTX_MESSAGE_AUTHOR, MsgContextMenu, parse_msg_route,
+    render_msg_context_menu,
+};
 
 use std::{
     cell::RefCell,
@@ -547,6 +552,13 @@ fn render_chat_row(
     }
     let content = column(parts).gap(tokens::SPACE_1).width(Size::Fill(1.0));
 
+    // The outermost element carries the message-row route key so a
+    // right-click anywhere on the row (padding, markdown body, blank
+    // trail) resolves to this message for the context menu. Keyed
+    // children (header/body) still win the hit when the click lands
+    // on them; their `chat:msg:<key>:…` routes parse to the same
+    // message via [`msg_menu::parse_msg_route`].
+    //
     // Own messages: subtle left accent stripe for visual differentiation.
     if entry.is_own {
         let accent_stripe = spacer()
@@ -562,11 +574,12 @@ fn render_chat_row(
                 bottom: 0.0,
             }),
         ])
+        .key(msg_menu::msg_row_key(msg_key))
         .gap(0.0)
         .width(Size::Fill(1.0))
         .align(Align::Stretch)
     } else {
-        content
+        content.key(msg_menu::msg_row_key(msg_key))
     }
 }
 

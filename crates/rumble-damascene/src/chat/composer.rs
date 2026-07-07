@@ -21,6 +21,21 @@ pub struct ChatComposerState {
     pub command_selected: Option<usize>,
 }
 
+impl ChatComposerState {
+    /// Replace the composer text, placing the caret at the end — ready
+    /// for the user to keep typing. Used by "Message @author" / "Send
+    /// message…" affordances to prefill `/msg <username> `. Callers
+    /// should also focus the input by pushing [`KEY_INPUT`] through the
+    /// App's focus-request drain so the caret is live immediately.
+    pub fn prefill(&mut self, selection: &mut Selection, text: impl Into<String>) {
+        let text = text.into();
+        let caret = text.len();
+        self.input = text;
+        *selection = Selection::caret(KEY_INPUT, caret);
+        self.command_selected = None;
+    }
+}
+
 /// What the App should do after [`handle_event`].
 pub enum ComposerOutcome {
     /// Not a composer event — the App should continue its event cascade.
@@ -36,11 +51,7 @@ pub enum ComposerOutcome {
 /// Complete the composer line to `/<name> ` with the caret at the end,
 /// ready for arguments. The trailing space hides the suggestion list.
 fn complete(state: &mut ChatComposerState, selection: &mut Selection, name: &str) {
-    let text = format!("/{name} ");
-    let caret = text.len();
-    state.input = text;
-    *selection = Selection::caret(KEY_INPUT, caret);
-    state.command_selected = None;
+    state.prefill(selection, format!("/{name} "));
 }
 
 /// Parse a submitted composer line into the commands to send. Slash
