@@ -314,7 +314,7 @@ pub(crate) async fn apply_create_room(
     broadcast_state_update(
         state,
         proto::state_update::Update::RoomCreated(proto::RoomCreated {
-            room: Some(crate::state::room_to_wire(&room)),
+            room: Some(room.to_proto()),
         }),
     )
     .await
@@ -791,10 +791,10 @@ pub(crate) const ACL_CONFLICT_MSG: &str =
 fn current_room_acl_version(persistence: &Persistence, room_uuid: Uuid) -> u64 {
     match persistence.get_room_acl(room_uuid.as_bytes()) {
         Some(acl) => {
-            let entries: Vec<proto::RoomAclEntry> = acl
+            let entries: Vec<rumble_protocol::RoomAclEntry> = acl
                 .entries
                 .iter()
-                .map(|e| proto::RoomAclEntry {
+                .map(|e| rumble_protocol::RoomAclEntry {
                     group: e.group.clone(),
                     grant: e.grant,
                     deny: e.deny,
@@ -823,7 +823,7 @@ pub(crate) async fn apply_set_room_acl(
     persistence: &Arc<Persistence>,
     room_uuid: Uuid,
     inherit_acl: bool,
-    entries: Vec<proto::RoomAclEntry>,
+    entries: Vec<rumble_protocol::RoomAclEntry>,
     base_version: u64,
 ) -> Result<String, String> {
     let persist = persistence;
@@ -856,14 +856,8 @@ pub(crate) async fn apply_set_room_acl(
 
     // Apply in-memory first; set_room_acl returns false if the room doesn't
     // exist. Bail before persisting/broadcasting so we don't leave a garbage
-    // sled ACL record and announce an ACL for a room no client has. The
-    // in-memory mirror holds domain ACL entries; convert at this wire boundary.
-    let domain_entries: Vec<rumble_protocol::RoomAclEntry> = entries
-        .iter()
-        .cloned()
-        .map(rumble_protocol::RoomAclEntry::from)
-        .collect();
-    if !state.set_room_acl(room_uuid, inherit_acl, domain_entries).await {
+    // sled ACL record and announce an ACL for a room no client has.
+    if !state.set_room_acl(room_uuid, inherit_acl, entries.clone()).await {
         return Err("Room not found".to_string());
     }
 
@@ -879,7 +873,7 @@ pub(crate) async fn apply_set_room_acl(
         proto::state_update::Update::RoomAclChanged(proto::RoomAclChanged {
             room_id: Some(room_id_from_uuid(room_uuid)),
             inherit_acl,
-            entries: entries.clone(),
+            entries: entries.iter().map(rumble_protocol::RoomAclEntry::to_proto).collect(),
         }),
     )
     .await
@@ -1135,8 +1129,8 @@ mod tests {
 
     // --- Versioned SetRoomAcl (#38) ------------------------------------------
 
-    fn acl_entry(group: &str, grant: u32) -> proto::RoomAclEntry {
-        proto::RoomAclEntry {
+    fn acl_entry(group: &str, grant: u32) -> rumble_protocol::RoomAclEntry {
+        rumble_protocol::RoomAclEntry {
             group: group.into(),
             grant,
             deny: 0,

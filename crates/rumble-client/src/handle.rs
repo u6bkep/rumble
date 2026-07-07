@@ -1563,7 +1563,7 @@ async fn run_connection_task<P: Platform>(
                                 payload: Some(Payload::CreateRoom(proto::CreateRoom {
                                     name,
                                     // Canonical encoding: a Root parent (top-level) is
-                                    // sent as an absent parent_id, matching room_to_wire.
+                                    // sent as an absent parent_id, matching Room::to_proto.
                                     parent_id: (parent_id != ROOT_ROOM_UUID).then(|| room_id_from_uuid(parent_id)),
                                     description: None,
                                 })),
@@ -2162,7 +2162,7 @@ async fn run_connection_task<P: Platform>(
                                 payload: Some(Payload::SetRoomAcl(proto::SetRoomAcl {
                                     room_id: room_id.as_bytes().to_vec(),
                                     inherit_acl,
-                                    entries,
+                                    entries: entries.iter().map(rumble_protocol::RoomAclEntry::to_proto).collect(),
                                     base_version,
                                 })),
                             };

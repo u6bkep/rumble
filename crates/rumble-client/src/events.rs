@@ -1439,7 +1439,7 @@ pub enum Command {
     SetRoomAcl {
         room_id: Uuid,
         inherit_acl: bool,
-        entries: Vec<rumble_protocol::proto::RoomAclEntry>,
+        entries: Vec<rumble_protocol::RoomAclEntry>,
         base_version: u64,
     },
 }

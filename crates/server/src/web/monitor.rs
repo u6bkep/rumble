@@ -28,7 +28,7 @@ fn room_dto(r: &Room) -> RoomDto {
     // Optimistic-concurrency token the ACL editor echoes back on save. Computed
     // from the same values the DTO carries via the room's wire encoding, so what
     // the editor loads is exactly what the version covers.
-    let acl_version = rumble_protocol::room_acl_version(r.inherit_acl, &r.to_proto().acls);
+    let acl_version = rumble_protocol::room_acl_version(r.inherit_acl, &r.acls);
     RoomDto {
         id: r.id.to_string(),
         name: r.name.clone(),

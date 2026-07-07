@@ -8,7 +8,6 @@ use axum::{
     Json,
     extract::{Path, State},
 };
-use rumble_protocol::proto;
 use rumble_web_types::{
     AddControllerRequest, BanRequest, CreateGroupRequest, CreateRoomRequest, KickRequest, ModifyGroupRequest,
     OkMessage, SetParticipantGroupRequest, SetRoomAclRequest, SetSudoPasswordRequest, SetUserGroupRequest,
@@ -101,10 +100,10 @@ pub async fn set_room_acl(
     Json(req): Json<SetRoomAclRequest>,
 ) -> ApiResult<OkMessage> {
     let room_uuid = parse_room_uuid(&uuid)?;
-    let entries: Vec<proto::RoomAclEntry> = req
+    let entries: Vec<rumble_protocol::RoomAclEntry> = req
         .entries
         .into_iter()
-        .map(|e| proto::RoomAclEntry {
+        .map(|e| rumble_protocol::RoomAclEntry {
             group: e.group,
             grant: e.grant,
             deny: e.deny,

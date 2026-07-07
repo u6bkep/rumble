@@ -234,7 +234,7 @@ pub fn with_state_hash(mut env: proto::Envelope, hash: Vec<u8>) -> proto::Envelo
 /// The result is never 0: 0 is reserved on the wire to mean "unversioned
 /// legacy write" (older clients that don't send a version), which servers
 /// accept unconditionally.
-pub fn room_acl_version(inherit_acl: bool, entries: &[proto::RoomAclEntry]) -> u64 {
+pub fn room_acl_version(inherit_acl: bool, entries: &[types::RoomAclEntry]) -> u64 {
     let mut hasher = Hasher::new();
     hasher.update(&[inherit_acl as u8]);
     for e in entries {
@@ -501,8 +501,8 @@ mod state_hash_tests {
 mod room_acl_version_tests {
     use super::*;
 
-    fn entry(group: &str, grant: u32, deny: u32, here: bool, subs: bool) -> proto::RoomAclEntry {
-        proto::RoomAclEntry {
+    fn entry(group: &str, grant: u32, deny: u32, here: bool, subs: bool) -> types::RoomAclEntry {
+        types::RoomAclEntry {
             group: group.into(),
             grant,
             deny,

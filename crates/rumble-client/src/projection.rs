@@ -303,29 +303,16 @@ fn verify_state_hash(state: &Arc<RwLock<State>>, expected_hash: &[u8], command_t
 /// (both excluded from the incremental-update hash). See
 /// [`verify_state_hash`] for the full rationale.
 fn state_hash_input(s: &State) -> rumble_protocol::proto::ServerState {
-    let rooms = s.rooms.iter().map(room_to_wire).collect();
+    // `Room::to_hash_input` is the canonical hash encoding (absent
+    // parent at Root, `effective_permissions` zeroed) — shared with the
+    // server, so the two sides cannot drift apart.
+    let rooms = s.rooms.iter().map(rumble_protocol::Room::to_hash_input).collect();
     rumble_protocol::proto::ServerState {
         rooms,
         users: s.users.iter().map(rumble_protocol::User::to_proto).collect(),
         groups: Vec::new(),
         slash_commands: Vec::new(),
     }
-}
-
-/// Serialize a domain [`Room`] to its canonical wire form for hashing,
-/// mirroring the server's `room_to_wire` exactly: `effective_permissions`
-/// zeroed (per-client, set after hashing on the server) and a Root parent
-/// (`parent == ROOT_ROOM_UUID`, which includes Root itself) encoded as an
-/// **absent** `parent_id` rather than an explicit nil one. The BLAKE3 state
-/// hash is computed over these bytes, so any divergence from the server's
-/// encoding would make every `StateUpdate` spuriously trigger a resync.
-fn room_to_wire(room: &rumble_protocol::Room) -> rumble_protocol::proto::RoomInfo {
-    let mut info = room.to_proto();
-    info.effective_permissions = 0;
-    if room.parent == rumble_protocol::ROOT_ROOM_UUID {
-        info.parent_id = None;
-    }
-    info
 }
 
 /// Short hex prefix of a hash for log readability (full 32-byte hashes

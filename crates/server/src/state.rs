@@ -18,7 +18,7 @@
 
 use dashmap::DashMap;
 use quinn::Connection;
-use rumble_protocol::{ROOT_ROOM_UUID, Room, RoomAclEntry, User, proto};
+use rumble_protocol::{ROOT_ROOM_UUID, Room, RoomAclEntry, User};
 use std::sync::{
     Arc, OnceLock,
     atomic::{AtomicU64, Ordering},
@@ -370,25 +370,6 @@ impl StateData {
 /// Re-exports the canonical hash function from the rumble-protocol crate.
 pub fn compute_server_state_hash(server_state: &rumble_protocol::proto::ServerState) -> Vec<u8> {
     rumble_protocol::compute_server_state_hash(server_state)
-}
-
-/// Convert a domain [`Room`] to its wire [`proto::RoomInfo`], preserving the
-/// legacy encoding where a top-level room (`parent == ROOT_ROOM_UUID`, which
-/// includes Root itself) is serialized with an **absent** `parent_id` rather
-/// than an explicit nil one.
-///
-/// The BLAKE3 state hash is computed over these bytes. The domain
-/// [`Room::to_proto`] emits `Some(nil)` for a Root-parented room, which would
-/// flip the hash input for every existing deployment (Root and every top-level
-/// room previously serialized `parent_id` as absent). Readers already treat
-/// absent and nil parent identically, so nulling it here is purely
-/// hash-preserving. This is the single server-side room→wire boundary.
-pub fn room_to_wire(room: &Room) -> proto::RoomInfo {
-    let mut info = room.to_proto();
-    if room.parent == ROOT_ROOM_UUID {
-        info.parent_id = None;
-    }
-    info
 }
 
 /// Pending authentication state for a client.
@@ -1467,7 +1448,7 @@ mod tests {
         }
 
         let hash_now = || async {
-            let rooms = state.get_rooms().await.iter().map(room_to_wire).collect();
+            let rooms = state.get_rooms().await.iter().map(Room::to_proto).collect();
             let users = state.build_user_list().await.iter().map(User::to_proto).collect();
             compute_server_state_hash(&rumble_protocol::proto::ServerState {
                 rooms,

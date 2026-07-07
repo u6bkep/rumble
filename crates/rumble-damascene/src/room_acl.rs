@@ -34,7 +34,7 @@
 use damascene_core::prelude::*;
 
 use rumble_client::{Command, State};
-use rumble_protocol::{Group, ROOT_ROOM_UUID, RoomAclEntry, permissions::Permissions, proto};
+use rumble_protocol::{Group, ROOT_ROOM_UUID, RoomAclEntry, permissions::Permissions};
 use uuid::Uuid;
 
 // ============================================================
@@ -181,8 +181,8 @@ impl AclEditEntry {
         }
     }
 
-    fn to_proto(&self) -> proto::RoomAclEntry {
-        proto::RoomAclEntry {
+    fn to_domain(&self) -> RoomAclEntry {
+        RoomAclEntry {
             group: self.group.clone(),
             grant: self.grant,
             deny: self.deny,
@@ -314,7 +314,7 @@ impl RoomAclModalState {
 
         // Version of the exact configuration we're copying into the editor —
         // the server compares the save against this base.
-        let base_version = rumble_protocol::room_acl_version(room.inherit_acl, &room.to_proto().acls);
+        let base_version = rumble_protocol::room_acl_version(room.inherit_acl, &room.acls);
 
         Some(RoomAclModalState {
             room_id,
@@ -370,7 +370,7 @@ impl RoomAclModalState {
             cmds.push(Command::SetRoomAcl {
                 room_id: self.room_id,
                 inherit_acl: self.inherit_acl,
-                entries: self.entries.iter().map(AclEditEntry::to_proto).collect(),
+                entries: self.entries.iter().map(AclEditEntry::to_domain).collect(),
                 base_version: self.base_version,
             });
         }

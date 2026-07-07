@@ -1563,7 +1563,7 @@ async fn send_server_state_to_client(
     // for hash). Rooms from `get_rooms()` carry `effective_permissions == 0`, so
     // the hash sees the zeroed values regardless of the receiving client.
     let server_state_for_hash = ProtoServerState {
-        rooms: rooms.iter().map(crate::state::room_to_wire).collect(),
+        rooms: rooms.iter().map(rumble_protocol::Room::to_proto).collect(),
         users: users.clone(),
         groups: groups.clone(),
         slash_commands: vec![], // excluded from the hash anyway
@@ -1582,7 +1582,7 @@ async fn send_server_state_to_client(
     // Build the actual message with effective_permissions set. Slash commands
     // ride along so clients can discover them for autocomplete.
     let server_state = ProtoServerState {
-        rooms: rooms.iter().map(crate::state::room_to_wire).collect(),
+        rooms: rooms.iter().map(rumble_protocol::Room::to_proto).collect(),
         users,
         groups,
         slash_commands: state.slash_commands(),
@@ -1683,7 +1683,12 @@ pub async fn broadcast_server_state(state: &Arc<ServerState>, persistence: &Arc<
 /// If there's a mismatch, the client will request a full resync.
 pub async fn broadcast_state_update(state: &Arc<ServerState>, update: proto::state_update::Update) -> Result<()> {
     // First, compute what the state hash should be after this update
-    let rooms = state.get_rooms().await.iter().map(crate::state::room_to_wire).collect();
+    let rooms = state
+        .get_rooms()
+        .await
+        .iter()
+        .map(rumble_protocol::Room::to_proto)
+        .collect();
     let users = state.build_user_list().await.iter().map(|u| u.to_proto()).collect();
     let server_state = ProtoServerState {
         rooms,
@@ -2589,7 +2594,10 @@ async fn handle_set_room_acl(
         &persistence,
         room_uuid,
         sra.inherit_acl,
-        sra.entries,
+        sra.entries
+            .into_iter()
+            .map(rumble_protocol::RoomAclEntry::from)
+            .collect(),
         sra.base_version,
     )
     .await

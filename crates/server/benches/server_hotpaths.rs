@@ -138,7 +138,7 @@ fn bench_state_sync(c: &mut Criterion) {
                     .get_rooms()
                     .await
                     .iter()
-                    .map(server::state::room_to_wire)
+                    .map(rumble_protocol::Room::to_proto)
                     .collect(),
                 users: state.build_user_list().await.iter().map(|u| u.to_proto()).collect(),
                 groups: vec![],

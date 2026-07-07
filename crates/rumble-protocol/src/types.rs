@@ -94,18 +94,34 @@ impl Room {
         })
     }
 
+    /// Convert to the wire type. This is the **canonical wire encoding**
+    /// shared by server state-sync serialization and the client's
+    /// hash-input reconstruction, so the two must never diverge:
+    /// a Root parent (including Root's self-parent) is encoded as an
+    /// *absent* `parent_id`, matching what pre-domain servers sent —
+    /// the BLAKE3 state hash consumes these bytes.
     pub fn to_proto(&self) -> proto::RoomInfo {
         proto::RoomInfo {
             id: Some(room_id_from_uuid(self.id)),
             name: self.name.clone(),
-            // Root's self-parent round-trips as an explicit nil parent;
-            // readers treat nil-parent and absent-parent identically.
-            parent_id: Some(room_id_from_uuid(self.parent)),
+            parent_id: (self.parent != ROOT_ROOM_UUID).then(|| room_id_from_uuid(self.parent)),
             description: self.description.clone(),
             inherit_acl: self.inherit_acl,
             acls: self.acls.iter().map(RoomAclEntry::to_proto).collect(),
             effective_permissions: self.effective_permissions,
         }
+    }
+
+    /// The BLAKE3 state-hash input encoding: [`Self::to_proto`] with
+    /// `effective_permissions` forced to `0`. The hash must be identical
+    /// for every client, but each client's `State` carries its own
+    /// per-client permission overlay — zeroing here is what keeps the
+    /// client's recomputed hash input byte-identical to the server's
+    /// (whose stored rooms never hold a per-client value).
+    pub fn to_hash_input(&self) -> proto::RoomInfo {
+        let mut p = self.to_proto();
+        p.effective_permissions = 0;
+        p
     }
 }
 
