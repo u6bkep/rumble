@@ -1,8 +1,11 @@
-//! Connection tab: identity detail, auto-connect, superuser elevation.
+//! Connection tab: identity detail, auto-connect.
+//!
+//! Superuser elevation used to live here; it moved to the Admin tab
+//! (`crate::admin`) so all server-administration surfaces share one home.
 
 use super::*;
 
-pub(super) fn render_connection(pending: &PendingSettings, identity: &Identity, app_state: &State) -> El {
+pub(super) fn render_connection(pending: &PendingSettings, identity: &Identity) -> El {
     use rumble_desktop_shell::KeySource;
 
     let mut cards: Vec<El> = Vec::new();
@@ -16,9 +19,6 @@ pub(super) fn render_connection(pending: &PendingSettings, identity: &Identity, 
             ],
         ));
         cards.push(section_card("Auto-connect", render_autoconnect_rows(pending)));
-        if let Some(superuser) = render_superuser_section(app_state) {
-            cards.push(section_card("Superuser", superuser));
-        }
         return column(cards).gap(tokens::SPACE_3).width(Size::Fill(1.0));
     };
 
@@ -152,10 +152,6 @@ pub(super) fn render_connection(pending: &PendingSettings, identity: &Identity, 
 
     cards.push(section_card("Auto-connect", render_autoconnect_rows(pending)));
 
-    if let Some(superuser) = render_superuser_section(app_state) {
-        cards.push(section_card("Superuser", superuser));
-    }
-
     column(cards).gap(tokens::SPACE_3).width(Size::Fill(1.0))
 }
 
@@ -175,45 +171,4 @@ fn render_autoconnect_rows(pending: &PendingSettings) -> Vec<El> {
 /// Mirrors wizard.rs's check; sync because it's a bare env-var test.
 fn ssh_agent_available() -> bool {
     rumble_desktop_shell::identity::SshAgentClient::is_available()
-}
-
-/// Render the Elevate / superuser section of the Connection tab, or
-/// `None` when the local user can't sudo (not connected, or the
-/// server's effective permissions don't carry [`Permissions::SUDO`]).
-/// When already elevated, swaps the button for a status notice.
-fn render_superuser_section(app_state: &State) -> Option<Vec<El>> {
-    if !app_state.connection.is_connected() {
-        return None;
-    }
-    let perms = Permissions::from_bits_truncate(app_state.effective_permissions);
-    if !perms.contains(Permissions::SUDO) {
-        return None;
-    }
-    let already_elevated = app_state
-        .my_user_id
-        .and_then(|id| app_state.get_user(id))
-        .map(|u| u.is_elevated)
-        .unwrap_or(false);
-
-    let mut out: Vec<El> = Vec::new();
-    if already_elevated {
-        out.push(
-            alert([
-                alert_title("Elevated this session"),
-                alert_description("You're operating as superuser. Disconnect to drop the elevation."),
-            ])
-            .info(),
-        );
-    } else {
-        out.push(
-            paragraph(
-                "Elevation bypasses the ACL system for the rest of this session — disconnect to drop it. Requires the \
-                 server-side sudo password set via `server set-sudo-password`.",
-            )
-            .muted()
-            .font_size(tokens::TEXT_XS.size),
-        );
-        out.push(row([spacer(), button("Elevate to superuser…").key(KEY_ELEVATE).primary()]).width(Size::Fill(1.0)));
-    }
-    Some(out)
 }

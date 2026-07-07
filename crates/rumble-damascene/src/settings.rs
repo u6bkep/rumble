@@ -23,7 +23,6 @@ use rumble_desktop_shell::{
     AutoDownloadRule, HotkeyBinding, HotkeyData, HotkeyFunction, HotkeyManager, HotkeyModifiers,
     HotkeyRegistrationStatus, KeyboardSettings, PersistentVoiceMode, Settings, ShortcutEntry, TimestampFormat,
 };
-use rumble_protocol::permissions::Permissions;
 use serde_json::Value as JsonValue;
 
 use crate::{
@@ -67,9 +66,10 @@ pub enum SettingsTab {
     Shortcuts,
     Files,
     Stats,
-    /// Server-administration UI. Rendered only when the connected user
-    /// has `MANAGE_ACL` at the root; the tab disappears from the row
-    /// when the permission is revoked mid-session.
+    /// Server-administration UI. Rendered when the connected user has
+    /// `MANAGE_ACL` (group/ACL editing) or `SUDO` (superuser
+    /// elevation); the tab disappears from the row when the last of
+    /// those permissions is revoked mid-session.
     Admin,
     /// Build / version info — git describe output from build.rs.
     About,
@@ -127,15 +127,17 @@ impl SettingsTab {
     }
 }
 
-/// True when the current user holds `MANAGE_ACL` on the root, gating
-/// the Admin tab. Read on every render so revoking the permission
-/// mid-session hides the tab immediately.
+/// Gate for the Admin tab: visible when the connected user can manage
+/// ACLs (`MANAGE_ACL`) **or** elevate to superuser (`SUDO`) — the
+/// elevate control lives at the top of the tab, and elevation targets
+/// users who may not hold `MANAGE_ACL` yet. Read on every render so
+/// revoking the permissions mid-session hides the tab immediately.
 pub fn admin_visible(app_state: &State) -> bool {
-    Permissions::from_bits_truncate(app_state.effective_permissions).contains(Permissions::MANAGE_ACL)
+    admin::can_manage_acl(app_state) || admin::can_elevate(app_state)
 }
 
 /// Filter `SettingsTab::ALL` to the tabs visible for the current
-/// session — Admin is dropped when the user lacks `MANAGE_ACL`.
+/// session — Admin is dropped when [`admin_visible`] fails.
 fn visible_tabs(app_state: &State) -> Vec<SettingsTab> {
     SettingsTab::ALL
         .iter()
@@ -444,7 +446,6 @@ const KEY_SAVE: &str = "settings:save";
 const KEY_AUTOCONNECT: &str = "settings:conn:autoconnect";
 const KEY_REGENERATE: &str = "settings:conn:regenerate";
 const KEY_SWITCH_AGENT: &str = "settings:conn:switch-agent";
-const KEY_ELEVATE: &str = "settings:conn:elevate";
 const KEY_COPY_PUBKEY: &str = "settings:conn:copy-pubkey";
 
 const KEY_INPUT_DEVICE: &str = "settings:dev:input";
@@ -624,7 +625,7 @@ pub fn render(
     }
 
     let body = match tab {
-        SettingsTab::Connection => connection::render_connection(pending, identity, app_state),
+        SettingsTab::Connection => connection::render_connection(pending, identity),
         SettingsTab::Devices => devices::render_devices(pending, &app_state.audio, meter),
         SettingsTab::Voice => voice::render_voice(pending),
         SettingsTab::Processing => {
@@ -1393,6 +1394,9 @@ pub fn handle_event(
             AdminOutcome::Ignored => {}
             AdminOutcome::Handled => return SettingsOutcome::Handled,
             AdminOutcome::Dispatch(cmds) => return SettingsOutcome::Dispatch(cmds),
+            // Elevate hand-off: close settings and let the App open the
+            // sudo-password modal.
+            AdminOutcome::OpenElevate => return SettingsOutcome::OpenElevate,
         }
     }
 
@@ -1468,8 +1472,11 @@ pub fn handle_event(
         state.open_select = OpenSelect::None;
         // Opening the Admin tab pulls the registered-user roster (offline
         // members + memberships). It's not part of synced state — a
-        // permission-gated admin query refreshed each time the tab is shown.
-        if *tab == SettingsTab::Admin {
+        // permission-gated admin query refreshed each time the tab is
+        // shown. Only fired for MANAGE_ACL holders: a SUDO-only user
+        // sees just the Superuser section, and the server would deny
+        // the roster query anyway.
+        if *tab == SettingsTab::Admin && admin::can_manage_acl(app_state) {
             return SettingsOutcome::Dispatch(vec![rumble_client::Command::RequestRegisteredUsers]);
         }
         return SettingsOutcome::Handled;
@@ -1481,10 +1488,6 @@ pub fn handle_event(
     }
     if event.is_click_or_activate(KEY_SWITCH_AGENT) {
         return SettingsOutcome::OpenIdentityWizardAgent;
-    }
-    // Elevate handoff: close settings and let the App open the modal.
-    if event.is_click_or_activate(KEY_ELEVATE) {
-        return SettingsOutcome::OpenElevate;
     }
     if event.is_click_or_activate(KEY_COPY_PUBKEY)
         && let Some(pubkey) = identity.public_key()
