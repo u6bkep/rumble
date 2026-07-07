@@ -36,7 +36,7 @@ use crate::{
     identity::Identity,
     lightbox, model,
     moderation::{self, KickBanModal, ModerationOutcome},
-    room_acl,
+    move_room, room_acl,
     room_tree::{self, RoomTreeOutcome, RoomTreeState},
     server_picker::{self, ServerForm, ServerPickerOutcome, ServerPickerState},
     settings::{self, SettingsOutcome, SettingsState},
@@ -863,6 +863,7 @@ impl<B: UiBackend> App for RumbleApp<B> {
                 room_tree_overlays.user_context_menu,
                 room_tree_overlays.move_room_modal,
                 room_tree_overlays.delete_room_modal,
+                room_tree_overlays.move_to_modal,
                 lightbox_layer,
                 video_lightbox_layer,
                 model_lightbox_layer,
@@ -2822,6 +2823,18 @@ impl<B: UiBackend> RumbleApp<B> {
     /// Test/scene-dump hook for the toolbar transmission-mode dropdown.
     pub fn set_voice_mode_menu_open_for_test(&mut self, open: bool) {
         self.voice_mode_menu_open = open;
+    }
+
+    /// Test/scene-dump hook: open the room "Move to…" destination
+    /// picker for `room_id` (no-op if the current state disallows
+    /// moving it), optionally with a destination pre-selected so the
+    /// dump captures the selected-row treatment.
+    pub fn open_move_room_for_test(&mut self, room_id: uuid::Uuid, selected: Option<uuid::Uuid>) {
+        let state = self.backend.state();
+        self.room_tree.move_to_modal = move_room::MoveToState::open_for(&state, room_id).map(|mut m| {
+            m.selected = selected;
+            m
+        });
     }
 
     /// Test/scene-dump hook to seed the chat composer text, e.g. `"/"` to

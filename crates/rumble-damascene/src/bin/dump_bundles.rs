@@ -104,10 +104,20 @@ enum Scene {
     /// exercises the self-talking room-tree indicator path that
     /// doesn't go through `talking_users` (which is remote-only).
     ConnectedSelfTalking,
-    /// Live session exercising every per-user voice-state glyph in the
-    /// room tree at once: idle (self), talking, self-muted, server-muted,
-    /// self-deafened, and a peer we've locally muted (additive badge).
+    /// Live session exercising the per-user talk-state glyph + status
+    /// flag matrix in the room tree: idle (self), talking, self-muted,
+    /// server-muted, self-deafened (+implied mute), locally muted,
+    /// and the combinations the flags render independently —
+    /// talking-while-self-muted, server-muted+deafened, and
+    /// locally-muted+self-muted.
     ConnectedUserStates,
+    /// Connected session whose room list is empty (pre-sync /
+    /// roomless server) with MAKE_ROOM held — exercises the Rooms-pane
+    /// empty state and its "New room" affordance plus the header "+".
+    ConnectedNoRooms,
+    /// Room "Move to…" destination picker open over a connected
+    /// backdrop with a nested tree, one destination pre-selected.
+    MoveRoomPicker,
     /// Live session that *looks* connected but whose audio devices have
     /// faulted: a hard input (microphone) failure plus a recovering
     /// output (speaker) loss. Exercises the under-toolbar fault banner
@@ -216,6 +226,8 @@ impl Scene {
         Scene::Connected,
         Scene::ConnectedSelfTalking,
         Scene::ConnectedUserStates,
+        Scene::ConnectedNoRooms,
+        Scene::MoveRoomPicker,
         Scene::ConnectedAudioFault,
         Scene::ConnectedSlashCommands,
         Scene::ConnectedSlashCommandHighlighted,
@@ -263,6 +275,8 @@ impl Scene {
             Scene::Connected => "connected",
             Scene::ConnectedSelfTalking => "connected_self_talking",
             Scene::ConnectedUserStates => "connected_user_states",
+            Scene::ConnectedNoRooms => "connected_no_rooms",
+            Scene::MoveRoomPicker => "move_room_picker",
             Scene::ConnectedAudioFault => "connected_audio_fault",
             Scene::ConnectedSlashCommands => "connected_slash_commands",
             Scene::ConnectedSlashCommandHighlighted => "connected_slash_command_highlighted",
@@ -320,6 +334,8 @@ impl Scene {
                 s
             }
             Scene::ConnectedUserStates => user_states_state(),
+            Scene::ConnectedNoRooms => no_rooms_state(),
+            Scene::MoveRoomPicker => move_room_state(),
             Scene::ConnectedAudioFault => {
                 // Session is "connected" but both audio devices have
                 // faulted: a hard mic failure (destructive badge) and a
@@ -604,6 +620,12 @@ impl Scene {
                 });
             }
             Scene::ModerationBan => app.open_kick_ban_for_test(true),
+            Scene::MoveRoomPicker => {
+                // Move "Stage" (child of Lobby); pre-select "Gaming" so
+                // the picker's selected-row fill is captured. Lobby
+                // (the current parent) must be absent from the list.
+                app.open_move_room_for_test(Uuid::from_u128(ROOM_STAGE), Some(Uuid::from_u128(ROOM_STAGE_GAMING)));
+            }
             Scene::SettingsConnectionSudo | Scene::SettingsConnectionElevated => {
                 app.open_settings_for_test(SettingsTab::Connection);
             }
@@ -1080,6 +1102,8 @@ fn user_states_state() -> State {
     };
     audio.talking_users.insert(2); // bob is talking
     audio.muted_users.insert(6); // we've locally muted frank
+    audio.talking_users.insert(7); // grace is talking (while self-muted)
+    audio.muted_users.insert(9); // we've locally muted ivan (who is also self-muted)
 
     let mut state = State {
         connection: ConnectionState::Connected {
@@ -1087,22 +1111,87 @@ fn user_states_state() -> State {
             user_id: 1,
         },
         rooms: vec![make_room(ROOM_LOBBY, "Lobby")],
+        // One user per cell of the talk-state × status-flag matrix the
+        // room tree renders (Mumble-style: primary talking glyph +
+        // independent trailing flags).
         users: vec![
             make_user(1, "alice", ROOM_LOBBY, |_| {}),                    // self, idle
             make_user(2, "bob", ROOM_LOBBY, |_| {}),                      // talking (via talking_users)
             make_user(3, "charlie", ROOM_LOBBY, |u| u.is_muted = true),   // self-muted
             make_user(4, "diana", ROOM_LOBBY, |u| u.server_muted = true), // server-muted
             make_user(5, "erin", ROOM_LOBBY, |u| {
-                // Self-deafened: client forces mute on deafen, so both set.
+                // Self-deafened: client forces mute on deafen, so both set
+                // (renders muted_self *and* deafened_self, as Mumble does).
                 u.is_deafened = true;
                 u.is_muted = true;
             }),
-            make_user(6, "frank", ROOM_LOBBY, |_| {}), // locally muted (badge via muted_users)
+            make_user(6, "frank", ROOM_LOBBY, |_| {}), // locally muted (flag via muted_users)
+            // Orthogonal combinations: the old single-glyph precedence
+            // hid exactly these.
+            make_user(7, "grace", ROOM_LOBBY, |u| u.is_muted = true), // talking + self-muted
+            make_user(8, "heidi", ROOM_LOBBY, |u| {
+                // Server-muted while self-deafened — both flags visible.
+                u.server_muted = true;
+                u.is_deafened = true;
+                u.is_muted = true;
+            }),
+            make_user(9, "ivan", ROOM_LOBBY, |u| u.is_muted = true), // locally muted + self-muted
         ],
         my_user_id: Some(1),
         my_room_id: Some(Uuid::from_u128(ROOM_LOBBY)),
         audio,
         effective_permissions: Permissions::TEXT_MESSAGE.bits(),
+        ..State::default()
+    };
+    state.rebuild_room_tree();
+    state
+}
+
+/// Connected session with an empty room list and `MAKE_ROOM` held —
+/// drives the Rooms-pane empty state with its "New room" button (and
+/// the header "+" affordance, both gated on MAKE_ROOM at Root).
+fn no_rooms_state() -> State {
+    let mut state = State {
+        connection: ConnectionState::Connected {
+            server_name: "rumble.example".into(),
+            user_id: 1,
+        },
+        rooms: Vec::new(),
+        users: Vec::new(),
+        my_user_id: Some(1),
+        my_room_id: None,
+        effective_permissions: (Permissions::MAKE_ROOM | Permissions::TEXT_MESSAGE).bits(),
+        ..State::default()
+    };
+    state.rebuild_room_tree();
+    state
+}
+
+/// Nested tree for the "Move to…" picker scene: Root → {Lobby → Stage,
+/// Work → Gaming}. The scene moves Stage, so valid destinations are
+/// Root, Work and Gaming — Lobby (current parent) and Stage itself are
+/// excluded. Needs MODIFY_ROOM (to move) + MAKE_ROOM (destinations).
+fn move_room_state() -> State {
+    let mut state = State {
+        connection: ConnectionState::Connected {
+            server_name: "rumble.example".into(),
+            user_id: 1,
+        },
+        rooms: vec![
+            make_room_with_parent(rumble_protocol::ROOT_ROOM_UUID.as_u128(), "Root", None),
+            make_room_with_parent(ROOM_LOBBY, "Lobby", Some(rumble_protocol::ROOT_ROOM_UUID.as_u128())),
+            make_room_with_parent(ROOM_STAGE, "Stage", Some(ROOM_LOBBY)),
+            make_room_with_parent(ROOM_WORK, "Work", Some(rumble_protocol::ROOT_ROOM_UUID.as_u128())),
+            make_room_with_parent(ROOM_STAGE_GAMING, "Gaming", Some(ROOM_WORK)),
+        ],
+        users: vec![make_user(1, "alice", ROOM_LOBBY, |_| {})],
+        my_user_id: Some(1),
+        my_room_id: Some(Uuid::from_u128(ROOM_LOBBY)),
+        effective_permissions: (Permissions::MODIFY_ROOM
+            | Permissions::MAKE_ROOM
+            | Permissions::TEXT_MESSAGE
+            | Permissions::SPEAK)
+            .bits(),
         ..State::default()
     };
     state.rebuild_room_tree();
