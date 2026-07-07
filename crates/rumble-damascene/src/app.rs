@@ -546,6 +546,17 @@ impl<B: UiBackend> App for RumbleApp<B> {
             // backlog (no sounds/auto-downloads), not detected as new ids.
             self.chat_seen = None;
         }
+        if !self.prev_was_connected && now_connected {
+            // A connect landing while the server-picker's row menu or
+            // remove-confirm dialog is open suppresses their rendering
+            // (picker overlays are gated on !connected) but would leave
+            // the state set: their Escape handlers keep claiming key
+            // events for an invisible overlay, and the dialog would
+            // reappear on the next disconnect. Drop both with the
+            // session that obsoleted them.
+            self.server_picker.row_menu = None;
+            self.server_picker.pending_remove = None;
+        }
         self.prev_was_connected = now_connected;
 
         // True only on the frame that absorbs the initial backlog — used to
