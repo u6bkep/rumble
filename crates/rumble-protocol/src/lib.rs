@@ -19,6 +19,8 @@ pub mod permissions;
 pub mod proto {
     include!(concat!(env!("OUT_DIR"), "/rumble.api.v1.rs"));
 }
+pub mod types;
+pub use types::{Group, GroupMembership, RegisteredUser, Room, RoomAclEntry, SlashCommand, User};
 
 // =============================================================================
 // Chat Attachment (wire-shape sidecar shared by client + traits + plugins)
