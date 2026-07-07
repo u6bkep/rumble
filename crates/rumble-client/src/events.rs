@@ -11,11 +11,7 @@
 //! crate.
 
 use rumble_audio::{PipelineConfig, UserRxConfig};
-use rumble_protocol::{
-    ChatAttachment,
-    proto::{RoomInfo, User},
-    uuid_from_room_id,
-};
+use rumble_protocol::{ChatAttachment, Group, RegisteredUser, Room, SlashCommand, User};
 use std::{
     collections::{HashMap, HashSet},
     time::{Instant, SystemTime, UNIX_EPOCH},
@@ -75,7 +71,9 @@ pub struct RoomTreeNode {
     pub id: Uuid,
     /// The room name.
     pub name: String,
-    /// The parent room UUID (None for root rooms).
+    /// The parent room UUID. `None` for the Root room, which self-parents
+    /// at nil — flattening the self-link to `None` here keeps the ancestor
+    /// walk terminating and stops Root becoming its own child.
     pub parent_id: Option<Uuid>,
     /// UUIDs of child rooms, in sorted order by name.
     pub children: Vec<Uuid>,
@@ -88,12 +86,14 @@ pub struct RoomTreeNode {
 /// This is rebuilt whenever the room list changes. The UI can use this
 /// to efficiently render the room list as a tree without rebuilding
 /// the hierarchy on each frame.
+///
+/// There is exactly one root by construction: the Root room at
+/// [`ROOT_ROOM_UUID`](rumble_protocol::ROOT_ROOM_UUID), which self-parents. There is no `roots` list —
+/// walk the tree from `ROOT_ROOM_UUID` and its `children`.
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct RoomTree {
     /// All nodes indexed by room UUID.
     pub nodes: HashMap<Uuid, RoomTreeNode>,
-    /// Root room UUIDs (rooms with no parent), sorted by name.
-    pub roots: Vec<Uuid>,
 }
 
 impl RoomTree {
@@ -103,61 +103,45 @@ impl RoomTree {
     }
 
     /// Rebuild the tree from a list of rooms.
-    pub fn rebuild(&mut self, rooms: &[RoomInfo]) {
+    ///
+    /// Every room carries a real parent (the wire boundary guarantees it —
+    /// see [`rumble_protocol::Room`]); the Root room self-parents at nil.
+    /// Root's self-link is flattened to `parent_id: None` so it never lands
+    /// in its own `children`. A non-root room whose parent isn't in the map
+    /// (a malformed/stale delivery) simply isn't attached anywhere — it stays
+    /// queryable via [`get`](Self::get) but won't appear under any parent.
+    pub fn rebuild(&mut self, rooms: &[Room]) {
         self.nodes.clear();
-        self.roots.clear();
 
-        // First pass: create all nodes
+        // First pass: create all nodes. Root self-parents (parent == id ==
+        // nil); represent that as `parent_id: None`.
         for room in rooms {
-            let Some(room_uuid) = room.id.as_ref().and_then(uuid_from_room_id) else {
-                continue;
-            };
-            let parent_uuid = room.parent_id.as_ref().and_then(uuid_from_room_id);
-
+            let parent_id = (!room.is_root()).then_some(room.parent);
             self.nodes.insert(
-                room_uuid,
+                room.id,
                 RoomTreeNode {
-                    id: room_uuid,
+                    id: room.id,
                     name: room.name.clone(),
-                    parent_id: parent_uuid,
+                    parent_id,
                     children: Vec::new(),
                     description: room.description.clone(),
                 },
             );
         }
 
-        // Second pass: build parent-child relationships and collect roots
+        // Second pass: attach each non-root node to its parent.
         let uuids: Vec<Uuid> = self.nodes.keys().copied().collect();
         for uuid in uuids {
-            let parent_id = self.nodes.get(&uuid).and_then(|n| n.parent_id);
-
-            if let Some(parent_uuid) = parent_id {
-                // Add as child of parent (if parent exists)
-                if self.nodes.contains_key(&parent_uuid) {
-                    if let Some(parent) = self.nodes.get_mut(&parent_uuid) {
-                        parent.children.push(uuid);
-                    }
-                } else {
-                    // Parent doesn't exist, treat as root
-                    self.roots.push(uuid);
-                }
-            } else {
-                // No parent, this is a root
-                self.roots.push(uuid);
+            let Some(parent_uuid) = self.nodes.get(&uuid).and_then(|n| n.parent_id) else {
+                continue; // Root (or an explicitly parentless node).
+            };
+            if let Some(parent) = self.nodes.get_mut(&parent_uuid) {
+                parent.children.push(uuid);
             }
         }
 
-        // Sort roots by name
-        self.roots.sort_by(|a, b| {
-            let name_a = self.nodes.get(a).map(|n| n.name.as_str()).unwrap_or("");
-            let name_b = self.nodes.get(b).map(|n| n.name.as_str()).unwrap_or("");
-            name_a.cmp(name_b)
-        });
-
-        // Sort children of each node by name
-        // First, collect the name for each UUID for sorting
+        // Sort children of each node by name.
         let names: HashMap<Uuid, String> = self.nodes.iter().map(|(id, node)| (*id, node.name.clone())).collect();
-
         for node in self.nodes.values_mut() {
             node.children.sort_by(|a, b| {
                 let name_a = names.get(a).map(|s| s.as_str()).unwrap_or("");
@@ -1071,7 +1055,7 @@ pub struct State {
 
     // Server state (when connected)
     /// List of rooms on the server.
-    pub rooms: Vec<RoomInfo>,
+    pub rooms: Vec<Room>,
     /// List of users on the server.
     pub users: Vec<User>,
     /// Our user ID (if connected).
@@ -1116,17 +1100,17 @@ pub struct State {
     /// Kick reason if we were kicked (for disconnect dialog). Cleared after reading.
     pub kicked: Option<String>,
     /// Server-defined permission group definitions (synced from ServerState).
-    pub group_definitions: Vec<rumble_protocol::proto::GroupInfo>,
+    pub group_definitions: Vec<Group>,
     /// Slash commands the server advertises (synced from ServerState), for
     /// composer autocomplete. Static for a connection; cleared on disconnect.
-    pub slash_commands: Vec<rumble_protocol::proto::SlashCommand>,
+    pub slash_commands: Vec<SlashCommand>,
     /// Admin-only roster of registered identities (incl. offline) with their
     /// group memberships and expiries. Populated on demand by
     /// [`Command::RequestRegisteredUsers`] (gated server-side on MANAGE_ACL),
     /// NOT part of the synced/hashed server state — it's a pulled admin view,
     /// refreshed when the admin UI opens and after a membership edit, and
     /// cleared on disconnect. Empty for non-admins and before the first pull.
-    pub registered_users: Vec<rumble_protocol::proto::RegisteredUserInfo>,
+    pub registered_users: Vec<RegisteredUser>,
 }
 
 impl State {
@@ -1138,32 +1122,24 @@ impl State {
 
     /// Get users in a specific room.
     pub fn users_in_room(&self, room_uuid: Uuid) -> Vec<&User> {
-        self.users
-            .iter()
-            .filter(|u| u.current_room.as_ref().and_then(uuid_from_room_id) == Some(room_uuid))
-            .collect()
+        self.users.iter().filter(|u| u.current_room == room_uuid).collect()
     }
 
     /// Check if a user is in a room.
     pub fn is_user_in_room(&self, user_id: u64, room_uuid: Uuid) -> bool {
-        self.users.iter().any(|u| {
-            u.user_id.as_ref().map(|id| id.value) == Some(user_id)
-                && u.current_room.as_ref().and_then(uuid_from_room_id) == Some(room_uuid)
-        })
+        self.users
+            .iter()
+            .any(|u| u.user_id == user_id && u.current_room == room_uuid)
     }
 
     /// Get room by UUID.
-    pub fn get_room(&self, room_uuid: Uuid) -> Option<&RoomInfo> {
-        self.rooms
-            .iter()
-            .find(|r| r.id.as_ref().and_then(uuid_from_room_id) == Some(room_uuid))
+    pub fn get_room(&self, room_uuid: Uuid) -> Option<&Room> {
+        self.rooms.iter().find(|r| r.id == room_uuid)
     }
 
     /// Get a user by ID.
     pub fn get_user(&self, user_id: u64) -> Option<&User> {
-        self.users
-            .iter()
-            .find(|u| u.user_id.as_ref().map(|id| id.value) == Some(user_id))
+        self.users.iter().find(|u| u.user_id == user_id)
     }
 }
 
@@ -1203,10 +1179,12 @@ pub enum Command {
     JoinRoom {
         room_id: Uuid,
     },
-    /// Create a new room, optionally under a parent room.
+    /// Create a new room under `parent_id` (pass [`ROOT_ROOM_UUID`](rumble_protocol::ROOT_ROOM_UUID) for a
+    /// top-level room). The wire encoding omits the parent when it is Root,
+    /// matching the server's canonical room encoding.
     CreateRoom {
         name: String,
-        parent_id: Option<Uuid>,
+        parent_id: Uuid,
     },
     /// Delete a room by UUID.
     DeleteRoom {
@@ -1667,13 +1645,35 @@ impl std::fmt::Debug for Command {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rumble_protocol::{
-        ROOT_ROOM_UUID,
-        proto::{RoomInfo, User, UserId},
-        room_id_from_uuid,
-    };
+    use rumble_protocol::ROOT_ROOM_UUID;
     use std::collections::HashMap;
     use uuid::Uuid;
+
+    fn test_room(id: Uuid, parent: Uuid, name: &str) -> Room {
+        Room {
+            id,
+            name: name.to_string(),
+            parent,
+            description: None,
+            inherit_acl: true,
+            acls: vec![],
+            effective_permissions: 0,
+        }
+    }
+
+    fn test_user(user_id: u64, current_room: Uuid, username: &str) -> User {
+        User {
+            user_id,
+            username: username.to_string(),
+            current_room,
+            is_muted: false,
+            is_deafened: false,
+            server_muted: false,
+            is_elevated: false,
+            groups: vec![],
+            label: None,
+        }
+    }
 
     #[test]
     fn test_state_users_in_room() {
@@ -1690,59 +1690,13 @@ mod tests {
             my_session_public_key: None,
             my_session_id: None,
             rooms: vec![
-                RoomInfo {
-                    id: Some(room_id_from_uuid(room1_uuid)),
-                    name: "Root".to_string(),
-                    parent_id: None,
-                    description: None,
-                    inherit_acl: true,
-                    acls: vec![],
-                    effective_permissions: 0,
-                },
-                RoomInfo {
-                    id: Some(room_id_from_uuid(room2_uuid)),
-                    name: "Room2".to_string(),
-                    parent_id: None,
-                    description: None,
-                    inherit_acl: true,
-                    acls: vec![],
-                    effective_permissions: 0,
-                },
+                test_room(room1_uuid, ROOT_ROOM_UUID, "Root"),
+                test_room(room2_uuid, ROOT_ROOM_UUID, "Room2"),
             ],
             users: vec![
-                User {
-                    user_id: Some(UserId { value: 1 }),
-                    current_room: Some(room_id_from_uuid(room1_uuid)),
-                    username: "user1".to_string(),
-                    is_muted: false,
-                    is_deafened: false,
-                    server_muted: false,
-                    is_elevated: false,
-                    groups: vec![],
-                    label: None,
-                },
-                User {
-                    user_id: Some(UserId { value: 2 }),
-                    current_room: Some(room_id_from_uuid(room1_uuid)),
-                    username: "user2".to_string(),
-                    is_muted: false,
-                    is_deafened: false,
-                    server_muted: false,
-                    is_elevated: false,
-                    groups: vec![],
-                    label: None,
-                },
-                User {
-                    user_id: Some(UserId { value: 3 }),
-                    current_room: Some(room_id_from_uuid(room2_uuid)),
-                    username: "user3".to_string(),
-                    is_muted: false,
-                    is_deafened: false,
-                    server_muted: false,
-                    is_elevated: false,
-                    groups: vec![],
-                    label: None,
-                },
+                test_user(1, room1_uuid, "user1"),
+                test_user(2, room1_uuid, "user2"),
+                test_user(3, room2_uuid, "user3"),
             ],
             audio: AudioState::default(),
             chat_messages: std::sync::Arc::new(vec![]),
@@ -1764,16 +1718,8 @@ mod tests {
         assert_eq!(users_in_room2[0].username, "user3");
     }
 
-    fn tree_room(uuid: Uuid, parent: Option<Uuid>, name: &str) -> RoomInfo {
-        RoomInfo {
-            id: Some(room_id_from_uuid(uuid)),
-            name: name.to_string(),
-            parent_id: parent.map(room_id_from_uuid),
-            description: None,
-            inherit_acl: true,
-            acls: vec![],
-            effective_permissions: 0,
-        }
+    fn tree_room(uuid: Uuid, parent: Uuid, name: &str) -> Room {
+        test_room(uuid, parent, name)
     }
 
     /// A server-delivered parent cycle (A → B → A) must not hang the
@@ -1784,7 +1730,7 @@ mod tests {
         let a = Uuid::from_u128(1);
         let b = Uuid::from_u128(2);
         let mut tree = RoomTree::new();
-        tree.rebuild(&[tree_room(a, Some(b), "A"), tree_room(b, Some(a), "B")]);
+        tree.rebuild(&[tree_room(a, b, "A"), tree_room(b, a, "B")]);
 
         // The walk is capped at the node count, so the chain is finite.
         assert!(tree.ancestors(a).count() <= tree.len());
@@ -1799,7 +1745,7 @@ mod tests {
     fn ancestors_terminates_on_self_parent() {
         let a = Uuid::from_u128(1);
         let mut tree = RoomTree::new();
-        tree.rebuild(&[tree_room(a, Some(a), "A")]);
+        tree.rebuild(&[tree_room(a, a, "A")]);
 
         assert_eq!(tree.ancestors(a).count(), 1);
         assert_eq!(tree.depth(a), 1);
@@ -1809,15 +1755,7 @@ mod tests {
     fn test_state_get_room() {
         let room_uuid = ROOT_ROOM_UUID;
         let state = State {
-            rooms: vec![RoomInfo {
-                id: Some(room_id_from_uuid(room_uuid)),
-                name: "Root".to_string(),
-                parent_id: None,
-                description: None,
-                inherit_acl: true,
-                acls: vec![],
-                effective_permissions: 0,
-            }],
+            rooms: vec![test_room(room_uuid, ROOT_ROOM_UUID, "Root")],
             ..Default::default()
         };
 
@@ -1836,50 +1774,25 @@ mod tests {
         let grandchild_uuid = Uuid::new_v4();
 
         let rooms = vec![
-            RoomInfo {
-                id: Some(room_id_from_uuid(root_uuid)),
-                name: "Root".to_string(),
-                parent_id: None,
-                description: None,
-                inherit_acl: true,
-                acls: vec![],
-                effective_permissions: 0,
-            },
-            RoomInfo {
-                id: Some(room_id_from_uuid(child1_uuid)),
-                name: "Alpha Channel".to_string(),
-                parent_id: Some(room_id_from_uuid(root_uuid)),
-                description: None,
-                inherit_acl: true,
-                acls: vec![],
-                effective_permissions: 0,
-            },
-            RoomInfo {
-                id: Some(room_id_from_uuid(child2_uuid)),
-                name: "Beta Channel".to_string(),
-                parent_id: Some(room_id_from_uuid(root_uuid)),
-                description: None,
-                inherit_acl: true,
-                acls: vec![],
-                effective_permissions: 0,
-            },
-            RoomInfo {
-                id: Some(room_id_from_uuid(grandchild_uuid)),
-                name: "Private".to_string(),
-                parent_id: Some(room_id_from_uuid(child1_uuid)),
-                description: None,
-                inherit_acl: true,
-                acls: vec![],
-                effective_permissions: 0,
-            },
+            test_room(root_uuid, ROOT_ROOM_UUID, "Root"),
+            test_room(child1_uuid, root_uuid, "Alpha Channel"),
+            test_room(child2_uuid, root_uuid, "Beta Channel"),
+            test_room(grandchild_uuid, child1_uuid, "Private"),
         ];
 
         let mut tree = RoomTree::new();
         tree.rebuild(&rooms);
 
         assert_eq!(tree.len(), 4);
-        assert_eq!(tree.roots.len(), 1);
-        assert_eq!(tree.roots[0], root_uuid);
+        // Exactly one root by construction: Root self-parents and is the
+        // only node with no parent link.
+        let roots: Vec<Uuid> = tree
+            .nodes
+            .values()
+            .filter(|n| n.parent_id.is_none())
+            .map(|n| n.id)
+            .collect();
+        assert_eq!(roots, vec![root_uuid]);
 
         let root_node = tree.get(root_uuid).unwrap();
         assert_eq!(root_node.children.len(), 2);
@@ -1905,5 +1818,20 @@ mod tests {
         assert!(tree.is_ancestor(root_uuid, grandchild_uuid));
         assert!(tree.is_ancestor(child1_uuid, grandchild_uuid));
         assert!(!tree.is_ancestor(child2_uuid, grandchild_uuid));
+    }
+
+    /// The Root room self-parents (`parent == id == nil`) on the wire, but
+    /// the tree must never list Root among its own children, and its
+    /// ancestor walk / depth must be empty.
+    #[test]
+    fn root_is_not_its_own_child() {
+        let mut tree = RoomTree::new();
+        tree.rebuild(&[test_room(ROOT_ROOM_UUID, ROOT_ROOM_UUID, "Root")]);
+
+        let root = tree.get(ROOT_ROOM_UUID).unwrap();
+        assert!(root.parent_id.is_none(), "Root's self-parent flattens to None");
+        assert!(root.children.is_empty(), "Root must not be its own child");
+        assert_eq!(tree.ancestors(ROOT_ROOM_UUID).count(), 0);
+        assert_eq!(tree.depth(ROOT_ROOM_UUID), 0);
     }
 }

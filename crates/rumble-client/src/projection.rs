@@ -303,20 +303,29 @@ fn verify_state_hash(state: &Arc<RwLock<State>>, expected_hash: &[u8], command_t
 /// (both excluded from the incremental-update hash). See
 /// [`verify_state_hash`] for the full rationale.
 fn state_hash_input(s: &State) -> rumble_protocol::proto::ServerState {
-    let rooms = s
-        .rooms
-        .iter()
-        .map(|r| rumble_protocol::proto::RoomInfo {
-            effective_permissions: 0,
-            ..r.clone()
-        })
-        .collect();
+    let rooms = s.rooms.iter().map(room_to_wire).collect();
     rumble_protocol::proto::ServerState {
         rooms,
-        users: s.users.clone(),
+        users: s.users.iter().map(rumble_protocol::User::to_proto).collect(),
         groups: Vec::new(),
         slash_commands: Vec::new(),
     }
+}
+
+/// Serialize a domain [`Room`] to its canonical wire form for hashing,
+/// mirroring the server's `room_to_wire` exactly: `effective_permissions`
+/// zeroed (per-client, set after hashing on the server) and a Root parent
+/// (`parent == ROOT_ROOM_UUID`, which includes Root itself) encoded as an
+/// **absent** `parent_id` rather than an explicit nil one. The BLAKE3 state
+/// hash is computed over these bytes, so any divergence from the server's
+/// encoding would make every `StateUpdate` spuriously trigger a resync.
+fn room_to_wire(room: &rumble_protocol::Room) -> rumble_protocol::proto::RoomInfo {
+    let mut info = room.to_proto();
+    info.effective_permissions = 0;
+    if room.parent == rumble_protocol::ROOT_ROOM_UUID {
+        info.parent_id = None;
+    }
+    info
 }
 
 /// Short hex prefix of a hash for log readability (full 32-byte hashes
@@ -677,11 +686,7 @@ fn apply_room(
                 });
             }
             if let Some(my_user_id) = s.my_user_id
-                && let Some(muted) = s
-                    .users
-                    .iter()
-                    .find(|u| u.user_id.as_ref().map(|x| x.value) == Some(my_user_id))
-                    .map(|u| u.server_muted)
+                && let Some(muted) = s.users.iter().find(|u| u.user_id == my_user_id).map(|u| u.server_muted)
             {
                 audio_cmds.push(AudioCommand::SetServerMuted { muted });
             }
@@ -693,37 +698,26 @@ fn apply_room(
             recompute_perms = true;
         }
         RoomEvent::RoomRemoved { room_id } => {
-            s.rooms
-                .retain(|r| r.id.as_ref().and_then(rumble_protocol::uuid_from_room_id) != Some(room_id));
+            s.rooms.retain(|r| r.id != room_id);
             s.rebuild_room_tree();
             recompute_perms = true;
         }
         RoomEvent::RoomRenamed { room_id, name } => {
-            if let Some(room) = s
-                .rooms
-                .iter_mut()
-                .find(|r| r.id.as_ref().and_then(rumble_protocol::uuid_from_room_id) == Some(room_id))
-            {
+            if let Some(room) = s.rooms.iter_mut().find(|r| r.id == room_id) {
                 room.name = name;
             }
             s.rebuild_room_tree();
         }
         RoomEvent::RoomMoved { room_id, new_parent } => {
-            if let Some(room) = s
-                .rooms
-                .iter_mut()
-                .find(|r| r.id.as_ref().and_then(rumble_protocol::uuid_from_room_id) == Some(room_id))
-            {
-                room.parent_id = new_parent.map(rumble_protocol::room_id_from_uuid);
+            if let Some(room) = s.rooms.iter_mut().find(|r| r.id == room_id) {
+                // A wire-absent parent means "top-level"; domain rooms encode
+                // that as the Root parent rather than an Option.
+                room.parent = new_parent.unwrap_or(rumble_protocol::ROOT_ROOM_UUID);
             }
             s.rebuild_room_tree();
         }
         RoomEvent::RoomDescriptionSet { room_id, description } => {
-            if let Some(room) = s
-                .rooms
-                .iter_mut()
-                .find(|r| r.id.as_ref().and_then(rumble_protocol::uuid_from_room_id) == Some(room_id))
-            {
+            if let Some(room) = s.rooms.iter_mut().find(|r| r.id == room_id) {
                 room.description = description;
             }
             s.rebuild_room_tree();
@@ -735,29 +729,21 @@ fn apply_room(
             effective: _,
             per_room_recompute: _,
         } => {
-            if let Some(room) = s
-                .rooms
-                .iter_mut()
-                .find(|r| r.id.as_ref().and_then(rumble_protocol::uuid_from_room_id) == Some(room_id))
-            {
+            if let Some(room) = s.rooms.iter_mut().find(|r| r.id == room_id) {
                 room.inherit_acl = inherit_acl;
                 room.acls = acls;
             }
             recompute_perms = true;
         }
         RoomEvent::UserJoined { user } => {
-            let user_id_value = user.user_id.as_ref().map(|id| id.value);
-            let already_exists = s
-                .users
-                .iter()
-                .any(|u| u.user_id.as_ref().map(|id| id.value) == user_id_value);
+            let user_id = user.user_id;
+            let already_exists = s.users.iter().any(|u| u.user_id == user_id);
             if !already_exists {
                 let my_room_id = s.my_room_id;
-                let user_room = user.current_room.as_ref().and_then(rumble_protocol::uuid_from_room_id);
-                let notify_audio = user_id_value.is_some() && my_room_id.is_some() && user_room == my_room_id;
+                let notify_audio = my_room_id == Some(user.current_room);
                 s.users.push(user);
-                if notify_audio && let Some(uid) = user_id_value {
-                    audio_cmds.push(AudioCommand::UserJoinedRoom { user_id: uid });
+                if notify_audio {
+                    audio_cmds.push(AudioCommand::UserJoinedRoom { user_id });
                 }
             }
         }
@@ -766,12 +752,11 @@ fn apply_room(
             let was_in_our_room = s
                 .users
                 .iter()
-                .find(|u| u.user_id.as_ref().map(|id| id.value) == Some(user_id))
-                .map(|u| u.current_room.as_ref().and_then(rumble_protocol::uuid_from_room_id) == my_room_id)
+                .find(|u| u.user_id == user_id)
+                .map(|u| Some(u.current_room) == my_room_id)
                 .unwrap_or(false);
-            s.users
-                .retain(|u| u.user_id.as_ref().map(|id| id.value) != Some(user_id));
-            if was_in_our_room && my_room_id.is_some() {
+            s.users.retain(|u| u.user_id != user_id);
+            if was_in_our_room {
                 audio_cmds.push(AudioCommand::UserLeftRoom { user_id });
             }
         }
@@ -779,18 +764,12 @@ fn apply_room(
             let my_room_id = s.my_room_id;
             let my_user_id = s.my_user_id;
 
-            let from_room_id = s
-                .users
-                .iter()
-                .find(|u| u.user_id.as_ref().map(|id| id.value) == Some(user_id))
-                .and_then(|u| u.current_room.as_ref().and_then(rumble_protocol::uuid_from_room_id));
+            let from_room_id = s.users.iter().find(|u| u.user_id == user_id).map(|u| u.current_room);
 
-            if let Some(user) = s
-                .users
-                .iter_mut()
-                .find(|u| u.user_id.as_ref().map(|id| id.value) == Some(user_id))
-            {
-                user.current_room = room_id.map(rumble_protocol::room_id_from_uuid);
+            if let Some(user) = s.users.iter_mut().find(|u| u.user_id == user_id) {
+                // A wire-absent destination means "moved to Root"; domain
+                // users always sit in a real room.
+                user.current_room = room_id.unwrap_or(rumble_protocol::ROOT_ROOM_UUID);
             }
 
             if my_user_id == Some(user_id) {
@@ -827,11 +806,7 @@ fn apply_room(
             is_elevated,
         } => {
             let my_user_id = s.my_user_id;
-            if let Some(user) = s
-                .users
-                .iter_mut()
-                .find(|u| u.user_id.as_ref().map(|id| id.value) == Some(user_id))
-            {
+            if let Some(user) = s.users.iter_mut().find(|u| u.user_id == user_id) {
                 let prev_server_muted = user.server_muted;
                 let prev_elevated = user.is_elevated;
                 user.is_muted = is_muted;
@@ -860,11 +835,7 @@ fn apply_room(
         }
         RoomEvent::UserGroupChanged { user_id, group, added } => {
             let my_user_id = s.my_user_id;
-            if let Some(user) = s
-                .users
-                .iter_mut()
-                .find(|u| u.user_id.as_ref().map(|id| id.value) == Some(user_id))
-            {
+            if let Some(user) = s.users.iter_mut().find(|u| u.user_id == user_id) {
                 let changed = if added {
                     if user.groups.contains(&group) {
                         false
@@ -942,15 +913,7 @@ fn apply_room(
 fn room_user_ids(s: &State, room_id: Uuid, exclude: Option<u64>) -> Vec<u64> {
     s.users
         .iter()
-        .filter_map(|u| {
-            let uid = u.user_id.as_ref().map(|id| id.value)?;
-            let user_room = u.current_room.as_ref().and_then(rumble_protocol::uuid_from_room_id)?;
-            if user_room == room_id && Some(uid) != exclude {
-                Some(uid)
-            } else {
-                None
-            }
-        })
+        .filter_map(|u| (u.current_room == room_id && Some(u.user_id) != exclude).then_some(u.user_id))
         .collect()
 }
 
@@ -970,11 +933,7 @@ fn recompute_effective_permissions(state: &Arc<RwLock<State>>) {
     };
 
     let mut user_groups = vec!["default".to_string()];
-    if let Some(me) = s
-        .users
-        .iter()
-        .find(|u| u.user_id.as_ref().map(|id| id.value) == Some(my_user_id))
-    {
+    if let Some(me) = s.users.iter().find(|u| u.user_id == my_user_id) {
         for g in &me.groups {
             if !user_groups.contains(g) {
                 user_groups.push(g.clone());
@@ -996,17 +955,13 @@ fn recompute_effective_permissions(state: &Arc<RwLock<State>>) {
     let is_elevated = s
         .users
         .iter()
-        .find(|u| u.user_id.as_ref().map(|id| id.value) == Some(my_user_id))
+        .find(|u| u.user_id == my_user_id)
         .map(|u| u.is_elevated)
         .unwrap_or(false);
 
     let my_room_id = s.my_room_id;
 
-    let room_uuids: Vec<Uuid> = s
-        .rooms
-        .iter()
-        .filter_map(|r| r.id.as_ref().and_then(rumble_protocol::uuid_from_room_id))
-        .collect();
+    let room_uuids: Vec<Uuid> = s.rooms.iter().map(|r| r.id).collect();
 
     let rooms_snapshot = s.rooms.clone();
     drop(s);
@@ -1034,7 +989,7 @@ fn recompute_effective_permissions(state: &Arc<RwLock<State>>) {
 }
 
 fn build_room_chain(
-    rooms: &[rumble_protocol::proto::RoomInfo],
+    rooms: &[rumble_protocol::Room],
     target: Uuid,
 ) -> Vec<(Uuid, Option<rumble_protocol::permissions::RoomAclData>)> {
     use rumble_protocol::permissions::{AclEntry, Permissions, RoomAclData};
@@ -1061,14 +1016,7 @@ fn build_room_chain(
         if current == rumble_protocol::ROOT_ROOM_UUID {
             break;
         }
-        let parent = rooms.iter().find_map(|r| {
-            let rid = r.id.as_ref().and_then(rumble_protocol::uuid_from_room_id)?;
-            if rid == current {
-                r.parent_id.as_ref().and_then(rumble_protocol::uuid_from_room_id)
-            } else {
-                None
-            }
-        });
+        let parent = rooms.iter().find(|r| r.id == current).map(|r| r.parent);
         match parent {
             Some(p) => current = p,
             None => break,
@@ -1084,8 +1032,7 @@ fn build_room_chain(
     path.into_iter()
         .map(|room_uuid| {
             let acl_data = rooms.iter().find_map(|r| {
-                let rid = r.id.as_ref().and_then(rumble_protocol::uuid_from_room_id)?;
-                if rid == room_uuid && !r.acls.is_empty() {
+                if r.id == room_uuid && !r.acls.is_empty() {
                     Some(RoomAclData {
                         inherit_acl: r.inherit_acl,
                         entries: r
@@ -1120,13 +1067,50 @@ fn apply_transfer(_state: &Arc<RwLock<State>>, ev: TransferEvent, _repaint: &Arc
 #[cfg(test)]
 mod tests {
     use rumble_protocol::{
-        compute_server_state_hash,
-        proto::{RoomId, RoomInfo, ServerState, User, UserId},
+        ROOT_ROOM_UUID, Room, User, compute_server_state_hash,
+        proto::{self, RoomId, RoomInfo, ServerState, UserId},
+        room_id_from_uuid,
     };
 
     use super::*;
 
-    fn room(uuid: u128, name: &str, effective: u32) -> RoomInfo {
+    /// A domain [`Room`] at top level (parent == Root).
+    fn room(uuid: u128, name: &str, effective: u32) -> Room {
+        Room {
+            id: Uuid::from_u128(uuid),
+            name: name.to_string(),
+            parent: ROOT_ROOM_UUID,
+            description: None,
+            inherit_acl: true,
+            acls: vec![],
+            effective_permissions: effective,
+        }
+    }
+
+    fn room_with_parent(uuid: u128, parent: u128, name: &str) -> Room {
+        let mut r = room(uuid, name, 0);
+        r.parent = Uuid::from_u128(parent);
+        r
+    }
+
+    fn user(id: u64, name: &str) -> User {
+        User {
+            user_id: id,
+            username: name.to_string(),
+            current_room: ROOT_ROOM_UUID,
+            is_muted: false,
+            is_deafened: false,
+            server_muted: false,
+            is_elevated: false,
+            groups: vec![],
+            label: None,
+        }
+    }
+
+    /// The canonical wire encoding of a top-level room the server would
+    /// hash: absent `parent_id`, zeroed `effective_permissions`. Used to
+    /// build an independent oracle for the hash-input tests.
+    fn wire_room(uuid: u128, name: &str) -> RoomInfo {
         RoomInfo {
             id: Some(RoomId {
                 uuid: uuid.to_be_bytes().to_vec(),
@@ -1136,23 +1120,17 @@ mod tests {
             description: None,
             inherit_acl: true,
             acls: vec![],
-            effective_permissions: effective,
+            effective_permissions: 0,
         }
     }
 
-    fn room_with_parent(uuid: u128, parent: u128, name: &str) -> RoomInfo {
-        let mut r = room(uuid, name, 0);
-        r.parent_id = Some(RoomId {
-            uuid: parent.to_be_bytes().to_vec(),
-        });
-        r
-    }
-
-    fn user(id: u64, name: &str) -> User {
-        User {
+    /// The wire encoding of a Root-room user (`current_room == Root`),
+    /// matching what [`User::to_proto`] emits.
+    fn wire_user(id: u64, name: &str) -> proto::User {
+        proto::User {
             user_id: Some(UserId { value: id }),
             username: name.to_string(),
-            current_room: None,
+            current_room: Some(room_id_from_uuid(ROOT_ROOM_UUID)),
             is_muted: false,
             is_deafened: false,
             server_muted: false,
@@ -1176,7 +1154,7 @@ mod tests {
         let s = State {
             rooms: vec![room(1, "Root", 0x1ff), room(2, "Lobby", 0x42)],
             users: vec![user(1, "alice"), user(2, "bob")],
-            group_definitions: vec![rumble_protocol::proto::GroupInfo {
+            group_definitions: vec![rumble_protocol::Group {
                 name: "admin".to_string(),
                 permissions: 0xffff_ffff,
                 is_builtin: true,
@@ -1184,11 +1162,12 @@ mod tests {
             ..Default::default()
         };
 
-        // Server's broadcast_state_update hash input: same rooms but with
-        // effective_permissions zeroed, groups + slash_commands empty.
+        // Server's broadcast_state_update hash input: canonical wire rooms
+        // (absent parent_id, effective_permissions zeroed), matching users,
+        // groups + slash_commands empty.
         let server_input = ServerState {
-            rooms: vec![room(1, "Root", 0), room(2, "Lobby", 0)],
-            users: s.users.clone(),
+            rooms: vec![wire_room(1, "Root"), wire_room(2, "Lobby")],
+            users: vec![wire_user(1, "alice"), wire_user(2, "bob")],
             groups: vec![],
             slash_commands: vec![],
         };
@@ -1212,8 +1191,8 @@ mod tests {
         };
 
         let server_input = ServerState {
-            rooms: vec![room(1, "Root", 0)],
-            users: vec![user(1, "alice"), user(2, "ghost")],
+            rooms: vec![wire_room(1, "Root")],
+            users: vec![wire_user(1, "alice"), wire_user(2, "ghost")],
             groups: vec![],
             slash_commands: vec![],
         };
@@ -1298,13 +1277,13 @@ mod tests {
             );
         }
 
-        fn user(&self, id: u64) -> Option<rumble_protocol::proto::User> {
+        fn user(&self, id: u64) -> Option<rumble_protocol::User> {
             self.state
                 .read()
                 .unwrap()
                 .users
                 .iter()
-                .find(|u| u.user_id.as_ref().map(|x| x.value) == Some(id))
+                .find(|u| u.user_id == id)
                 .cloned()
         }
 
@@ -1417,7 +1396,7 @@ mod tests {
     fn self_user_moved_updates_my_room_and_audio() {
         let target = Uuid::from_u128(5);
         let mut peer = user(2, "peer");
-        peer.current_room = Some(rumble_protocol::room_id_from_uuid(target));
+        peer.current_room = target;
         let mut h = Harness::new(State {
             my_user_id: Some(1),
             users: vec![user(1, "me"), peer],

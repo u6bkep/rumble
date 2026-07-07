@@ -346,12 +346,13 @@ impl RpcServer {
                 Err(e) => RpcResponse::error(format!("Invalid room UUID: {}", e)),
             },
             RpcRequest::CreateRoom { name, parent_id } => {
+                // Absent parent means top-level: the Root room.
                 let parent_uuid = match parent_id {
                     Some(id) => match id.parse::<Uuid>() {
-                        Ok(uuid) => Some(uuid),
+                        Ok(uuid) => uuid,
                         Err(e) => return RpcResponse::error(format!("Invalid parent UUID: {}", e)),
                     },
-                    None => None,
+                    None => rumble_protocol::ROOT_ROOM_UUID,
                 };
                 command_sink(Command::CreateRoom {
                     name,

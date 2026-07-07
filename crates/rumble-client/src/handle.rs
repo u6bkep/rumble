@@ -1205,18 +1205,15 @@ async fn run_connection_task<P: Platform>(
                                 // Pre-compute our room from the connect-time
                                 // user list (falling back to root if missing).
                                 let my_room_uuid = users.iter()
-                                    .find(|u| u.user_id.as_ref().map(|id| id.value) == Some(user_id))
-                                    .and_then(|u| u.current_room.as_ref())
-                                    .and_then(rumble_protocol::uuid_from_room_id)
+                                    .find(|u| u.user_id == user_id)
+                                    .map(|u| u.current_room)
                                     .unwrap_or(ROOT_ROOM_UUID);
 
                                 // Per-room effective permissions for the
                                 // FullStateReplaced payload (server-computed).
                                 let mut per_room_permissions: HashMap<Uuid, u32> = HashMap::new();
                                 for room in &rooms {
-                                    if let Some(room_uuid) = room.id.as_ref().and_then(rumble_protocol::uuid_from_room_id) {
-                                        per_room_permissions.insert(room_uuid, room.effective_permissions);
-                                    }
+                                    per_room_permissions.insert(room.id, room.effective_permissions);
                                 }
 
                                 let _ = bus.room.send(crate::RoomEvent::FullStateReplaced {
@@ -1399,15 +1396,12 @@ async fn run_connection_task<P: Platform>(
                                         session_id: session_info.session_id,
                                     });
                                     let my_room_uuid = users.iter()
-                                        .find(|u| u.user_id.as_ref().map(|id| id.value) == Some(user_id))
-                                        .and_then(|u| u.current_room.as_ref())
-                                        .and_then(rumble_protocol::uuid_from_room_id)
+                                        .find(|u| u.user_id == user_id)
+                                        .map(|u| u.current_room)
                                         .unwrap_or(ROOT_ROOM_UUID);
                                     let mut per_room_permissions: HashMap<Uuid, u32> = HashMap::new();
                                     for room in &rooms {
-                                        if let Some(room_uuid) = room.id.as_ref().and_then(rumble_protocol::uuid_from_room_id) {
-                                            per_room_permissions.insert(room_uuid, room.effective_permissions);
-                                        }
+                                        per_room_permissions.insert(room.id, room.effective_permissions);
                                     }
                                     let _ = bus.room.send(crate::RoomEvent::FullStateReplaced {
                                         rooms,
@@ -1568,7 +1562,9 @@ async fn run_connection_task<P: Platform>(
                                 state_hash: Vec::new(),
                                 payload: Some(Payload::CreateRoom(proto::CreateRoom {
                                     name,
-                                    parent_id: parent_id.map(room_id_from_uuid),
+                                    // Canonical encoding: a Root parent (top-level) is
+                                    // sent as an absent parent_id, matching room_to_wire.
+                                    parent_id: (parent_id != ROOT_ROOM_UUID).then(|| room_id_from_uuid(parent_id)),
                                     description: None,
                                 })),
                             };
@@ -2234,10 +2230,10 @@ async fn connect_to_server<T: Transport>(
 ) -> anyhow::Result<(
     T,
     u64, // user_id
-    Vec<proto::RoomInfo>,
-    Vec<proto::User>,
-    Vec<proto::GroupInfo>,
-    Vec<proto::SlashCommand>,
+    Vec<rumble_protocol::Room>,
+    Vec<rumble_protocol::User>,
+    Vec<rumble_protocol::Group>,
+    Vec<rumble_protocol::SlashCommand>,
     SessionIdentity,
 )> {
     info!(server_addr = %addr, client_name, "Connecting to server");
@@ -2348,8 +2344,26 @@ async fn connect_to_server<T: Transport>(
     send_envelope(&mut transport, &auth).await?;
     debug!("Sent Authenticate");
 
-    // Step 8: Wait for ServerState or AuthFailed
+    // Step 8: Wait for ServerState or AuthFailed. Convert the wire records
+    // into domain types at this ingress boundary: rooms/users with a
+    // missing or malformed id are dropped (never defaulted — a nil default
+    // would alias Root), matching the old and_then(uuid_from_room_id)
+    // filtering. Everything downstream — and the whole client `State` —
+    // then speaks domain types.
     let (rooms, users, groups, slash_commands) = wait_for_auth_result(&mut transport).await?;
+    let rooms: Vec<rumble_protocol::Room> = rooms
+        .into_iter()
+        .filter_map(rumble_protocol::Room::from_proto)
+        .collect();
+    let users: Vec<rumble_protocol::User> = users
+        .into_iter()
+        .filter_map(rumble_protocol::User::from_proto)
+        .collect();
+    let groups: Vec<rumble_protocol::Group> = groups.into_iter().map(rumble_protocol::Group::from).collect();
+    let slash_commands: Vec<rumble_protocol::SlashCommand> = slash_commands
+        .into_iter()
+        .map(rumble_protocol::SlashCommand::from)
+        .collect();
 
     let session_identity = SessionIdentity {
         signing_key: session_signing,
@@ -2645,22 +2659,39 @@ fn handle_server_message(
             if let Some(kind) = se.kind {
                 match kind {
                     proto::server_event::Kind::ServerState(ss) => {
-                        // Build per-room permissions map from server-computed
-                        // values, then emit a single FullStateReplaced event.
-                        // The projection handles state mutation, audio task
-                        // notifications (RoomChanged + SetServerMuted), and
-                        // permission recalc.
+                        // Convert wire records to domain types at this ingress
+                        // boundary (rooms/users with a missing/malformed id are
+                        // dropped, never defaulted). Build the per-room
+                        // permissions map from the server-computed values, then
+                        // emit a single FullStateReplaced event. The projection
+                        // handles state mutation, audio task notifications
+                        // (RoomChanged + SetServerMuted), and permission recalc.
+                        let rooms: Vec<rumble_protocol::Room> = ss
+                            .rooms
+                            .into_iter()
+                            .filter_map(rumble_protocol::Room::from_proto)
+                            .collect();
+                        let users: Vec<rumble_protocol::User> = ss
+                            .users
+                            .into_iter()
+                            .filter_map(rumble_protocol::User::from_proto)
+                            .collect();
+                        let groups: Vec<rumble_protocol::Group> =
+                            ss.groups.into_iter().map(rumble_protocol::Group::from).collect();
+                        let slash_commands: Vec<rumble_protocol::SlashCommand> = ss
+                            .slash_commands
+                            .into_iter()
+                            .map(rumble_protocol::SlashCommand::from)
+                            .collect();
                         let mut per_room_permissions: HashMap<Uuid, u32> = HashMap::new();
-                        for room in &ss.rooms {
-                            if let Some(room_uuid) = room.id.as_ref().and_then(rumble_protocol::uuid_from_room_id) {
-                                per_room_permissions.insert(room_uuid, room.effective_permissions);
-                            }
+                        for room in &rooms {
+                            per_room_permissions.insert(room.id, room.effective_permissions);
                         }
                         let _ = bus.room.send(crate::RoomEvent::FullStateReplaced {
-                            rooms: ss.rooms,
-                            users: ss.users,
-                            groups: ss.groups,
-                            slash_commands: ss.slash_commands,
+                            rooms,
+                            users,
+                            groups,
+                            slash_commands,
                             per_room_permissions,
                         });
                     }
@@ -2801,10 +2832,15 @@ fn handle_server_message(
         }
         Some(Payload::RegisteredUsers(ru)) => {
             // Reply to a Command::RequestRegisteredUsers pull (admin only).
-            // Pure delta to the projection — the sole State writer.
-            let _ = bus
-                .room
-                .send(crate::RoomEvent::RegisteredUsersReplaced { users: ru.users });
+            // Pure delta to the projection — the sole State writer. Convert
+            // wire records to domain at the boundary; entries with a
+            // non-32-byte public key are dropped as unaddressable.
+            let users: Vec<rumble_protocol::RegisteredUser> = ru
+                .users
+                .into_iter()
+                .filter_map(rumble_protocol::RegisteredUser::from_proto)
+                .collect();
+            let _ = bus.room.send(crate::RoomEvent::RegisteredUsersReplaced { users });
         }
         _ => {}
     }
@@ -2837,7 +2873,10 @@ fn apply_state_update(update: proto::StateUpdate, bus: &crate::projection::Event
     };
     match u {
         proto::state_update::Update::RoomCreated(rc) => {
-            if let Some(room) = rc.room {
+            // Convert to domain at the boundary; a room with a missing or
+            // malformed id is dropped rather than defaulted to nil (which
+            // would alias Root).
+            if let Some(room) = rc.room.and_then(rumble_protocol::Room::from_proto) {
                 let _ = bus.room.send(RoomEvent::RoomAdded { room });
             }
         }
@@ -2877,7 +2916,9 @@ fn apply_state_update(update: proto::StateUpdate, bus: &crate::projection::Event
             }
         }
         proto::state_update::Update::UserJoined(uj) => {
-            if let Some(user) = uj.user {
+            // Convert to domain at the boundary; a user with no id is dropped
+            // (undeliverable garbage).
+            if let Some(user) = uj.user.and_then(rumble_protocol::User::from_proto) {
                 let _ = bus.room.send(RoomEvent::UserJoined { user });
             }
         }
@@ -2925,7 +2966,9 @@ fn apply_state_update(update: proto::StateUpdate, bus: &crate::projection::Event
                 // Existing-vs-new is decided in the projection (which
                 // holds the source of truth); we emit Modified and the
                 // projection upserts.
-                let _ = bus.room.send(RoomEvent::GroupModified { group });
+                let _ = bus.room.send(RoomEvent::GroupModified {
+                    group: rumble_protocol::Group::from(group),
+                });
             }
         }
         proto::state_update::Update::UserGroupChanged(ugc) => {
@@ -2941,7 +2984,11 @@ fn apply_state_update(update: proto::StateUpdate, bus: &crate::projection::Event
                 let _ = bus.room.send(RoomEvent::RoomAclChanged {
                     room_id: rid,
                     inherit_acl: rac.inherit_acl,
-                    acls: rac.entries,
+                    acls: rac
+                        .entries
+                        .into_iter()
+                        .map(rumble_protocol::RoomAclEntry::from)
+                        .collect(),
                     // The server-computed effective bitmask for this
                     // editor isn't included in the proto envelope today;
                     // projection will recompute locally.

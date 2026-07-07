@@ -30,10 +30,7 @@ use std::collections::HashMap;
 
 use rumble_audio::{PipelineConfig, UserRxConfig};
 use rumble_client_traits::file_transfer::{TransferDirection, TransferId, TransferStage};
-use rumble_protocol::{
-    Uuid,
-    proto::{GroupInfo, RegisteredUserInfo, RoomAclEntry, RoomInfo, SlashCommand, User},
-};
+use rumble_protocol::{Group, RegisteredUser, Room, RoomAclEntry, SlashCommand, User, Uuid};
 
 use crate::events::{AudioDeviceInfo, AudioSettings, ChatMessage, PendingCertificate, VoiceMode};
 
@@ -258,9 +255,9 @@ pub enum RoomEvent {
     /// fields. Distinct from a sequence of incremental adds so the
     /// projection can apply it as one atomic write.
     FullStateReplaced {
-        rooms: Vec<RoomInfo>,
+        rooms: Vec<Room>,
         users: Vec<User>,
-        groups: Vec<GroupInfo>,
+        groups: Vec<Group>,
         /// Slash-command catalog reported by the server. Empty on the
         /// disconnect/reset variants, which clear it.
         slash_commands: Vec<SlashCommand>,
@@ -268,7 +265,7 @@ pub enum RoomEvent {
     },
 
     RoomAdded {
-        room: RoomInfo,
+        room: Room,
     },
     RoomRemoved {
         room_id: Uuid,
@@ -337,17 +334,17 @@ pub enum RoomEvent {
     /// overwrites [`State::registered_users`]. Not part of the synced/hashed
     /// server state — a pulled admin view. `None`/empty on the disconnect reset.
     RegisteredUsersReplaced {
-        users: Vec<RegisteredUserInfo>,
+        users: Vec<RegisteredUser>,
     },
 
     GroupAdded {
-        group: GroupInfo,
+        group: Group,
     },
     GroupRemoved {
         name: String,
     },
     GroupModified {
-        group: GroupInfo,
+        group: Group,
     },
 
     /// Our own user moved rooms (could be our own action or a
