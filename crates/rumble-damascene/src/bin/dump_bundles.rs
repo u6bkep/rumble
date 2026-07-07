@@ -184,13 +184,14 @@ enum Scene {
     /// Kick/ban moderation modal (ban variant) — reason field + the
     /// ban-duration tabs.
     ModerationBan,
-    /// Settings → Connection while the local user holds [`SUDO`] but
-    /// hasn't elevated yet — the "Elevate to superuser…" button is
-    /// visible.
-    SettingsConnectionSudo,
-    /// Settings → Connection after a successful elevation — the
-    /// button is replaced with the "Elevated this session" notice.
-    SettingsConnectionElevated,
+    /// Settings → Admin while the local user holds [`SUDO`] (but not
+    /// `MANAGE_ACL`) and hasn't elevated yet — the tab is visible via
+    /// the SUDO gate and shows only the Superuser section with the
+    /// "Elevate to superuser…" button.
+    SettingsAdminSudo,
+    /// Settings → Admin after a successful elevation — the button is
+    /// replaced with the "Elevated this session" notice.
+    SettingsAdminElevated,
     /// Settings → Connection with a configured plaintext local
     /// identity. Exercises the per-source detail block + the
     /// "Switch to SSH agent key…" affordance.
@@ -248,8 +249,8 @@ impl Scene {
         Scene::RoomAclModal,
         Scene::ElevatePrompt,
         Scene::ModerationBan,
-        Scene::SettingsConnectionSudo,
-        Scene::SettingsConnectionElevated,
+        Scene::SettingsAdminSudo,
+        Scene::SettingsAdminElevated,
         Scene::SettingsConnectionLocalKey,
         Scene::SettingsConnectionSshAgent,
         Scene::FileSharePending,
@@ -296,8 +297,8 @@ impl Scene {
             Scene::RoomAclModal => "room_acl_modal",
             Scene::ElevatePrompt => "elevate_prompt",
             Scene::ModerationBan => "moderation_ban",
-            Scene::SettingsConnectionSudo => "settings_connection_sudo",
-            Scene::SettingsConnectionElevated => "settings_connection_elevated",
+            Scene::SettingsAdminSudo => "settings_admin_sudo",
+            Scene::SettingsAdminElevated => "settings_admin_elevated",
             Scene::SettingsConnectionLocalKey => "settings_connection_local_key",
             Scene::SettingsConnectionSshAgent => "settings_connection_ssh_agent",
             Scene::FileSharePending => "file_share_pending",
@@ -410,9 +411,9 @@ impl Scene {
             Scene::SettingsStats => State::default(),
             Scene::SettingsAdmin => admin_state(),
             Scene::RoomAclModal => room_acl_state(),
-            Scene::ElevatePrompt | Scene::SettingsConnectionSudo => sudo_capable_state(false),
+            Scene::ElevatePrompt | Scene::SettingsAdminSudo => sudo_capable_state(false),
             Scene::ModerationBan => connected_state(),
-            Scene::SettingsConnectionElevated => sudo_capable_state(true),
+            Scene::SettingsAdminElevated => sudo_capable_state(true),
             Scene::FileSharePending | Scene::FileShareFailed => file_share_state(self),
         }
     }
@@ -610,8 +611,8 @@ impl Scene {
                 });
             }
             Scene::ModerationBan => app.open_kick_ban_for_test(true),
-            Scene::SettingsConnectionSudo | Scene::SettingsConnectionElevated => {
-                app.open_settings_for_test(SettingsTab::Connection);
+            Scene::SettingsAdminSudo | Scene::SettingsAdminElevated => {
+                app.open_settings_for_test(SettingsTab::Admin);
             }
             Scene::SettingsConnectionLocalKey => {
                 app.set_local_identity_for_test();
@@ -1124,10 +1125,11 @@ fn user_states_state() -> State {
 }
 
 /// Connected state with `SUDO` (and `TEXT_MESSAGE`) on the local user
-/// so the Connection-tab elevate UI renders. `elevated` flips the
-/// local user's `is_elevated` flag — driving the gold name in the room
-/// tree and swapping the button for the "already elevated" notice in
-/// Settings.
+/// so the Admin tab shows via the SUDO gate (deliberately *without*
+/// `MANAGE_ACL`, so only the Superuser section renders). `elevated`
+/// flips the local user's `is_elevated` flag — driving the gold name
+/// in the room tree and swapping the button for the "already elevated"
+/// notice in Settings → Admin.
 fn sudo_capable_state(elevated: bool) -> State {
     let mut state = connected_state();
     state.effective_permissions = (Permissions::TEXT_MESSAGE | Permissions::SUDO).bits();

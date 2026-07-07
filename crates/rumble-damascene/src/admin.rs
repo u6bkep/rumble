@@ -1,11 +1,14 @@
-//! Server-administration UI: permission groups and their members.
+//! Server-administration UI: superuser elevation, permission groups
+//! and their members.
 //!
 //! Rendered as the **Admin** tab of the Settings dialog when the
-//! connected user has `MANAGE_ACL` at the root. The tab owns its own
-//! ephemeral UI state (search query, which group is expanded, popover
-//! and dialog flags). Commands fire immediately — there is no
-//! pending-state / Save round-trip for admin actions, matching the
-//! egui client's semantics.
+//! connected user has `MANAGE_ACL` (group/ACL editing) or `SUDO`
+//! (superuser elevation) at the root — each section renders only for
+//! the permission that enables it. The tab owns its own ephemeral UI
+//! state (search query, which group is expanded, popover and dialog
+//! flags). Commands fire immediately — there is no pending-state /
+//! Save round-trip for admin actions, matching the egui client's
+//! semantics.
 //!
 //! Visual model: each group is one accordion card. The header shows
 //! `[built-in]` badge, name, member count, and a short permission
@@ -47,6 +50,33 @@ fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+// ============================================================
+// Capability gates
+// ============================================================
+//
+// Both are read at render time (which sections appear) AND re-checked
+// at click time (mirroring room_tree's gating) so a stale tree can't
+// fire an action after the permission was revoked mid-session.
+//
+// Note on `SUDO`: the bit in `effective_permissions` says the user's
+// groups *grant* elevation — the client can't know whether the server
+// actually has a sudo password configured (`server set-sudo-password`).
+// If it doesn't, the Elevate attempt simply fails server-side.
+
+/// True when the local user can elevate to superuser: connected with
+/// [`Permissions::SUDO`] in the effective permission set.
+pub fn can_elevate(app_state: &State) -> bool {
+    app_state.connection.is_connected()
+        && Permissions::from_bits_truncate(app_state.effective_permissions).contains(Permissions::SUDO)
+}
+
+/// True when the local user can edit groups / memberships: connected
+/// with [`Permissions::MANAGE_ACL`] in the effective permission set.
+pub fn can_manage_acl(app_state: &State) -> bool {
+    app_state.connection.is_connected()
+        && Permissions::from_bits_truncate(app_state.effective_permissions).contains(Permissions::MANAGE_ACL)
 }
 
 /// Preset durations offered when adding a user to a group. The membership's
@@ -247,6 +277,9 @@ pub enum AdminOutcome {
     Handled,
     /// Event consumed and the App should fire each command in order.
     Dispatch(Vec<Command>),
+    /// User clicked "Elevate to superuser…" — the caller should close
+    /// settings and open the sudo-password prompt.
+    OpenElevate,
 }
 
 impl AdminOutcome {
@@ -280,6 +313,7 @@ fn membership_edit(public_key: [u8; 32], group: String, add: bool, expires_at: u
 // the new-group dialog below and the server's group-creation op
 // reject names containing `:` to keep that invariant.
 
+const KEY_ELEVATE: &str = "admin:elevate";
 const KEY_SEARCH: &str = "admin:search";
 const KEY_NEW_GROUP_OPEN: &str = "admin:newgroup:open";
 const KEY_NEW_GROUP_NAME: &str = "admin:newgroup:name";
@@ -356,11 +390,58 @@ fn parse_group_route(route: &str) -> Option<(&str, &str, Option<&str>)> {
 /// Render the body of the Admin tab — i.e. the content that lives
 /// inside the Settings modal's scroll area. Floating layers (popovers
 /// and dialogs) are returned separately by [`render_overlays`].
+///
+/// Each section is gated on its own permission: the Superuser card on
+/// `SUDO`, the group/ACL editor on `MANAGE_ACL`. The tab itself only
+/// shows when at least one gate passes (see `settings::admin_visible`),
+/// so the body is never empty in practice.
 pub fn render(state: &AdminState, app_state: &State, selection: &Selection) -> El {
-    let header = render_header(state, selection);
-    let groups = render_group_list(state, app_state, selection);
+    let mut sections: Vec<El> = Vec::new();
 
-    column([header, groups]).gap(tokens::SPACE_3).width(Size::Fill(1.0))
+    if can_elevate(app_state) {
+        sections.push(render_superuser_section(app_state));
+    }
+
+    if can_manage_acl(app_state) {
+        sections.push(render_header(state, selection));
+        sections.push(render_group_list(state, app_state, selection));
+    }
+
+    column(sections).gap(tokens::SPACE_3).width(Size::Fill(1.0))
+}
+
+/// The Superuser card at the top of the tab. Shows the elevate button,
+/// or the "already elevated" notice once `UserStatusChanged` flips the
+/// local user's `is_elevated` flag (which also golds their name in the
+/// room tree — that indicator lives in `room_tree.rs`, untouched here).
+fn render_superuser_section(app_state: &State) -> El {
+    let already_elevated = app_state
+        .my_user_id
+        .and_then(|id| app_state.get_user(id))
+        .map(|u| u.is_elevated)
+        .unwrap_or(false);
+
+    let mut rows: Vec<El> = Vec::new();
+    if already_elevated {
+        rows.push(
+            alert([
+                alert_title("Elevated this session"),
+                alert_description("You're operating as superuser. Disconnect to drop the elevation."),
+            ])
+            .info(),
+        );
+    } else {
+        rows.push(
+            paragraph(
+                "Elevation bypasses the ACL system for the rest of this session — disconnect to drop it. Requires the \
+                 server-side sudo password set via `server set-sudo-password`.",
+            )
+            .muted()
+            .font_size(tokens::TEXT_XS.size),
+        );
+        rows.push(row([spacer(), button("Elevate to superuser…").key(KEY_ELEVATE).primary()]).width(Size::Fill(1.0)));
+    }
+    crate::settings::section_card("Superuser", rows)
 }
 
 /// Floating layers (action menu, "+ add user" popover, new-group and
@@ -969,6 +1050,21 @@ pub fn handle_event(
     let Some(route) = event.route() else {
         return AdminOutcome::Ignored;
     };
+
+    // Superuser elevation hand-off. Re-check the capability at click
+    // time so a stale tree can't open the prompt after SUDO was revoked.
+    if route == KEY_ELEVATE {
+        if can_elevate(app_state) {
+            return AdminOutcome::OpenElevate;
+        }
+        return AdminOutcome::Handled;
+    }
+
+    // Everything below mutates groups / memberships — re-check
+    // MANAGE_ACL at click time (the sections are also render-gated).
+    if !can_manage_acl(app_state) {
+        return AdminOutcome::Ignored;
+    }
 
     if route == KEY_NEW_GROUP_OPEN {
         state.new_group = Some(NewGroupForm::default());
