@@ -33,20 +33,24 @@ need theme tinting.
 
 ## What's wired today
 
-User-state glyphs in `room_tree.rs::push_room_subtree`. The first five
-form the *primary voice-state glyph* (one per user, by priority: server →
-deafen → self-mute → talking → idle); deafen supersedes self-mute because
-deafening implies muting client-side. Local mute is orthogonal (our own
-choice not to hear a peer), so it rides as an additive second badge.
+User-state glyphs in `room_tree.rs::push_room_subtree`, composed the
+way Mumble's user rows do it (`UserModel::data` in
+`reference/mumble/src/mumble/UserModel.cpp`): one *talk-state* glyph
+leads the row, and each status renders as an independent trailing
+*flag* icon in Mumble's canonical order — so orthogonal states are all
+visible at once (a self-muted user still shows their talk state, a
+server-muted user still shows their deafen flag, and deafen — which
+implies mute client-side — shows `muted_self` *and* `deafened_self`,
+exactly as Mumble does).
 
 | State | SVG | Kind |
 |---|---|---|
-| Talking | `talking_on.svg` | primary |
-| Idle | `talking_off.svg` | primary |
-| Self-muted | `muted_self.svg` | primary |
-| Self-deafened | `deafened_self.svg` | primary |
-| Server-muted | `muted_server.svg` | primary |
-| Locally muted (by us) | `muted_local.svg` | additive badge |
+| Talking | `talking_on.svg` | talk-state glyph |
+| Idle (or self while self-muted) | `talking_off.svg` | talk-state glyph |
+| Server-muted (`user.server_muted`) | `muted_server.svg` | flag 1 |
+| Self-muted (`user.is_muted`) | `muted_self.svg` | flag 2 |
+| Locally muted by us (`audio.muted_users`) | `muted_local.svg` | flag 3 |
+| Self-deafened (`user.is_deafened`) | `deafened_self.svg` | flag 4 |
 
 Top toolbar (`app.rs::top_toolbar`):
 
@@ -65,7 +69,7 @@ Top toolbar (`app.rs::top_toolbar`):
 - `talking_on.svg` / `talking_off.svg` — speaking indicators (wired).
 - `muted_self.svg` / `muted_pushtomute.svg` / `muted_suppressed.svg` — mic-off variants.
 - `muted_server.svg` — server-imposed mute (wired).
-- `muted_local.svg` — locally muted other user (wired, additive badge).
+- `muted_local.svg` — locally muted other user (wired, status flag).
 - `deafened_self.svg` — self-deafened (wired in room tree + toolbar).
 - `deafened_server.svg` / `self_undeafened.svg` — deafen states (`self_undeafened` wired in toolbar; `deafened_server` unused — no `server_deafened` proto field yet).
 - `channel.svg` / `channel_active.svg` — currently empty `<svg>` placeholders in the upstream theme. Use `IconName::Folder` for the room glyph until rumble ships its own.

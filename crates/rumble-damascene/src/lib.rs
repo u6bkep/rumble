@@ -22,6 +22,7 @@ pub mod lightbox;
 pub mod media_cache;
 pub mod model;
 pub mod moderation;
+pub mod move_room;
 pub mod password_input;
 pub mod room_acl;
 pub mod room_tree;
