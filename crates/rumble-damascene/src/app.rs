@@ -40,6 +40,7 @@ use crate::{
     room_tree::{self, RoomTreeOutcome, RoomTreeState},
     server_picker::{self, ServerForm, ServerPickerOutcome, ServerPickerState},
     settings::{self, SettingsOutcome, SettingsState},
+    user_audio::{self, UserAudioModal, UserAudioOutcome},
     video,
     wizard::{self, PendingAgentOp, UnlockState, WizardOutcome, WizardState},
 };
@@ -79,6 +80,10 @@ pub struct RumbleApp<B: UiBackend = crate::backend::NativeUiBackend> {
     /// Cancel/Escape/scrim or on submit. Opened from a connected user's
     /// context menu (gated on KICK / BAN).
     kick_ban: Option<KickBanModal>,
+    /// Per-user audio panel (local volume + RX pipeline override).
+    /// `Some` while open; opened from a remote user's context menu,
+    /// cleared on Close/Escape/scrim, Save, or disconnect.
+    user_audio: Option<UserAudioModal>,
     /// In-flight ssh-agent op spawned on `runtime`.
     pending_agent_op: Option<PendingAgentOp>,
 
@@ -270,6 +275,20 @@ impl<B: UiBackend> RumbleApp<B> {
             config: initial_pipeline,
         });
 
+        // Same for the RX defaults, when the user has saved any. The
+        // built-in RX default is an empty pipeline (the audio task's
+        // own default), so there's nothing to push for first-run users.
+        // `merge_with_default_tx_pipeline` is the generic "make a
+        // persisted pipeline executable" fixup (drop unregistered
+        // types, backfill new settings keys) despite the TX in its
+        // name — it never adds stages, which is exactly what we want
+        // for an RX chain too.
+        if let Some(persisted_rx) = settings.settings().audio.rx_pipeline.as_ref() {
+            backend.send(Command::UpdateRxPipelineDefaults {
+                config: merge_with_default_tx_pipeline(persisted_rx, &processor_registry),
+            });
+        }
+
         // Push the rest of the persisted audio config so the audio task
         // starts with the user's chosen voice mode, devices, and encoder
         // settings — not the BackendHandle's hardcoded defaults. Without
@@ -325,6 +344,7 @@ impl<B: UiBackend> RumbleApp<B> {
             unlock: UnlockState::default(),
             elevate: None,
             kick_ban: None,
+            user_audio: None,
             pending_agent_op: None,
             server_picker: ServerPickerState::default(),
             settings_state: SettingsState::default(),
@@ -492,6 +512,7 @@ impl<B: UiBackend> App for RumbleApp<B> {
             self.room_acl_modal = None;
             self.elevate = None;
             self.kick_ban = None;
+            self.user_audio = None;
             self.voice_mode_menu_open = false;
             // Re-arm chat seeding: the next connect clears chat_messages and
             // delivers the new server's history, which must be absorbed as
@@ -818,6 +839,16 @@ impl<B: UiBackend> App for RumbleApp<B> {
             None
         };
 
+        // Per-user audio panel + its add-processor dropdown. Two layers
+        // for the same reason the settings dialog splits panel/popover:
+        // the dropdown must paint above the modal it is anchored to.
+        let (user_audio_layer, user_audio_popover) = if session_gate_clear && let Some(m) = self.user_audio.as_ref() {
+            let (panel, popover) = user_audio::render(m, &self.processor_registry, &self.selection);
+            (Some(panel), popover)
+        } else {
+            (None, None)
+        };
+
         // Always wrap in `overlays(...)` — even with no app layers, the
         // root must be an `Axis::Overlay` container so damascene's runtime
         // tooltip layer overlays the main view instead of competing for
@@ -849,6 +880,8 @@ impl<B: UiBackend> App for RumbleApp<B> {
                 room_acl_popover_layer,
                 elevate_layer,
                 kick_ban_layer,
+                user_audio_layer,
+                user_audio_popover,
                 cert_layer,
                 unlock_layer,
                 wizard_layer,
@@ -972,6 +1005,38 @@ impl<B: UiBackend> App for RumbleApp<B> {
                 ModerationOutcome::Submit(cmd) => {
                     self.backend.send(cmd);
                     self.kick_ban = None;
+                    return;
+                }
+            }
+        }
+
+        // Per-user audio panel — same modal-first capture rule. All the
+        // commands it emits target the always-running audio task
+        // (local playback config), so dispatching them is safe in any
+        // connection state.
+        if self.user_audio.is_some() {
+            let app_state = self.backend.state();
+            let outcome = {
+                let m = self.user_audio.as_mut().expect("checked");
+                user_audio::handle_event(m, &event, &app_state, &self.processor_registry, &mut self.selection)
+            };
+            match outcome {
+                UserAudioOutcome::Ignored | UserAudioOutcome::Handled => return,
+                UserAudioOutcome::Close => {
+                    self.user_audio = None;
+                    return;
+                }
+                UserAudioOutcome::Dispatch(cmds) => {
+                    for cmd in cmds {
+                        self.backend.send(cmd);
+                    }
+                    return;
+                }
+                UserAudioOutcome::Submit(cmds) => {
+                    for cmd in cmds {
+                        self.backend.send(cmd);
+                    }
+                    self.user_audio = None;
                     return;
                 }
             }
@@ -1296,6 +1361,11 @@ impl<B: UiBackend> App for RumbleApp<B> {
                 } else {
                     KickBanModal::kick(user_id, username)
                 });
+            }
+            RoomTreeOutcome::OpenUserAudio { user_id } => {
+                // `open_for` returns None if the user vanished between
+                // menu-open and click — nothing to configure then.
+                self.user_audio = UserAudioModal::open_for(&room_tree_state, user_id);
             }
         }
     }
@@ -2642,6 +2712,9 @@ impl<B: UiBackend> RumbleApp<B> {
         self.backend.send(Command::UpdateTxPipeline {
             config: pending.tx_pipeline.clone(),
         });
+        self.backend.send(Command::UpdateRxPipelineDefaults {
+            config: pending.rx_pipeline.clone(),
+        });
         // File-transfer bandwidth caps: UI edits in KiB/s, backend takes
         // bytes/sec (0 = unlimited). Applies live to in-flight transfers.
         self.backend.send(Command::SetFileTransferSpeedLimits {
@@ -2655,10 +2728,11 @@ impl<B: UiBackend> RumbleApp<B> {
             // back; persisting them here means a restart re-applies
             // the same configuration.
             s.audio = (&pending.audio).into();
-            // The TX pipeline lives nested inside `PersistentAudioSettings`
-            // and the `From<&AudioSettings>` impl above stamps it back
-            // to `None`, so we re-apply it after the conversion.
+            // The TX/RX pipelines live nested inside `PersistentAudioSettings`
+            // and the `From<&AudioSettings>` impl above stamps them back
+            // to `None`, so we re-apply them after the conversion.
             s.audio.tx_pipeline = Some(pending.tx_pipeline.clone());
+            s.audio.rx_pipeline = Some(pending.rx_pipeline.clone());
             s.voice_mode = pending.voice_mode;
             s.input_device_id = pending.input_device.clone();
             s.output_device_id = pending.output_device.clone();
@@ -2802,6 +2876,14 @@ impl<B: UiBackend> RumbleApp<B> {
         } else {
             KickBanModal::kick(2, "bob".to_string())
         });
+    }
+
+    /// Test/scene-dump hook: open the per-user audio panel for the given
+    /// user id, seeded from the backend's current state (username +
+    /// any per-user RX override).
+    pub fn open_user_audio_for_test(&mut self, user_id: u64) {
+        let snapshot = self.backend.state();
+        self.user_audio = UserAudioModal::open_for(&snapshot, user_id);
     }
 
     /// Test/scene-dump hook for the toolbar transmission-mode dropdown.

@@ -184,6 +184,10 @@ enum Scene {
     /// Kick/ban moderation modal (ban variant) — reason field + the
     /// ban-duration tabs.
     ModerationBan,
+    /// Per-user audio panel over the connected backdrop: volume slider
+    /// at a non-default value plus an active RX pipeline override, so
+    /// the embedded pipeline editor renders a real stage card.
+    UserAudioPanel,
     /// Settings → Connection while the local user holds [`SUDO`] but
     /// hasn't elevated yet — the "Elevate to superuser…" button is
     /// visible.
@@ -248,6 +252,7 @@ impl Scene {
         Scene::RoomAclModal,
         Scene::ElevatePrompt,
         Scene::ModerationBan,
+        Scene::UserAudioPanel,
         Scene::SettingsConnectionSudo,
         Scene::SettingsConnectionElevated,
         Scene::SettingsConnectionLocalKey,
@@ -296,6 +301,7 @@ impl Scene {
             Scene::RoomAclModal => "room_acl_modal",
             Scene::ElevatePrompt => "elevate_prompt",
             Scene::ModerationBan => "moderation_ban",
+            Scene::UserAudioPanel => "user_audio_panel",
             Scene::SettingsConnectionSudo => "settings_connection_sudo",
             Scene::SettingsConnectionElevated => "settings_connection_elevated",
             Scene::SettingsConnectionLocalKey => "settings_connection_local_key",
@@ -412,6 +418,7 @@ impl Scene {
             Scene::RoomAclModal => room_acl_state(),
             Scene::ElevatePrompt | Scene::SettingsConnectionSudo => sudo_capable_state(false),
             Scene::ModerationBan => connected_state(),
+            Scene::UserAudioPanel => user_audio_state(),
             Scene::SettingsConnectionElevated => sudo_capable_state(true),
             Scene::FileSharePending | Scene::FileShareFailed => file_share_state(self),
         }
@@ -610,6 +617,7 @@ impl Scene {
                 });
             }
             Scene::ModerationBan => app.open_kick_ban_for_test(true),
+            Scene::UserAudioPanel => app.open_user_audio_for_test(2),
             Scene::SettingsConnectionSudo | Scene::SettingsConnectionElevated => {
                 app.open_settings_for_test(SettingsTab::Connection);
             }
@@ -1181,6 +1189,33 @@ fn device_state() -> AudioState {
         selected_output: Some("alsa:headphones".to_string()),
         ..AudioState::default()
     }
+}
+
+/// Connected state with a per-user RX override for bob (user 2): a
+/// -6 dB volume trim plus a gain-stage pipeline override, so the
+/// per-user Audio panel renders both the non-default slider label and
+/// a populated pipeline-editor card.
+fn user_audio_state() -> State {
+    use rumble_client::{ProcessorRegistry, UserRxConfig, register_builtin_processors};
+    let mut registry = ProcessorRegistry::new();
+    register_builtin_processors(&mut registry);
+    let override_pipeline = rumble_client::PipelineConfig {
+        processors: registry
+            .default_config(rumble_client::processors::type_ids::GAIN)
+            .into_iter()
+            .collect(),
+        ..rumble_client::PipelineConfig::default()
+    };
+
+    let mut state = connected_state();
+    state.audio.per_user_rx.insert(
+        2,
+        UserRxConfig {
+            volume_db: -6.0,
+            pipeline_override: Some(override_pipeline),
+        },
+    );
+    state
 }
 
 fn processing_state() -> AudioState {

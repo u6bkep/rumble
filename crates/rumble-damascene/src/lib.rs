@@ -23,12 +23,14 @@ pub mod media_cache;
 pub mod model;
 pub mod moderation;
 pub mod password_input;
+pub mod pipeline_ui;
 pub mod room_acl;
 pub mod room_tree;
 pub mod server_picker;
 pub mod settings;
 pub mod sfx;
 pub mod theme;
+pub mod user_audio;
 pub mod video;
 pub mod wizard;
 

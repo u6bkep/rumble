@@ -212,6 +212,12 @@ pub struct PersistentAudioSettings {
     pub packet_loss_percent: i32,
     /// TX pipeline configuration (processors and their settings).
     pub tx_pipeline: Option<PipelineConfig>,
+    /// Default RX pipeline applied to every remote user without a
+    /// per-user override. `None` means "use the built-in default at
+    /// startup" (currently an empty pipeline). Added after
+    /// `tx_pipeline`; `#[serde(default)]` on the struct keeps older
+    /// settings files loading cleanly.
+    pub rx_pipeline: Option<PipelineConfig>,
 }
 
 impl Default for PersistentAudioSettings {
@@ -224,6 +230,7 @@ impl Default for PersistentAudioSettings {
             fec_enabled: defaults.fec_enabled,
             packet_loss_percent: defaults.packet_loss_percent,
             tx_pipeline: None,
+            rx_pipeline: None,
         }
     }
 }
@@ -237,6 +244,7 @@ impl From<&AudioSettings> for PersistentAudioSettings {
             fec_enabled: s.fec_enabled,
             packet_loss_percent: s.packet_loss_percent,
             tx_pipeline: None,
+            rx_pipeline: None,
         }
     }
 }
