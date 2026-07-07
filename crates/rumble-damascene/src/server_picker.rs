@@ -21,13 +21,22 @@ use rumble_desktop_shell::RecentServer;
 // State + form
 // ============================================================
 
-/// Picker-owned UI state. Today this is just the optional add/edit
-/// form; the saved-server list itself reads from the App's
-/// `SettingsStore` so a successful add immediately repaints with the
-/// new entry on the next frame.
+/// Picker-owned UI state: the optional add/edit form, the open "…"
+/// row-overflow menu, and the pending remove confirmation. The
+/// saved-server list itself reads from the App's `SettingsStore` so a
+/// successful add immediately repaints with the new entry on the next
+/// frame.
 #[derive(Default)]
 pub struct ServerPickerState {
     pub form: Option<ServerForm>,
+    /// Address of the saved server whose "…" overflow menu is open,
+    /// or `None` when no row menu is showing. Addresses (not list
+    /// positions) identify rows — see [`ServerPickerOutcome`].
+    pub row_menu: Option<String>,
+    /// Address of the saved server awaiting remove confirmation.
+    /// While set, the confirm dialog renders and the actual
+    /// [`ServerPickerOutcome::DeleteRecent`] only fires on confirm.
+    pub pending_remove: Option<String>,
 }
 
 impl ServerPickerState {
@@ -112,12 +121,14 @@ pub enum ServerPickerOutcome {
     BeginAdd,
     /// User clicked Connect on the saved server with this address.
     ConnectRecent(String),
-    /// User clicked Edit on the saved server with this address — App
-    /// should open an edit form via [`ServerPickerState::begin_edit`]
-    /// (it has access to the `RecentServer` lookup; we don't pipe it
-    /// through here).
+    /// User picked "Edit…" from the row's overflow menu — App should
+    /// open an edit form via [`ServerPickerState::begin_edit`] (it has
+    /// access to the `RecentServer` lookup; we don't pipe it through
+    /// here).
     BeginEdit(String),
-    /// User clicked Remove on the saved server with this address.
+    /// User confirmed removal of the saved server with this address in
+    /// the remove-confirmation dialog. (Picking "Remove…" from the row
+    /// menu only opens the dialog; it never fires this directly.)
     DeleteRecent(String),
     /// User clicked Save in the form. App validates + persists; the
     /// picker stays open until the App calls
@@ -133,8 +144,22 @@ pub enum ServerPickerOutcome {
 
 const KEY_ADD: &str = "server:add";
 const KEY_CONNECT_PREFIX: &str = "server:connect:";
+/// "…" overflow-menu trigger on a row (`server:menu:{addr}`).
+const KEY_MENU_PREFIX: &str = "server:menu:";
+/// Edit / Remove items inside the open row menu.
 const KEY_EDIT_PREFIX: &str = "server:edit:";
 const KEY_DELETE_PREFIX: &str = "server:delete:";
+/// The row-overflow dropdown itself. Only one is open at a time, so a
+/// fixed key is fine; the anchored trigger key carries the address.
+/// `dropdown()` derives its scrim route as `{key}:dismiss`.
+const KEY_ROW_MENU: &str = "server:row_menu";
+const KEY_ROW_MENU_DISMISS: &str = "server:row_menu:dismiss";
+
+/// Remove-confirmation dialog. `modal()` derives `{key}:dismiss`.
+const KEY_REMOVE_MODAL: &str = "server_remove";
+const KEY_REMOVE_DISMISS: &str = "server_remove:dismiss";
+const KEY_REMOVE_CANCEL: &str = "server_remove:cancel";
+const KEY_REMOVE_CONFIRM: &str = "server_remove:confirm";
 
 const KEY_FORM_DISMISS: &str = "server_form:dismiss";
 const KEY_FORM_CANCEL: &str = "server_form:cancel";
@@ -247,18 +272,99 @@ fn server_row(server: &RecentServer) -> El {
     }
     let subtitle = subtitle_parts.join(" · ");
 
+    // Connect stays the row's primary action; Edit / Remove live
+    // behind the "…" overflow trigger (shadcn row-actions idiom) so
+    // the destructive path is never one stray click away. The trigger
+    // is a focusable icon_button, so the menu stays keyboard-reachable
+    // (Tab to the trigger, Enter/Space to open, then Tab/Enter within
+    // the menu items).
     item([
         item_content([item_title(title), item_description(subtitle)]),
         item_actions([
             button("Connect")
                 .key(format!("{KEY_CONNECT_PREFIX}{}", server.addr))
                 .primary(),
-            button("Edit").key(format!("{KEY_EDIT_PREFIX}{}", server.addr)).ghost(),
-            button("Remove")
-                .key(format!("{KEY_DELETE_PREFIX}{}", server.addr))
-                .ghost(),
+            icon_button("more-horizontal")
+                .key(format!("{KEY_MENU_PREFIX}{}", server.addr))
+                .ghost()
+                .tooltip("More actions"),
         ]),
     ])
+}
+
+// ============================================================
+// Overlays — row overflow menu + remove confirmation
+// ============================================================
+
+/// Floating layers owned by the picker (beyond the add/edit form
+/// modal): the "…" row-actions dropdown and the remove-confirmation
+/// dialog. Returned separately so the App's layer composer controls
+/// z-order (dialog above menu).
+#[derive(Default)]
+pub struct ServerPickerOverlays {
+    pub row_menu: Option<El>,
+    pub remove_dialog: Option<El>,
+}
+
+impl ServerPickerOverlays {
+    pub fn any(&self) -> bool {
+        self.row_menu.is_some() || self.remove_dialog.is_some()
+    }
+}
+
+/// Render the picker's floating layers. `recent_servers` is consulted
+/// for display names and to drop a menu whose row vanished from the
+/// list (the dropdown anchors to the row's trigger key, which no
+/// longer exists in the laid-out tree in that case).
+pub fn render_overlays(state: &ServerPickerState, recent_servers: &[RecentServer]) -> ServerPickerOverlays {
+    let mut out = ServerPickerOverlays::default();
+
+    if let Some(addr) = state.row_menu.as_deref()
+        && recent_servers.iter().any(|s| s.addr == addr)
+    {
+        out.row_menu = Some(dropdown(
+            KEY_ROW_MENU,
+            format!("{KEY_MENU_PREFIX}{addr}"),
+            [
+                menu_item("Edit…").key(format!("{KEY_EDIT_PREFIX}{addr}")),
+                menu_item("Remove…").key(format!("{KEY_DELETE_PREFIX}{addr}")),
+            ],
+        ));
+    }
+
+    if let Some(addr) = state.pending_remove.as_deref() {
+        // Prefer the bookmark's label for the prompt; fall back to the
+        // address (also covers an entry deleted out from under the
+        // dialog — confirming then is a harmless no-op removal).
+        let name = recent_servers
+            .iter()
+            .find(|s| s.addr == addr)
+            .map(|s| {
+                if s.label.is_empty() {
+                    s.addr.clone()
+                } else {
+                    s.label.clone()
+                }
+            })
+            .unwrap_or_else(|| addr.to_string());
+        out.remove_dialog = Some(modal(
+            KEY_REMOVE_MODAL,
+            "Remove server",
+            [
+                paragraph(format!("Remove \"{name}\" from your saved servers?")).text_color(tokens::WARNING),
+                row([
+                    button("Cancel").key(KEY_REMOVE_CANCEL),
+                    spacer(),
+                    button("Remove").key(KEY_REMOVE_CONFIRM).destructive(),
+                ])
+                .gap(tokens::SPACE_2)
+                .width(Size::Fill(1.0))
+                .align(Align::Center),
+            ],
+        ));
+    }
+
+    out
 }
 
 /// Render the add/edit form modal. Returns `None` when no form is open.
@@ -322,11 +428,50 @@ pub fn handle_event(state: &mut ServerPickerState, event: &UiEvent, selection: &
     if let Some(addr) = parse_addr_route(event, KEY_CONNECT_PREFIX) {
         return ServerPickerOutcome::ConnectRecent(addr);
     }
-    if let Some(addr) = parse_addr_route(event, KEY_EDIT_PREFIX) {
-        return ServerPickerOutcome::BeginEdit(addr);
+    // "…" trigger toggles the row overflow menu.
+    if let Some(addr) = parse_addr_route(event, KEY_MENU_PREFIX) {
+        state.row_menu = match state.row_menu.as_deref() {
+            Some(open) if open == addr => None,
+            _ => Some(addr),
+        };
+        return ServerPickerOutcome::Handled;
     }
-    if let Some(addr) = parse_addr_route(event, KEY_DELETE_PREFIX) {
-        return ServerPickerOutcome::DeleteRecent(addr);
+    // Open row menu: Edit / Remove items, click-outside, Escape. The
+    // Edit/Remove routes only exist while the menu element is up, but
+    // gating on `row_menu` keeps Escape from leaking to lower layers.
+    if state.row_menu.is_some() {
+        if (event.is_route(KEY_ROW_MENU_DISMISS) && event.kind == UiEventKind::Click)
+            || event.kind == UiEventKind::Escape
+        {
+            state.row_menu = None;
+            return ServerPickerOutcome::Handled;
+        }
+        if let Some(addr) = parse_addr_route(event, KEY_EDIT_PREFIX) {
+            state.row_menu = None;
+            return ServerPickerOutcome::BeginEdit(addr);
+        }
+        if let Some(addr) = parse_addr_route(event, KEY_DELETE_PREFIX) {
+            // Removal is destructive — stage it behind the confirm
+            // dialog instead of deleting on the spot.
+            state.row_menu = None;
+            state.pending_remove = Some(addr);
+            return ServerPickerOutcome::Handled;
+        }
+    }
+    // Remove-confirmation dialog lifecycle.
+    if state.pending_remove.is_some() {
+        if event.is_click_or_activate(KEY_REMOVE_CANCEL)
+            || (event.is_route(KEY_REMOVE_DISMISS) && event.kind == UiEventKind::Click)
+            || event.kind == UiEventKind::Escape
+        {
+            state.pending_remove = None;
+            return ServerPickerOutcome::Handled;
+        }
+        if event.is_click_or_activate(KEY_REMOVE_CONFIRM)
+            && let Some(addr) = state.pending_remove.take()
+        {
+            return ServerPickerOutcome::DeleteRecent(addr);
+        }
     }
 
     // Form lifecycle. Cancel / dismiss / Escape all close, and only
@@ -431,5 +576,83 @@ fn relative_time(then: u64) -> String {
         format!("{}h ago", secs / 3600)
     } else {
         format!("{}d ago", secs / 86_400)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use damascene_core::{event::UiEvent, selection::Selection};
+
+    use super::*;
+
+    const ADDR: &str = "127.0.0.1:5000";
+
+    fn click(state: &mut ServerPickerState, route: &str) -> ServerPickerOutcome {
+        let event = UiEvent::synthetic_click(route);
+        handle_event(state, &event, &mut Selection::default())
+    }
+
+    /// The "…" trigger toggles the row menu open and closed.
+    #[test]
+    fn overflow_trigger_toggles_row_menu() {
+        let mut state = ServerPickerState::default();
+        let trigger = format!("{KEY_MENU_PREFIX}{ADDR}");
+        assert!(matches!(click(&mut state, &trigger), ServerPickerOutcome::Handled));
+        assert_eq!(state.row_menu.as_deref(), Some(ADDR));
+        assert!(matches!(click(&mut state, &trigger), ServerPickerOutcome::Handled));
+        assert_eq!(state.row_menu, None, "second trigger click must close the menu");
+    }
+
+    /// "Remove…" in the menu must only stage the confirmation — the
+    /// destructive DeleteRecent fires exclusively from the dialog's
+    /// confirm button.
+    #[test]
+    fn remove_requires_confirmation() {
+        let mut state = ServerPickerState {
+            row_menu: Some(ADDR.to_string()),
+            ..Default::default()
+        };
+        let out = click(&mut state, &format!("{KEY_DELETE_PREFIX}{ADDR}"));
+        assert!(matches!(out, ServerPickerOutcome::Handled), "menu pick must not delete");
+        assert_eq!(state.row_menu, None);
+        assert_eq!(state.pending_remove.as_deref(), Some(ADDR));
+
+        let out = click(&mut state, KEY_REMOVE_CONFIRM);
+        assert!(matches!(out, ServerPickerOutcome::DeleteRecent(addr) if addr == ADDR));
+        assert_eq!(state.pending_remove, None);
+    }
+
+    /// Cancel (and the scrim dismiss route) close the dialog without
+    /// deleting anything.
+    #[test]
+    fn remove_cancel_keeps_server() {
+        let mut state = ServerPickerState {
+            pending_remove: Some(ADDR.to_string()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            click(&mut state, KEY_REMOVE_CANCEL),
+            ServerPickerOutcome::Handled
+        ));
+        assert_eq!(state.pending_remove, None);
+
+        state.pending_remove = Some(ADDR.to_string());
+        assert!(matches!(
+            click(&mut state, KEY_REMOVE_DISMISS),
+            ServerPickerOutcome::Handled
+        ));
+        assert_eq!(state.pending_remove, None);
+    }
+
+    /// "Edit…" flows back as BeginEdit and closes the menu.
+    #[test]
+    fn edit_from_menu_begins_edit() {
+        let mut state = ServerPickerState {
+            row_menu: Some(ADDR.to_string()),
+            ..Default::default()
+        };
+        let out = click(&mut state, &format!("{KEY_EDIT_PREFIX}{ADDR}"));
+        assert!(matches!(out, ServerPickerOutcome::BeginEdit(addr) if addr == ADDR));
+        assert_eq!(state.row_menu, None);
     }
 }
