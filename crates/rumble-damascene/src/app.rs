@@ -203,6 +203,18 @@ pub struct RumbleApp<B: UiBackend = crate::backend::NativeUiBackend> {
     /// cleared by any menu action, the dismiss scrim, or Escape.
     file_context_menu: Option<chat::FileContextMenu>,
 
+    /// Right-click context menu for a chat message row (copy text /
+    /// message the author). `Some` while open; cleared by any menu
+    /// action, the dismiss scrim, or Escape. Mutually exclusive with
+    /// `file_context_menu`.
+    msg_context_menu: Option<chat::MsgContextMenu>,
+
+    /// Element keys to focus, drained by damascene's runtime once per
+    /// frame via [`App::drain_focus_requests`]. Pushed by affordances
+    /// like "Message @author", which prefill the chat composer and want
+    /// the caret live immediately.
+    pending_focus: Vec<String>,
+
     /// In-flight "Save As" dialog. When the handle completes the App
     /// copies the source file to the user-chosen destination.
     pending_save_as: Option<(PathBuf, JoinHandle<Option<PathBuf>>)>,
@@ -366,6 +378,8 @@ impl<B: UiBackend> RumbleApp<B> {
             ))),
             lightboxes: crate::lightbox::Lightboxes::default(),
             file_context_menu: None,
+            msg_context_menu: None,
+            pending_focus: Vec::new(),
             pending_save_as: None,
             pending_pick_download_dir: None,
             file_drop_hover: false,
@@ -504,6 +518,7 @@ impl<B: UiBackend> App for RumbleApp<B> {
             self.room_acl_modal = None;
             self.elevate = None;
             self.kick_ban = None;
+            self.msg_context_menu = None;
             self.voice_mode_menu_open = false;
             // Re-arm chat seeding: the next connect clears chat_messages and
             // delivers the new server's history, which must be absorbed as
@@ -575,6 +590,10 @@ impl<B: UiBackend> App for RumbleApp<B> {
 
     fn drain_toasts(&mut self) -> Vec<ToastSpec> {
         std::mem::take(&mut self.pending_toasts)
+    }
+
+    fn drain_focus_requests(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.pending_focus)
     }
 
     fn drain_link_opens(&mut self) -> Vec<String> {
@@ -807,6 +826,12 @@ impl<B: UiBackend> App for RumbleApp<B> {
             None
         };
 
+        let msg_ctx_layer = if content_layers_clear {
+            self.msg_context_menu.as_ref().map(chat::render_msg_context_menu)
+        } else {
+            None
+        };
+
         // Per-room ACL editor modal. Suppressed under cert / unlock /
         // wizard for the same reason settings is — those gate the
         // session itself. Renders above the settings dialog when both
@@ -868,6 +893,7 @@ impl<B: UiBackend> App for RumbleApp<B> {
                 video_lightbox_layer,
                 model_lightbox_layer,
                 file_ctx_layer,
+                msg_ctx_layer,
                 drop_target_layer,
                 voice_mode_layer,
                 settings_panel,
@@ -1174,6 +1200,48 @@ impl<B: UiBackend> App for RumbleApp<B> {
             }
         }
 
+        // Chat message right-click → message context menu. Comes after
+        // the file-card branch so file cards keep their own menu; any
+        // other keyed part of a message row (wrapper, header, body)
+        // parses back to the message.
+        if event.kind == UiEventKind::SecondaryClick
+            && let Some(route) = event.route()
+            && let Some(msg_key) = chat::parse_msg_route(route)
+            && let Some(point) = event.pointer_pos()
+        {
+            self.open_msg_context_menu(msg_key, point);
+            return;
+        }
+
+        // Message context menu actions.
+        if self.msg_context_menu.is_some() {
+            if event.is_click_or_activate(chat::KEY_MSG_CTX_COPY) {
+                if let Some(menu) = self.msg_context_menu.take() {
+                    self.copy_to_clipboard(menu.text, "Message copied to clipboard");
+                }
+                return;
+            }
+            if event.is_click_or_activate(chat::KEY_MSG_CTX_MESSAGE_AUTHOR) {
+                if let Some(menu) = self.msg_context_menu.take() {
+                    // Render-time gating (`can_dm`) decided whether the item
+                    // showed; re-check the author still resolves to a
+                    // connected user at click time so a stale menu can't
+                    // prefill a DM to someone who has since left.
+                    let resolvable = self.backend.state().users.iter().any(|u| u.username == menu.sender);
+                    if menu.can_dm && resolvable {
+                        self.prefill_composer(format!("/msg {} ", menu.sender));
+                    }
+                }
+                return;
+            }
+            if event.is_route(chat::KEY_MSG_CTX_DISMISS) && event.kind == UiEventKind::Click
+                || event.kind == UiEventKind::Escape
+            {
+                self.msg_context_menu = None;
+                return;
+            }
+        }
+
         if event.kind == UiEventKind::Click
             && let Some(route) = event.route()
             && let Some(transfer_id) = chat::parse_download_key(route)
@@ -1331,6 +1399,9 @@ impl<B: UiBackend> App for RumbleApp<B> {
                 } else {
                     KickBanModal::kick(user_id, username)
                 });
+            }
+            RoomTreeOutcome::MessageUser { username } => {
+                self.prefill_composer(format!("/msg {username} "));
             }
         }
     }
@@ -1819,6 +1890,60 @@ impl<B: UiBackend> RumbleApp<B> {
             local_path,
             point,
         });
+        // Only one chat context menu at a time.
+        self.msg_context_menu = None;
+    }
+
+    // ---------- message context menu ----------
+
+    /// Open the right-click context menu for a chat message row.
+    /// Snapshots the body + author and resolves whether the author is a
+    /// messageable connected user. No-op if the message isn't in the
+    /// current log (e.g. cleared between press and release).
+    fn open_msg_context_menu(&mut self, msg_key: u128, point: (f32, f32)) {
+        let snapshot = self.backend.state();
+        let Some(msg) = snapshot
+            .chat_messages
+            .iter()
+            .find(|m| u128::from_le_bytes(m.id) == msg_key)
+        else {
+            return;
+        };
+        // "Message @author" is offered only for a resolvable remote
+        // author: system/local notices have no author, our own messages
+        // don't need a self-DM, and an author who already left can't be
+        // messaged. Mirror ChatRow::from_msg's identity rule (prefer
+        // sender_id, fall back to username).
+        let is_own = match (snapshot.my_user_id, msg.sender_id) {
+            (Some(mine), Some(theirs)) => mine == theirs,
+            _ => {
+                msg.sender_id.is_none()
+                    && snapshot
+                        .my_user_id
+                        .and_then(|id| snapshot.get_user(id))
+                        .is_some_and(|u| u.username == msg.sender)
+            }
+        };
+        let can_dm = !msg.visibility.is_system()
+            && !is_own
+            && !msg.sender.is_empty()
+            && snapshot.users.iter().any(|u| u.username == msg.sender);
+        self.msg_context_menu = Some(chat::MsgContextMenu {
+            text: msg.text.clone(),
+            sender: msg.sender.clone(),
+            can_dm,
+            point,
+        });
+        // Only one chat context menu at a time.
+        self.file_context_menu = None;
+    }
+
+    /// Prefill the chat composer (caret at the end) and request focus so
+    /// the user can keep typing immediately — e.g. `/msg <username> `
+    /// from "Message @author" / "Send message…".
+    fn prefill_composer(&mut self, text: String) {
+        self.composer.prefill(&mut self.selection, text);
+        self.pending_focus.push(chat::KEY_INPUT.to_string());
     }
 
     /// Open the file with the OS default application.
@@ -2835,6 +2960,26 @@ impl<B: UiBackend> RumbleApp<B> {
             m.selected = selected;
             m
         });
+    }
+
+    /// Test/scene-dump hook: open the chat-message context menu for the
+    /// first remote non-system message in the log (so both "Copy text"
+    /// and "Message @author" render), anchored at a fixed point.
+    pub fn open_msg_context_menu_for_test(&mut self, point: (f32, f32)) {
+        let snapshot = self.backend.state();
+        let own_username = snapshot
+            .my_user_id
+            .and_then(|id| snapshot.get_user(id))
+            .map(|u| u.username.clone())
+            .unwrap_or_default();
+        let msg_key = snapshot
+            .chat_messages
+            .iter()
+            .find(|m| !m.visibility.is_system() && m.sender != own_username)
+            .map(|m| u128::from_le_bytes(m.id));
+        if let Some(msg_key) = msg_key {
+            self.open_msg_context_menu(msg_key, point);
+        }
     }
 
     /// Test/scene-dump hook to seed the chat composer text, e.g. `"/"` to

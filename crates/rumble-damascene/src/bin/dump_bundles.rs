@@ -123,6 +123,9 @@ enum Scene {
     /// output (speaker) loss. Exercises the under-toolbar fault banner
     /// (`fault_banner`) in both its destructive and warning treatments.
     ConnectedAudioFault,
+    /// Live session with the right-click context menu open on a remote
+    /// user's chat message — exercises "Copy text" + "Message @author".
+    ChatMessageMenu,
     /// Live session with the chat composer holding `/`, showing the
     /// slash-command suggestion list (builtins + server-advertised).
     ConnectedSlashCommands,
@@ -229,6 +232,7 @@ impl Scene {
         Scene::ConnectedNoRooms,
         Scene::MoveRoomPicker,
         Scene::ConnectedAudioFault,
+        Scene::ChatMessageMenu,
         Scene::ConnectedSlashCommands,
         Scene::ConnectedSlashCommandHighlighted,
         Scene::ConnectedImagePreview,
@@ -278,6 +282,7 @@ impl Scene {
             Scene::ConnectedNoRooms => "connected_no_rooms",
             Scene::MoveRoomPicker => "move_room_picker",
             Scene::ConnectedAudioFault => "connected_audio_fault",
+            Scene::ChatMessageMenu => "chat_message_menu",
             Scene::ConnectedSlashCommands => "connected_slash_commands",
             Scene::ConnectedSlashCommandHighlighted => "connected_slash_command_highlighted",
             Scene::ConnectedImagePreview => "connected_image_preview",
@@ -326,7 +331,9 @@ impl Scene {
                 },
                 ..State::default()
             },
-            Scene::Connected | Scene::ConnectedImagePreview | Scene::ImageLightbox => connected_state(),
+            Scene::Connected | Scene::ChatMessageMenu | Scene::ConnectedImagePreview | Scene::ImageLightbox => {
+                connected_state()
+            }
             Scene::ConnectedModelPreview | Scene::ModelLightbox => connected_state_with_model(),
             Scene::ConnectedSelfTalking => {
                 let mut s = connected_state();
@@ -584,6 +591,8 @@ impl Scene {
             }
             Scene::SettingsConnection => app.open_settings_for_test(SettingsTab::Connection),
             Scene::ToolbarVoiceModeOpen => app.set_voice_mode_menu_open_for_test(true),
+            // Fixed anchor inside the chat sidebar, over the message list.
+            Scene::ChatMessageMenu => app.open_msg_context_menu_for_test((260.0, 220.0)),
             Scene::ConnectedSlashCommands => app.set_chat_input_for_test("/"),
             Scene::ConnectedSlashCommandHighlighted => {
                 app.set_chat_input_for_test("/");

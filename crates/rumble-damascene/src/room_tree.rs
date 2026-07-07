@@ -243,6 +243,9 @@ pub enum RoomTreeOutcome {
     /// User picked "Kick…" / "Ban…" on a connected user — App should open
     /// the moderation modal (reason + ban duration) for this user.
     OpenKickBan { user_id: u64, username: String, ban: bool },
+    /// User picked "Send message…" on a remote user — App should prefill
+    /// the chat composer with a `/msg <username> ` command and focus it.
+    MessageUser { username: String },
 }
 
 impl RoomTreeOutcome {
@@ -286,6 +289,7 @@ const KEY_USER_CTX_SERVER_MUTE: &str = "user_ctx:server_mute";
 const KEY_USER_CTX_SERVER_UNMUTE: &str = "user_ctx:server_unmute";
 const KEY_USER_CTX_KICK: &str = "user_ctx:kick";
 const KEY_USER_CTX_BAN: &str = "user_ctx:ban";
+const KEY_USER_CTX_SEND_MSG: &str = "user_ctx:send_msg";
 
 const KEY_MOVE_DISMISS: &str = "move_room:dismiss";
 const KEY_MOVE_CANCEL: &str = "move_room:cancel";
@@ -719,6 +723,7 @@ fn render_user_context_menu(menu: &UserContextMenu, app_state: &State) -> El {
             }),
         );
     } else {
+        items.push(menu_item("Send message…").key(KEY_USER_CTX_SEND_MSG));
         items.push(
             menu_item(if menu.is_locally_muted {
                 "Unmute locally"
@@ -1079,6 +1084,9 @@ fn handle_user_context_menu_event(state: &mut RoomTreeState, event: &UiEvent) ->
             user_id,
             username: menu.username.clone(),
             ban: key == KEY_USER_CTX_BAN,
+        },
+        KEY_USER_CTX_SEND_MSG => RoomTreeOutcome::MessageUser {
+            username: menu.username.clone(),
         },
         _ => return None,
     };
