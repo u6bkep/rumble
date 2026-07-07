@@ -741,6 +741,14 @@ impl<B: UiBackend> App for RumbleApp<B> {
         } else {
             None
         };
+        // Saved-server row overflow menu + remove confirmation. Same
+        // gating as the form, plus disconnected-only: the picker (and
+        // the row the menu anchors to) only renders while disconnected.
+        let picker_overlays = if session_gate_clear && !state.connection.is_connected() {
+            server_picker::render_overlays(&self.server_picker, &shell.recent_servers)
+        } else {
+            server_picker::ServerPickerOverlays::default()
+        };
 
         let voice_mode_layer = if self.voice_mode_menu_open && session_gate_clear && state.connection.is_connected() {
             Some(voice_mode_menu(state.audio.voice_mode))
@@ -915,6 +923,8 @@ impl<B: UiBackend> App for RumbleApp<B> {
             main,
             [
                 connect_layer,
+                picker_overlays.row_menu,
+                picker_overlays.remove_dialog,
                 room_tree_overlays.room_context_menu,
                 room_tree_overlays.user_context_menu,
                 room_tree_overlays.move_room_modal,
@@ -3097,6 +3107,12 @@ impl<B: UiBackend> RumbleApp<B> {
     /// Test/scene-dump hook for the saved-server add/edit modal.
     pub fn set_server_form_for_test(&mut self, form: ServerForm) {
         self.server_picker.form = Some(form);
+    }
+
+    /// Test/scene-dump hook for the saved-server remove-confirmation
+    /// dialog (normally staged via the row's "…" menu).
+    pub fn set_server_pending_remove_for_test(&mut self, addr: String) {
+        self.server_picker.pending_remove = Some(addr);
     }
 
     /// Test/scene-dump hook for the timestamp-format dropdown inside

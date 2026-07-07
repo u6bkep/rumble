@@ -96,6 +96,9 @@ enum Scene {
     AddServerModal,
     /// Edit-server form open over the disconnected backdrop.
     EditServerModal,
+    /// Remove-server confirmation dialog open over the disconnected
+    /// backdrop (staged from the saved-server row's "…" menu).
+    RemoveServerConfirm,
     /// Connection in progress.
     Connecting,
     /// Live session: rooms, users, chat — exercises the full shell.
@@ -229,6 +232,7 @@ impl Scene {
         Scene::DisconnectedEmpty,
         Scene::AddServerModal,
         Scene::EditServerModal,
+        Scene::RemoveServerConfirm,
         Scene::Connecting,
         Scene::Connected,
         Scene::ConnectedSelfTalking,
@@ -280,6 +284,7 @@ impl Scene {
             Scene::DisconnectedEmpty => "disconnected_empty",
             Scene::AddServerModal => "add_server_modal",
             Scene::EditServerModal => "edit_server_modal",
+            Scene::RemoveServerConfirm => "remove_server_confirm",
             Scene::Connecting => "connecting",
             Scene::Connected => "connected",
             Scene::ConnectedSelfTalking => "connected_self_talking",
@@ -328,9 +333,11 @@ impl Scene {
 
     fn build_state(self) -> State {
         match self {
-            Scene::Disconnected | Scene::DisconnectedEmpty | Scene::AddServerModal | Scene::EditServerModal => {
-                State::default()
-            }
+            Scene::Disconnected
+            | Scene::DisconnectedEmpty
+            | Scene::AddServerModal
+            | Scene::EditServerModal
+            | Scene::RemoveServerConfirm => State::default(),
             Scene::Connecting => State {
                 connection: ConnectionState::Connecting {
                     server_addr: "rumble.example:5000".into(),
@@ -567,6 +574,10 @@ impl Scene {
                     username: "alice".to_string(),
                     error: None,
                 });
+            }
+            Scene::RemoveServerConfirm => {
+                app.set_recent_servers_for_test(demo_recent_servers());
+                app.set_server_pending_remove_for_test("127.0.0.1:5000".to_string());
             }
             Scene::WizardSelectMethod => {
                 app.set_wizard_state_for_test(WizardState::SelectMethod);
