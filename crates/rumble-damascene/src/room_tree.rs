@@ -23,7 +23,7 @@
 use std::{panic::Location, sync::LazyLock};
 
 use damascene_core::prelude::*;
-use rumble_client::{Command, State};
+use rumble_client::{Command, ROOT_ROOM_UUID, State};
 use rumble_protocol::permissions::Permissions;
 use uuid::Uuid;
 
@@ -119,19 +119,12 @@ fn find_room_at(point: (f32, f32), cx: &EventCx, app_state: &State) -> Option<Uu
 /// [`EventCx::rect_of_key`].
 fn collect_drop_targets(state: &State) -> Vec<(String, Uuid)> {
     fn walk(state: &State, room_id: Uuid, out: &mut Vec<(String, Uuid)>) {
-        use rumble_protocol::uuid_from_room_id;
         let Some(node) = state.room_tree.nodes.get(&room_id) else {
             return;
         };
         out.push((room_route_key(room_id), room_id));
-        for user in state.users.iter().filter(|u| {
-            u.current_room
-                .as_ref()
-                .and_then(uuid_from_room_id)
-                .is_some_and(|id| id == room_id)
-        }) {
-            let user_id = user.user_id.as_ref().map(|u| u.value).unwrap_or(0);
-            out.push((user_route_key(user_id, room_id), room_id));
+        for user in state.users.iter().filter(|u| u.current_room == room_id) {
+            out.push((user_route_key(user.user_id, room_id), room_id));
         }
         for &child in &node.children {
             walk(state, child, out);
@@ -139,9 +132,7 @@ fn collect_drop_targets(state: &State) -> Vec<(String, Uuid)> {
     }
 
     let mut out = Vec::new();
-    for &root_id in &state.room_tree.roots {
-        walk(state, root_id, &mut out);
-    }
+    walk(state, ROOT_ROOM_UUID, &mut out);
     out
 }
 
@@ -380,9 +371,7 @@ fn can_make_root_room(app_state: &State) -> bool {
 
 fn rooms_view(state: &State, selected_room_id: Option<Uuid>) -> El {
     let mut entries: Vec<El> = Vec::new();
-    for &root_id in &state.room_tree.roots {
-        push_room_subtree(state, root_id, 0, selected_room_id, &mut entries);
-    }
+    push_room_subtree(state, ROOT_ROOM_UUID, 0, selected_room_id, &mut entries);
 
     // Header: title + the root-level "new room" affordance, gated on
     // MAKE_ROOM at Root (re-checked at click time in `handle_event`).
@@ -440,22 +429,11 @@ fn rooms_view(state: &State, selected_room_id: Option<Uuid>) -> El {
 }
 
 fn push_room_subtree(state: &State, room_id: Uuid, depth: usize, selected_room_id: Option<Uuid>, out: &mut Vec<El>) {
-    use rumble_protocol::uuid_from_room_id;
-
     let Some(node) = state.room_tree.nodes.get(&room_id) else {
         return;
     };
 
-    let user_count = state
-        .users
-        .iter()
-        .filter(|u| {
-            u.current_room
-                .as_ref()
-                .and_then(uuid_from_room_id)
-                .is_some_and(|id| id == room_id)
-        })
-        .count();
+    let user_count = state.users.iter().filter(|u| u.current_room == room_id).count();
     let is_current = state.my_room_id == Some(room_id);
     let is_selected = selected_room_id == Some(room_id);
 
@@ -504,13 +482,8 @@ fn push_room_subtree(state: &State, room_id: Uuid, depth: usize, selected_room_i
     }
     out.push(row_el);
 
-    for user in state.users.iter().filter(|u| {
-        u.current_room
-            .as_ref()
-            .and_then(uuid_from_room_id)
-            .is_some_and(|id| id == room_id)
-    }) {
-        let user_id = user.user_id.as_ref().map(|u| u.value).unwrap_or(0);
+    for user in state.users.iter().filter(|u| u.current_room == room_id) {
+        let user_id = user.user_id;
         // talking_users only tracks remote peers (populated from received
         // voice datagrams); for self we use the local capture/VAD signal.
         let is_self = state.my_user_id == Some(user_id);
@@ -874,7 +847,7 @@ pub fn handle_event(state: &mut RoomTreeState, event: &UiEvent, app_state: &Stat
         if can_make_root_room(app_state) {
             return RoomTreeOutcome::one(Command::CreateRoom {
                 name: "New Room".to_string(),
-                parent_id: None,
+                parent_id: ROOT_ROOM_UUID,
             });
         }
         return RoomTreeOutcome::Handled;
@@ -938,7 +911,7 @@ fn open_room_context_menu(state: &mut RoomTreeState, app_state: &State, room_id:
     let Some(node) = app_state.room_tree.nodes.get(&room_id) else {
         return;
     };
-    let is_root = app_state.room_tree.roots.contains(&room_id);
+    let is_root = room_id == ROOT_ROOM_UUID;
     state.room_context_menu = Some(RoomContextMenu {
         room_id,
         room_name: node.name.clone(),
@@ -961,11 +934,7 @@ fn open_user_context_menu(
     anchor: MenuAnchor,
 ) {
     let is_self = app_state.my_user_id == Some(user_id);
-    let Some(user) = app_state
-        .users
-        .iter()
-        .find(|u| u.user_id.as_ref().map(|i| i.value) == Some(user_id))
-    else {
+    let Some(user) = app_state.users.iter().find(|u| u.user_id == user_id) else {
         return;
     };
     state.user_context_menu = Some(UserContextMenu {
@@ -1018,7 +987,7 @@ fn handle_room_context_menu_event(
             state.room_context_menu = None;
             Some(RoomTreeOutcome::one(Command::CreateRoom {
                 name: "New Room".to_string(),
-                parent_id: Some(room_id),
+                parent_id: room_id,
             }))
         }
         KEY_ROOM_CTX_MOVE => {

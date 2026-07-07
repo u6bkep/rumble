@@ -38,12 +38,9 @@ use rumble_damascene::{
 };
 use rumble_desktop_shell::{KeyInfo, RecentServer, SettingsStore};
 use rumble_protocol::{
-    ChatAttachment, Uuid,
+    ChatAttachment, Group, GroupMembership, ROOT_ROOM_UUID, RegisteredUser, Room, RoomAclEntry, User, Uuid,
     permissions::{ADMIN_PERMISSIONS, DEFAULT_PERMISSIONS, Permissions},
-    proto::{
-        GroupInfo, GroupMembership, RegisteredUserInfo, RelayFileSharePayload, RoomAclEntry, RoomInfo, User, UserId,
-    },
-    room_id_from_uuid,
+    proto::RelayFileSharePayload,
 };
 
 // ---------------------------------------------------------------------
@@ -378,11 +375,11 @@ impl Scene {
                 // Server-advertised commands; merged with the client builtins
                 // (/msg, /tree) in the suggestion list.
                 s.slash_commands = vec![
-                    rumble_protocol::proto::SlashCommand {
+                    rumble_protocol::SlashCommand {
                         name: "echo".into(),
                         description: "Summon an echo bot that plays your audio back".into(),
                     },
-                    rumble_protocol::proto::SlashCommand {
+                    rumble_protocol::SlashCommand {
                         name: "link-cleaner".into(),
                         description: "Strip tracking params from posted links".into(),
                     },
@@ -719,11 +716,27 @@ const ROOM_WORK: u128 = 0x2222_2222_2222_2222_2222_2222_2222_2222;
 const ROOM_STAGE: u128 = 0x3333_3333_3333_3333_3333_3333_3333_3333;
 const ROOM_STAGE_GAMING: u128 = 0x4444_4444_4444_4444_4444_4444_4444_4444;
 
-fn make_room(uuid: u128, name: &str) -> RoomInfo {
-    RoomInfo {
-        id: Some(room_id_from_uuid(Uuid::from_u128(uuid))),
+/// The Root room every server has. Fixtures include it explicitly so the
+/// single-root tree walk (from [`ROOT_ROOM_UUID`]) has an anchor; top-level
+/// rooms hang off it.
+fn make_root() -> Room {
+    Room {
+        id: ROOT_ROOM_UUID,
+        name: "Root".into(),
+        parent: ROOT_ROOM_UUID,
+        description: None,
+        inherit_acl: false,
+        acls: Vec::new(),
+        effective_permissions: 0,
+    }
+}
+
+/// A top-level room (child of Root).
+fn make_room(uuid: u128, name: &str) -> Room {
+    Room {
+        id: Uuid::from_u128(uuid),
         name: name.into(),
-        parent_id: None,
+        parent: ROOT_ROOM_UUID,
         description: None,
         inherit_acl: false,
         acls: Vec::new(),
@@ -733,9 +746,9 @@ fn make_room(uuid: u128, name: &str) -> RoomInfo {
 
 fn make_user(id: u64, name: &str, room: u128, mut tweak: impl FnMut(&mut User)) -> User {
     let mut u = User {
-        user_id: Some(UserId { value: id }),
+        user_id: id,
         username: name.into(),
-        current_room: Some(room_id_from_uuid(Uuid::from_u128(room))),
+        current_room: Uuid::from_u128(room),
         is_muted: false,
         is_deafened: false,
         server_muted: false,
@@ -795,7 +808,8 @@ fn admin_state() -> State {
             user_id: 1,
         },
         rooms: vec![
-            RoomInfo {
+            make_root(),
+            Room {
                 acls: vec![RoomAclEntry {
                     group: "moderators".into(),
                     grant: (Permissions::MUTE_DEAFEN | Permissions::MOVE_USER).bits(),
@@ -805,7 +819,7 @@ fn admin_state() -> State {
                 }],
                 ..make_room(ROOM_LOBBY, "Lobby")
             },
-            RoomInfo {
+            Room {
                 acls: vec![RoomAclEntry {
                     group: "streamers".into(),
                     grant: Permissions::SPEAK.bits(),
@@ -835,22 +849,22 @@ fn admin_state() -> State {
         my_room_id: Some(Uuid::from_u128(ROOM_LOBBY)),
         effective_permissions: ADMIN_PERMISSIONS.bits(),
         group_definitions: vec![
-            GroupInfo {
+            Group {
                 name: "default".into(),
                 permissions: DEFAULT_PERMISSIONS.bits(),
                 is_builtin: true,
             },
-            GroupInfo {
+            Group {
                 name: "admin".into(),
                 permissions: ADMIN_PERMISSIONS.bits(),
                 is_builtin: true,
             },
-            GroupInfo {
+            Group {
                 name: "moderators".into(),
                 permissions: (Permissions::MUTE_DEAFEN | Permissions::MOVE_USER | Permissions::KICK).bits(),
                 is_builtin: false,
             },
-            GroupInfo {
+            Group {
                 name: "streamers".into(),
                 permissions: 0,
                 is_builtin: false,
@@ -878,15 +892,15 @@ fn admin_state() -> State {
 /// Deterministic registered-user fixture. `key_byte` seeds a distinct 32-byte
 /// public key; all memberships are permanent so no wall-clock expiry text
 /// leaks into goldens.
-fn reg_user(key_byte: u8, username: &str, online: bool, groups: &[&str]) -> RegisteredUserInfo {
-    RegisteredUserInfo {
-        public_key: vec![key_byte; 32],
+fn reg_user(key_byte: u8, username: &str, online: bool, groups: &[&str]) -> RegisteredUser {
+    RegisteredUser {
+        public_key: [key_byte; 32],
         username: username.into(),
         groups: groups
             .iter()
             .map(|g| GroupMembership {
                 group: (*g).into(),
-                expires_at: 0,
+                expires_at: None,
             })
             .collect(),
         online,
@@ -913,7 +927,7 @@ fn room_acl_state() -> State {
             // Root holds an ACL granting moderators MUTE_DEAFEN —
             // surfaces in the inherited block of the target room as a
             // `/Root` rule.
-            RoomInfo {
+            Room {
                 acls: vec![RoomAclEntry {
                     group: "moderators".into(),
                     grant: Permissions::MUTE_DEAFEN.bits(),
@@ -928,7 +942,7 @@ fn room_acl_state() -> State {
             // breadcrumb segment.
             make_room_with_parent(ROOM_WORK, "Lobby", Some(rumble_protocol::ROOT_ROOM_UUID.as_u128())),
             // Edit target: a sub-room with two local entries.
-            RoomInfo {
+            Room {
                 inherit_acl: true,
                 acls: vec![
                     RoomAclEntry {
@@ -967,22 +981,22 @@ fn room_acl_state() -> State {
             | Permissions::SPEAK)
             .bits(),
         group_definitions: vec![
-            GroupInfo {
+            Group {
                 name: "default".into(),
                 permissions: DEFAULT_PERMISSIONS.bits(),
                 is_builtin: true,
             },
-            GroupInfo {
+            Group {
                 name: "admin".into(),
                 permissions: ADMIN_PERMISSIONS.bits(),
                 is_builtin: true,
             },
-            GroupInfo {
+            Group {
                 name: "moderators".into(),
                 permissions: (Permissions::MUTE_DEAFEN | Permissions::MOVE_USER).bits(),
                 is_builtin: false,
             },
-            GroupInfo {
+            Group {
                 name: "streamers".into(),
                 permissions: 0,
                 is_builtin: false,
@@ -997,11 +1011,11 @@ fn room_acl_state() -> State {
 /// Same as `make_room` but lets the fixture set a parent_id. The
 /// existing `make_room` always returns root-level rooms; the room-acl
 /// scene needs a real tree depth so the breadcrumb has segments.
-fn make_room_with_parent(uuid: u128, name: &str, parent: Option<u128>) -> RoomInfo {
-    RoomInfo {
-        id: Some(room_id_from_uuid(Uuid::from_u128(uuid))),
+fn make_room_with_parent(uuid: u128, name: &str, parent: Option<u128>) -> Room {
+    Room {
+        id: Uuid::from_u128(uuid),
         name: name.into(),
-        parent_id: parent.map(|p| room_id_from_uuid(Uuid::from_u128(p))),
+        parent: parent.map(Uuid::from_u128).unwrap_or(ROOT_ROOM_UUID),
         description: None,
         inherit_acl: true,
         acls: Vec::new(),
@@ -1062,7 +1076,11 @@ fn connected_state() -> State {
             server_name: "rumble.example".into(),
             user_id: 1,
         },
-        rooms: vec![make_room(ROOM_LOBBY, "Lobby"), make_room(ROOM_WORK, "Work")],
+        rooms: vec![
+            make_root(),
+            make_room(ROOM_LOBBY, "Lobby"),
+            make_room(ROOM_WORK, "Work"),
+        ],
         users: vec![
             make_user(1, "alice", ROOM_LOBBY, |_| {}),
             make_user(2, "bob", ROOM_WORK, |_| {}),
@@ -1139,7 +1157,7 @@ fn user_states_state() -> State {
             server_name: "rumble.example".into(),
             user_id: 1,
         },
-        rooms: vec![make_room(ROOM_LOBBY, "Lobby")],
+        rooms: vec![make_root(), make_room(ROOM_LOBBY, "Lobby")],
         // One user per cell of the talk-state × status-flag matrix the
         // room tree renders (Mumble-style: primary talking glyph +
         // independent trailing flags).
@@ -1176,19 +1194,19 @@ fn user_states_state() -> State {
     state
 }
 
-/// Connected session with an empty room list and `MAKE_ROOM` held —
-/// drives the Rooms-pane empty state with its "New room" button (and
-/// the header "+" affordance, both gated on MAKE_ROOM at Root).
+/// Connected session with only the Root room (every server always has one)
+/// and `MAKE_ROOM` held — drives the Rooms pane with an empty Root and the
+/// header "+" create affordance gated on MAKE_ROOM at Root.
 fn no_rooms_state() -> State {
     let mut state = State {
         connection: ConnectionState::Connected {
             server_name: "rumble.example".into(),
             user_id: 1,
         },
-        rooms: Vec::new(),
+        rooms: vec![make_root()],
         users: Vec::new(),
         my_user_id: Some(1),
-        my_room_id: None,
+        my_room_id: Some(ROOT_ROOM_UUID),
         effective_permissions: (Permissions::MAKE_ROOM | Permissions::TEXT_MESSAGE).bits(),
         ..State::default()
     };
@@ -1236,11 +1254,7 @@ fn move_room_state() -> State {
 fn sudo_capable_state(elevated: bool) -> State {
     let mut state = connected_state();
     state.effective_permissions = (Permissions::TEXT_MESSAGE | Permissions::SUDO).bits();
-    if let Some(me) = state
-        .users
-        .iter_mut()
-        .find(|u| u.user_id.as_ref().map(|id| id.value) == Some(1))
-    {
+    if let Some(me) = state.users.iter_mut().find(|u| u.user_id == 1) {
         me.is_elevated = elevated;
     }
     state

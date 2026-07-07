@@ -7,7 +7,7 @@ use rumble_client_traits::{
 };
 use rumble_desktop::QuinnTransport;
 use rumble_protocol::{
-    build_auth_payload, build_session_cert_payload, compute_cert_hash,
+    Group, Room, User, build_auth_payload, build_session_cert_payload, compute_cert_hash,
     proto::{self, envelope::Payload},
 };
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -25,9 +25,9 @@ fn now_ms() -> i64 {
 pub struct RumbleConnection {
     pub transport: QuinnTransport,
     pub user_id: u64,
-    pub rooms: Vec<proto::RoomInfo>,
-    pub users: Vec<proto::User>,
-    pub groups: Vec<proto::GroupInfo>,
+    pub rooms: Vec<Room>,
+    pub users: Vec<User>,
+    pub groups: Vec<Group>,
 }
 
 /// Connect to a Rumble server and perform the full auth handshake.
@@ -105,7 +105,12 @@ pub async fn connect(
     debug!("Sent Authenticate");
 
     // Wait for ServerState (slash commands are irrelevant to the bridge).
+    // Convert the wire snapshot to domain types at this boundary; malformed
+    // records (missing id) are dropped rather than defaulted.
     let (rooms, users, groups, _slash_commands) = wait_for_auth_result(&mut transport).await?;
+    let rooms: Vec<Room> = rooms.into_iter().filter_map(Room::from_proto).collect();
+    let users: Vec<User> = users.into_iter().filter_map(User::from_proto).collect();
+    let groups: Vec<Group> = groups.into_iter().map(Group::from).collect();
     info!(
         rooms = rooms.len(),
         users = users.len(),

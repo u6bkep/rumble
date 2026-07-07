@@ -54,12 +54,7 @@ use rumble_client::{
 };
 use rumble_damascene::{Identity, RumbleApp, backend::UiBackend};
 use rumble_desktop_shell::SettingsStore;
-use rumble_protocol::{
-    Uuid,
-    permissions::Permissions,
-    proto::{RoomInfo, User, UserId},
-    room_id_from_uuid,
-};
+use rumble_protocol::{ROOT_ROOM_UUID, Room, User, Uuid, permissions::Permissions};
 
 const ROOM_LOBBY: u128 = 0x1111_1111_1111_1111_1111_1111_1111_1111;
 const ROOM_WORK: u128 = 0x2222_2222_2222_2222_2222_2222_2222_2222;
@@ -88,11 +83,23 @@ impl UiBackend for MockBackend {
     }
 }
 
-fn make_room(uuid: u128, name: &str) -> RoomInfo {
-    RoomInfo {
-        id: Some(room_id_from_uuid(Uuid::from_u128(uuid))),
+fn make_root() -> Room {
+    Room {
+        id: ROOT_ROOM_UUID,
+        name: "Root".into(),
+        parent: ROOT_ROOM_UUID,
+        description: None,
+        inherit_acl: false,
+        acls: Vec::new(),
+        effective_permissions: 0,
+    }
+}
+
+fn make_room(uuid: u128, name: &str) -> Room {
+    Room {
+        id: Uuid::from_u128(uuid),
         name: name.into(),
-        parent_id: None,
+        parent: ROOT_ROOM_UUID,
         description: None,
         inherit_acl: false,
         acls: Vec::new(),
@@ -102,9 +109,9 @@ fn make_room(uuid: u128, name: &str) -> RoomInfo {
 
 fn make_user(id: u64, name: &str, room: u128) -> User {
     User {
-        user_id: Some(UserId { value: id }),
+        user_id: id,
         username: name.into(),
-        current_room: Some(room_id_from_uuid(Uuid::from_u128(room))),
+        current_room: Uuid::from_u128(room),
         is_muted: false,
         is_deafened: false,
         server_muted: false,
@@ -153,7 +160,11 @@ fn connected_state_with_chat(n_messages: usize) -> State {
             server_name: "rumble.example".into(),
             user_id: 1,
         },
-        rooms: vec![make_room(ROOM_LOBBY, "Lobby"), make_room(ROOM_WORK, "Work")],
+        rooms: vec![
+            make_root(),
+            make_room(ROOM_LOBBY, "Lobby"),
+            make_room(ROOM_WORK, "Work"),
+        ],
         users: vec![
             make_user(1, "alice", ROOM_LOBBY),
             make_user(2, "bob", ROOM_WORK),

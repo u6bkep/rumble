@@ -724,7 +724,19 @@ fn handle_rumble_envelope(
                         // Rumble connection was down (ghost users, missing
                         // joins, channel changes) and prunes stale proxy
                         // sessions.
-                        let (rooms, users) = (ss.rooms.len(), ss.users.len());
+                        // Convert the wire snapshot to domain types at this
+                        // boundary; malformed records (missing id) are dropped.
+                        let new_rooms: Vec<rumble_protocol::Room> = ss
+                            .rooms
+                            .into_iter()
+                            .filter_map(rumble_protocol::Room::from_proto)
+                            .collect();
+                        let new_users: Vec<rumble_protocol::User> = ss
+                            .users
+                            .into_iter()
+                            .filter_map(rumble_protocol::User::from_proto)
+                            .collect();
+                        let (rooms, users) = (new_rooms.len(), new_users.len());
                         let out = {
                             let mut state = write_bridge(bridge_state);
                             let state = &mut *state;
@@ -746,14 +758,14 @@ fn handle_rumble_envelope(
                             let out = reconcile::reconcile_server_state(
                                 &old_rooms,
                                 &old_users,
-                                &ss.rooms,
-                                &ss.users,
+                                &new_rooms,
+                                &new_users,
                                 &mut state.channels,
                                 &mut state.users,
                                 &skip,
                             );
-                            state.rumble_rooms = ss.rooms;
-                            state.rumble_users = ss.users;
+                            state.rumble_rooms = new_rooms;
+                            state.rumble_users = new_users;
                             out
                         };
                         for rumble_id in &out.removed_user_ids {
@@ -805,13 +817,11 @@ fn handle_rumble_envelope(
                             let rumble_user_id = if cb.sender_id != 0 {
                                 Some(cb.sender_id)
                             } else {
-                                state.rumble_users.iter().find_map(|u| {
-                                    if u.username == cb.sender {
-                                        u.user_id.as_ref().map(|id| id.value)
-                                    } else {
-                                        None
-                                    }
-                                })
+                                state
+                                    .rumble_users
+                                    .iter()
+                                    .find(|u| u.username == cb.sender)
+                                    .map(|u| u.user_id)
                             };
                             let actor = rumble_user_id.and_then(|rid| {
                                 // Check if this is one of our virtual users (Mumble client)
@@ -994,7 +1004,9 @@ fn handle_state_update(
                     .map(|uuid| state.channels.get_or_insert(uuid))
                     .unwrap_or(0);
 
-                state.rumble_users.push(user.clone());
+                if let Some(domain_user) = rumble_protocol::User::from_proto(user.clone()) {
+                    state.rumble_users.push(domain_user);
+                }
 
                 let user_state = mumble::UserState {
                     session: Some(session),
@@ -1020,9 +1032,7 @@ fn handle_state_update(
             }
             let session = state.users.get_mumble_session(rumble_id);
             state.users.remove_by_rumble_id(rumble_id);
-            state
-                .rumble_users
-                .retain(|u| u.user_id.as_ref().map(|id| id.value).unwrap_or(0) != rumble_id);
+            state.rumble_users.retain(|u| u.user_id != rumble_id);
 
             // Clean up outbound sequence counter for this user
             rumble_outbound_seq.remove(&rumble_id);
@@ -1051,12 +1061,12 @@ fn handle_state_update(
             }
             // Keep the cached roster current so late-joining Mumble clients
             // (build_user_states) see the user's actual room.
-            if let Some(user) = state
-                .rumble_users
-                .iter_mut()
-                .find(|u| u.user_id.as_ref().map(|id| id.value) == Some(rumble_id))
-            {
-                user.current_room = um.to_room_id.clone();
+            if let Some(user) = state.rumble_users.iter_mut().find(|u| u.user_id == rumble_id) {
+                user.current_room = um
+                    .to_room_id
+                    .as_ref()
+                    .and_then(rumble_protocol::uuid_from_room_id)
+                    .unwrap_or(rumble_protocol::ROOT_ROOM_UUID);
             }
             let session = state.users.get_mumble_session(rumble_id);
             let channel_id = um
@@ -1085,11 +1095,7 @@ fn handle_state_update(
             }
             // Keep the cached roster current so late-joining Mumble clients
             // (build_user_states) see the user's actual mute/deaf state.
-            if let Some(user) = state
-                .rumble_users
-                .iter_mut()
-                .find(|u| u.user_id.as_ref().map(|id| id.value) == Some(rumble_id))
-            {
+            if let Some(user) = state.rumble_users.iter_mut().find(|u| u.user_id == rumble_id) {
                 user.is_muted = usc.is_muted;
                 user.is_deafened = usc.is_deafened;
             }
@@ -1120,7 +1126,9 @@ fn handle_state_update(
                         .map(|p| state.channels.get_or_insert(p))
                         .unwrap_or(0);
 
-                    state.rumble_rooms.push(room.clone());
+                    if let Some(domain_room) = rumble_protocol::Room::from_proto(room.clone()) {
+                        state.rumble_rooms.push(domain_room);
+                    }
 
                     let channel_state = mumble::ChannelState {
                         channel_id: Some(channel_id),
@@ -1142,9 +1150,7 @@ fn handle_state_update(
                 let mut state = write_bridge(bridge_state);
                 let channel_id = state.channels.get_mumble_id(&uuid);
                 state.channels.remove_by_uuid(&uuid);
-                state
-                    .rumble_rooms
-                    .retain(|r| r.id.as_ref().and_then(rumble_protocol::uuid_from_room_id) != Some(uuid));
+                state.rumble_rooms.retain(|r| r.id != uuid);
 
                 if let Some(channel_id) = channel_id {
                     let remove = mumble::ChannelRemove { channel_id };
@@ -1197,11 +1203,7 @@ fn handle_state_update(
                 // Update cached room description
                 {
                     let mut state = write_bridge(bridge_state);
-                    if let Some(room) = state
-                        .rumble_rooms
-                        .iter_mut()
-                        .find(|r| r.id.as_ref().and_then(rumble_protocol::uuid_from_room_id) == Some(uuid))
-                    {
+                    if let Some(room) = state.rumble_rooms.iter_mut().find(|r| r.id == uuid) {
                         room.description = if rdc.description.is_empty() {
                             None
                         } else {
@@ -1384,7 +1386,7 @@ pub(crate) fn resolve_chat_sender_channel(state: &BridgeState, sender_id: u64, s
         if let Some(channel) = state
             .rumble_users
             .iter()
-            .find(|u| u.user_id.as_ref().map(|id| id.value) == Some(sender_id))
+            .find(|u| u.user_id == sender_id)
             .and_then(|u| roster_user_channel(state, u))
         {
             return Some(channel);
@@ -1402,11 +1404,8 @@ pub(crate) fn resolve_chat_sender_channel(state: &BridgeState, sender_id: u64, s
 }
 
 /// Map a cached roster user's `current_room` to its Mumble channel.
-fn roster_user_channel(state: &BridgeState, user: &proto::User) -> Option<u32> {
-    let uuid = user
-        .current_room
-        .as_ref()
-        .and_then(rumble_protocol::uuid_from_room_id)?;
+fn roster_user_channel(state: &BridgeState, user: &rumble_protocol::User) -> Option<u32> {
+    let uuid = user.current_room;
     state
         .channels
         .get_mumble_id(&uuid)
@@ -1420,7 +1419,7 @@ fn roster_user_channel(state: &BridgeState, user: &proto::User) -> Option<u32> {
 /// visited set guards against malformed parent-link cycles, so the walk always
 /// terminates.
 pub(crate) fn collect_subtree_channels(
-    rooms: &[proto::RoomInfo],
+    rooms: &[rumble_protocol::Room],
     channels: &ChannelMap,
     root_channel: u32,
 ) -> HashSet<u32> {
@@ -1439,18 +1438,10 @@ pub(crate) fn collect_subtree_channels(
     // avoid a self-edge (its parent_id is unset, like root-level rooms').
     let mut children: HashMap<uuid::Uuid, Vec<uuid::Uuid>> = HashMap::new();
     for room in rooms {
-        let Some(id) = room.id.as_ref().and_then(rumble_protocol::uuid_from_room_id) else {
-            continue;
-        };
-        if id == rumble_protocol::ROOT_ROOM_UUID {
+        if room.id == rumble_protocol::ROOT_ROOM_UUID {
             continue;
         }
-        let parent = room
-            .parent_id
-            .as_ref()
-            .and_then(rumble_protocol::uuid_from_room_id)
-            .unwrap_or(rumble_protocol::ROOT_ROOM_UUID);
-        children.entry(parent).or_default().push(id);
+        children.entry(room.parent).or_default().push(room.id);
     }
 
     let mut visited = HashSet::from([root_uuid]);
@@ -1476,20 +1467,29 @@ mod tests {
     use crate::state::MumbleClient;
     use uuid::Uuid;
 
-    fn room(id: Uuid, parent: Option<Uuid>) -> proto::RoomInfo {
-        proto::RoomInfo {
-            id: Some(rumble_protocol::room_id_from_uuid(id)),
-            parent_id: parent.map(rumble_protocol::room_id_from_uuid),
-            ..Default::default()
+    fn room(id: Uuid, parent: Option<Uuid>) -> rumble_protocol::Room {
+        rumble_protocol::Room {
+            id,
+            name: String::new(),
+            parent: parent.unwrap_or(rumble_protocol::ROOT_ROOM_UUID),
+            description: None,
+            inherit_acl: true,
+            acls: Vec::new(),
+            effective_permissions: 0,
         }
     }
 
-    fn roster_user(user_id: u64, username: &str, current_room: Uuid) -> proto::User {
-        proto::User {
-            user_id: Some(proto::UserId { value: user_id }),
+    fn roster_user(user_id: u64, username: &str, current_room: Uuid) -> rumble_protocol::User {
+        rumble_protocol::User {
+            user_id,
             username: username.to_string(),
-            current_room: Some(rumble_protocol::room_id_from_uuid(current_room)),
-            ..Default::default()
+            current_room,
+            is_muted: false,
+            is_deafened: false,
+            server_muted: false,
+            is_elevated: false,
+            groups: Vec::new(),
+            label: None,
         }
     }
 
@@ -1506,7 +1506,7 @@ mod tests {
     /// Root(0) <- a, Root(0) <- c, a <- b. `a` encodes its root parent
     /// explicitly while `c` uses the unset-parent form; both mean "directly
     /// under Root" and must be treated identically.
-    fn sample_tree() -> (Vec<proto::RoomInfo>, ChannelMap, [u32; 3]) {
+    fn sample_tree() -> (Vec<rumble_protocol::Room>, ChannelMap, [u32; 3]) {
         let root = rumble_protocol::ROOT_ROOM_UUID;
         let a = Uuid::from_u128(0xA);
         let b = Uuid::from_u128(0xB);

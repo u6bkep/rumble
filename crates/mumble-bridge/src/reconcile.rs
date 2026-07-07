@@ -13,7 +13,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
 };
 
-use rumble_protocol::proto;
+use rumble_protocol::{Room, User};
 use uuid::Uuid;
 
 use crate::{
@@ -36,10 +36,9 @@ pub struct SkipRules {
 }
 
 impl SkipRules {
-    fn skips(&self, user: &proto::User) -> bool {
-        let id = user_id(user);
-        Some(id) == self.bridge_user_id
-            || self.virtual_user_ids.contains(&id)
+    fn skips(&self, user: &User) -> bool {
+        Some(user.user_id) == self.bridge_user_id
+            || self.virtual_user_ids.contains(&user.user_id)
             || self.pending_usernames.contains(&user.username)
     }
 }
@@ -68,29 +67,14 @@ pub struct ReconcileOutput {
     pub removed_user_ids: Vec<u64>,
 }
 
-fn user_id(user: &proto::User) -> u64 {
-    user.user_id.as_ref().map(|id| id.value).unwrap_or(0)
-}
-
-fn room_uuid(room: &proto::RoomInfo) -> Option<Uuid> {
-    room.id.as_ref().and_then(rumble_protocol::uuid_from_room_id)
-}
-
-fn parent_uuid(room: &proto::RoomInfo) -> Uuid {
-    room.parent_id
-        .as_ref()
-        .and_then(rumble_protocol::uuid_from_room_id)
-        .unwrap_or(rumble_protocol::ROOT_ROOM_UUID)
-}
-
 /// Depth of `uuid` in the old room tree (root = 0). Unknown ancestry stops
 /// the walk; a parent cycle is capped at the room count.
-fn old_depth(uuid: Uuid, old_by_uuid: &HashMap<Uuid, &proto::RoomInfo>) -> usize {
+fn old_depth(uuid: Uuid, old_by_uuid: &HashMap<Uuid, &Room>) -> usize {
     let mut depth = 0;
     let mut cur = uuid;
     while cur != rumble_protocol::ROOT_ROOM_UUID && depth <= old_by_uuid.len() {
         match old_by_uuid.get(&cur) {
-            Some(room) => cur = parent_uuid(room),
+            Some(room) => cur = room.parent,
             None => break,
         }
         depth += 1;
@@ -103,24 +87,23 @@ fn old_depth(uuid: Uuid, old_by_uuid: &HashMap<Uuid, &proto::RoomInfo>) -> usize
 /// (assigning IDs for new entities, pruning vanished ones) and returning the
 /// ordered Mumble messages that bring every connected client up to date.
 pub fn reconcile_server_state(
-    old_rooms: &[proto::RoomInfo],
-    old_users: &[proto::User],
-    new_rooms: &[proto::RoomInfo],
-    new_users: &[proto::User],
+    old_rooms: &[Room],
+    old_users: &[User],
+    new_rooms: &[Room],
+    new_users: &[User],
     channels: &mut ChannelMap,
     users: &mut UserMap,
     skip: &SkipRules,
 ) -> ReconcileOutput {
     let mut out = ReconcileOutput::default();
 
-    let old_room_by_uuid: HashMap<Uuid, &proto::RoomInfo> =
-        old_rooms.iter().filter_map(|r| room_uuid(r).map(|u| (u, r))).collect();
-    let old_user_by_id: HashMap<u64, &proto::User> = old_users.iter().map(|u| (user_id(u), u)).collect();
+    let old_room_by_uuid: HashMap<Uuid, &Room> = old_rooms.iter().map(|r| (r.id, r)).collect();
+    let old_user_by_id: HashMap<u64, &User> = old_users.iter().map(|u| (u.user_id, u)).collect();
 
     // --- Users: removals. Prune from the *map*, not just the old roster, so
     // stale proxy sessions that drifted out of the cache are cleaned up too.
     // Only users with a proxy session were ever announced to Mumble clients.
-    let new_user_ids: HashSet<u64> = new_users.iter().filter(|u| !skip.skips(u)).map(user_id).collect();
+    let new_user_ids: HashSet<u64> = new_users.iter().filter(|u| !skip.skips(u)).map(|u| u.user_id).collect();
     let mut vanished: Vec<(u64, u32)> = users.entries().filter(|(id, _)| !new_user_ids.contains(id)).collect();
     vanished.sort_unstable();
     for &(rumble_id, session) in &vanished {
@@ -140,35 +123,27 @@ pub fn reconcile_server_state(
     // ChannelState is always emitted (and its ID assigned) before any child
     // references it. Mirrors `build_channel_states`.
     let mut children_of: HashMap<Uuid, Vec<usize>> = HashMap::new();
-    let mut new_uuids: Vec<Option<Uuid>> = Vec::new();
+    let mut new_uuids: Vec<Uuid> = Vec::new();
     for (idx, room) in new_rooms.iter().enumerate() {
-        let uuid = room_uuid(room);
-        new_uuids.push(uuid);
-        if let Some(uuid) = uuid
-            && uuid != rumble_protocol::ROOT_ROOM_UUID
-        {
-            children_of.entry(parent_uuid(room)).or_default().push(idx);
+        new_uuids.push(room.id);
+        if room.id != rumble_protocol::ROOT_ROOM_UUID {
+            children_of.entry(room.parent).or_default().push(idx);
         }
     }
     let mut queue = VecDeque::new();
-    if let Some(root_idx) = new_uuids
-        .iter()
-        .position(|u| *u == Some(rumble_protocol::ROOT_ROOM_UUID))
-    {
+    if let Some(root_idx) = new_uuids.iter().position(|u| *u == rumble_protocol::ROOT_ROOM_UUID) {
         queue.push_back(root_idx);
     } else if let Some(children) = children_of.get(&rumble_protocol::ROOT_ROOM_UUID) {
         queue.extend(children.iter().copied());
     }
     while let Some(idx) = queue.pop_front() {
         let room = &new_rooms[idx];
-        let Some(uuid) = new_uuids[idx] else { continue };
+        let uuid = new_uuids[idx];
         let channel_id = channels.get_or_insert(uuid);
-        let parent = (uuid != rumble_protocol::ROOT_ROOM_UUID).then(|| channels.get_or_insert(parent_uuid(room)));
+        let parent = (uuid != rumble_protocol::ROOT_ROOM_UUID).then(|| channels.get_or_insert(room.parent));
         let changed = match old_room_by_uuid.get(&uuid) {
             None => true,
-            Some(old) => {
-                old.name != room.name || old.description != room.description || parent_uuid(old) != parent_uuid(room)
-            }
+            Some(old) => old.name != room.name || old.description != room.description || old.parent != room.parent,
         };
         if changed {
             out.messages.push(SyncMessage::ChannelState(mumble::ChannelState {
@@ -187,13 +162,8 @@ pub fn reconcile_server_state(
     // --- Users: additions and changes. After channel adds so a user's new
     // channel already exists client-side.
     for user in new_users.iter().filter(|u| !skip.skips(u)) {
-        let rumble_id = user_id(user);
-        let channel_id = user
-            .current_room
-            .as_ref()
-            .and_then(rumble_protocol::uuid_from_room_id)
-            .map(|uuid| channels.get_or_insert(uuid))
-            .unwrap_or(0);
+        let rumble_id = user.user_id;
+        let channel_id = channels.get_or_insert(user.current_room);
         let changed = match (users.get_mumble_session(rumble_id), old_user_by_id.get(&rumble_id)) {
             // No proxy session yet: never announced to Mumble clients.
             (None, _) => true,
@@ -222,7 +192,7 @@ pub fn reconcile_server_state(
     // --- Channels: removals, deepest (by the old tree) first so a Mumble
     // client never sees a parent vanish while a known child still references
     // it. The root channel (0) is never removed.
-    let new_uuid_set: HashSet<Uuid> = new_uuids.iter().flatten().copied().collect();
+    let new_uuid_set: HashSet<Uuid> = new_uuids.iter().copied().collect();
     let mut removed: Vec<(usize, u32, Uuid)> = channels
         .rumble_uuids()
         .filter(|uuid| *uuid != rumble_protocol::ROOT_ROOM_UUID && !new_uuid_set.contains(uuid))
@@ -243,7 +213,7 @@ pub fn reconcile_server_state(
 
 #[cfg(test)]
 mod tests {
-    use rumble_protocol::{ROOT_ROOM_UUID, room_id_from_uuid};
+    use rumble_protocol::ROOT_ROOM_UUID;
 
     use super::*;
 
@@ -251,33 +221,38 @@ mod tests {
         Uuid::from_u128(n)
     }
 
-    fn user(id: u64, name: &str, room: Uuid, muted: bool, deafened: bool) -> proto::User {
-        proto::User {
-            user_id: Some(proto::UserId { value: id }),
+    fn user(id: u64, name: &str, room: Uuid, muted: bool, deafened: bool) -> User {
+        User {
+            user_id: id,
             username: name.to_string(),
-            current_room: Some(room_id_from_uuid(room)),
+            current_room: room,
             is_muted: muted,
             is_deafened: deafened,
-            ..Default::default()
+            server_muted: false,
+            is_elevated: false,
+            groups: Vec::new(),
+            label: None,
         }
     }
 
-    fn room(uuid: Uuid, name: &str, parent: Option<Uuid>, description: Option<&str>) -> proto::RoomInfo {
-        proto::RoomInfo {
-            id: Some(room_id_from_uuid(uuid)),
+    fn room(uuid: Uuid, name: &str, parent: Option<Uuid>, description: Option<&str>) -> Room {
+        Room {
+            id: uuid,
             name: name.to_string(),
-            parent_id: parent.map(room_id_from_uuid),
+            parent: parent.unwrap_or(ROOT_ROOM_UUID),
             description: description.map(str::to_string),
-            ..Default::default()
+            inherit_acl: true,
+            acls: Vec::new(),
+            effective_permissions: 0,
         }
     }
 
-    fn root() -> proto::RoomInfo {
+    fn root() -> Room {
         room(ROOT_ROOM_UUID, "Root", None, None)
     }
 
     /// Apply `rooms`/`users` as the baseline state, populating the maps.
-    fn seed(rooms: &[proto::RoomInfo], users_list: &[proto::User], channels: &mut ChannelMap, users: &mut UserMap) {
+    fn seed(rooms: &[Room], users_list: &[User], channels: &mut ChannelMap, users: &mut UserMap) {
         reconcile_server_state(&[], &[], rooms, users_list, channels, users, &SkipRules::default());
     }
 

@@ -240,9 +240,7 @@ fn voice_relay_end_to_end() {
     // Both clients land in Root by default; confirm client2 sees client1.
     assert!(
         wait_for(&handle2, Duration::from_secs(2), |s| {
-            s.users
-                .iter()
-                .any(|u| u.user_id.as_ref().map(|id| id.value) == Some(user1_id))
+            s.users.iter().any(|u| u.user_id == user1_id)
         }),
         "client2 should see client1 in user list"
     );

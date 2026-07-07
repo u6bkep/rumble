@@ -34,11 +34,7 @@
 use damascene_core::prelude::*;
 
 use rumble_client::{Command, State};
-use rumble_protocol::{
-    ROOT_ROOM_UUID,
-    permissions::Permissions,
-    proto::{GroupInfo, RoomAclEntry},
-};
+use rumble_protocol::{Group, ROOT_ROOM_UUID, RoomAclEntry, permissions::Permissions, proto};
 use uuid::Uuid;
 
 // ============================================================
@@ -176,7 +172,7 @@ pub struct AclEditEntry {
 }
 
 impl AclEditEntry {
-    fn from_proto(entry: &RoomAclEntry) -> Self {
+    fn from_domain(entry: &RoomAclEntry) -> Self {
         Self {
             group: entry.group.clone(),
             grant: entry.grant,
@@ -185,8 +181,8 @@ impl AclEditEntry {
         }
     }
 
-    fn to_proto(&self) -> RoomAclEntry {
-        RoomAclEntry {
+    fn to_proto(&self) -> proto::RoomAclEntry {
+        proto::RoomAclEntry {
             group: self.group.clone(),
             grant: self.grant,
             deny: self.deny,
@@ -314,11 +310,11 @@ impl RoomAclModalState {
         path.reverse();
         path.push((room_id, room_name.clone()));
 
-        let entries: Vec<AclEditEntry> = room.acls.iter().map(AclEditEntry::from_proto).collect();
+        let entries: Vec<AclEditEntry> = room.acls.iter().map(AclEditEntry::from_domain).collect();
 
         // Version of the exact configuration we're copying into the editor —
         // the server compares the save against this base.
-        let base_version = rumble_protocol::room_acl_version(room.inherit_acl, &room.acls);
+        let base_version = rumble_protocol::room_acl_version(room.inherit_acl, &room.to_proto().acls);
 
         Some(RoomAclModalState {
             room_id,
@@ -986,7 +982,7 @@ fn render_add_rule_popover(state: &RoomAclModalState, app_state: &State, query: 
     // have an entry for if they want multiple-scope rules. That's
     // unusual but legal — `apply_here=t, apply_subs=f` plus
     // `apply_here=f, apply_subs=t` is a valid combo of two entries.
-    let mut candidates: Vec<&GroupInfo> = app_state
+    let mut candidates: Vec<&Group> = app_state
         .group_definitions
         .iter()
         .filter(|g| q.is_empty() || g.name.to_lowercase().contains(&q))

@@ -355,7 +355,7 @@ fn test_backend_create_room() {
     // Create a new room
     handle.send(BackendCommand::CreateRoom {
         name: "Backend Test Room".to_string(),
-        parent_id: None,
+        parent_id: rumble_protocol::ROOT_ROOM_UUID,
     });
 
     // Wait for room to appear
@@ -389,7 +389,7 @@ fn test_backend_delete_room() {
     // Create a room to delete
     handle.send(BackendCommand::CreateRoom {
         name: "Room To Delete".to_string(),
-        parent_id: None,
+        parent_id: rumble_protocol::ROOT_ROOM_UUID,
     });
 
     wait_for(&handle, Duration::from_secs(2), |s| {
@@ -402,8 +402,7 @@ fn test_backend_delete_room() {
         .rooms
         .iter()
         .find(|r| r.name == "Room To Delete")
-        .and_then(|r| r.id.as_ref())
-        .and_then(rumble_protocol::uuid_from_room_id)
+        .map(|r| r.id)
         .expect("Should find created room");
 
     let count_before = handle.state().rooms.len();
@@ -441,7 +440,7 @@ fn test_backend_rename_room() {
     // Create a room to rename
     handle.send(BackendCommand::CreateRoom {
         name: "Original Room Name".to_string(),
-        parent_id: None,
+        parent_id: rumble_protocol::ROOT_ROOM_UUID,
     });
 
     wait_for(&handle, Duration::from_secs(2), |s| {
@@ -453,8 +452,7 @@ fn test_backend_rename_room() {
         .rooms
         .iter()
         .find(|r| r.name == "Original Room Name")
-        .and_then(|r| r.id.as_ref())
-        .and_then(rumble_protocol::uuid_from_room_id)
+        .map(|r| r.id)
         .expect("Should find created room");
 
     // Rename the room
@@ -500,7 +498,7 @@ fn test_backend_user_appears_in_state() {
         state
             .users
             .iter()
-            .any(|u| { u.user_id.as_ref().map(|id| id.value) == Some(my_user_id) && u.username == "visible-user" }),
+            .any(|u| { u.user_id == my_user_id && u.username == "visible-user" }),
         "Should see ourselves in users list"
     );
 }
@@ -542,9 +540,7 @@ fn test_two_backends_see_each_other() {
 
     // Backend 2 should see backend 1 in its user list
     let backend2_sees_backend1 = wait_for(&handle2, Duration::from_secs(2), |s| {
-        s.users
-            .iter()
-            .any(|u| u.user_id.as_ref().map(|id| id.value) == Some(user1_id))
+        s.users.iter().any(|u| u.user_id == user1_id)
     });
 
     assert!(backend2_sees_backend1, "Backend 2 should see backend 1");
@@ -552,9 +548,7 @@ fn test_two_backends_see_each_other() {
     // Backend 1 should receive update about backend 2
     // (may need to wait for the state update)
     let backend1_sees_backend2 = wait_for(&handle1, Duration::from_secs(2), |s| {
-        s.users
-            .iter()
-            .any(|u| u.user_id.as_ref().map(|id| id.value) == Some(user2_id))
+        s.users.iter().any(|u| u.user_id == user2_id)
     });
 
     assert!(backend1_sees_backend2, "Backend 1 should see backend 2");
@@ -581,12 +575,7 @@ fn test_no_duplicate_users_when_second_client_connects() {
     let user1_id = handle1.state().my_user_id.expect("user 1 should have ID");
 
     // Verify client 1 only appears once in its own user list
-    let user1_count_before = handle1
-        .state()
-        .users
-        .iter()
-        .filter(|u| u.user_id.as_ref().map(|id| id.value) == Some(user1_id))
-        .count();
+    let user1_count_before = handle1.state().users.iter().filter(|u| u.user_id == user1_id).count();
     assert_eq!(
         user1_count_before, 1,
         "User 1 should appear exactly once before second client connects"
@@ -607,41 +596,24 @@ fn test_no_duplicate_users_when_second_client_connects() {
 
     // Wait for handle1 to see handle2
     wait_for(&handle1, Duration::from_secs(2), |s| {
-        s.users
-            .iter()
-            .any(|u| u.user_id.as_ref().map(|id| id.value) == Some(user2_id))
+        s.users.iter().any(|u| u.user_id == user2_id)
     });
 
     // Verify client 1 still only appears once (no duplicates from UserJoined broadcast)
-    let user1_count_after = handle1
-        .state()
-        .users
-        .iter()
-        .filter(|u| u.user_id.as_ref().map(|id| id.value) == Some(user1_id))
-        .count();
+    let user1_count_after = handle1.state().users.iter().filter(|u| u.user_id == user1_id).count();
     assert_eq!(
         user1_count_after, 1,
         "User 1 should still appear exactly once after second client connects"
     );
 
     // Verify client 2 only appears once in both client lists
-    let user2_count_in_handle1 = handle1
-        .state()
-        .users
-        .iter()
-        .filter(|u| u.user_id.as_ref().map(|id| id.value) == Some(user2_id))
-        .count();
+    let user2_count_in_handle1 = handle1.state().users.iter().filter(|u| u.user_id == user2_id).count();
     assert_eq!(
         user2_count_in_handle1, 1,
         "User 2 should appear exactly once in client 1's list"
     );
 
-    let user2_count_in_handle2 = handle2
-        .state()
-        .users
-        .iter()
-        .filter(|u| u.user_id.as_ref().map(|id| id.value) == Some(user2_id))
-        .count();
+    let user2_count_in_handle2 = handle2.state().users.iter().filter(|u| u.user_id == user2_id).count();
     assert_eq!(
         user2_count_in_handle2, 1,
         "User 2 should appear exactly once in its own list"
@@ -679,7 +651,7 @@ fn test_backend_room_updates_broadcast() {
     // Backend 1 creates a room
     handle1.send(BackendCommand::CreateRoom {
         name: "Broadcast Room".to_string(),
-        parent_id: None,
+        parent_id: rumble_protocol::ROOT_ROOM_UUID,
     });
 
     // Both should see the new room
@@ -727,9 +699,7 @@ fn test_backend_disconnect_removes_user() {
 
     // Backend 2 should see backend 1
     wait_for(&handle2, Duration::from_secs(2), |s| {
-        s.users
-            .iter()
-            .any(|u| u.user_id.as_ref().map(|id| id.value) == Some(user1_id))
+        s.users.iter().any(|u| u.user_id == user1_id)
     });
 
     // Backend 1 disconnects
@@ -737,9 +707,7 @@ fn test_backend_disconnect_removes_user() {
 
     // Wait for backend 2 to see the user leave
     let user1_gone = wait_for(&handle2, Duration::from_secs(3), |s| {
-        !s.users
-            .iter()
-            .any(|u| u.user_id.as_ref().map(|id| id.value) == Some(user1_id))
+        !s.users.iter().any(|u| u.user_id == user1_id)
     });
 
     assert!(user1_gone, "Backend 1 should be gone from user list after disconnect");
@@ -766,7 +734,7 @@ fn test_backend_join_room() {
     // Create a new room
     handle.send(BackendCommand::CreateRoom {
         name: "Room To Join".to_string(),
-        parent_id: None,
+        parent_id: rumble_protocol::ROOT_ROOM_UUID,
     });
 
     wait_for(&handle, Duration::from_secs(2), |s| {
@@ -778,8 +746,7 @@ fn test_backend_join_room() {
         .rooms
         .iter()
         .find(|r| r.name == "Room To Join")
-        .and_then(|r| r.id.as_ref())
-        .and_then(rumble_protocol::uuid_from_room_id)
+        .map(|r| r.id)
         .expect("Should find created room");
 
     // Join the room
@@ -789,10 +756,9 @@ fn test_backend_join_room() {
     // The user's current_room should be updated
     let joined = wait_for(&handle, Duration::from_secs(2), |s| {
         let my_id = s.my_user_id;
-        s.users.iter().any(|u| {
-            u.user_id.as_ref().map(|id| id.value) == my_id
-                && u.current_room.as_ref().and_then(rumble_protocol::uuid_from_room_id) == Some(room_uuid)
-        })
+        s.users
+            .iter()
+            .any(|u| Some(u.user_id) == my_id && u.current_room == room_uuid)
     });
 
     assert!(joined, "User should be in the new room");

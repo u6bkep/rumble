@@ -117,7 +117,7 @@ impl SfxEngine {
             Some(room) => snapshot
                 .users_in_room(room)
                 .iter()
-                .filter_map(|u| u.user_id.as_ref().map(|id| id.value))
+                .map(|u| u.user_id)
                 .filter(|id| Some(*id) != my_id)
                 .collect(),
             None => HashSet::new(),

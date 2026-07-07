@@ -858,7 +858,7 @@ mod tests {
         State {
             slash_commands: cmds
                 .iter()
-                .map(|(n, d)| rumble_protocol::proto::SlashCommand {
+                .map(|(n, d)| rumble_protocol::SlashCommand {
                     name: (*n).to_string(),
                     description: (*d).to_string(),
                 })

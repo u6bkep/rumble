@@ -17,7 +17,7 @@
 //! top-of-tree.
 
 use damascene_core::prelude::*;
-use rumble_client::{Command, State};
+use rumble_client::{Command, ROOT_ROOM_UUID, State};
 use rumble_protocol::permissions::Permissions;
 use uuid::Uuid;
 
@@ -83,7 +83,7 @@ fn room_perms(app_state: &State, room_id: Uuid) -> Permissions {
 /// `MODIFY_ROOM`-on-the-moved-room check; the Root room additionally
 /// can't be moved (everything lives under it).
 pub fn can_move_room(app_state: &State, room_id: Uuid) -> bool {
-    if room_id == rumble_protocol::ROOT_ROOM_UUID {
+    if room_id == ROOT_ROOM_UUID {
         return false;
     }
     app_state.room_tree.nodes.contains_key(&room_id)
@@ -156,9 +156,7 @@ pub fn destinations(app_state: &State, source: Uuid) -> Vec<Destination> {
     }
 
     let mut out = Vec::new();
-    for &root_id in &app_state.room_tree.roots {
-        walk(app_state, source, root_id, 0, &mut out);
-    }
+    walk(app_state, source, ROOT_ROOM_UUID, 0, &mut out);
     out
 }
 

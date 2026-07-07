@@ -332,8 +332,14 @@ async fn main() -> Result<()> {
         // re-pushed pending_registrations above are all in place before this
         // event is processed, so the reconcile skip rules see the right state.
         let server_state = proto::ServerState {
-            rooms: std::mem::take(&mut rumble_conn.rooms),
-            users: std::mem::take(&mut rumble_conn.users),
+            rooms: std::mem::take(&mut rumble_conn.rooms)
+                .iter()
+                .map(|r| r.to_proto())
+                .collect(),
+            users: std::mem::take(&mut rumble_conn.users)
+                .iter()
+                .map(|u| u.to_proto())
+                .collect(),
             groups: Vec::new(),
             slash_commands: Vec::new(),
         };

@@ -77,10 +77,7 @@ impl UserAudioModal {
     /// Returns `None` when the user id isn't in the current state
     /// (e.g. they disconnected between menu-open and click).
     pub fn open_for(app_state: &State, user_id: u64) -> Option<Self> {
-        let user = app_state
-            .users
-            .iter()
-            .find(|u| u.user_id.as_ref().map(|i| i.value) == Some(user_id))?;
+        let user = app_state.users.iter().find(|u| u.user_id == user_id)?;
         let config = app_state.audio.per_user_rx.get(&user_id).cloned().unwrap_or_default();
         Some(Self {
             user_id,

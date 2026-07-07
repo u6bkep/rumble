@@ -27,8 +27,8 @@ use damascene_core::prelude::*;
 use base64::Engine as _;
 use rumble_client::{Command, State};
 use rumble_protocol::{
+    Group, RegisteredUser,
     permissions::{ALL_ROOM_SCOPED, ALL_SERVER_SCOPED, Permissions},
-    proto::{GroupInfo, RegisteredUserInfo},
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -159,7 +159,7 @@ fn format_expiry(expires_at: u64, now: u64) -> Option<String> {
 /// identities). The roster is the single source of truth — group membership is
 /// keyed by long-term public key, so connected-but-unregistered users can't be
 /// members anyway.
-fn group_members<'a>(app_state: &'a State, group: &str) -> Vec<&'a RegisteredUserInfo> {
+fn group_members<'a>(app_state: &'a State, group: &str) -> Vec<&'a RegisteredUser> {
     app_state
         .registered_users
         .iter()
@@ -168,11 +168,11 @@ fn group_members<'a>(app_state: &'a State, group: &str) -> Vec<&'a RegisteredUse
 }
 
 /// Expiry of `user`'s membership in `group` (0 = permanent / not a member).
-fn membership_expiry(user: &RegisteredUserInfo, group: &str) -> u64 {
+fn membership_expiry(user: &RegisteredUser, group: &str) -> u64 {
     user.groups
         .iter()
         .find(|m| m.group == group)
-        .map(|m| m.expires_at)
+        .and_then(|m| m.expires_at)
         .unwrap_or(0)
 }
 
@@ -538,7 +538,7 @@ fn render_header(state: &AdminState, selection: &Selection) -> El {
 
 fn render_group_list(state: &AdminState, app_state: &State, selection: &Selection) -> El {
     let query = state.search_query.trim().to_lowercase();
-    let groups: Vec<&GroupInfo> = filtered_groups(&app_state.group_definitions, &app_state.registered_users, &query);
+    let groups: Vec<&Group> = filtered_groups(&app_state.group_definitions, &app_state.registered_users, &query);
 
     if groups.is_empty() {
         return paragraph(if query.is_empty() {
@@ -570,7 +570,7 @@ fn render_group_list(state: &AdminState, app_state: &State, selection: &Selectio
     accordion(items)
 }
 
-fn filtered_groups<'a>(groups: &'a [GroupInfo], users: &[RegisteredUserInfo], query: &str) -> Vec<&'a GroupInfo> {
+fn filtered_groups<'a>(groups: &'a [Group], users: &[RegisteredUser], query: &str) -> Vec<&'a Group> {
     if query.is_empty() {
         return groups.iter().collect();
     }
@@ -606,7 +606,7 @@ fn render_group_card(
     state: &AdminState,
     app_state: &State,
     selection: &Selection,
-    group: &GroupInfo,
+    group: &Group,
     open: bool,
     used_in_rooms: usize,
 ) -> El {
@@ -636,9 +636,9 @@ fn render_group_card(
 }
 
 fn render_group_header(
-    group: &GroupInfo,
+    group: &Group,
     perms: Permissions,
-    members: &[&RegisteredUserInfo],
+    members: &[&RegisteredUser],
     is_builtin: bool,
     open: bool,
 ) -> El {
@@ -688,9 +688,9 @@ fn render_members_section(
     _state: &AdminState,
     _app_state: &State,
     _selection: &Selection,
-    group: &GroupInfo,
+    group: &Group,
     is_builtin: bool,
-    members: &[&RegisteredUserInfo],
+    members: &[&RegisteredUser],
 ) -> El {
     let now = now_secs();
     let mut chips: Vec<El> = members
@@ -785,7 +785,7 @@ fn chip(username: &str, public_key: &[u8], group: &str, is_builtin: bool, online
 // Base permissions
 // ============================================================
 
-fn render_base_perms_section(group: &GroupInfo, perms: Permissions, _is_builtin: bool) -> El {
+fn render_base_perms_section(group: &Group, perms: Permissions, _is_builtin: bool) -> El {
     let all_bits = (ALL_ROOM_SCOPED | ALL_SERVER_SCOPED).bits();
     let everything_on = (perms.bits() & all_bits) == all_bits;
 
@@ -867,7 +867,7 @@ fn render_add_user_popover(popover_state: &AddUserPopover, app_state: &State, se
     let query = popover_state.query.trim().to_lowercase();
     // Candidates are registered identities (incl. offline) not already in the
     // group — membership is keyed by long-term public key.
-    let mut candidates: Vec<&RegisteredUserInfo> = app_state
+    let mut candidates: Vec<&RegisteredUser> = app_state
         .registered_users
         .iter()
         .filter(|u| !u.groups.iter().any(|m| m.group == *group))

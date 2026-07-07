@@ -76,9 +76,8 @@ pub fn parse_chat(raw: &str, app_state: &State) -> Vec<Command> {
                 }
                 match app_state.users.iter().find(|u| u.username == target_name) {
                     Some(user) => {
-                        let uid = user.user_id.as_ref().map(|id| id.value).unwrap_or(0);
                         vec![Command::SendDirectMessage {
-                            target_user_id: uid,
+                            target_user_id: user.user_id,
                             target_username: target_name.to_string(),
                             text: body.to_string(),
                         }]

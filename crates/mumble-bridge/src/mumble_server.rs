@@ -213,13 +213,10 @@ async fn mumble_auth_handshake(
         // (via the reverse virtual-user map) because they are handled by the
         // same-name takeover below and their roster entry only disappears
         // asynchronously, once the UnregisterParticipant lands.
-        let rumble_taken = state.rumble_users.iter().any(|u| {
-            u.username == username
-                && !u
-                    .user_id
-                    .as_ref()
-                    .is_some_and(|id| state.reverse_virtual_user_map.contains_key(&id.value))
-        });
+        let rumble_taken = state
+            .rumble_users
+            .iter()
+            .any(|u| u.username == username && !state.reverse_virtual_user_map.contains_key(&u.user_id));
         if rumble_taken {
             None
         } else {
@@ -310,24 +307,15 @@ pub(crate) fn build_channel_states(state: &mut BridgeState) -> Vec<mumble::Chann
 
     // First pass: assign Mumble IDs and build a parent->children map
     let mut children_of: HashMap<uuid::Uuid, Vec<usize>> = HashMap::new();
-    let mut room_uuids: Vec<Option<uuid::Uuid>> = Vec::new();
+    let mut room_uuids: Vec<uuid::Uuid> = Vec::new();
 
     for (idx, room) in state.rumble_rooms.iter().enumerate() {
-        let uuid = room.id.as_ref().and_then(rumble_protocol::uuid_from_room_id);
-        room_uuids.push(uuid);
-        if let Some(uuid) = uuid {
-            // Ensure channel IDs are assigned
-            state.channels.get_or_insert(uuid);
+        room_uuids.push(room.id);
+        // Ensure channel IDs are assigned
+        state.channels.get_or_insert(room.id);
 
-            let parent_uuid = room
-                .parent_id
-                .as_ref()
-                .and_then(rumble_protocol::uuid_from_room_id)
-                .unwrap_or(rumble_protocol::ROOT_ROOM_UUID);
-
-            if uuid != rumble_protocol::ROOT_ROOM_UUID {
-                children_of.entry(parent_uuid).or_default().push(idx);
-            }
+        if room.id != rumble_protocol::ROOT_ROOM_UUID {
+            children_of.entry(room.parent).or_default().push(idx);
         }
     }
 
@@ -336,9 +324,7 @@ pub(crate) fn build_channel_states(state: &mut BridgeState) -> Vec<mumble::Chann
     let mut queue = VecDeque::new();
 
     // Find the root room index
-    let root_idx = room_uuids
-        .iter()
-        .position(|u| *u == Some(rumble_protocol::ROOT_ROOM_UUID));
+    let root_idx = room_uuids.iter().position(|u| *u == rumble_protocol::ROOT_ROOM_UUID);
 
     if let Some(root_idx) = root_idx {
         queue.push_back(root_idx);
@@ -360,21 +346,13 @@ pub(crate) fn build_channel_states(state: &mut BridgeState) -> Vec<mumble::Chann
 
     while let Some(idx) = queue.pop_front() {
         let room = &state.rumble_rooms[idx];
-        let uuid = match room_uuids[idx] {
-            Some(u) => u,
-            None => continue,
-        };
+        let uuid = room_uuids[idx];
 
         let channel_id = state.channels.get_or_insert(uuid);
         let parent = if uuid == rumble_protocol::ROOT_ROOM_UUID {
             None
         } else {
-            let parent_uuid = room
-                .parent_id
-                .as_ref()
-                .and_then(rumble_protocol::uuid_from_room_id)
-                .unwrap_or(rumble_protocol::ROOT_ROOM_UUID);
-            Some(state.channels.get_or_insert(parent_uuid))
+            Some(state.channels.get_or_insert(room.parent))
         };
 
         channels.push(mumble::ChannelState {
@@ -401,7 +379,7 @@ pub(crate) fn build_user_states(state: &BridgeState, exclude_session: u32) -> Ve
     let mut users = Vec::new();
 
     for user in &state.rumble_users {
-        let rumble_id = user.user_id.as_ref().map(|id| id.value).unwrap_or(0);
+        let rumble_id = user.user_id;
 
         // Skip the bridge's own user
         if Some(rumble_id) == state.bridge_user_id {
@@ -410,11 +388,7 @@ pub(crate) fn build_user_states(state: &BridgeState, exclude_session: u32) -> Ve
 
         let session = state.users.get_mumble_session(rumble_id);
         if let Some(session) = session {
-            let channel_id = user
-                .current_room
-                .as_ref()
-                .and_then(rumble_protocol::uuid_from_room_id)
-                .and_then(|uuid| state.channels.get_mumble_id(&uuid));
+            let channel_id = state.channels.get_mumble_id(&user.current_room);
 
             users.push(mumble::UserState {
                 session: Some(session),

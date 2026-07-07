@@ -144,9 +144,9 @@ pub struct BridgeState {
     /// Next Mumble session ID for local Mumble clients.
     pub next_mumble_session: u32,
     /// Cached Rumble rooms (from latest ServerState/StateUpdate).
-    pub rumble_rooms: Vec<rumble_protocol::proto::RoomInfo>,
+    pub rumble_rooms: Vec<rumble_protocol::Room>,
     /// Cached Rumble users (from latest ServerState/StateUpdate).
-    pub rumble_users: Vec<rumble_protocol::proto::User>,
+    pub rumble_users: Vec<rumble_protocol::User>,
     /// Our bridge user ID on the Rumble server.
     pub bridge_user_id: Option<u64>,
     /// Whether we are connected to the Rumble server.
