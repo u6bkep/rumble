@@ -134,8 +134,13 @@ fn bench_state_sync(c: &mut Criterion) {
         let state = populated_state(&rt, users, rooms);
         let proto = rt.block_on(async {
             ProtoServerState {
-                rooms: state.get_rooms().await,
-                users: state.build_user_list().await,
+                rooms: state
+                    .get_rooms()
+                    .await
+                    .iter()
+                    .map(server::state::room_to_wire)
+                    .collect(),
+                users: state.build_user_list().await.iter().map(|u| u.to_proto()).collect(),
                 groups: vec![],
                 slash_commands: vec![],
             }
@@ -161,7 +166,7 @@ fn bench_acl_eval(c: &mut Criterion) {
         let leaf = rt.block_on(async {
             let mut parent = ROOT_ROOM_UUID;
             for i in 0..depth.saturating_sub(1) {
-                parent = state.create_room_with_parent(format!("r{i}"), Some(parent)).await;
+                parent = state.create_room_with_parent(format!("r{i}"), parent).await;
             }
             parent
         });

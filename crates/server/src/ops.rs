@@ -279,8 +279,11 @@ pub(crate) async fn apply_create_room(
         return Err("Parent room does not exist".to_string());
     }
 
+    // Top-level rooms parent to Root; resolve the wire-optional default once,
+    // here at the boundary, before handing plain Uuids inward.
+    let parent = parent_uuid.unwrap_or(rumble_protocol::ROOT_ROOM_UUID);
     let room_uuid = state
-        .create_room_with_parent_desc(name.clone(), parent_uuid, description.clone())
+        .create_room_with_parent_desc(name.clone(), parent, description.clone())
         .await;
 
     {
@@ -296,10 +299,13 @@ pub(crate) async fn apply_create_room(
         }
     }
 
-    let room_info = proto::RoomInfo {
-        id: Some(room_id_from_uuid(room_uuid)),
+    // Serialize the created room through the single room→wire boundary so the
+    // RoomCreated broadcast encodes parent identically to the full-state path
+    // (top-level ⇒ absent parent), keeping the incremental hash in agreement.
+    let room = rumble_protocol::Room {
+        id: room_uuid,
         name,
-        parent_id: parent_uuid.map(room_id_from_uuid),
+        parent,
         description,
         inherit_acl: true,
         acls: vec![],
@@ -307,7 +313,9 @@ pub(crate) async fn apply_create_room(
     };
     broadcast_state_update(
         state,
-        proto::state_update::Update::RoomCreated(proto::RoomCreated { room: Some(room_info) }),
+        proto::state_update::Update::RoomCreated(proto::RoomCreated {
+            room: Some(crate::state::room_to_wire(&room)),
+        }),
     )
     .await
     .map_err(|e| format!("Failed to broadcast room creation: {e}"))?;
@@ -330,7 +338,7 @@ pub(crate) async fn apply_delete_room(
         .get_rooms()
         .await
         .iter()
-        .find(|r| r.id.as_ref().and_then(rumble_protocol::uuid_from_room_id) == Some(room_uuid))
+        .find(|r| r.id == room_uuid)
         .map(|r| r.name.clone())
         .unwrap_or_else(|| "room".to_string());
 
@@ -341,8 +349,9 @@ pub(crate) async fn apply_delete_room(
     // orphaned with a dangling parent_id. Each child is reparented as its own
     // move+persist+broadcast step — mirroring the MoveRoom handler — so the
     // per-step incremental state hash stays correct.
-    if let Some((parent, children)) = state.room_parent_and_children(room_uuid).await {
-        let new_parent = parent.unwrap_or(rumble_protocol::ROOT_ROOM_UUID);
+    if let Some((new_parent, children)) = state.room_parent_and_children(room_uuid).await {
+        // `new_parent` is already Root for a top-level room (domain rooms carry
+        // a real parent), so children reparent to the deleted room's parent.
         for child in children {
             state.move_room(child, new_parent).await;
 
@@ -847,8 +856,14 @@ pub(crate) async fn apply_set_room_acl(
 
     // Apply in-memory first; set_room_acl returns false if the room doesn't
     // exist. Bail before persisting/broadcasting so we don't leave a garbage
-    // sled ACL record and announce an ACL for a room no client has.
-    if !state.set_room_acl(room_uuid, inherit_acl, entries.clone()).await {
+    // sled ACL record and announce an ACL for a room no client has. The
+    // in-memory mirror holds domain ACL entries; convert at this wire boundary.
+    let domain_entries: Vec<rumble_protocol::RoomAclEntry> = entries
+        .iter()
+        .cloned()
+        .map(rumble_protocol::RoomAclEntry::from)
+        .collect();
+    if !state.set_room_acl(room_uuid, inherit_acl, domain_entries).await {
         return Err("Room not found".to_string());
     }
 
@@ -944,8 +959,7 @@ mod tests {
         assert!(!state.room_exists(mid).await, "deleted room is gone");
         let (child_parent, _) = state.room_parent_and_children(child).await.unwrap();
         assert_eq!(
-            child_parent,
-            Some(parent),
+            child_parent, parent,
             "child must be reparented to the grandparent, not orphaned under the deleted room"
         );
 
@@ -971,7 +985,7 @@ mod tests {
         apply_delete_room(&state, &persist, top).await.unwrap();
 
         let (child_parent, _) = state.room_parent_and_children(child).await.unwrap();
-        assert_eq!(child_parent, Some(ROOT_ROOM_UUID), "child falls back to Root");
+        assert_eq!(child_parent, ROOT_ROOM_UUID, "child falls back to Root");
     }
 
     /// Creating a room under a non-existent parent is rejected, not persisted as

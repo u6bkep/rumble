@@ -3,20 +3,17 @@
 
 use super::{ApiResult, WebState, auth::Admin};
 use axum::{Json, extract::State};
-use rumble_protocol::uuid_from_room_id;
+use rumble_protocol::{ROOT_ROOM_UUID, Room};
 use rumble_web_types::{AclEntryDto, GroupDto, RegisteredUserDto, RoomDto, StateSnapshot, UserDto};
 use std::{collections::HashSet, sync::atomic::Ordering};
 
 const BUILTIN_GROUPS: [&str; 2] = ["default", "admin"];
 
-/// Render a proto room into a wire DTO, including its ACL entries.
-fn room_dto(r: &rumble_protocol::proto::RoomInfo) -> RoomDto {
-    let id =
-        r.id.as_ref()
-            .and_then(uuid_from_room_id)
-            .map(|u| u.to_string())
-            .unwrap_or_default();
-    let parent_id = r.parent_id.as_ref().and_then(uuid_from_room_id).map(|u| u.to_string());
+/// Render a domain room into a wire DTO, including its ACL entries.
+fn room_dto(r: &Room) -> RoomDto {
+    // A top-level room parents to Root; surface that as no parent (the DTO's
+    // `parent_id` is optional), matching the pre-domain wire behavior.
+    let parent_id = (r.parent != ROOT_ROOM_UUID).then(|| r.parent.to_string());
     let acls = r
         .acls
         .iter()
@@ -28,17 +25,18 @@ fn room_dto(r: &rumble_protocol::proto::RoomInfo) -> RoomDto {
             apply_subs: e.apply_subs,
         })
         .collect();
+    // Optimistic-concurrency token the ACL editor echoes back on save. Computed
+    // from the same values the DTO carries via the room's wire encoding, so what
+    // the editor loads is exactly what the version covers.
+    let acl_version = rumble_protocol::room_acl_version(r.inherit_acl, &r.to_proto().acls);
     RoomDto {
-        id,
+        id: r.id.to_string(),
         name: r.name.clone(),
         parent_id,
         description: r.description.clone(),
         inherit_acl: r.inherit_acl,
         acls,
-        // Optimistic-concurrency token the ACL editor echoes back on save.
-        // Computed from the same hydrated values the DTO carries, so what the
-        // editor loads is exactly what the version covers.
-        acl_version: rumble_protocol::room_acl_version(r.inherit_acl, &r.acls),
+        acl_version,
     }
 }
 

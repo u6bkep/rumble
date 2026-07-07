@@ -609,10 +609,7 @@ async fn handle_authenticate(
                 let last_uuid = uuid::Uuid::from_bytes(last_room_bytes);
                 // Check if the room still exists
                 let rooms = state.get_rooms().await;
-                if rooms
-                    .iter()
-                    .any(|r| r.id.as_ref().and_then(uuid_from_room_id) == Some(last_uuid))
-                {
+                if rooms.iter().any(|r| r.id == last_uuid) {
                     info!(user_id = sender.user_id, room = %last_uuid, "Restoring user to last room");
                     last_uuid
                 } else {
@@ -969,18 +966,11 @@ async fn collect_descendant_rooms(state: &ServerState, root: uuid::Uuid) -> std:
     // message from Root really does reach every room.
     let mut children_map: std::collections::HashMap<uuid::Uuid, Vec<uuid::Uuid>> = std::collections::HashMap::new();
     for room in &rooms {
-        let Some(rid) = room.id.as_ref().and_then(uuid_from_room_id) else {
-            continue;
-        };
-        if rid == ROOT_ROOM_UUID {
+        if room.id == ROOT_ROOM_UUID {
             continue;
         }
-        let pid = room
-            .parent_id
-            .as_ref()
-            .and_then(uuid_from_room_id)
-            .unwrap_or(ROOT_ROOM_UUID);
-        children_map.entry(pid).or_default().push(rid);
+        // Top-level rooms parent to Root; `parent` is already Root for them.
+        children_map.entry(room.parent).or_default().push(room.id);
     }
 
     // BFS from root; the visited (insert) check doubles as a guard against
@@ -1091,9 +1081,7 @@ async fn handle_join_room(
 
     // Check if room exists
     let rooms = state.get_rooms().await;
-    let room = rooms
-        .iter()
-        .find(|r| r.id.as_ref().and_then(uuid_from_room_id) == Some(new_room_uuid));
+    let room = rooms.iter().find(|r| r.id == new_room_uuid);
 
     let room_name = match room {
         Some(r) => r.name.clone(),
@@ -1247,7 +1235,7 @@ async fn handle_rename_room(
         .get_rooms()
         .await
         .iter()
-        .find(|r| r.id.as_ref().and_then(uuid_from_room_id) == Some(room_uuid))
+        .find(|r| r.id == room_uuid)
         .map(|r| r.name.clone())
         .unwrap_or_else(|| "room".to_string());
 
@@ -1331,7 +1319,7 @@ async fn handle_move_room(
         .get_rooms()
         .await
         .iter()
-        .find(|r| r.id.as_ref().and_then(uuid_from_room_id) == Some(room_uuid))
+        .find(|r| r.id == room_uuid)
         .map(|r| r.name.clone())
         .unwrap_or_else(|| "room".to_string());
 
@@ -1339,7 +1327,7 @@ async fn handle_move_room(
         .get_rooms()
         .await
         .iter()
-        .find(|r| r.id.as_ref().and_then(uuid_from_room_id) == Some(new_parent_uuid))
+        .find(|r| r.id == new_parent_uuid)
         .map(|r| r.name.clone())
         .unwrap_or_else(|| "Root".to_string());
 
@@ -1351,11 +1339,15 @@ async fn handle_move_room(
     }
     {
         let rooms = state.get_rooms().await;
+        // A top-level room parents to Root; treat that as "no further parent" so
+        // the upward walk terminates (Root self-parents, which would otherwise
+        // spin until the step bound).
         let parent_of = |uuid: Uuid| -> Option<Uuid> {
             rooms
                 .iter()
-                .find(|r| r.id.as_ref().and_then(uuid_from_room_id) == Some(uuid))
-                .and_then(|r| r.parent_id.as_ref().and_then(uuid_from_room_id))
+                .find(|r| r.id == uuid)
+                .map(|r| r.parent)
+                .filter(|p| *p != ROOT_ROOM_UUID)
         };
         // Walk up from the new parent; if we reach the room being moved, the
         // move would close a cycle. Bound the walk by room count as a guard
@@ -1551,7 +1543,7 @@ async fn send_server_state_to_client(
     // the `set_room_acl` write-through) — the same complete room list the
     // incremental `broadcast_state_update` hashes, so the two hashes agree.
     let mut rooms = state.get_rooms().await;
-    let users = state.build_user_list().await;
+    let users: Vec<proto::User> = state.build_user_list().await.iter().map(|u| u.to_proto()).collect();
 
     // Build group definitions for client-side ACL evaluation
     let groups: Vec<proto::GroupInfo> = {
@@ -1567,9 +1559,11 @@ async fn send_server_state_to_client(
             .collect()
     };
 
-    // Build the ServerState message (without per-client effective_permissions for hash)
+    // Build the ServerState message (without per-client effective_permissions
+    // for hash). Rooms from `get_rooms()` carry `effective_permissions == 0`, so
+    // the hash sees the zeroed values regardless of the receiving client.
     let server_state_for_hash = ProtoServerState {
-        rooms: rooms.clone(),
+        rooms: rooms.iter().map(crate::state::room_to_wire).collect(),
         users: users.clone(),
         groups: groups.clone(),
         slash_commands: vec![], // excluded from the hash anyway
@@ -1578,18 +1572,17 @@ async fn send_server_state_to_client(
     // Compute the state hash BEFORE setting per-client effective_permissions
     let state_hash = compute_server_state_hash(&server_state_for_hash);
 
-    // Now compute per-room effective permissions for this specific client
+    // Now compute per-room effective permissions for this specific client, on
+    // the domain rooms (id is a plain Uuid), then serialize once for the wire.
     for room in &mut rooms {
-        if let Some(room_uuid) = room.id.as_ref().and_then(uuid_from_room_id) {
-            let perms = acl::evaluate_user_permissions(state, client, room_uuid, persistence).await;
-            room.effective_permissions = perms.bits();
-        }
+        let perms = acl::evaluate_user_permissions(state, client, room.id, persistence).await;
+        room.effective_permissions = perms.bits();
     }
 
     // Build the actual message with effective_permissions set. Slash commands
     // ride along so clients can discover them for autocomplete.
     let server_state = ProtoServerState {
-        rooms,
+        rooms: rooms.iter().map(crate::state::room_to_wire).collect(),
         users,
         groups,
         slash_commands: state.slash_commands(),
@@ -1690,8 +1683,8 @@ pub async fn broadcast_server_state(state: &Arc<ServerState>, persistence: &Arc<
 /// If there's a mismatch, the client will request a full resync.
 pub async fn broadcast_state_update(state: &Arc<ServerState>, update: proto::state_update::Update) -> Result<()> {
     // First, compute what the state hash should be after this update
-    let rooms = state.get_rooms().await;
-    let users = state.build_user_list().await;
+    let rooms = state.get_rooms().await.iter().map(crate::state::room_to_wire).collect();
+    let users = state.build_user_list().await.iter().map(|u| u.to_proto()).collect();
     let server_state = ProtoServerState {
         rooms,
         users,
@@ -2509,15 +2502,20 @@ async fn handle_request_registered_users(
                 .into_iter()
                 .map(|g| {
                     let expires_at = persistence.get_group_expiry(&key, &g);
-                    proto::GroupMembership { group: g, expires_at }
+                    // Domain makes the `0 == permanent` wire sentinel explicit.
+                    rumble_protocol::GroupMembership {
+                        group: g,
+                        expires_at: (expires_at != 0).then_some(expires_at),
+                    }
                 })
                 .collect();
-            proto::RegisteredUserInfo {
-                public_key: key.to_vec(),
+            rumble_protocol::RegisteredUser {
+                public_key: key,
                 username: user.username,
                 groups,
                 online: online_keys.contains(&key),
             }
+            .to_proto()
         })
         .collect();
 
@@ -2694,10 +2692,7 @@ pub(crate) async fn remove_participant(state: &Arc<ServerState>, user_id: u64) -
 /// an already-present participant emits `UserMoved`.
 pub(crate) async fn move_participant_to_room(state: &Arc<ServerState>, user_id: u64, room_uuid: Uuid) -> Result<bool> {
     let rooms = state.get_rooms().await;
-    if !rooms
-        .iter()
-        .any(|r| r.id.as_ref().and_then(uuid_from_room_id) == Some(room_uuid))
-    {
+    if !rooms.iter().any(|r| r.id == room_uuid) {
         return Ok(false);
     }
     let was_present = state.get_user_room(user_id).await.is_some();
@@ -3062,7 +3057,7 @@ mod tests {
     async fn tree_descendants_cover_root_level_and_nested_rooms() {
         let state = ServerState::new();
         let a = state.create_room("a".to_string()).await; // directly under Root
-        let b = state.create_room_with_parent("b".to_string(), Some(a)).await;
+        let b = state.create_room_with_parent("b".to_string(), a).await;
 
         let from_root = collect_descendant_rooms(&state, ROOT_ROOM_UUID).await;
         assert!(from_root.contains(&ROOT_ROOM_UUID));
@@ -3081,7 +3076,7 @@ mod tests {
     async fn tree_descendants_terminate_on_parent_cycle() {
         let state = ServerState::new();
         let a = state.create_room("a".to_string()).await;
-        let b = state.create_room_with_parent("b".to_string(), Some(a)).await;
+        let b = state.create_room_with_parent("b".to_string(), a).await;
         assert!(state.move_room(a, b).await); // a <-> b parent cycle
 
         let set = collect_descendant_rooms(&state, a).await;

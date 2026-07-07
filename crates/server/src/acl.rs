@@ -128,7 +128,9 @@ async fn build_room_chain_owned(
     target: Uuid,
     persist: &Persistence,
 ) -> Vec<(Uuid, Option<RoomAclData>)> {
-    // Build the path from target to root by walking parent links
+    // Build the path from target to root by walking parent links. Domain rooms
+    // carry a plain `parent` Uuid; top-level rooms parent to Root (nil), so the
+    // walk terminates when `current` reaches nil.
     let rooms = state.get_rooms().await;
     let mut path = Vec::new();
     let mut current = target;
@@ -138,25 +140,24 @@ async fn build_room_chain_owned(
         if current == Uuid::nil() {
             break;
         }
-        // Find parent of current room
-        let parent = rooms.iter().find_map(|r| {
-            let rid = r.id.as_ref().and_then(rumble_protocol::uuid_from_room_id)?;
-            if rid == current {
-                r.parent_id.as_ref().and_then(rumble_protocol::uuid_from_room_id)
-            } else {
-                None
-            }
-        });
-        match parent {
-            Some(parent_uuid) => current = parent_uuid,
+        match rooms.iter().find(|r| r.id == current) {
+            Some(r) => current = r.parent,
+            // Dangling parent link (corrupt/missing room): stop walking. The
+            // defensive root-insert below still yields a safe chain.
             None => break,
+        }
+        // Bound the walk against a malformed parent-link cycle in stored data,
+        // so a corrupt tree still evaluates instead of hanging.
+        if path.len() > rooms.len() + 1 {
+            break;
         }
     }
 
     // Reverse to get root-to-target order
     path.reverse();
 
-    // Ensure root is in the chain
+    // Ensure root heads the chain. Dead for well-formed data (the walk always
+    // reaches nil), but keeps a corrupt/dangling chain evaluating from Root.
     if path.first() != Some(&Uuid::nil()) {
         path.insert(0, Uuid::nil());
     }
@@ -298,10 +299,8 @@ mod tests {
         let persist = persistence_with_default();
         grant_at_root(&persist, "default", Permissions::MUTE_DEAFEN, true);
 
-        let child = state
-            .create_room_with_parent("child".into(), Some(ROOT_ROOM_UUID))
-            .await;
-        let grandchild = state.create_room_with_parent("grandchild".into(), Some(child)).await;
+        let child = state.create_room_with_parent("child".into(), ROOT_ROOM_UUID).await;
+        let grandchild = state.create_room_with_parent("grandchild".into(), child).await;
 
         let m = member(1, "anon", None, &[]);
         let perms = evaluate_member_permissions(&state, &m, grandchild, &persist).await;

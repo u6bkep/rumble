@@ -18,11 +18,7 @@
 
 use dashmap::DashMap;
 use quinn::Connection;
-use rumble_protocol::{
-    ROOT_ROOM_UUID,
-    proto::{RoomInfo, User, UserId},
-    room_id_from_uuid, root_room_id, uuid_from_room_id,
-};
+use rumble_protocol::{ROOT_ROOM_UUID, Room, RoomAclEntry, User, proto};
 use std::sync::{
     Arc, OnceLock,
     atomic::{AtomicU64, Ordering},
@@ -330,8 +326,9 @@ pub struct UserStatus {
 /// This consolidates rooms and memberships to avoid nested lock acquisition.
 #[derive(Debug, Clone)]
 pub struct StateData {
-    /// Room definitions. The Root room always has UUID 0.
-    pub rooms: Vec<RoomInfo>,
+    /// Room definitions, held as domain [`Room`] values (prost types appear only
+    /// at the wire edge). The Root room is UUID 0 and self-parents.
+    pub rooms: Vec<Room>,
     /// Mapping of user_id to room UUID for room membership.
     pub memberships: Vec<(u64 /* user_id */, Uuid /* room_uuid */)>,
     /// Mapping of user_id to mute/deafen status.
@@ -341,10 +338,11 @@ pub struct StateData {
 impl StateData {
     fn new() -> Self {
         Self {
-            rooms: vec![RoomInfo {
-                id: Some(root_room_id()),
+            rooms: vec![Room {
+                id: ROOT_ROOM_UUID,
                 name: "Root".to_string(),
-                parent_id: None,
+                // Root self-parents (see the domain-type invariant).
+                parent: ROOT_ROOM_UUID,
                 description: None,
                 inherit_acl: true,
                 acls: vec![],
@@ -372,6 +370,25 @@ impl StateData {
 /// Re-exports the canonical hash function from the rumble-protocol crate.
 pub fn compute_server_state_hash(server_state: &rumble_protocol::proto::ServerState) -> Vec<u8> {
     rumble_protocol::compute_server_state_hash(server_state)
+}
+
+/// Convert a domain [`Room`] to its wire [`proto::RoomInfo`], preserving the
+/// legacy encoding where a top-level room (`parent == ROOT_ROOM_UUID`, which
+/// includes Root itself) is serialized with an **absent** `parent_id` rather
+/// than an explicit nil one.
+///
+/// The BLAKE3 state hash is computed over these bytes. The domain
+/// [`Room::to_proto`] emits `Some(nil)` for a Root-parented room, which would
+/// flip the hash input for every existing deployment (Root and every top-level
+/// room previously serialized `parent_id` as absent). Readers already treat
+/// absent and nil parent identically, so nulling it here is purely
+/// hash-preserving. This is the single server-side room→wire boundary.
+pub fn room_to_wire(room: &Room) -> proto::RoomInfo {
+    let mut info = room.to_proto();
+    if room.parent == ROOT_ROOM_UUID {
+        info.parent_id = None;
+    }
+    info
 }
 
 /// Pending authentication state for a client.
@@ -790,12 +807,13 @@ impl ServerState {
     /// Add a room with a specific UUID (for loading from persistence).
     /// Returns false if a room with that UUID already exists.
     pub async fn add_room_with_uuid(&self, uuid: Uuid, name: String) -> bool {
-        self.add_room_with_uuid_and_parent(uuid, name, None).await
+        self.add_room_with_uuid_and_parent(uuid, name, ROOT_ROOM_UUID).await
     }
 
     /// Add a room with a specific UUID and parent (for loading from persistence).
-    /// Returns false if a room with that UUID already exists.
-    pub async fn add_room_with_uuid_and_parent(&self, uuid: Uuid, name: String, parent: Option<Uuid>) -> bool {
+    /// Returns false if a room with that UUID already exists. A top-level room
+    /// passes `ROOT_ROOM_UUID` as its parent.
+    pub async fn add_room_with_uuid_and_parent(&self, uuid: Uuid, name: String, parent: Uuid) -> bool {
         self.add_room_with_uuid_and_parent_desc(uuid, name, parent, None).await
     }
 
@@ -805,22 +823,18 @@ impl ServerState {
         &self,
         uuid: Uuid,
         name: String,
-        parent: Option<Uuid>,
+        parent: Uuid,
         description: Option<String>,
     ) -> bool {
         let mut data = self.state_data.write().await;
         // Check if room already exists
-        let exists = data
-            .rooms
-            .iter()
-            .any(|r| r.id.as_ref().and_then(uuid_from_room_id) == Some(uuid));
-        if exists {
+        if data.rooms.iter().any(|r| r.id == uuid) {
             return false;
         }
-        data.rooms.push(RoomInfo {
-            id: Some(room_id_from_uuid(uuid)),
+        data.rooms.push(Room {
+            id: uuid,
             name,
-            parent_id: parent.map(room_id_from_uuid),
+            parent,
             description,
             inherit_acl: true,
             acls: vec![],
@@ -831,27 +845,23 @@ impl ServerState {
 
     /// Create a new room and return its UUID.
     pub async fn create_room(&self, name: String) -> Uuid {
-        self.create_room_with_parent(name, None).await
+        self.create_room_with_parent(name, ROOT_ROOM_UUID).await
     }
 
-    /// Create a new room with a parent and return its UUID.
-    pub async fn create_room_with_parent(&self, name: String, parent: Option<Uuid>) -> Uuid {
+    /// Create a new room with a parent and return its UUID. A top-level room
+    /// passes `ROOT_ROOM_UUID` as its parent.
+    pub async fn create_room_with_parent(&self, name: String, parent: Uuid) -> Uuid {
         self.create_room_with_parent_desc(name, parent, None).await
     }
 
     /// Create a new room with a parent and description, returning its UUID.
-    pub async fn create_room_with_parent_desc(
-        &self,
-        name: String,
-        parent: Option<Uuid>,
-        description: Option<String>,
-    ) -> Uuid {
+    pub async fn create_room_with_parent_desc(&self, name: String, parent: Uuid, description: Option<String>) -> Uuid {
         let mut data = self.state_data.write().await;
         let new_uuid = Uuid::new_v4();
-        data.rooms.push(RoomInfo {
-            id: Some(room_id_from_uuid(new_uuid)),
+        data.rooms.push(Room {
+            id: new_uuid,
             name,
-            parent_id: parent.map(room_id_from_uuid),
+            parent,
             description,
             inherit_acl: true,
             acls: vec![],
@@ -870,8 +880,7 @@ impl ServerState {
 
         let mut data = self.state_data.write().await;
         let before_len = data.rooms.len();
-        data.rooms
-            .retain(|r| uuid_from_room_id(r.id.as_ref().unwrap_or(&root_room_id())) != Some(room_uuid));
+        data.rooms.retain(|r| r.id != room_uuid);
         let deleted = data.rooms.len() < before_len;
 
         if deleted {
@@ -890,7 +899,7 @@ impl ServerState {
     pub async fn rename_room(&self, room_uuid: Uuid, new_name: String) -> bool {
         let mut data = self.state_data.write().await;
         for r in data.rooms.iter_mut() {
-            if uuid_from_room_id(r.id.as_ref().unwrap_or(&root_room_id())) == Some(room_uuid) {
+            if r.id == room_uuid {
                 r.name = new_name;
                 return true;
             }
@@ -904,27 +913,22 @@ impl ServerState {
             return true;
         }
         let data = self.state_data.read().await;
-        data.rooms
-            .iter()
-            .any(|r| uuid_from_room_id(r.id.as_ref().unwrap_or(&root_room_id())) == Some(room_uuid))
+        data.rooms.iter().any(|r| r.id == room_uuid)
     }
 
     /// Return `(parent, direct_children)` for `room_uuid`: the room's own parent
-    /// (`None` = directly under Root) and the UUIDs of rooms whose `parent_id`
-    /// points at this room. Returns `None` if the room doesn't exist. Used by
-    /// the delete path to heal the tree (reparent children before removal).
-    pub async fn room_parent_and_children(&self, room_uuid: Uuid) -> Option<(Option<Uuid>, Vec<Uuid>)> {
+    /// (`ROOT_ROOM_UUID` = directly under Root) and the UUIDs of rooms whose
+    /// parent points at this room. Returns `None` if the room doesn't exist.
+    /// Used by the delete path to heal the tree (reparent children before
+    /// removal).
+    pub async fn room_parent_and_children(&self, room_uuid: Uuid) -> Option<(Uuid, Vec<Uuid>)> {
         let data = self.state_data.read().await;
-        let parent = data
-            .rooms
-            .iter()
-            .find(|r| uuid_from_room_id(r.id.as_ref().unwrap_or(&root_room_id())) == Some(room_uuid))
-            .map(|r| r.parent_id.as_ref().and_then(uuid_from_room_id))?;
+        let parent = data.rooms.iter().find(|r| r.id == room_uuid).map(|r| r.parent)?;
         let children = data
             .rooms
             .iter()
-            .filter(|r| r.parent_id.as_ref().and_then(uuid_from_room_id) == Some(room_uuid))
-            .filter_map(|r| uuid_from_room_id(r.id.as_ref().unwrap_or(&root_room_id())))
+            .filter(|r| r.parent == room_uuid)
+            .map(|r| r.id)
             .collect();
         Some((parent, children))
     }
@@ -933,8 +937,8 @@ impl ServerState {
     pub async fn move_room(&self, room_uuid: Uuid, new_parent_uuid: Uuid) -> bool {
         let mut data = self.state_data.write().await;
         for r in data.rooms.iter_mut() {
-            if uuid_from_room_id(r.id.as_ref().unwrap_or(&root_room_id())) == Some(room_uuid) {
-                r.parent_id = Some(room_id_from_uuid(new_parent_uuid));
+            if r.id == room_uuid {
+                r.parent = new_parent_uuid;
                 return true;
             }
         }
@@ -951,15 +955,10 @@ impl ServerState {
     /// the load-at-startup pass in `Server::load_persisted_rooms`). Persistence
     /// is durability only; nothing on the read/broadcast path consults it for
     /// ACLs anymore. Returns false if no room has `room_uuid`.
-    pub async fn set_room_acl(
-        &self,
-        room_uuid: Uuid,
-        inherit_acl: bool,
-        acls: Vec<rumble_protocol::proto::RoomAclEntry>,
-    ) -> bool {
+    pub async fn set_room_acl(&self, room_uuid: Uuid, inherit_acl: bool, acls: Vec<RoomAclEntry>) -> bool {
         let mut data = self.state_data.write().await;
         for r in data.rooms.iter_mut() {
-            if uuid_from_room_id(r.id.as_ref().unwrap_or(&root_room_id())) == Some(room_uuid) {
+            if r.id == room_uuid {
                 r.inherit_acl = inherit_acl;
                 r.acls = acls;
                 return true;
@@ -975,14 +974,12 @@ impl ServerState {
     /// Idempotent — re-running it reproduces the same in-memory state.
     pub async fn hydrate_room_acls(&self, persistence: &crate::persistence::Persistence) {
         for room in self.get_rooms().await {
-            let Some(uuid) = room.id.as_ref().and_then(uuid_from_room_id) else {
-                continue;
-            };
+            let uuid = room.id;
             if let Some(acl) = persistence.get_room_acl(uuid.as_bytes()) {
                 let entries = acl
                     .entries
                     .iter()
-                    .map(|e| rumble_protocol::proto::RoomAclEntry {
+                    .map(|e| RoomAclEntry {
                         group: e.group.clone(),
                         grant: e.grant,
                         deny: e.deny,
@@ -999,7 +996,7 @@ impl ServerState {
     pub async fn set_room_description(&self, room_uuid: Uuid, description: String) -> bool {
         let mut data = self.state_data.write().await;
         for r in data.rooms.iter_mut() {
-            if uuid_from_room_id(r.id.as_ref().unwrap_or(&root_room_id())) == Some(room_uuid) {
+            if r.id == room_uuid {
                 r.description = if description.is_empty() {
                     None
                 } else {
@@ -1011,8 +1008,8 @@ impl ServerState {
         false
     }
 
-    /// Get current room list.
-    pub async fn get_rooms(&self) -> Vec<RoomInfo> {
+    /// Get current room list as domain [`Room`] values.
+    pub async fn get_rooms(&self) -> Vec<Room> {
         self.state_data.read().await.rooms.clone()
     }
 
@@ -1073,8 +1070,8 @@ impl ServerState {
             };
 
             users.push(User {
-                user_id: Some(UserId { value: uid }),
-                current_room: Some(room_id_from_uuid(rid)),
+                user_id: uid,
+                current_room: rid,
                 username: member.identity.display_name().await,
                 is_muted: status.is_muted,
                 is_deafened: status.is_deafened,
@@ -1156,7 +1153,6 @@ impl Default for ServerState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rumble_protocol::is_root_room;
 
     /// Test that we can create server state and it has the Root room.
     #[tokio::test]
@@ -1166,7 +1162,7 @@ mod tests {
         let rooms = state.get_rooms().await;
         assert_eq!(rooms.len(), 1);
         assert_eq!(rooms[0].name, "Root");
-        assert!(is_root_room(rooms[0].id.as_ref().unwrap()));
+        assert!(rooms[0].is_root());
     }
 
     /// User ID allocation is lock-free and yields unique, increasing IDs.
@@ -1218,7 +1214,7 @@ mod tests {
         assert_eq!(rooms.len(), 2);
 
         let room = rooms.iter().find(|r| r.name == "Persisted Room").unwrap();
-        assert_eq!(uuid_from_room_id(room.id.as_ref().unwrap()), Some(specific_uuid));
+        assert_eq!(room.id, specific_uuid);
 
         // Try to add a room with the same UUID - should fail
         let added_again = state.add_room_with_uuid(specific_uuid, "Duplicate".to_string()).await;
@@ -1311,9 +1307,7 @@ mod tests {
         assert!(renamed);
 
         let rooms = state.get_rooms().await;
-        let room = rooms
-            .iter()
-            .find(|r| uuid_from_room_id(r.id.as_ref().unwrap()) == Some(room_uuid));
+        let room = rooms.iter().find(|r| r.id == room_uuid);
         assert_eq!(room.unwrap().name, "New Name");
     }
 
@@ -1437,24 +1431,21 @@ mod tests {
         state.register_participant(participant(3, "ghost", None, &[]));
 
         let mut users = state.build_user_list().await;
-        users.sort_by_key(|u| u.user_id.as_ref().unwrap().value);
+        users.sort_by_key(|u| u.user_id);
 
         assert_eq!(users.len(), 2, "only members with a room membership are listed");
 
         let alice = &users[0];
-        assert_eq!(alice.user_id.as_ref().unwrap().value, 1);
+        assert_eq!(alice.user_id, 1);
         assert_eq!(alice.username, "alice");
-        assert_eq!(alice.current_room.as_ref().and_then(uuid_from_room_id), Some(room_a));
+        assert_eq!(alice.current_room, room_a);
         assert_eq!(alice.groups, vec!["mods".to_string()]);
         assert_eq!(alice.label.as_deref(), Some("Mumble"));
         assert!(alice.is_muted && alice.server_muted && !alice.is_deafened);
 
         let bob = &users[1];
         assert_eq!(bob.username, "bob");
-        assert_eq!(
-            bob.current_room.as_ref().and_then(uuid_from_room_id),
-            Some(ROOT_ROOM_UUID)
-        );
+        assert_eq!(bob.current_room, ROOT_ROOM_UUID);
         assert!(!bob.is_muted && !bob.server_muted);
         assert!(bob.groups.is_empty());
         assert_eq!(bob.label, None);
@@ -1476,8 +1467,8 @@ mod tests {
         }
 
         let hash_now = || async {
-            let rooms = state.get_rooms().await;
-            let users = state.build_user_list().await;
+            let rooms = state.get_rooms().await.iter().map(room_to_wire).collect();
+            let users = state.build_user_list().await.iter().map(User::to_proto).collect();
             compute_server_state_hash(&rumble_protocol::proto::ServerState {
                 rooms,
                 users,
@@ -1523,10 +1514,10 @@ mod tests {
 
         // Fresh state == "just restarted": ACL fields are cold.
         let state = ServerState::new();
-        let root_of = |rooms: &[RoomInfo]| {
+        let root_of = |rooms: &[Room]| {
             rooms
                 .iter()
-                .find(|r| r.id.as_ref().and_then(uuid_from_room_id) == Some(ROOT_ROOM_UUID))
+                .find(|r| r.id == ROOT_ROOM_UUID)
                 .cloned()
                 .expect("root room present")
         };

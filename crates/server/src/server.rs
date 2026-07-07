@@ -164,8 +164,13 @@ impl Server {
                 if uuid == rumble_protocol::ROOT_ROOM_UUID {
                     continue;
                 }
-                // Convert parent bytes to UUID if present
-                let parent = room.parent.map(uuid::Uuid::from_bytes);
+                // Normalize a legacy record with a missing parent to Root (the
+                // domain model has no parentless non-root room). In-memory
+                // normalization suffices — the next save rewrites the record.
+                let parent = room
+                    .parent
+                    .map(uuid::Uuid::from_bytes)
+                    .unwrap_or(rumble_protocol::ROOT_ROOM_UUID);
                 let description = if room.description.is_empty() {
                     None
                 } else {
