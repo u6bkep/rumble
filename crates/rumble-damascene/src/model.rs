@@ -410,8 +410,8 @@ impl ModelThumbnailer {
         let scene = build_scene(model)
             .camera(CameraState::framing(model_bounds(model)))
             .framing(Framing::Manual);
-        let mut tree = chart3d(scene);
-        render_scene_to_image(runner, device, queue, &mut tree, THUMB_PX, THUMB_PX)
+        let tree = chart3d(scene);
+        render_scene_to_image(runner, device, queue, tree, THUMB_PX, THUMB_PX)
     }
 }
 
@@ -429,7 +429,7 @@ fn render_scene_to_image(
     runner: &mut Runner,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
-    tree: &mut El,
+    tree: El,
     w: u32,
     h: u32,
 ) -> Option<Image> {

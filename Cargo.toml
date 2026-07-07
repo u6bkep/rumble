@@ -42,11 +42,11 @@ rand = "0.10.0-rc.3"
 # default-features = false so per-crate consumers can opt out of bundled fonts
 # (issue #49 / e4237ca). Desktop clients re-enable default_fonts explicitly;
 # rumble-admin-web opts out of NotoColorEmoji (~10 MB) to shrink the wasm bundle.
-damascene-core = { git = "https://github.com/computer-whisperer/damascene", rev = "257edf064a276ceb0178196ece467c3aa6bfb136", default-features = false }
-damascene-markdown = { git = "https://github.com/computer-whisperer/damascene", rev = "257edf064a276ceb0178196ece467c3aa6bfb136" }
-damascene-wgpu = { git = "https://github.com/computer-whisperer/damascene", rev = "257edf064a276ceb0178196ece467c3aa6bfb136" }
-damascene-web = { git = "https://github.com/computer-whisperer/damascene", rev = "257edf064a276ceb0178196ece467c3aa6bfb136", default-features = false }
-damascene-winit-wgpu = { git = "https://github.com/computer-whisperer/damascene", rev = "257edf064a276ceb0178196ece467c3aa6bfb136" }
+damascene-core = { git = "https://github.com/computer-whisperer/damascene", rev = "45e091f778f25da95ff800e34b6f20f5b7422ed2", default-features = false }
+damascene-markdown = { git = "https://github.com/computer-whisperer/damascene", rev = "45e091f778f25da95ff800e34b6f20f5b7422ed2" }
+damascene-wgpu = { git = "https://github.com/computer-whisperer/damascene", rev = "45e091f778f25da95ff800e34b6f20f5b7422ed2" }
+damascene-web = { git = "https://github.com/computer-whisperer/damascene", rev = "45e091f778f25da95ff800e34b6f20f5b7422ed2", default-features = false }
+damascene-winit-wgpu = { git = "https://github.com/computer-whisperer/damascene", rev = "45e091f778f25da95ff800e34b6f20f5b7422ed2" }
 
 # Shared third-party deps. Per-crate feature picks live at each consumer
 # so the workspace stays neutral about what each crate actually uses;

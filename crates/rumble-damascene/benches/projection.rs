@@ -201,7 +201,7 @@ fn make_app(
 /// offset before layout, since offsets are keyed by `computed_id`.
 fn find_computed_id(el: &El, key: &str) -> Option<String> {
     if el.key.as_deref() == Some(key) {
-        return Some(el.computed_id.clone());
+        return Some(el.computed_id.to_string());
     }
     el.children.iter().find_map(|c| find_computed_id(c, key))
 }
