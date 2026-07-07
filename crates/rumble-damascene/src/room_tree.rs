@@ -246,6 +246,9 @@ pub enum RoomTreeOutcome {
     /// User picked "Send message…" on a remote user — App should prefill
     /// the chat composer with a `/msg <username> ` command and focus it.
     MessageUser { username: String },
+    /// User picked "Audio…" on a remote user — App should open the
+    /// per-user audio panel (local volume + RX pipeline override).
+    OpenUserAudio { user_id: u64 },
 }
 
 impl RoomTreeOutcome {
@@ -285,6 +288,7 @@ const KEY_USER_CTX_SELF_DEAFEN: &str = "user_ctx:self_deafen";
 const KEY_USER_CTX_SELF_UNDEAFEN: &str = "user_ctx:self_undeafen";
 const KEY_USER_CTX_MUTE_LOCAL: &str = "user_ctx:mute_local";
 const KEY_USER_CTX_UNMUTE_LOCAL: &str = "user_ctx:unmute_local";
+const KEY_USER_CTX_AUDIO: &str = "user_ctx:audio";
 const KEY_USER_CTX_SERVER_MUTE: &str = "user_ctx:server_mute";
 const KEY_USER_CTX_SERVER_UNMUTE: &str = "user_ctx:server_unmute";
 const KEY_USER_CTX_KICK: &str = "user_ctx:kick";
@@ -736,6 +740,9 @@ fn render_user_context_menu(menu: &UserContextMenu, app_state: &State) -> El {
                 KEY_USER_CTX_MUTE_LOCAL
             }),
         );
+        // Per-user audio panel (local volume + RX pipeline override).
+        // Purely local playback config, so no permission gate.
+        items.push(menu_item("Audio…").key(KEY_USER_CTX_AUDIO));
         // The server-mute item is gated on MUTE_DEAFEN. We always
         // show the row but [`handle_event`] re-checks the per-room
         // bit at click time so a stale menu can't fire SetServerMute
@@ -1080,6 +1087,7 @@ fn handle_user_context_menu_event(state: &mut RoomTreeState, event: &UiEvent) ->
                 muted: key == KEY_USER_CTX_SERVER_MUTE,
             })
         }
+        KEY_USER_CTX_AUDIO => RoomTreeOutcome::OpenUserAudio { user_id },
         KEY_USER_CTX_KICK | KEY_USER_CTX_BAN => RoomTreeOutcome::OpenKickBan {
             user_id,
             username: menu.username.clone(),

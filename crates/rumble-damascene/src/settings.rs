@@ -29,7 +29,12 @@ use serde_json::Value as JsonValue;
 use crate::{
     admin::{self, AdminOutcome, AdminState},
     identity::Identity,
+    pipeline_ui::{self, PipelineEvent, PipelineKeys},
 };
+// The card shell lives with the shared pipeline editor; re-export it
+// into this module's namespace so the tab submodules keep getting it
+// through their `use super::*` glob.
+pub(crate) use crate::pipeline_ui::section_card;
 
 mod about;
 mod chat;
@@ -153,8 +158,11 @@ pub enum OpenSelect {
     InputDevice,
     OutputDevice,
     TimestampFormat,
-    /// "Add processor" dropdown on the Processing tab.
+    /// "Add processor" dropdown for the TX section of the Processing tab.
     AddProcessor,
+    /// "Add processor" dropdown for the RX-defaults section of the
+    /// Processing tab.
+    AddRxProcessor,
     /// Function dropdown open on the shortcut entry with this id.
     ShortcutFunction(String),
     /// Data dropdown open on the shortcut entry with this id.
@@ -181,6 +189,11 @@ pub struct PendingSettings {
     // Processing — TX pipeline configuration. Seeded from
     // `state.audio.tx_pipeline` when the dialog opens.
     pub tx_pipeline: PipelineConfig,
+
+    // Processing — default RX pipeline applied to every remote user
+    // without a per-user override. Seeded from
+    // `state.audio.rx_pipeline_defaults` when the dialog opens.
+    pub rx_pipeline: PipelineConfig,
 
     // Sounds
     pub sfx_enabled: bool,
@@ -268,6 +281,7 @@ impl PendingSettings {
             voice_mode: (&audio.voice_mode).into(),
             audio: audio.settings.clone(),
             tx_pipeline: audio.tx_pipeline.clone(),
+            rx_pipeline: audio.rx_pipeline_defaults.clone(),
             keyboard: settings.keyboard.clone(),
             sfx_enabled: settings.sfx.enabled,
             sfx_volume: settings.sfx.volume,
@@ -547,15 +561,19 @@ fn shortcut_field_kind(field_path: &str) -> &str {
     field_path.split_once(':').map(|(head, _)| head).unwrap_or(field_path)
 }
 
-/// Processing-tab routed keys are built per-processor / per-field at
-/// render time; see [`proc_enabled_key`] / [`proc_field_key`]. The
-/// shared prefix lets [`handle_event`] cheaply ignore unrelated routes.
-const PROC_PREFIX: &str = "settings:proc:";
-
-/// Trigger for the "Add processor" dropdown at the bottom of the
-/// Processing tab. Not parsed by [`parse_proc_route`] — handled with
-/// `select::classify_event` like the other dropdowns.
-const KEY_PROC_ADD: &str = "settings:proc-add";
+/// Routed-key namespaces for the two pipeline editors on the
+/// Processing tab. Per-stage keys are built by the shared
+/// [`pipeline_ui`] editor; the shared prefixes let [`handle_event`]
+/// cheaply ignore unrelated routes. The TX namespace keeps its
+/// historical `settings:proc:` value.
+pub(super) const TX_PIPELINE_KEYS: PipelineKeys = PipelineKeys {
+    prefix: "settings:proc:",
+    add_key: "settings:proc-add",
+};
+pub(super) const RX_PIPELINE_KEYS: PipelineKeys = PipelineKeys {
+    prefix: "settings:rxproc:",
+    add_key: "settings:rxproc-add",
+};
 
 /// Limits clamp KB/s sliders. 5000 KB/s ≈ 5 MB/s — well above any
 /// realistic rumble file-transfer cap.
@@ -566,64 +584,6 @@ fn sfx_kind_key(idx: usize) -> String {
 }
 fn sfx_preview_key(idx: usize) -> String {
     format!("settings:sfx:preview:{idx}")
-}
-
-/// Route key for a processor's enable switch. The slot is identified by
-/// the processor's index in the pipeline rather than its `type_id` so
-/// keys stay short and the parsing in `handle_event` is a single
-/// `parse::<usize>()`. Indices are stable within a render cycle; the
-/// reorder / remove / add buttons mutate the underlying `Vec` *after*
-/// the event has been handled, so the route → index mapping in flight
-/// matches the tree that produced the event.
-fn proc_enabled_key(idx: usize) -> String {
-    format!("{PROC_PREFIX}{idx}:enabled")
-}
-
-/// Route key for one schema field of a processor. Layout:
-/// `settings:proc:<idx>:f:<field>`. The `:f:` separator avoids
-/// collisions with `enabled` / `up` / `down` / `remove` even if a
-/// schema were ever to define a field literally named one of those.
-fn proc_field_key(idx: usize, field: &str) -> String {
-    format!("{PROC_PREFIX}{idx}:f:{field}")
-}
-
-fn proc_move_up_key(idx: usize) -> String {
-    format!("{PROC_PREFIX}{idx}:up")
-}
-fn proc_move_down_key(idx: usize) -> String {
-    format!("{PROC_PREFIX}{idx}:down")
-}
-fn proc_remove_key(idx: usize) -> String {
-    format!("{PROC_PREFIX}{idx}:remove")
-}
-
-/// Per-processor route slots. Builders above produce the strings;
-/// [`parse_proc_route`] inverts them back to (idx, slot).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProcRouteSlot<'a> {
-    Enabled,
-    Field(&'a str),
-    MoveUp,
-    MoveDown,
-    Remove,
-}
-
-/// Inverse of the `proc_*_key` helpers. Returns the
-/// (processor index, slot) for routes under the processing namespace,
-/// or `None` for unrelated routes (including [`KEY_PROC_ADD`], which is
-/// matched separately).
-fn parse_proc_route(route: &str) -> Option<(usize, ProcRouteSlot<'_>)> {
-    let rest = route.strip_prefix(PROC_PREFIX)?;
-    let (idx_str, tail) = rest.split_once(':')?;
-    let idx: usize = idx_str.parse().ok()?;
-    let slot = match tail {
-        "enabled" => ProcRouteSlot::Enabled,
-        "up" => ProcRouteSlot::MoveUp,
-        "down" => ProcRouteSlot::MoveDown,
-        "remove" => ProcRouteSlot::Remove,
-        other => ProcRouteSlot::Field(other.strip_prefix("f:")?),
-    };
-    Some((idx, slot))
 }
 
 // ============================================================
@@ -788,13 +748,8 @@ pub fn render(
                 .enumerate()
                 .map(|(idx, fmt)| (idx.to_string(), fmt.label().to_string())),
         )),
-        OpenSelect::AddProcessor => Some(select_menu(
-            KEY_PROC_ADD,
-            processor_registry
-                .list_available()
-                .into_iter()
-                .map(|(type_id, name, _desc)| (type_id.to_string(), name.to_string())),
-        )),
+        OpenSelect::AddProcessor => Some(pipeline_ui::render_add_menu(&TX_PIPELINE_KEYS, processor_registry)),
+        OpenSelect::AddRxProcessor => Some(pipeline_ui::render_add_menu(&RX_PIPELINE_KEYS, processor_registry)),
         OpenSelect::ShortcutFunction(entry_id) => Some(select_menu(
             shortcut_function_key(entry_id),
             HotkeyFunction::ALL
@@ -1356,31 +1311,9 @@ fn physical_key_to_binding_string(physical: PhysicalKey) -> Option<String> {
 
 // ---- view helpers ---------------------------------------------------
 
-/// Wrap a related group of settings rows in a titled card. The card
-/// is the "panel" we group settings into so each tab reads as a stack
-/// of bordered groups instead of a flat run of dividers + headings.
-fn section_card<I, E>(title: impl Into<String>, children: I) -> El
-where
-    I: IntoIterator<Item = E>,
-    E: Into<El>,
-{
-    card([
-        card_header([card_title(title)]).padding(Sides {
-            left: tokens::SPACE_4,
-            right: tokens::SPACE_4,
-            top: tokens::SPACE_3,
-            bottom: tokens::SPACE_2,
-        }),
-        card_content(children.into_iter().map(Into::into).collect::<Vec<_>>())
-            .padding(Sides {
-                left: tokens::SPACE_4,
-                right: tokens::SPACE_4,
-                top: 0.0,
-                bottom: tokens::SPACE_4,
-            })
-            .gap(tokens::SPACE_2),
-    ])
-}
+// `section_card` (the titled card each tab groups its rows into) lives
+// in `crate::pipeline_ui` now, re-imported at the top of this module so
+// the tab submodules keep seeing it via `use super::*`.
 
 fn stat_row(label: impl Into<String>, value: impl Into<String>, color: Option<Color>) -> El {
     let value_text = text(value).mono().font_size(tokens::TEXT_XS.size);
@@ -1955,251 +1888,60 @@ pub fn handle_event(
         return SettingsOutcome::Handled;
     }
 
-    // ---------- Processing tab: dynamic per-processor controls ----------
+    // ---------- Processing tab: TX + RX pipeline editors ----------
     //
-    // Routes here are built at render time as `settings:proc:<idx>:<slot>`
-    // — see [`ProcRouteSlot`] for the slot vocabulary (enable switch,
-    // schema field, move-up / move-down / remove buttons). We dispatch
-    // text/switch/slider events against whichever shape the schema
-    // picked, so the keyboard + pointer codepaths converge into a
-    // single update of `pending.tx_pipeline`.
-
-    // "Add processor" dropdown. Picking a type appends a fresh
-    // `ProcessorConfig` (defaults from the registry) to the end of the
-    // pipeline — the user then moves / reorders / configures from
-    // there. Duplicates of the same type_id are allowed; the pipeline
-    // is keyed by index, not type, and a chain like "gain → denoise →
-    // gain" is a legitimate use case.
-    if let Some(action) = select::classify_event(event, KEY_PROC_ADD) {
-        match action {
-            select::SelectAction::Toggle => {
-                state.open_select = if state.open_select == OpenSelect::AddProcessor {
-                    OpenSelect::None
-                } else {
-                    OpenSelect::AddProcessor
-                };
-            }
-            select::SelectAction::Dismiss => state.open_select = OpenSelect::None,
-            select::SelectAction::Pick(value) => {
-                if let Some(mut new_config) = processor_registry.default_config(&value) {
-                    // Default to enabled — that's what the user just
-                    // explicitly asked for. The factory's
-                    // `default_settings()` already populates each
-                    // schema field, so no backfill is needed.
-                    new_config.enabled = true;
-                    pending.tx_pipeline.processors.push(new_config);
-                }
-                state.open_select = OpenSelect::None;
-            }
-            _ => {}
+    // Both sections are instances of the shared [`pipeline_ui`] editor;
+    // routes are prefix-scoped per section (see `TX_PIPELINE_KEYS` /
+    // `RX_PIPELINE_KEYS`) so an event can only ever mutate the pending
+    // pipeline it was rendered from. Edits accumulate in `pending` and
+    // land on Save/Apply like every other tab.
+    match pipeline_ui::handle_event(
+        &TX_PIPELINE_KEYS,
+        event,
+        &mut pending.tx_pipeline,
+        processor_registry,
+        selection,
+    ) {
+        PipelineEvent::Ignored => {}
+        PipelineEvent::Changed => return SettingsOutcome::Handled,
+        PipelineEvent::AddToggle => {
+            state.open_select = if state.open_select == OpenSelect::AddProcessor {
+                OpenSelect::None
+            } else {
+                OpenSelect::AddProcessor
+            };
+            return SettingsOutcome::Handled;
         }
-        return SettingsOutcome::Handled;
-    }
-
-    // Text-input events arrive on `target_key` rather than `route`, so
-    // check this before the generic `route()`-driven handlers.
-    if let Some(target) = event.target_key()
-        && let Some((idx, ProcRouteSlot::Field(field))) = parse_proc_route(target)
-        && let Some(proc_config) = pending.tx_pipeline.processors.get_mut(idx)
-        && schema_field_type(processor_registry, &proc_config.type_id, field) == Some("string")
-    {
-        let route = proc_field_key(idx, field);
-        let mut value = proc_config
-            .settings
-            .get(field)
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
-        text_input::apply_event(&mut value, selection, event, &route);
-        ensure_object(&mut proc_config.settings)[field] = JsonValue::String(value);
-        return SettingsOutcome::Handled;
-    }
-
-    if let Some(route) = event.route()
-        && let Some((idx, slot)) = parse_proc_route(route)
-    {
-        // Mutating actions on the pipeline list itself. These can fire
-        // even when `idx` would otherwise be out of bounds for a
-        // settings access, so handle them before the per-processor
-        // `get_mut` below — though in practice the route was just
-        // produced by the render at `idx`, so it should always be live.
-        if matches!(event.kind, UiEventKind::Click | UiEventKind::Activate) {
-            match slot {
-                ProcRouteSlot::MoveUp => {
-                    if idx > 0 && idx < pending.tx_pipeline.processors.len() {
-                        pending.tx_pipeline.processors.swap(idx - 1, idx);
-                    }
-                    return SettingsOutcome::Handled;
-                }
-                ProcRouteSlot::MoveDown => {
-                    if idx + 1 < pending.tx_pipeline.processors.len() {
-                        pending.tx_pipeline.processors.swap(idx, idx + 1);
-                    }
-                    return SettingsOutcome::Handled;
-                }
-                ProcRouteSlot::Remove => {
-                    if idx < pending.tx_pipeline.processors.len() {
-                        pending.tx_pipeline.processors.remove(idx);
-                    }
-                    return SettingsOutcome::Handled;
-                }
-                _ => {}
-            }
+        PipelineEvent::AddDismiss | PipelineEvent::AddPicked => {
+            state.open_select = OpenSelect::None;
+            return SettingsOutcome::Handled;
         }
-
-        let Some(proc_config) = pending.tx_pipeline.processors.get_mut(idx) else {
-            return SettingsOutcome::Ignored;
-        };
-
-        match slot {
-            // Per-processor enable switch.
-            ProcRouteSlot::Enabled => {
-                if switch::apply_event(&mut proc_config.enabled, event, route) {
-                    return SettingsOutcome::Handled;
-                }
-            }
-            // Action buttons handled above; we only get here for non-
-            // Click/Activate events (e.g. focus traversal), which the
-            // ghost icon-button surface absorbs on its own.
-            ProcRouteSlot::MoveUp | ProcRouteSlot::MoveDown | ProcRouteSlot::Remove => {}
-            // Schema-driven field. The schema lookup is the source of
-            // truth for "what control type was rendered" — the event
-            // codepaths can't peek at the rendered tree.
-            ProcRouteSlot::Field(field) => {
-                let prop_type = schema_field_type(processor_registry, &proc_config.type_id, field);
-                let prop_schema = processor_registry
-                    .settings_schema(&proc_config.type_id)
-                    .and_then(|s| s.get("properties").cloned())
-                    .and_then(|p| p.get(field).cloned());
-
-                match prop_type {
-                    Some("boolean") => {
-                        // After `merge_with_default_tx_pipeline` runs,
-                        // every schema-defined field is present on the
-                        // persisted config. The schema-default fallback
-                        // is the same one the display path uses
-                        // (`render_schema_field`), so a missing field
-                        // can't make the toggle's "current value" disagree
-                        // with what's painted on screen.
-                        let schema_default = prop_schema
-                            .as_ref()
-                            .and_then(|s| s.get("default"))
-                            .and_then(|d| d.as_bool())
-                            .unwrap_or(false);
-                        let mut value = proc_config
-                            .settings
-                            .get(field)
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(schema_default);
-                        if switch::apply_event(&mut value, event, route) {
-                            ensure_object(&mut proc_config.settings)[field] = JsonValue::Bool(value);
-                            return SettingsOutcome::Handled;
-                        }
-                    }
-                    Some("number") => {
-                        if let Some(schema) = prop_schema.as_ref() {
-                            let min = schema.get("minimum").and_then(|m| m.as_f64()).unwrap_or(-100.0) as f32;
-                            let max = schema.get("maximum").and_then(|m| m.as_f64()).unwrap_or(100.0) as f32;
-                            let span = (max - min).max(f32::EPSILON);
-
-                            // Pointer drag.
-                            if matches!(
-                                event.kind,
-                                UiEventKind::PointerDown | UiEventKind::Drag | UiEventKind::Click
-                            ) && let (Some(rect), Some(x)) = (event.target_rect(), event.pointer_x())
-                            {
-                                let n = slider::normalized_from_event(rect, x);
-                                let value = (min + n * span).clamp(min, max);
-                                ensure_object(&mut proc_config.settings)[field] = serde_json::json!(value as f64);
-                                return SettingsOutcome::Handled;
-                            }
-
-                            // Keyboard nudge.
-                            let current = proc_config
-                                .settings
-                                .get(field)
-                                .and_then(|v| v.as_f64())
-                                .map(|v| v as f32)
-                                .unwrap_or(min);
-                            let mut n = ((current - min) / span).clamp(0.0, 1.0);
-                            if slider::apply_event(&mut n, event, route, 0.05, 0.25) {
-                                let value = (min + n.clamp(0.0, 1.0) * span).clamp(min, max);
-                                ensure_object(&mut proc_config.settings)[field] = serde_json::json!(value as f64);
-                                return SettingsOutcome::Handled;
-                            }
-                        }
-                    }
-                    Some("integer") => {
-                        if let Some(schema) = prop_schema.as_ref() {
-                            let min = schema.get("minimum").and_then(|m| m.as_i64()).unwrap_or(0);
-                            let max = schema.get("maximum").and_then(|m| m.as_i64()).unwrap_or(100);
-                            let span = (max - min).max(1) as f32;
-
-                            if matches!(
-                                event.kind,
-                                UiEventKind::PointerDown | UiEventKind::Drag | UiEventKind::Click
-                            ) && let (Some(rect), Some(x)) = (event.target_rect(), event.pointer_x())
-                            {
-                                let n = slider::normalized_from_event(rect, x);
-                                let value = (min as f32 + n * span).round().clamp(min as f32, max as f32) as i64;
-                                ensure_object(&mut proc_config.settings)[field] = serde_json::json!(value);
-                                return SettingsOutcome::Handled;
-                            }
-
-                            let current = proc_config.settings.get(field).and_then(|v| v.as_i64()).unwrap_or(min);
-                            let mut n = ((current - min) as f32 / span).clamp(0.0, 1.0);
-                            if slider::apply_event(&mut n, event, route, 0.05, 0.25) {
-                                let value = (min as f32 + n.clamp(0.0, 1.0) * span)
-                                    .round()
-                                    .clamp(min as f32, max as f32) as i64;
-                                ensure_object(&mut proc_config.settings)[field] = serde_json::json!(value);
-                                return SettingsOutcome::Handled;
-                            }
-                        }
-                    }
-                    _ => {
-                        // String / unknown — text-input branch handles
-                        // those above via `target_key`.
-                    }
-                }
-            }
+    }
+    match pipeline_ui::handle_event(
+        &RX_PIPELINE_KEYS,
+        event,
+        &mut pending.rx_pipeline,
+        processor_registry,
+        selection,
+    ) {
+        PipelineEvent::Ignored => {}
+        PipelineEvent::Changed => return SettingsOutcome::Handled,
+        PipelineEvent::AddToggle => {
+            state.open_select = if state.open_select == OpenSelect::AddRxProcessor {
+                OpenSelect::None
+            } else {
+                OpenSelect::AddRxProcessor
+            };
+            return SettingsOutcome::Handled;
+        }
+        PipelineEvent::AddDismiss | PipelineEvent::AddPicked => {
+            state.open_select = OpenSelect::None;
+            return SettingsOutcome::Handled;
         }
     }
 
     SettingsOutcome::Ignored
 }
-
-/// Look up the JSON-Schema `type` for a single property of the named
-/// processor. Returns `None` when the processor or property is unknown
-/// — callers fall through to "ignore the event" in that case.
-fn schema_field_type(registry: &ProcessorRegistry, type_id: &str, field: &str) -> Option<&'static str> {
-    let schema = registry.settings_schema(type_id)?;
-    let properties = schema.get("properties")?.as_object()?;
-    let prop = properties.get(field)?;
-    let ty = prop.get("type")?.as_str()?;
-    // `serde_json::Value` strings are `&str` borrowed from the value
-    // itself, not `&'static`. The set of types we care about is small
-    // and known, so map them to `'static` literals to avoid leaking
-    // the borrow into the caller's lifetime.
-    Some(match ty {
-        "number" => "number",
-        "integer" => "integer",
-        "boolean" => "boolean",
-        "string" => "string",
-        _ => return None,
-    })
-}
-
-/// `serde_json::Value::object_mut` doesn't exist on stable; this helper
-/// makes sure `value` is an object so we can index into it. Replaces a
-/// non-object `value` with an empty object as a side effect.
-fn ensure_object(value: &mut JsonValue) -> &mut JsonValue {
-    if !value.is_object() {
-        *value = JsonValue::Object(serde_json::Map::new());
-    }
-    value
-}
-
 #[cfg(test)]
 mod hotkey_capture_tests {
     use rumble_desktop_shell::HotkeyManager;
